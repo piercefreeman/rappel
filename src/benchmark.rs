@@ -2,10 +2,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
-use tracing::info;
+use tokio::{sync::mpsc, task::JoinHandle, time};
+use tracing::{Instrument, info, warn};
 
 use crate::{
-    db::Database,
+    db::{CompletionRecord, Database},
     messages::MessageError,
     python_worker::{
         ActionDispatchPayload, PythonWorkerConfig, PythonWorkerPool, RoundTripMetrics,
@@ -36,6 +37,8 @@ impl Default for HarnessConfig {
 pub struct BenchmarkHarness {
     workers: PythonWorkerPool,
     database: Database,
+    completion_tx: mpsc::Sender<CompletionRecord>,
+    completion_handle: JoinHandle<()>,
 }
 
 impl BenchmarkHarness {
@@ -45,7 +48,17 @@ impl BenchmarkHarness {
         database: Database,
     ) -> Result<Self> {
         let workers = PythonWorkerPool::new(config, worker_count).await?;
-        Ok(Self { workers, database })
+        let (tx, rx) = mpsc::channel(1024);
+        let db_clone = database.clone();
+        let handle = tokio::spawn(async move {
+            run_completion_worker(db_clone, rx).await;
+        });
+        Ok(Self {
+            workers,
+            database,
+            completion_tx: tx,
+            completion_handle: handle,
+        })
     }
 
     pub async fn run(&self, config: &HarnessConfig) -> Result<BenchmarkSummary> {
@@ -87,17 +100,14 @@ impl BenchmarkHarness {
                         payload: action.payload,
                     };
                     let worker = self.workers.next_worker();
+                    let span = tracing::debug_span!(
+                        "dispatch",
+                        action_id = payload.action_id,
+                        instance_id = payload.instance_id,
+                        sequence = payload.sequence
+                    );
                     let fut: BoxFuture<'_, Result<RoundTripMetrics, MessageError>> =
-                        Box::pin(async move {
-                            let span = tracing::info_span!(
-                                "dispatch",
-                                action_id = payload.action_id,
-                                instance_id = payload.instance_id,
-                                sequence = payload.sequence
-                            );
-                            let _guard = span.enter();
-                            worker.send_action(payload).await
-                        });
+                        Box::pin(async move { worker.send_action(payload).await }.instrument(span));
                     inflight.push(fut);
                     dispatched += 1;
                 }
@@ -105,17 +115,15 @@ impl BenchmarkHarness {
 
             match inflight.next().await {
                 Some(Ok(metrics)) => {
-                    self.database
-                        .record_delivery(metrics.action_id, metrics.delivery_id)
-                        .await?;
-                    self.database.mark_action_acked(metrics.action_id).await?;
-                    self.database
-                        .mark_action_completed(
-                            metrics.action_id,
-                            metrics.success,
-                            &metrics.response_payload,
-                        )
-                        .await?;
+                    let record = CompletionRecord {
+                        action_id: metrics.action_id,
+                        success: metrics.success,
+                        delivery_id: metrics.delivery_id,
+                        result_payload: metrics.response_payload.clone(),
+                    };
+                    if let Err(err) = self.completion_tx.send(record).await {
+                        warn!(?err, "completion channel closed");
+                    }
                     tracing::debug!(
                         action_id = metrics.action_id,
                         round_trip_ms = %format!("{:.3}", metrics.round_trip.as_secs_f64() * 1000.0),
@@ -160,7 +168,17 @@ impl BenchmarkHarness {
     }
 
     pub async fn shutdown(self) -> Result<()> {
-        self.workers.shutdown().await?;
+        let BenchmarkHarness {
+            workers,
+            completion_tx,
+            completion_handle,
+            ..
+        } = self;
+        drop(completion_tx);
+        workers.shutdown().await?;
+        if let Err(err) = completion_handle.await {
+            warn!(?err, "completion worker failed");
+        }
         Ok(())
     }
 }
@@ -249,5 +267,47 @@ impl BenchmarkSummary {
             p95_round_trip_ms = %format!("{:.3} ms", self.p95_round_trip_ms),
             "benchmark summary",
         );
+    }
+}
+
+async fn run_completion_worker(db: Database, mut rx: mpsc::Receiver<CompletionRecord>) {
+    const BATCH_SIZE: usize = 128;
+    let mut buffer = Vec::with_capacity(BATCH_SIZE);
+    let mut ticker = time::interval(Duration::from_millis(5));
+    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    Some(record) => {
+                        buffer.push(record);
+                        if buffer.len() >= BATCH_SIZE {
+                            if let Err(err) = db.mark_actions_batch(&buffer).await {
+                                warn!(?err, "failed to flush completion batch");
+                            }
+                            buffer.clear();
+                        }
+                    }
+                    None => break,
+                }
+            }
+            _ = ticker.tick() => {
+                if buffer.is_empty() {
+                    if rx.is_closed() {
+                        break;
+                    }
+                    continue;
+                }
+                if let Err(err) = db.mark_actions_batch(&buffer).await {
+                    warn!(?err, "failed to flush completion batch");
+                }
+                buffer.clear();
+            }
+        }
+    }
+    if !buffer.is_empty()
+        && let Err(err) = db.mark_actions_batch(&buffer).await
+    {
+        warn!(?err, "failed to flush completion batch");
     }
 }

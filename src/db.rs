@@ -6,6 +6,14 @@ pub struct Database {
     pool: PgPool,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompletionRecord {
+    pub action_id: i64,
+    pub success: bool,
+    pub delivery_id: u64,
+    pub result_payload: Vec<u8>,
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct LedgerAction {
     pub id: i64,
@@ -127,49 +135,38 @@ impl Database {
         Ok(records)
     }
 
-    pub async fn record_delivery(&self, action_id: i64, delivery_id: u64) -> Result<()> {
-        tracing::debug!(action_id, delivery_id, "db.record_delivery");
-        sqlx::query("UPDATE daemon_action_ledger SET delivery_id = $2 WHERE id = $1")
-            .bind(action_id)
-            .bind(delivery_id as i64)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    pub async fn mark_action_acked(&self, action_id: i64) -> Result<()> {
-        tracing::debug!(action_id, "db.mark_action_acked");
-        sqlx::query(
-            "UPDATE daemon_action_ledger SET status = 'acked', acked_at = NOW() WHERE id = $1",
-        )
-        .bind(action_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn mark_action_completed(
-        &self,
-        action_id: i64,
-        success: bool,
-        result_payload: &[u8],
-    ) -> Result<()> {
-        tracing::debug!(
-            action_id,
-            success,
-            payload_len = result_payload.len(),
-            "db.mark_action_completed"
-        );
+    pub async fn mark_actions_batch(&self, records: &[CompletionRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let span = tracing::debug_span!("db.mark_actions_batch", count = records.len());
+        let _guard = span.enter();
+        let ids: Vec<i64> = records.iter().map(|r| r.action_id).collect();
+        let successes: Vec<bool> = records.iter().map(|r| r.success).collect();
+        let deliveries: Vec<i64> = records.iter().map(|r| r.delivery_id as i64).collect();
+        let payloads: Vec<Vec<u8>> = records.iter().map(|r| r.result_payload.clone()).collect();
         sqlx::query(
             r#"
-            UPDATE daemon_action_ledger
-            SET status = 'completed', success = $2, completed_at = NOW(), result_payload = $3
-            WHERE id = $1
+            WITH data AS (
+                SELECT *
+                FROM UNNEST($1::BIGINT[], $2::BOOL[], $3::BIGINT[], $4::BYTEA[])
+                    AS t(action_id, success, delivery_id, result_payload)
+            )
+            UPDATE daemon_action_ledger AS dal
+            SET status = 'completed',
+                success = data.success,
+                completed_at = NOW(),
+                acked_at = COALESCE(dal.acked_at, NOW()),
+                delivery_id = data.delivery_id,
+                result_payload = data.result_payload
+            FROM data
+            WHERE dal.id = data.action_id
             "#,
         )
-        .bind(action_id)
-        .bind(success)
-        .bind(result_payload)
+        .bind(ids)
+        .bind(successes)
+        .bind(deliveries)
+        .bind(payloads)
         .execute(&self.pool)
         .await?;
         Ok(())

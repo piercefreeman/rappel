@@ -23,3 +23,22 @@ There is no shortage of robust background queues in Python, including ones that 
 2. Celery/RabbitMQ
 
 Almost all of these require a dedicated task broker that you host alongside your app. This usually isn't a huge deal during POCs, but they all have a ton of knobs and dials so you can performance tune it to your own environment. It's also yet another thing in which to build a competency. Cloud hosting of most of these are billed per-event and can get very expensive depending on how you orchestrate your jobs.
+
+
+## Benchmarking & Log Parsing
+
+Stream benchmark output directly into our parser to summarize throughput and latency samples:
+
+```
+$ cargo run --bin bench -- \
+  --messages 100000 \
+  --payload 1024 \
+  --concurrency 64 \
+  --workers 4 \
+  --log-interval 15 \
+  --database-url postgres://mountaineer:mountaineer@localhost:5433/mountaineer_daemons \
+  --partition 0 | \
+  uv run python/tools/parse_bench_logs.py
+```
+
+Add `--json` to the parser if you prefer JSON output.
