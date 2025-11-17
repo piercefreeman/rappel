@@ -1,4 +1,4 @@
-"""Minimal worker loop that speaks the benchmarking protocol."""
+"""Python worker that executes user-defined carabiner actions."""
 
 from __future__ import annotations
 
@@ -8,11 +8,14 @@ import sys
 import time
 from typing import BinaryIO
 
+from carabiner_worker.actions import (
+    ActionRunner,
+    serialize_error_payload,
+    serialize_result_payload,
+)
 from proto.messages_pb2 import Ack, ActionDispatch, ActionResult, Envelope, MessageKind
 
-logging.basicConfig(
-    level=logging.INFO, format="[worker] %(message)s", stream=sys.stderr
-)
+logging.basicConfig(level=logging.INFO, format="[worker] %(message)s", stream=sys.stderr)
 
 _HEADER = struct.Struct("<I")
 
@@ -46,10 +49,15 @@ def _send_ack(stream: BinaryIO, delivery_id: int, partition_id: int) -> None:
     _write_frame(stream, envelope)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv:
+        logging.warning("Ignoring unexpected CLI arguments: %s", " ".join(argv))
     logging.info("Python worker booted")
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
+    runner = ActionRunner()
 
     while True:
         envelope = _read_frame(stdin)
@@ -68,14 +76,27 @@ def main() -> None:
 
             worker_start = time.perf_counter_ns()
             payload = dispatch.payload
-            # Touch the bytes so python work roughly scales with payload size.
-            checksum = sum(payload)
+            action_name = "unknown"
+            success = True
+            try:
+                invocation, result = runner.run_serialized(payload)
+                action_name = invocation.action
+                response_payload = serialize_result_payload(result)
+            except Exception as exc:  # noqa: BLE001 - propagate errors back to rust
+                success = False
+                response_payload = serialize_error_payload(action_name, exc)
+                logging.exception(
+                    "Action %s failed for action_id=%s sequence=%s",
+                    action_name,
+                    dispatch.action_id,
+                    dispatch.sequence,
+                )
             worker_end = time.perf_counter_ns()
 
             response = ActionResult(
                 action_id=dispatch.action_id,
-                success=True,
-                payload=payload,
+                success=success,
+                payload=response_payload,
                 worker_start_ns=worker_start,
                 worker_end_ns=worker_end,
             )
@@ -86,7 +107,12 @@ def main() -> None:
                 payload=response.SerializeToString(),
             )
             _write_frame(stdout, response_envelope)
-            logging.debug("Handled seq=%s checksum=%s", dispatch.sequence, checksum)
+            logging.debug(
+                "Handled action=%s seq=%s success=%s",
+                action_name,
+                dispatch.sequence,
+                success,
+            )
         elif kind == MessageKind.MESSAGE_KIND_HEARTBEAT:
             logging.debug("Received heartbeat delivery=%s", envelope.delivery_id)
             _send_ack(stdout, envelope.delivery_id, partition)

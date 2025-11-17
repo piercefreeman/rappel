@@ -76,9 +76,7 @@ def parse_lines(lines: Iterable[str]) -> tuple[List[Progress], List[ActionMetric
     return progress, actions
 
 
-def summarize(
-    progress: List[Progress], actions: List[ActionMetric], out: TextIO
-) -> None:
+def summarize(progress: List[Progress], actions: List[ActionMetric], out: TextIO) -> None:
     print(f"progress points: {len(progress)}", file=out)
     for p in progress:
         print(
@@ -98,9 +96,7 @@ def summarize(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Parse benchmark logs")
-    parser.add_argument(
-        "logfile", nargs="?", type=argparse.FileType("r"), default=sys.stdin
-    )
+    parser.add_argument("logfile", nargs="?", type=argparse.FileType("r"), default=sys.stdin)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 

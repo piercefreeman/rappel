@@ -14,8 +14,8 @@ clean:
 	rm -rf $(PY_PROTO_OUT)
 
 lint:
-	uvx ruff format python
-	uvx ruff check python --fix
-	uvx --with protobuf ty check python
+	uv run --project python ruff format python
+	uv run --project python ruff check python --fix
+	uv run --project python ty check python
 	cargo fmt
 	cargo clippy -- -D warnings
