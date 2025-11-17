@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 from enum import Enum
-from typing import Annotated, Any, Union
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, Field, TypeAdapter
 
@@ -23,14 +23,14 @@ class EncodedModelIdentifier(BaseModel):
 
 
 class PrimitiveEncodedValue(BaseModel):
-    kind: EncodedKind = Field(default=EncodedKind.PRIMITIVE, const=True)
+    kind: Literal[EncodedKind.PRIMITIVE] = Field(default=EncodedKind.PRIMITIVE)
     value: Any
 
     model_config = {"extra": "forbid"}
 
 
 class BaseModelEncodedValue(BaseModel):
-    kind: EncodedKind = Field(default=EncodedKind.BASEMODEL, const=True)
+    kind: Literal[EncodedKind.BASEMODEL] = Field(default=EncodedKind.BASEMODEL)
     model: EncodedModelIdentifier
     data: dict[str, Any]
 
@@ -74,15 +74,11 @@ def _decode_value(data: Any) -> Any:
     if encoded.kind is EncodedKind.PRIMITIVE:
         return encoded.value
     if encoded.kind is EncodedKind.BASEMODEL:
-        return _instantiate_serialized_model(
-            encoded.model.module, encoded.model.name, encoded.data
-        )
+        return _instantiate_serialized_model(encoded.model.module, encoded.model.name, encoded.data)
     raise ValueError(f"unsupported encoded kind: {encoded.kind!r}")
 
 
-def _instantiate_serialized_model(
-    module: str, name: str, model_data: dict[str, Any]
-) -> Any:
+def _instantiate_serialized_model(module: str, name: str, model_data: dict[str, Any]) -> Any:
     cls = _import_symbol(module, name)
     if hasattr(cls, "model_validate"):
         return cls.model_validate(model_data)  # type: ignore[attr-defined]

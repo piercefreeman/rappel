@@ -92,9 +92,7 @@ def action(
 
     def decorator(target: TAsync) -> TAsync:
         if not inspect.iscoroutinefunction(target):
-            raise TypeError(
-                f"action '{target.__name__}' must be defined with 'async def'"
-            )
+            raise TypeError(f"action '{target.__name__}' must be defined with 'async def'")
         action_name = name or target.__name__
         registry.register(action_name, target)
         return target
@@ -120,20 +118,17 @@ class ActionRunner:
         summary = ", ".join(names) if names else "<none>"
         logging.info("Registered %s actions: %s", len(names), summary)
 
-    def invoke(self, invocation: ActionCall) -> Any:
+    def run_serialized(self, payload: bytes) -> tuple[ActionCall, Any]:
+        """Deserialize a payload and execute the referenced action."""
+        invocation = deserialize_action_call(payload)
         self._ensure_module_loaded(invocation.module)
         handler = registry.get(invocation.action)
         if handler is None:
             raise RuntimeError(f"action '{invocation.action}' is not registered")
         result = handler(**invocation.kwargs)
         if asyncio.iscoroutine(result):
-            return asyncio.run(result)
+            return invocation, asyncio.run(result)
         raise RuntimeError(
             f"action '{invocation.action}' did not return a coroutine; "
             "ensure it is defined with 'async def'"
         )
-
-    def run_serialized(self, payload: bytes) -> tuple[ActionCall, Any]:
-        """Deserialize a payload and execute the referenced action."""
-        invocation = deserialize_action_call(payload)
-        return invocation, self.invoke(invocation)
