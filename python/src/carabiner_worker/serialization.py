@@ -4,18 +4,17 @@ import importlib
 import json
 import traceback
 from dataclasses import dataclass
-from typing import Any
+from enum import Enum
+from typing import Annotated, Any, Union
 
-try:
-    from pydantic import BaseModel
-except ImportError:  # pragma: no cover - used in real runtime
-    BaseModel = None  # type: ignore[assignment]
+from pydantic import BaseModel, Field, TypeAdapter
 
 PRIMITIVE_TYPES = (str, int, float, bool, type(None))
 
 
 @dataclass
 class ActionCall:
+    module: str
     action: str
     kwargs: dict[str, Any]
 
@@ -26,16 +25,56 @@ class ActionResultPayload:
     error: dict[str, str] | None
 
 
-def serialize_action_call(action: str, /, **kwargs: Any) -> bytes:
+class EncodedKind(str, Enum):
+    PRIMITIVE = "primitive"
+    BASEMODEL = "basemodel"
+
+
+class EncodedModelIdentifier(BaseModel):
+    module: str
+    name: str
+
+    model_config = {"extra": "forbid"}
+
+
+class PrimitiveEncodedValue(BaseModel):
+    kind: EncodedKind = Field(default=EncodedKind.PRIMITIVE, const=True)
+    value: Any
+
+    model_config = {"extra": "forbid"}
+
+
+class BaseModelEncodedValue(BaseModel):
+    kind: EncodedKind = Field(default=EncodedKind.BASEMODEL, const=True)
+    model: EncodedModelIdentifier
+    data: dict[str, Any]
+
+    model_config = {"extra": "forbid"}
+
+
+_encoded_value_adapter = TypeAdapter(
+    Annotated[
+        Union[PrimitiveEncodedValue, BaseModelEncodedValue],
+        Field(discriminator="kind"),
+    ]
+)
+
+
+def serialize_action_call(module: str, action: str, /, **kwargs: Any) -> bytes:
     """Serialize an action name and keyword arguments into bytes."""
+    if not isinstance(module, str) or not module:
+        raise ValueError("action module must be a non-empty string")
     encoded_kwargs = {key: _encode_value(value) for key, value in kwargs.items()}
-    payload = {"action": action, "kwargs": encoded_kwargs}
+    payload = {"module": module, "action": action, "kwargs": encoded_kwargs}
     return _dumps(payload)
 
 
 def deserialize_action_call(payload: bytes) -> ActionCall:
     """Deserialize a payload into an action invocation."""
     data = _loads(payload)
+    module = data.get("module")
+    if not isinstance(module, str) or not module:
+        raise ValueError("payload missing module name")
     action = data.get("action")
     if not isinstance(action, str) or not action:
         raise ValueError("payload missing action name")
@@ -43,7 +82,7 @@ def deserialize_action_call(payload: bytes) -> ActionCall:
     if not isinstance(kwargs_data, dict):
         raise ValueError("payload kwargs must be an object")
     kwargs = {key: _decode_value(value) for key, value in kwargs_data.items()}
-    return ActionCall(action=action, kwargs=kwargs)
+    return ActionCall(module=module, action=action, kwargs=kwargs)
 
 
 def serialize_result_payload(value: Any) -> bytes:
@@ -102,30 +141,26 @@ def _encode_value(value: Any) -> dict[str, Any]:
 def _decode_value(data: Any) -> Any:
     if not isinstance(data, dict):
         raise ValueError("encoded values must be objects")
-    kind = data.get("kind")
-    if kind == "primitive":
-        return data.get("value")
-    if kind == "basemodel":
-        model_info = data.get("model", {})
-        if not isinstance(model_info, dict):
-            raise ValueError("model identifier must be an object")
-        module = model_info.get("module")
-        name = model_info.get("name")
-        if not isinstance(module, str) or not isinstance(name, str):
-            raise ValueError("model identifier missing module or name")
-        cls = _import_symbol(module, name)
-        model_data = data.get("data", {})
-        if not isinstance(model_data, dict):
-            raise ValueError("model data must be an object")
-        if hasattr(cls, "model_validate"):
-            return cls.model_validate(model_data)  # type: ignore[attr-defined]
-        return cls(**model_data)
-    raise ValueError(f"unsupported encoded kind: {kind!r}")
+    encoded = _encoded_value_adapter.validate_python(data)
+    if encoded.kind is EncodedKind.PRIMITIVE:
+        return encoded.value
+    if encoded.kind is EncodedKind.BASEMODEL:
+        return _instantiate_serialized_model(
+            encoded.model.module, encoded.model.name, encoded.data
+        )
+    raise ValueError(f"unsupported encoded kind: {encoded.kind!r}")
+
+
+def _instantiate_serialized_model(
+    module: str, name: str, model_data: dict[str, Any]
+) -> Any:
+    cls = _import_symbol(module, name)
+    if hasattr(cls, "model_validate"):
+        return cls.model_validate(model_data)  # type: ignore[attr-defined]
+    return cls(**model_data)
 
 
 def _is_base_model(value: Any) -> bool:
-    if BaseModel is None:
-        return False
     return isinstance(value, BaseModel)
 
 

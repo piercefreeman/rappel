@@ -16,8 +16,11 @@ class SampleModel(BaseModel):
 
 
 def test_action_round_trip_with_basemodel() -> None:
-    payload = serialize_action_call("demo.echo", request=SampleModel(payload="hello"))
+    payload = serialize_action_call(
+        "demo.module", "demo.echo", request=SampleModel(payload="hello")
+    )
     invocation = deserialize_action_call(payload)
+    assert invocation.module == "demo.module"
     assert invocation.action == "demo.echo"
     assert isinstance(invocation.kwargs["request"], SampleModel)
     assert invocation.kwargs["request"].payload == "hello"

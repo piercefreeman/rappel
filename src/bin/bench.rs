@@ -120,8 +120,10 @@ async fn main() -> Result<()> {
 
     info!(?options, "starting benchmark");
     let database = Database::connect(&options.database_url).await?;
-    let mut worker_config = PythonWorkerConfig::default();
-    worker_config.user_module = options.user_module.clone();
+    let worker_config = PythonWorkerConfig {
+        user_module: options.user_module.clone(),
+        ..PythonWorkerConfig::default()
+    };
     let harness = BenchmarkHarness::new(worker_config, options.worker_count, database).await?;
 
     let config = HarnessConfig {

@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import importlib
 import logging
 import struct
 import sys
 import time
-from dataclasses import dataclass
 from typing import Any, BinaryIO
 
 from carabiner_worker import registry as action_registry
@@ -57,26 +55,24 @@ def _send_ack(stream: BinaryIO, delivery_id: int, partition_id: int) -> None:
     _write_frame(stream, envelope)
 
 
-@dataclass
-class WorkerArgs:
-    user_module: str
-
-
 class UserActionExecutor:
-    """Loads a user module once and resolves registered actions."""
+    """Ensures user action modules are imported before invocation."""
 
-    def __init__(self, module_name: str):
-        self.module_name = module_name
-        self._load_module()
+    def __init__(self) -> None:
+        self._loaded_modules: set[str] = set()
 
-    def _load_module(self) -> None:
-        logging.info("Importing user module %s", self.module_name)
-        importlib.import_module(self.module_name)
+    def _ensure_module_loaded(self, module_name: str) -> None:
+        if module_name in self._loaded_modules:
+            return
+        logging.info("Importing user module %s", module_name)
+        importlib.import_module(module_name)
+        self._loaded_modules.add(module_name)
         names = action_registry.names()
         summary = ", ".join(names) if names else "<none>"
         logging.info("Registered %s actions: %s", len(names), summary)
 
     def invoke(self, invocation: ActionCall) -> Any:
+        self._ensure_module_loaded(invocation.module)
         handler = action_registry.get(invocation.action)
         if handler is None:
             raise RuntimeError(f"action '{invocation.action}' is not registered")
@@ -89,23 +85,15 @@ class UserActionExecutor:
         )
 
 
-def _parse_args(argv: list[str]) -> WorkerArgs:
-    parser = argparse.ArgumentParser(description="Carabiner Python worker")
-    parser.add_argument(
-        "--user-module",
-        required=True,
-        help="Python module path containing @action definitions",
-    )
-    parsed = parser.parse_args(argv)
-    return WorkerArgs(user_module=parsed.user_module)
-
-
 def main(argv: list[str] | None = None) -> None:
-    args = _parse_args(argv if argv is not None else sys.argv[1:])
-    logging.info("Python worker booted for module %s", args.user_module)
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv:
+        logging.warning("Ignoring unexpected CLI arguments: %s", " ".join(argv))
+    logging.info("Python worker booted")
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
-    executor = UserActionExecutor(args.user_module)
+    executor = UserActionExecutor()
 
     while True:
         envelope = _read_frame(stdin)
@@ -157,7 +145,10 @@ def main(argv: list[str] | None = None) -> None:
             )
             _write_frame(stdout, response_envelope)
             logging.debug(
-                "Handled action=%s seq=%s success=%s", action_name, dispatch.sequence, success
+                "Handled action=%s seq=%s success=%s",
+                action_name,
+                dispatch.sequence,
+                success,
             )
         elif kind == MessageKind.MESSAGE_KIND_HEARTBEAT:
             logging.debug("Received heartbeat delivery=%s", envelope.delivery_id)

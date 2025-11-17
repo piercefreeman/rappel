@@ -70,11 +70,7 @@ impl BenchmarkHarness {
         self.database.reset_partition(config.partition_id).await?;
         let encoded_payload = build_benchmark_payload(config.payload_size);
         self.database
-            .seed_actions(
-                config.partition_id,
-                config.total_messages,
-                &encoded_payload,
-            )
+            .seed_actions(config.partition_id, config.total_messages, &encoded_payload)
             .await?;
 
         let total = config.total_messages;
