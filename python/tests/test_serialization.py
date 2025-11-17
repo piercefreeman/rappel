@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from carabiner_worker.serialization import (
+from carabiner_worker.actions import (
     deserialize_action_call,
     deserialize_result_payload,
     serialize_action_call,

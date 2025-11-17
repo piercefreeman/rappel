@@ -2,27 +2,12 @@ from __future__ import annotations
 
 import importlib
 import json
-import traceback
-from dataclasses import dataclass
 from enum import Enum
 from typing import Annotated, Any, Union
 
 from pydantic import BaseModel, Field, TypeAdapter
 
 PRIMITIVE_TYPES = (str, int, float, bool, type(None))
-
-
-@dataclass
-class ActionCall:
-    module: str
-    action: str
-    kwargs: dict[str, Any]
-
-
-@dataclass
-class ActionResultPayload:
-    result: Any | None
-    error: dict[str, str] | None
 
 
 class EncodedKind(str, Enum):
@@ -58,62 +43,6 @@ _encoded_value_adapter = TypeAdapter(
         Field(discriminator="kind"),
     ]
 )
-
-
-def serialize_action_call(module: str, action: str, /, **kwargs: Any) -> bytes:
-    """Serialize an action name and keyword arguments into bytes."""
-    if not isinstance(module, str) or not module:
-        raise ValueError("action module must be a non-empty string")
-    encoded_kwargs = {key: _encode_value(value) for key, value in kwargs.items()}
-    payload = {"module": module, "action": action, "kwargs": encoded_kwargs}
-    return _dumps(payload)
-
-
-def deserialize_action_call(payload: bytes) -> ActionCall:
-    """Deserialize a payload into an action invocation."""
-    data = _loads(payload)
-    module = data.get("module")
-    if not isinstance(module, str) or not module:
-        raise ValueError("payload missing module name")
-    action = data.get("action")
-    if not isinstance(action, str) or not action:
-        raise ValueError("payload missing action name")
-    kwargs_data = data.get("kwargs", {})
-    if not isinstance(kwargs_data, dict):
-        raise ValueError("payload kwargs must be an object")
-    kwargs = {key: _decode_value(value) for key, value in kwargs_data.items()}
-    return ActionCall(module=module, action=action, kwargs=kwargs)
-
-
-def serialize_result_payload(value: Any) -> bytes:
-    """Serialize a successful action result."""
-    return _dumps({"result": _encode_value(value)})
-
-
-def serialize_error_payload(action: str, exc: BaseException) -> bytes:
-    """Serialize an error raised during action execution."""
-    error_payload = {
-        "error": {
-            "action": action,
-            "type": exc.__class__.__name__,
-            "message": str(exc),
-            "traceback": traceback.format_exc(),
-        }
-    }
-    return _dumps(error_payload)
-
-
-def deserialize_result_payload(payload: bytes) -> ActionResultPayload:
-    """Deserialize bytes produced by serialize_result_payload/error."""
-    data = _loads(payload)
-    if "error" in data:
-        error = data["error"]
-        if not isinstance(error, dict):
-            raise ValueError("error payload must be an object")
-        return ActionResultPayload(result=None, error=error)
-    if "result" not in data:
-        raise ValueError("result payload missing 'result' field")
-    return ActionResultPayload(result=_decode_value(data["result"]), error=None)
 
 
 def _encode_value(value: Any) -> dict[str, Any]:
