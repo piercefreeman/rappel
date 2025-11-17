@@ -8,29 +8,31 @@ class Ack(_ProtoMessage):
     def __init__(self, acked_delivery_id: int = ...) -> None: ...
     acked_delivery_id: int
 
-class BenchmarkCommand(_ProtoMessage):
+class ActionDispatch(_ProtoMessage):
     def __init__(
         self,
-        monotonic_ns: int = ...,
+        action_id: int = ...,
+        instance_id: int = ...,
         sequence: int = ...,
-        payload_size: int = ...,
         payload: bytes = ...,
     ) -> None: ...
-    monotonic_ns: int
+    action_id: int
+    instance_id: int
     sequence: int
-    payload_size: int
     payload: bytes
 
-class BenchmarkResponse(_ProtoMessage):
+class ActionResult(_ProtoMessage):
     def __init__(
         self,
-        correlated_delivery_id: int = ...,
-        sequence: int = ...,
+        action_id: int = ...,
+        success: bool = ...,
+        payload: bytes = ...,
         worker_start_ns: int = ...,
         worker_end_ns: int = ...,
     ) -> None: ...
-    correlated_delivery_id: int
-    sequence: int
+    action_id: int
+    success: bool
+    payload: bytes
     worker_start_ns: int
     worker_end_ns: int
 
@@ -49,7 +51,7 @@ class Envelope(_ProtoMessage):
 
 class MessageKind:
     MESSAGE_KIND_UNSPECIFIED: int
-    MESSAGE_KIND_BENCHMARK_COMMAND: int
-    MESSAGE_KIND_BENCHMARK_RESPONSE: int
+    MESSAGE_KIND_ACTION_DISPATCH: int
+    MESSAGE_KIND_ACTION_RESULT: int
     MESSAGE_KIND_ACK: int
     MESSAGE_KIND_HEARTBEAT: int

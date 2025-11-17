@@ -5,8 +5,8 @@ package carabiner.messages;
 // Basic transport messages for Rust <-> Python worker communication.
 enum MessageKind {
   MESSAGE_KIND_UNSPECIFIED = 0;
-  MESSAGE_KIND_BENCHMARK_COMMAND = 1;
-  MESSAGE_KIND_BENCHMARK_RESPONSE = 2;
+  MESSAGE_KIND_ACTION_DISPATCH = 1;
+  MESSAGE_KIND_ACTION_RESULT = 2;
   MESSAGE_KIND_ACK = 3;
   MESSAGE_KIND_HEARTBEAT = 4;
 }
@@ -19,18 +19,19 @@ message Envelope {
   bytes payload = 4;
 }
 
-message BenchmarkCommand {
-  uint64 monotonic_ns = 1;
-  uint32 sequence = 2;
-  uint32 payload_size = 3;
+message ActionDispatch {
+  uint64 action_id = 1;
+  uint64 instance_id = 2;
+  uint32 sequence = 3;
   bytes payload = 4;
 }
 
-message BenchmarkResponse {
-  uint64 correlated_delivery_id = 1;
-  uint32 sequence = 2;
-  uint64 worker_start_ns = 3;
-  uint64 worker_end_ns = 4;
+message ActionResult {
+  uint64 action_id = 1;
+  bool success = 2;
+  bytes payload = 3;
+  uint64 worker_start_ns = 4;
+  uint64 worker_end_ns = 5;
 }
 
 message Ack {

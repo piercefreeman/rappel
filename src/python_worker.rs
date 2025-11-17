@@ -6,7 +6,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -41,16 +41,20 @@ impl Default for PythonWorkerConfig {
 
 #[derive(Debug, Clone)]
 pub struct RoundTripMetrics {
+    pub action_id: i64,
+    pub instance_id: i64,
     pub delivery_id: u64,
     pub sequence: u32,
     pub ack_latency: Duration,
     pub round_trip: Duration,
     pub worker_duration: Duration,
+    pub response_payload: Vec<u8>,
+    pub success: bool,
 }
 
 struct SharedState {
     pending_acks: HashMap<u64, oneshot::Sender<Instant>>,
-    pending_responses: HashMap<u64, oneshot::Sender<(proto::BenchmarkResponse, Instant)>>,
+    pending_responses: HashMap<u64, oneshot::Sender<(proto::ActionResult, Instant)>>,
 }
 
 impl SharedState {
@@ -60,6 +64,14 @@ impl SharedState {
             pending_responses: HashMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ActionDispatchPayload {
+    pub action_id: i64,
+    pub instance_id: i64,
+    pub sequence: i32,
+    pub payload: Vec<u8>,
 }
 
 pub struct PythonWorker {
@@ -125,13 +137,19 @@ impl PythonWorker {
         })
     }
 
-    pub async fn send_benchmark_command(
+    pub async fn send_action(
         &self,
-        sequence: u32,
-        payload_size: usize,
+        dispatch: ActionDispatchPayload,
     ) -> Result<RoundTripMetrics, MessageError> {
         let delivery_id = self.next_delivery.fetch_add(1, Ordering::SeqCst);
         let send_instant = Instant::now();
+        tracing::debug!(
+            action_id = dispatch.action_id,
+            instance_id = dispatch.instance_id,
+            sequence = dispatch.sequence,
+            payload_len = dispatch.payload.len(),
+            "worker.send_action"
+        );
         let (ack_tx, ack_rx) = oneshot::channel();
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -141,17 +159,17 @@ impl PythonWorker {
             shared.pending_responses.insert(delivery_id, response_tx);
         }
 
-        let command = proto::BenchmarkCommand {
-            monotonic_ns: messages::now_monotonic_ns(),
-            sequence,
-            payload_size: payload_size as u32,
-            payload: vec![0; payload_size],
+        let command = proto::ActionDispatch {
+            action_id: dispatch.action_id as u64,
+            instance_id: dispatch.instance_id as u64,
+            sequence: dispatch.sequence as u32,
+            payload: dispatch.payload.clone(),
         };
 
         let envelope = proto::Envelope {
             delivery_id,
             partition_id: self.partition_id,
-            kind: proto::MessageKind::BenchmarkCommand as i32,
+            kind: proto::MessageKind::ActionDispatch as i32,
             payload: messages::encode_message(&command),
         };
 
@@ -174,11 +192,15 @@ impl PythonWorker {
         );
 
         Ok(RoundTripMetrics {
+            action_id: dispatch.action_id,
+            instance_id: dispatch.instance_id,
             delivery_id,
-            sequence,
+            sequence: dispatch.sequence as u32,
             ack_latency,
             round_trip,
             worker_duration,
+            response_payload: response.payload,
+            success: response.success,
         })
     }
 
@@ -215,21 +237,16 @@ impl PythonWorker {
                         warn!(delivery = ack.acked_delivery_id, "unexpected ACK");
                     }
                 }
-                proto::MessageKind::BenchmarkResponse => {
+                proto::MessageKind::ActionResult => {
                     let response =
-                        messages::decode_message::<proto::BenchmarkResponse>(&envelope.payload)?;
+                        messages::decode_message::<proto::ActionResult>(&envelope.payload)?;
                     {
                         let mut guard = shared.lock().await;
-                        if let Some(sender) = guard
-                            .pending_responses
-                            .remove(&response.correlated_delivery_id)
+                        if let Some(sender) = guard.pending_responses.remove(&envelope.delivery_id)
                         {
                             let _ = sender.send((response, Instant::now()));
                         } else {
-                            warn!(
-                                delivery = response.correlated_delivery_id,
-                                "orphan response"
-                            );
+                            warn!(delivery = envelope.delivery_id, "orphan response");
                         }
                     }
                 }
@@ -264,5 +281,50 @@ impl Drop for PythonWorker {
         if let Err(err) = self.child.start_kill() {
             warn!(?err, "failed to kill python worker during drop");
         }
+    }
+}
+
+pub struct PythonWorkerPool {
+    workers: Vec<Arc<PythonWorker>>,
+    cursor: AtomicUsize,
+}
+
+impl PythonWorkerPool {
+    pub async fn new(config: PythonWorkerConfig, count: usize) -> AnyResult<Self> {
+        let worker_count = count.max(1);
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let worker = PythonWorker::spawn(config.clone()).await?;
+            workers.push(Arc::new(worker));
+        }
+        Ok(Self {
+            workers,
+            cursor: AtomicUsize::new(0),
+        })
+    }
+
+    pub fn next_worker(&self) -> Arc<PythonWorker> {
+        let idx = self.cursor.fetch_add(1, Ordering::Relaxed);
+        Arc::clone(&self.workers[idx % self.workers.len()])
+    }
+
+    pub fn len(&self) -> usize {
+        self.workers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.workers.is_empty()
+    }
+
+    pub async fn shutdown(self) -> AnyResult<()> {
+        for worker in self.workers {
+            match Arc::try_unwrap(worker) {
+                Ok(worker) => {
+                    worker.shutdown().await?;
+                }
+                Err(_) => warn!("python worker still in use during shutdown; skipping"),
+            }
+        }
+        Ok(())
     }
 }

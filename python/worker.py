@@ -8,13 +8,7 @@ import sys
 import time
 from typing import BinaryIO
 
-from proto.messages_pb2 import (
-    Ack,
-    BenchmarkCommand,
-    BenchmarkResponse,
-    Envelope,
-    MessageKind,
-)
+from proto.messages_pb2 import Ack, ActionDispatch, ActionResult, Envelope, MessageKind
 
 logging.basicConfig(
     level=logging.INFO, format="[worker] %(message)s", stream=sys.stderr
@@ -66,32 +60,33 @@ def main() -> None:
         kind = envelope.kind
         partition = envelope.partition_id
 
-        if kind == MessageKind.MESSAGE_KIND_BENCHMARK_COMMAND:
+        if kind == MessageKind.MESSAGE_KIND_ACTION_DISPATCH:
             _send_ack(stdout, envelope.delivery_id, partition)
 
-            command = BenchmarkCommand()
-            command.ParseFromString(envelope.payload)
+            dispatch = ActionDispatch()
+            dispatch.ParseFromString(envelope.payload)
 
             worker_start = time.perf_counter_ns()
-            payload = command.payload
+            payload = dispatch.payload
             # Touch the bytes so python work roughly scales with payload size.
             checksum = sum(payload)
             worker_end = time.perf_counter_ns()
 
-            response = BenchmarkResponse(
-                correlated_delivery_id=envelope.delivery_id,
-                sequence=command.sequence,
+            response = ActionResult(
+                action_id=dispatch.action_id,
+                success=True,
+                payload=payload,
                 worker_start_ns=worker_start,
                 worker_end_ns=worker_end,
             )
             response_envelope = Envelope(
                 delivery_id=envelope.delivery_id,
                 partition_id=partition,
-                kind=MessageKind.MESSAGE_KIND_BENCHMARK_RESPONSE,
+                kind=MessageKind.MESSAGE_KIND_ACTION_RESULT,
                 payload=response.SerializeToString(),
             )
             _write_frame(stdout, response_envelope)
-            logging.debug("Handled seq=%s checksum=%s", command.sequence, checksum)
+            logging.debug("Handled seq=%s checksum=%s", dispatch.sequence, checksum)
         elif kind == MessageKind.MESSAGE_KIND_HEARTBEAT:
             logging.debug("Received heartbeat delivery=%s", envelope.delivery_id)
             _send_ack(stdout, envelope.delivery_id, partition)

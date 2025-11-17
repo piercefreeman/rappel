@@ -20,7 +20,7 @@ _sym_db = _symbol_database.Default()
 
 
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(
-    b'\n\x0emessages.proto\x12\x12\x63\x61rabiner.messages"u\n\x08\x45nvelope\x12\x13\n\x0b\x64\x65livery_id\x18\x01 \x01(\x04\x12\x14\n\x0cpartition_id\x18\x02 \x01(\r\x12-\n\x04kind\x18\x03 \x01(\x0e\x32\x1f.carabiner.messages.MessageKind\x12\x0f\n\x07payload\x18\x04 \x01(\x0c"a\n\x10\x42\x65nchmarkCommand\x12\x14\n\x0cmonotonic_ns\x18\x01 \x01(\x04\x12\x10\n\x08sequence\x18\x02 \x01(\r\x12\x14\n\x0cpayload_size\x18\x03 \x01(\r\x12\x0f\n\x07payload\x18\x04 \x01(\x0c"u\n\x11\x42\x65nchmarkResponse\x12\x1e\n\x16\x63orrelated_delivery_id\x18\x01 \x01(\x04\x12\x10\n\x08sequence\x18\x02 \x01(\r\x12\x17\n\x0fworker_start_ns\x18\x03 \x01(\x04\x12\x15\n\rworker_end_ns\x18\x04 \x01(\x04" \n\x03\x41\x63k\x12\x19\n\x11\x61\x63ked_delivery_id\x18\x01 \x01(\x04*\xa6\x01\n\x0bMessageKind\x12\x1c\n\x18MESSAGE_KIND_UNSPECIFIED\x10\x00\x12"\n\x1eMESSAGE_KIND_BENCHMARK_COMMAND\x10\x01\x12#\n\x1fMESSAGE_KIND_BENCHMARK_RESPONSE\x10\x02\x12\x14\n\x10MESSAGE_KIND_ACK\x10\x03\x12\x1a\n\x16MESSAGE_KIND_HEARTBEAT\x10\x04\x62\x06proto3'
+    b'\n\x0emessages.proto\x12\x12\x63\x61rabiner.messages"u\n\x08\x45nvelope\x12\x13\n\x0b\x64\x65livery_id\x18\x01 \x01(\x04\x12\x14\n\x0cpartition_id\x18\x02 \x01(\r\x12-\n\x04kind\x18\x03 \x01(\x0e\x32\x1f.carabiner.messages.MessageKind\x12\x0f\n\x07payload\x18\x04 \x01(\x0c"[\n\x0e\x41\x63tionDispatch\x12\x11\n\taction_id\x18\x01 \x01(\x04\x12\x13\n\x0binstance_id\x18\x02 \x01(\x04\x12\x10\n\x08sequence\x18\x03 \x01(\r\x12\x0f\n\x07payload\x18\x04 \x01(\x0c"s\n\x0c\x41\x63tionResult\x12\x11\n\taction_id\x18\x01 \x01(\x04\x12\x0f\n\x07success\x18\x02 \x01(\x08\x12\x0f\n\x07payload\x18\x03 \x01(\x0c\x12\x17\n\x0fworker_start_ns\x18\x04 \x01(\x04\x12\x15\n\rworker_end_ns\x18\x05 \x01(\x04" \n\x03\x41\x63k\x12\x19\n\x11\x61\x63ked_delivery_id\x18\x01 \x01(\x04*\x9f\x01\n\x0bMessageKind\x12\x1c\n\x18MESSAGE_KIND_UNSPECIFIED\x10\x00\x12 \n\x1cMESSAGE_KIND_ACTION_DISPATCH\x10\x01\x12\x1e\n\x1aMESSAGE_KIND_ACTION_RESULT\x10\x02\x12\x14\n\x10MESSAGE_KIND_ACK\x10\x03\x12\x1a\n\x16MESSAGE_KIND_HEARTBEAT\x10\x04\x62\x06proto3'
 )
 
 _globals = globals()
@@ -28,14 +28,14 @@ _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, "messages_pb2", _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
     DESCRIPTOR._loaded_options = None
-    _globals["_MESSAGEKIND"]._serialized_start = 410
-    _globals["_MESSAGEKIND"]._serialized_end = 576
+    _globals["_MESSAGEKIND"]._serialized_start = 402
+    _globals["_MESSAGEKIND"]._serialized_end = 561
     _globals["_ENVELOPE"]._serialized_start = 38
     _globals["_ENVELOPE"]._serialized_end = 155
-    _globals["_BENCHMARKCOMMAND"]._serialized_start = 157
-    _globals["_BENCHMARKCOMMAND"]._serialized_end = 254
-    _globals["_BENCHMARKRESPONSE"]._serialized_start = 256
-    _globals["_BENCHMARKRESPONSE"]._serialized_end = 373
-    _globals["_ACK"]._serialized_start = 375
-    _globals["_ACK"]._serialized_end = 407
+    _globals["_ACTIONDISPATCH"]._serialized_start = 157
+    _globals["_ACTIONDISPATCH"]._serialized_end = 248
+    _globals["_ACTIONRESULT"]._serialized_start = 250
+    _globals["_ACTIONRESULT"]._serialized_end = 365
+    _globals["_ACK"]._serialized_start = 367
+    _globals["_ACK"]._serialized_end = 399
 # @@protoc_insertion_point(module_scope)
