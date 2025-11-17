@@ -55,3 +55,33 @@ class MessageKind:
     MESSAGE_KIND_ACTION_RESULT: int
     MESSAGE_KIND_ACK: int
     MESSAGE_KIND_HEARTBEAT: int
+
+class WorkflowDagNode(_ProtoMessage):
+    def __init__(
+        self,
+        id: str = ...,
+        action: str = ...,
+        kwargs: dict[str, str] | None = ...,
+        depends_on: list[str] | None = ...,
+        wait_for_sync: list[str] | None = ...,
+    ) -> None: ...
+    id: str
+    action: str
+    kwargs: dict[str, str]
+    depends_on: list[str]
+    wait_for_sync: list[str]
+
+class WorkflowRegistration(_ProtoMessage):
+    def __init__(
+        self,
+        workflow_name: str = ...,
+        concurrent: bool = ...,
+        nodes: list[WorkflowDagNode] | None = ...,
+        dag_json: str = ...,
+        dag_hash: str = ...,
+    ) -> None: ...
+    workflow_name: str
+    concurrent: bool
+    nodes: list[WorkflowDagNode]
+    dag_json: str
+    dag_hash: str

@@ -170,4 +170,41 @@ impl Database {
         .await?;
         Ok(())
     }
+
+    pub async fn upsert_workflow_version(
+        &self,
+        workflow_name: &str,
+        dag_hash: &str,
+        dag_json: &str,
+        concurrent: bool,
+    ) -> Result<i64> {
+        let mut tx = self.pool.begin().await?;
+        if let Some(existing_id) = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM workflow_versions WHERE workflow_name = $1 AND dag_hash = $2",
+        )
+        .bind(workflow_name)
+        .bind(dag_hash)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            tx.commit().await?;
+            return Ok(existing_id);
+        }
+
+        let id = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO workflow_versions (workflow_name, dag_hash, dag_json, concurrent)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id
+            "#,
+        )
+        .bind(workflow_name)
+        .bind(dag_hash)
+        .bind(dag_json)
+        .bind(concurrent)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
 }

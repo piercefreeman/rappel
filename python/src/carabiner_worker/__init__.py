@@ -1,5 +1,6 @@
 """Public API for user-defined carabiner actions."""
 
+from . import bridge
 from .actions import (
     ActionCall,
     ActionResultPayload,
@@ -31,4 +32,5 @@ __all__ = [
     "serialize_result_payload",
     "deserialize_result_payload",
     "serialize_error_payload",
+    "bridge",
 ]

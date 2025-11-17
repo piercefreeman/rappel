@@ -30,5 +30,10 @@ ignore = ["E501"]
 "proto/messages_pb2.pyi" = ["N802"]
 
 [build-system]
-requires = ["uv_build>=0.8.13,<0.9.0"]
-build-backend = "uv_build"
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+manifest-path = "../Cargo.toml"
+python-source = "src"
+module-name = "carabiner_worker._bridge"

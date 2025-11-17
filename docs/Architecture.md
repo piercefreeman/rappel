@@ -5,6 +5,8 @@ Within our workers, every bit of Python logic that's run is technically an actio
 Python Client Lib -> Rust Client Bridge -> DB
 DB -> Rust Workflow Runner -> Python action runners
 
+All Python library code is within one library - and all rust code is within one library as well. We compile the rust down to a maturin embedded executable for the rust client bridge - and a separate launchable bin entrypoint for the rust worker controller.
+
 ## python: client library
 
 Parse what users intend to run via their Workflow instances, send the DAG definition to the database for execution.
