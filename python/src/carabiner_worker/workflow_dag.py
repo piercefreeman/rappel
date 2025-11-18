@@ -434,9 +434,7 @@ class WorkflowDagBuilder(ast.NodeVisitor):
 
     def _capture_block(self, node: ast.AST) -> None:
         snippet = ast.get_source_segment(self._source, node)
-        if snippet is None:
-            snippet = ast.unparse(node)
-        snippet = textwrap.dedent(snippet).strip()
+        snippet = self._normalize_block_snippet(snippet, node)
         if not snippet:
             return
         block_id = self._new_node_id()
@@ -460,6 +458,19 @@ class WorkflowDagBuilder(ast.NodeVisitor):
             self._var_to_node[name] = block_id
             self._collections.pop(name, None)
         self._append_node(block_node)
+
+    def _normalize_block_snippet(self, snippet: Optional[str], node: ast.AST) -> str:
+        text = snippet or ast.unparse(node)
+        text = textwrap.dedent(text).strip("\n")
+        if not text:
+            return text
+        try:
+            compile(text, "<workflow_block>", "exec")
+            return text
+        except SyntaxError:
+            fallback = textwrap.dedent(ast.unparse(node)).strip("\n")
+            compile(fallback, "<workflow_block>", "exec")
+            return fallback
 
     def _append_python_block(self, code: str, produces: List[str]) -> None:
         snippet = textwrap.dedent(code).strip()

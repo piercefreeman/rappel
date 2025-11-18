@@ -257,6 +257,7 @@ async fn workflow_executes_end_to_end() -> Result<()> {
 
     let message = completed
         .iter()
+        .rev()
         .find_map(|metrics| parse_result(&metrics.response_payload).transpose())
         .transpose()?
         .context("expected primitive result")?;
@@ -336,6 +337,7 @@ async fn workflow_executes_complex_flow() -> Result<()> {
 
     let message = completed
         .iter()
+        .rev()
         .find_map(|metrics| parse_result(&metrics.response_payload).transpose())
         .transpose()?
         .context("expected primitive result")?;
