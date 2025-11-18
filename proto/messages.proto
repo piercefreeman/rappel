@@ -46,6 +46,7 @@ message WorkflowDagNode {
   repeated string wait_for_sync = 5;
   repeated string produces = 6;
   string module = 7;
+  string guard = 8;
 }
 
 message WorkflowDagDefinition {

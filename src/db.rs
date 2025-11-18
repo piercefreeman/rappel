@@ -151,6 +151,7 @@ mod tests {
             wait_for_sync: wait_for_sync.iter().map(|s| s.to_string()).collect(),
             module: String::new(),
             produces: Vec::new(),
+            guard: String::new(),
         }
     }
 

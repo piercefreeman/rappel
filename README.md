@@ -2,11 +2,76 @@
 
 carabiner is a library to let you build durable background tasks that withstand device restarts, task crashes, and long-running jobs. It's built for Python and Postgres without any additional deploy time requirements.
 
-## On Instances and Actions
+## Usage
+
+An example is worth a thousand words:
+
+```python
+from dataclasses import dataclass
+from typing import List
+from myapp.models import User, GreetingSummary
+
+
+class GreetingWorkflow(Workflow):
+    def __init__(self, user_id: str):
+        self.user_id = user_id
+
+    async def run(self) -> GreetingSummary:
+        user = await fetch_user(self.user_id)      # first action
+        summary = await build_greetings(user)      # second action, chained
+        return summary
+
+
+@action
+async def fetch_user(user_id: str) -> User:
+    ...  # e.g. load from database
+
+
+@action
+async def build_greetings(user: User) -> GreetingSummary:
+    messages: List[str] = []
+    for topic in user.interests:        # loop + dot syntax on action result
+        messages.append(f"Hi {user.name}, let's talk about {topic}!")
+    return GreetingSummary(user=user, messages=messages)
+```
 
 Actions are the distributed work that your system does: these are the parallelism primitives that can be retired, throw errors independently, etc.
 
 Instances are your control flow - also written in Python - that orchestrate the actions. They are intended to be fast business logic: list iterations. Not long-running or blocking network jobs, for instance.
+
+### Complex Workflows
+
+Workflows can get much more complex than the example above:
+
+1. Helper functions
+
+You can declare helper functions in your file, in your class, or import helper functions from elsewhere in your project.
+
+```python
+from myapp.helpers import _format_currency
+
+async def run(self) -> Summary:
+    # actions related to one another
+    profile = await fetch_profile(user_id=self.user_id)
+    txns = await load_transactions(user_id=self.user_id)
+    summary = await compute_summary(profile=profile, txns=txns)
+
+    # helper functions
+    pretty = _format_currency(summary.transactions.total)
+```
+
+1. Nested logics
+
+Use if statements, for loops, or any other Python primitives within the control logic. We will automatically detect these branches and compile them into a DAG node that gets executed just like your other actions.
+
+```python
+async def run(self) -> Summary:
+  # loop + non-action helper call
+  top_spenders: List[float] = []
+  for record in summary.transactions.records:
+      if _is_high_value(record):
+          top_spenders.append(record.amount)
+```
 
 ## Philosophy
 

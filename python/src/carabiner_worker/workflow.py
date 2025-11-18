@@ -72,6 +72,8 @@ class Workflow:
                 produces=list(node.produces),
             )
             proto_node.kwargs.update(node.kwargs)
+            if node.guard:
+                proto_node.guard = node.guard
             dag_definition.nodes.append(proto_node)
         dag_bytes = dag_definition.SerializeToString()
         dag_hash = hashlib.sha256(dag_bytes).hexdigest()

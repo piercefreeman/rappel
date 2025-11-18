@@ -66,6 +66,7 @@ class WorkflowDagNode(_ProtoMessage):
         wait_for_sync: list[str] | None = ...,
         produces: list[str] | None = ...,
         module: str = ...,
+        guard: str = ...,
     ) -> None: ...
     id: str
     action: str
@@ -74,6 +75,7 @@ class WorkflowDagNode(_ProtoMessage):
     wait_for_sync: list[str]
     produces: list[str]
     module: str
+    guard: str
 
 class WorkflowDagDefinition(_ProtoMessage):
     def __init__(
