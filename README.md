@@ -75,7 +75,7 @@ async def run(self) -> Summary:
 
 ## Philosophy
 
-Background jobs in webapps are so frequently used that they should really be a primitive of your fullstack library: database, backend, frontend, _and_ background jobs. Otherwise you're stuck in a situation where users either have to always make blocking requests to an API or you spin up ephemeral background jobs that will be killed during re-deployments or an accidental docker crash.
+Background jobs in webapps are so frequently used that they should really be a primitive of your fullstack library: database, backend, frontend, _and_ background jobs. Otherwise you're stuck in a situation where users either have to always make blocking requests to an API or you spin up ephemeral tasks that will be killed during re-deployments or an accidental docker crash.
 
 After trying most of the ecosystem in the last 3 years, I believe background jobs should provide a few key features:
 
@@ -96,11 +96,45 @@ There is no shortage of robust background queues in Python, including ones that 
 
 Almost all of these require a dedicated task broker that you host alongside your app. This usually isn't a huge deal during POCs, but they all have a ton of knobs and dials so you can performance tune it to your own environment. It's also yet another thing in which to build a competency. Cloud hosting of most of these are billed per-event and can get very expensive depending on how you orchestrate your jobs.
 
-## Benchmarking & Log Parsing
+## Local Server Runtime
+
+The Rust runtime exposes both HTTP and gRPC APIs via the `carabiner-server` binary:
+
+```bash
+$ cargo run --bin boot-carabiner-singleton
+```
+
+Developers can either launch it directly or rely on the `boot-carabiner-singleton` helper which finds (or starts) a single shared instance on
+`127.0.0.1:24117`. The helper prints the active HTTP port to stdout so Python clients can connect without additional
+configuration:
+
+```bash
+$ cargo run --bin boot-carabiner-singleton
+24117
+```
+
+The Python bridge automatically shells out to the helper unless you provide `CARABINER_SERVER_URL`
+(`CARABINER_GRPC_ADDR` for direct sockets) overrides. Once the ports are known it opens a gRPC channel to the
+`WorkflowService`.
+
+## Packaging
+
+Use the helper script to produce distributable wheels that bundle the Rust executables with the
+Python package:
+
+```bash
+$ uv run scripts/build_wheel.py --out-dir target/wheels
+```
+
+The script compiles every Rust binary (release profile), stages the required entrypoints
+(`carabiner-server`, `boot-carabiner-singleton`) inside the Python package, and invokes
+`uv build --wheel` to produce an artifact suitable for publishing to PyPI.
+
+## Benchmarking
 
 Stream benchmark output directly into our parser to summarize throughput and latency samples:
 
-```
+```bash
 $ cargo run --bin bench -- \
   --messages 100000 \
   --payload 1024 \
@@ -113,32 +147,3 @@ $ cargo run --bin bench -- \
 ```
 
 Add `--json` to the parser if you prefer JSON output.
-
-## Local Server Runtime
-
-The Rust runtime now exposes both HTTP and gRPC APIs via the `carabiner-server` binary. Developers can either launch it
-directly or rely on the `boot-carabiner-singleton` helper which finds (or starts) a single shared instance on
-`127.0.0.1:24117`. The helper prints the active HTTP port to stdout so Python clients can connect without additional
-configuration:
-
-```
-$ cargo run --bin boot-carabiner-singleton
-24117
-```
-
-The Python bridge automatically shells out to the helper unless you provide `CARABINER_SERVER_URL`
-(`CARABINER_GRPC_ADDR` for direct sockets) overrides. Once the ports are known it opens a gRPC channel to the
-`WorkflowService`, keeping the development story lightweight and free of PyO3 wheels.
-
-## Packaging
-
-Use the helper script to produce distributable wheels that bundle the Rust executables with the
-Python package:
-
-```
-$ scripts/build_wheel.py --out-dir target/wheels
-```
-
-The script compiles every Rust binary (release profile), stages the required entrypoints
-(`carabiner-server`, `boot-carabiner-singleton`) inside the Python package, and invokes
-`uv build --wheel` to produce an artifact suitable for publishing to PyPI.
