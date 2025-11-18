@@ -17,7 +17,7 @@ use tracing::{Instrument, info, warn};
 
 use crate::{
     WorkflowVersionId,
-    benchmark_common::{BenchmarkResult, BenchmarkSummary, spawn_completion_worker},
+    benchmark::common::{BenchmarkResult, BenchmarkSummary, spawn_completion_worker},
     db::{CompletionRecord, Database},
     instances,
     messages::{MessageError, proto::WorkflowRegistration},

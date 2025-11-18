@@ -1,6 +1,4 @@
-pub mod benchmark_actions;
-pub mod benchmark_common;
-pub mod benchmark_instances;
+pub mod benchmark;
 pub mod config;
 pub mod dag_state;
 pub mod db;
@@ -10,9 +8,12 @@ pub mod server_client;
 pub mod server_worker;
 pub mod worker;
 
-pub use benchmark_actions::{BenchmarkHarness, HarnessConfig};
-pub use benchmark_common::{BenchmarkResult, BenchmarkSummary};
-pub use benchmark_instances::{WorkflowBenchmarkConfig, WorkflowBenchmarkHarness};
+#[cfg(test)]
+pub mod integration_tests;
+
+pub use benchmark::actions::{BenchmarkHarness, HarnessConfig};
+pub use benchmark::common::{BenchmarkResult, BenchmarkSummary};
+pub use benchmark::instances::{WorkflowBenchmarkConfig, WorkflowBenchmarkHarness};
 pub use config::AppConfig;
 pub use db::{Database, LedgerAction};
 pub use worker::{ActionDispatchPayload, PythonWorker, PythonWorkerConfig, PythonWorkerPool};

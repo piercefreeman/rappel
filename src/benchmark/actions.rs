@@ -10,7 +10,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{Instrument, info, warn};
 
 use crate::{
-    benchmark_common::{BenchmarkResult, BenchmarkSummary, spawn_completion_worker},
+    benchmark::common::{BenchmarkResult, BenchmarkSummary, spawn_completion_worker},
     db::{CompletionRecord, Database},
     messages::MessageError,
     server_worker::WorkerBridgeServer,

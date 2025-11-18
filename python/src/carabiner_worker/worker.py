@@ -80,7 +80,7 @@ async def _handle_dispatch(
     success = True
     action_name = "unknown"
     try:
-        invocation, result = runner.run_serialized(dispatch.payload)
+        invocation, result = await runner.run_serialized(dispatch.payload)
         action_name = invocation.action
         response_payload = serialize_result_payload(result)
     except Exception as exc:  # noqa: BLE001 - propagate structured errors
