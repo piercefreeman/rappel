@@ -35,6 +35,8 @@ async def build_greetings(user: User) -> GreetingSummary:
     return GreetingSummary(user=user, messages=messages)
 ```
 
+Your webserver wants to greet some user but do it (1) asynchronously and (2) guarantees this happens even if your app exits.
+
 Actions are the distributed work that your system does: these are the parallelism primitives that can be retired, throw errors independently, etc.
 
 Instances are your control flow - also written in Python - that orchestrate the actions. They are intended to be fast business logic: list iterations. Not long-running or blocking network jobs, for instance.
@@ -71,6 +73,28 @@ async def run(self) -> Summary:
   for record in summary.transactions.records:
       if _is_high_value(record):
           top_spenders.append(record.amount)
+```
+
+1. asyncio primitives
+
+Use asyncio.gather to parallelize tasks. Use asyncio.sleep to sleep for a longer period of time.
+
+```python
+from asyncio import gather, sleep
+
+async def run(self) -> Summary:
+    # parallelize independent actions with gather
+    profile, settings, history = await gather(
+        fetch_profile(user_id=self.user_id),
+        fetch_settings(user_id=self.user_id),
+        fetch_purchase_history(user_id=self.user_id)
+    )
+    
+    # wait before sending email
+    await sleep(24*60*60)
+    recommendations = await email_ping(history)
+    
+    return Summary(profile=profile, settings=settings, recommendations=recommendations)
 ```
 
 ## Philosophy

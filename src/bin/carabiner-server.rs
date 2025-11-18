@@ -1,15 +1,16 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
 use carabiner::{
+    db::{Database, WorkflowVersionDetail, WorkflowVersionSummary},
     instances,
     messages::proto::{
         self,
@@ -20,10 +21,11 @@ use carabiner::{
 use clap::Parser;
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use tera::{Context as TeraContext, Tera};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response as GrpcResponse, Status, transport::Server};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 const REGISTER_PATH: &str = "/v1/workflows/register";
 const WAIT_PATH: &str = "/v1/workflows/wait";
@@ -40,12 +42,17 @@ struct Args {
     /// gRPC address to bind, defaults to HTTP port + 1 when omitted.
     #[arg(long)]
     grpc_addr: Option<SocketAddr>,
+    /// Database URL used for dashboard pages. Falls back to DATABASE_URL.
+    #[arg(long, env = "DATABASE_URL")]
+    database_url: Option<String>,
 }
 
 #[derive(Clone)]
 struct HttpState {
     http_addr: SocketAddr,
     grpc_addr: SocketAddr,
+    database: Option<Database>,
+    templates: Arc<Tera>,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,12 +137,27 @@ async fn main() -> Result<()> {
     let Args {
         http_addr,
         grpc_addr,
+        database_url,
     } = Args::parse();
     tracing_subscriber::fmt::init();
 
     let http_addr = http_addr.unwrap_or_else(server::default_http_addr);
     let grpc_addr = grpc_addr
         .unwrap_or_else(|| SocketAddr::new(http_addr.ip(), http_addr.port().saturating_add(1)));
+
+    let database = match database_url {
+        Some(url) => {
+            let db = Database::connect(&url)
+                .await
+                .with_context(|| format!("failed to connect to dashboard database at {url}"))?;
+            Some(db)
+        }
+        None => None,
+    };
+    let mut templates = Tera::new("templates/**/*.html")
+        .context("failed to initialize templates from templates/ directory")?;
+    templates.autoescape_on(vec![".html", ".tera"]);
+    let templates = Arc::new(templates);
 
     let http_listener = TcpListener::bind(http_addr)
         .await
@@ -149,6 +171,8 @@ async fn main() -> Result<()> {
     let http_state = HttpState {
         http_addr,
         grpc_addr,
+        database,
+        templates,
     };
 
     let http_task = tokio::spawn(run_http_server(http_listener, http_state));
@@ -164,6 +188,8 @@ async fn main() -> Result<()> {
 
 async fn run_http_server(listener: TcpListener, state: HttpState) -> Result<()> {
     let app = Router::new()
+        .route("/", get(list_workflows))
+        .route("/workflow/:workflow_version_id", get(workflow_detail))
         .route(server::HEALTH_PATH, get(healthz))
         .route(REGISTER_PATH, post(register_workflow_http))
         .route(WAIT_PATH, post(wait_for_instance_http))
@@ -188,6 +214,67 @@ async fn healthz(State(state): State<HttpState>) -> Json<HealthResponse> {
         http_port: state.http_addr.port(),
         grpc_port: state.grpc_addr.port(),
     })
+}
+
+async fn list_workflows(State(state): State<HttpState>) -> Html<String> {
+    let HttpState {
+        database,
+        templates,
+        ..
+    } = state;
+    let Some(database) = database else {
+        warn!("dashboard requested but database_url not configured");
+        return Html(render_database_missing_page(&templates));
+    };
+    match database.list_workflow_versions().await {
+        Ok(workflows) => Html(render_home_page(&templates, &workflows)),
+        Err(err) => {
+            error!(?err, "failed to load workflow summaries");
+            Html(render_error_page(
+                &templates,
+                "Unable to load workflows",
+                "We couldn't fetch workflow versions. Please try again after checking the database connection.",
+            ))
+        }
+    }
+}
+
+async fn workflow_detail(
+    State(state): State<HttpState>,
+    Path(version_id): Path<i64>,
+) -> Html<String> {
+    let HttpState {
+        database,
+        templates,
+        ..
+    } = state;
+    let Some(database) = database else {
+        warn!(
+            workflow_version_id = version_id,
+            "workflow detail requested but database_url not configured"
+        );
+        return Html(render_database_missing_page(&templates));
+    };
+    match database.load_workflow_version(version_id).await {
+        Ok(Some(workflow)) => Html(render_workflow_detail_page(&templates, &workflow)),
+        Ok(None) => Html(render_error_page(
+            &templates,
+            "Workflow not found",
+            "The requested workflow version could not be located.",
+        )),
+        Err(err) => {
+            error!(
+                ?err,
+                workflow_version_id = version_id,
+                "failed to load workflow detail"
+            );
+            Html(render_error_page(
+                &templates,
+                "Unable to load workflow",
+                "We hit an unexpected error when loading this workflow. Please try again shortly.",
+            ))
+        }
+    }
 }
 
 async fn register_workflow_http(
@@ -262,4 +349,200 @@ fn sanitize_interval(value: Option<f64>) -> Duration {
     let raw = value.unwrap_or(1.0);
     let clamped = raw.clamp(0.1, 30.0);
     Duration::from_secs_f64(clamped)
+}
+
+fn render_home_page(templates: &Tera, workflows: &[WorkflowVersionSummary]) -> String {
+    let items = workflows
+        .iter()
+        .map(|workflow| HomeWorkflowContext {
+            id: workflow.id,
+            name: workflow.workflow_name.clone(),
+            hash: workflow.dag_hash.clone(),
+            created_at: workflow
+                .created_at
+                .format("%Y-%m-%d %H:%M:%S UTC")
+                .to_string(),
+        })
+        .collect();
+    let context = HomePageContext {
+        title: "Carabiner • Workflows".to_string(),
+        workflows: items,
+    };
+    render_template(templates, "home.html", &context)
+}
+
+fn render_workflow_detail_page(templates: &Tera, workflow: &WorkflowVersionDetail) -> String {
+    let nodes = workflow
+        .dag
+        .nodes
+        .iter()
+        .map(|node| WorkflowNodeTemplateContext {
+            id: node.id.clone(),
+            module: if node.module.is_empty() {
+                "default".to_string()
+            } else {
+                node.module.clone()
+            },
+            action: if node.action.is_empty() {
+                "action".to_string()
+            } else {
+                node.action.clone()
+            },
+            guard: if node.guard.is_empty() {
+                "None".to_string()
+            } else {
+                node.guard.clone()
+            },
+            depends_on_display: format_dependencies(&node.depends_on),
+            waits_for_display: format_dependencies(&node.wait_for_sync),
+        })
+        .collect();
+    let info = WorkflowDetailMetadata {
+        id: workflow.id,
+        name: workflow.workflow_name.clone(),
+        hash: workflow.dag_hash.clone(),
+        created_at: workflow
+            .created_at
+            .format("%Y-%m-%d %H:%M:%S UTC")
+            .to_string(),
+        concurrency_label: if workflow.concurrent {
+            "Concurrent".to_string()
+        } else {
+            "Serial".to_string()
+        },
+    };
+    let context = WorkflowDetailPageContext {
+        title: format!("{} • Workflow Detail", workflow.workflow_name),
+        workflow: info,
+        nodes,
+        has_nodes: !workflow.dag.nodes.is_empty(),
+        graph_data: build_graph_data(workflow),
+    };
+    render_template(templates, "workflow.html", &context)
+}
+
+fn render_error_page(templates: &Tera, title: &str, message: &str) -> String {
+    let context = ErrorPageContext {
+        title: title.to_string(),
+        message: message.to_string(),
+    };
+    render_template(templates, "error.html", &context)
+}
+
+fn render_database_missing_page(templates: &Tera) -> String {
+    render_error_page(
+        templates,
+        "Database not configured",
+        "Set the DATABASE_URL (or pass --database-url) so the dashboard can query workflow versions.",
+    )
+}
+
+fn render_template<T: Serialize>(templates: &Tera, template: &str, data: &T) -> String {
+    let context = match TeraContext::from_serialize(data) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            error!(?err, "failed to serialize template context");
+            TeraContext::new()
+        }
+    };
+    match templates.render(template, &context) {
+        Ok(html) => html,
+        Err(err) => {
+            error!(?err, template = template, "failed to render template");
+            "<!DOCTYPE html><html lang=\"en\"><body><h1>Template error</h1></body></html>"
+                .to_string()
+        }
+    }
+}
+
+fn format_dependencies(items: &[String]) -> String {
+    if items.is_empty() {
+        "None".to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+#[derive(Serialize)]
+struct WorkflowGraphData {
+    nodes: Vec<WorkflowGraphNode>,
+}
+
+#[derive(Serialize)]
+struct WorkflowGraphNode {
+    id: String,
+    action: String,
+    module: String,
+    depends_on: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct HomePageContext {
+    title: String,
+    workflows: Vec<HomeWorkflowContext>,
+}
+
+#[derive(Serialize)]
+struct HomeWorkflowContext {
+    id: i64,
+    name: String,
+    hash: String,
+    created_at: String,
+}
+
+#[derive(Serialize)]
+struct WorkflowDetailPageContext {
+    title: String,
+    workflow: WorkflowDetailMetadata,
+    nodes: Vec<WorkflowNodeTemplateContext>,
+    has_nodes: bool,
+    graph_data: WorkflowGraphData,
+}
+
+#[derive(Serialize)]
+struct WorkflowDetailMetadata {
+    id: i64,
+    name: String,
+    hash: String,
+    created_at: String,
+    concurrency_label: String,
+}
+
+#[derive(Serialize)]
+struct WorkflowNodeTemplateContext {
+    id: String,
+    module: String,
+    action: String,
+    guard: String,
+    depends_on_display: String,
+    waits_for_display: String,
+}
+
+#[derive(Serialize)]
+struct ErrorPageContext {
+    title: String,
+    message: String,
+}
+
+fn build_graph_data(workflow: &WorkflowVersionDetail) -> WorkflowGraphData {
+    let nodes = workflow
+        .dag
+        .nodes
+        .iter()
+        .map(|node| WorkflowGraphNode {
+            id: node.id.clone(),
+            action: if node.action.is_empty() {
+                "action".to_string()
+            } else {
+                node.action.clone()
+            },
+            module: if node.module.is_empty() {
+                "workflow".to_string()
+            } else {
+                node.module.clone()
+            },
+            depends_on: node.depends_on.clone(),
+        })
+        .collect();
+    WorkflowGraphData { nodes }
 }

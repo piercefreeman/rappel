@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose};
+use chrono::{DateTime, Utc};
 use prost::Message;
 use serde_json::json;
 use sqlx::{
@@ -146,6 +147,24 @@ struct WorkflowVersionRow {
     pub dag_proto: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkflowVersionSummary {
+    pub id: i64,
+    pub workflow_name: String,
+    pub dag_hash: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowVersionDetail {
+    pub id: i64,
+    pub workflow_name: String,
+    pub dag_hash: String,
+    pub concurrent: bool,
+    pub created_at: DateTime<Utc>,
+    pub dag: WorkflowDagDefinition,
+}
+
 impl Database {
     pub async fn connect(database_url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
@@ -162,6 +181,64 @@ impl Database {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    pub async fn list_workflow_versions(&self) -> Result<Vec<WorkflowVersionSummary>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, workflow_name, dag_hash, created_at
+            FROM workflow_versions
+            ORDER BY created_at DESC
+            "#,
+        )
+        .map(|row: PgRow| WorkflowVersionSummary {
+            id: row.get("id"),
+            workflow_name: row.get("workflow_name"),
+            dag_hash: row.get("dag_hash"),
+            created_at: row.get("created_at"),
+        })
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn load_workflow_version(
+        &self,
+        version_id: i64,
+    ) -> Result<Option<WorkflowVersionDetail>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, workflow_name, dag_hash, dag_proto, concurrent, created_at
+            FROM workflow_versions
+            WHERE id = $1
+            "#,
+        )
+        .bind(version_id)
+        .map(|row: PgRow| {
+            (
+                row.get::<i64, _>("id"),
+                row.get::<String, _>("workflow_name"),
+                row.get::<String, _>("dag_hash"),
+                row.get::<Vec<u8>, _>("dag_proto"),
+                row.get::<bool, _>("concurrent"),
+                row.get::<DateTime<Utc>, _>("created_at"),
+            )
+        })
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((id, workflow_name, dag_hash, dag_proto, concurrent, created_at)) = row else {
+            return Ok(None);
+        };
+        let dag = WorkflowDagDefinition::decode(dag_proto.as_slice())
+            .context("failed to decode workflow dag")?;
+        Ok(Some(WorkflowVersionDetail {
+            id,
+            workflow_name,
+            dag_hash,
+            concurrent,
+            created_at,
+            dag,
+        }))
     }
 
     pub async fn reset_partition(&self, partition_id: i32) -> Result<()> {
