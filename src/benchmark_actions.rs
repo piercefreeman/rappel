@@ -101,8 +101,8 @@ impl BenchmarkHarness {
                     let worker = self.workers.next_worker();
                     let span = tracing::debug_span!(
                         "dispatch",
-                        action_id = payload.action_id,
-                        instance_id = payload.instance_id,
+                        action_id = %payload.action_id,
+                        instance_id = %payload.instance_id,
                         sequence = payload.sequence
                     );
                     let fut: BoxFuture<'_, Result<RoundTripMetrics, MessageError>> =
@@ -124,7 +124,7 @@ impl BenchmarkHarness {
                         warn!(?err, "completion channel closed");
                     }
                     tracing::debug!(
-                        action_id = metrics.action_id,
+                        action_id = %metrics.action_id,
                         round_trip_ms = %format!("{:.3}", metrics.round_trip.as_secs_f64() * 1000.0),
                         ack_ms = %format!("{:.3}", metrics.ack_latency.as_secs_f64() * 1000.0),
                         worker_ms = %format!("{:.3}", metrics.worker_duration.as_secs_f64() * 1000.0),

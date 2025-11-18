@@ -20,14 +20,14 @@ message Envelope {
 }
 
 message ActionDispatch {
-  uint64 action_id = 1;
-  uint64 instance_id = 2;
+  string action_id = 1;
+  string instance_id = 2;
   uint32 sequence = 3;
   bytes payload = 4;
 }
 
 message ActionResult {
-  uint64 action_id = 1;
+  string action_id = 1;
   bool success = 2;
   bytes payload = 3;
   uint64 worker_start_ns = 4;
@@ -77,7 +77,7 @@ message RegisterWorkflowRequest {
 }
 
 message RegisterWorkflowResponse {
-  int64 workflow_version_id = 1;
+  string workflow_version_id = 1;
 }
 
 message WaitForInstanceRequest {

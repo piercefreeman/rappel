@@ -17,7 +17,7 @@ PROGRESS_RE = re.compile(
     r"benchmark progress processed=(?P<processed>\d+) total=(?P<total>\d+) elapsed=(?P<elapsed>[^ ]+) throughput=(?P<throughput>[^ ]+) msg/s in_flight=(?P<inflight>\d+) worker_count=(?P<workers>\d+) db_queue=(?P<queue>\d+)"
 )
 ACTION_RE = re.compile(
-    r"action completed action_id=(?P<action>\d+) round_trip_ms=(?P<rt>[^ ]+) ack_ms=(?P<ack>[^ ]+) worker_ms=(?P<worker>[^ ]+)"
+    r"action completed action_id=(?P<action>\S+) round_trip_ms=(?P<rt>[^ ]+) ack_ms=(?P<ack>[^ ]+) worker_ms=(?P<worker>[^ ]+)"
 )
 console = Console()
 
@@ -37,7 +37,7 @@ class Progress:
 @dataclass
 class ActionMetric:
     ts: str
-    action_id: int
+    action_id: str
     round_trip_ms: float
     ack_ms: float
     worker_ms: float
@@ -72,7 +72,7 @@ def parse_lines(lines: Iterable[str]) -> tuple[List[Progress], List[ActionMetric
             actions.append(
                 ActionMetric(
                     ts,
-                    int(m.group("action")),
+                    m.group("action"),
                     float(m.group("rt")),
                     float(m.group("ack")),
                     float(m.group("worker")),

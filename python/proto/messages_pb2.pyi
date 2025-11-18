@@ -11,26 +11,26 @@ class Ack(_ProtoMessage):
 class ActionDispatch(_ProtoMessage):
     def __init__(
         self,
-        action_id: int = ...,
-        instance_id: int = ...,
+        action_id: str = ...,
+        instance_id: str = ...,
         sequence: int = ...,
         payload: bytes = ...,
     ) -> None: ...
-    action_id: int
-    instance_id: int
+    action_id: str
+    instance_id: str
     sequence: int
     payload: bytes
 
 class ActionResult(_ProtoMessage):
     def __init__(
         self,
-        action_id: int = ...,
+        action_id: str = ...,
         success: bool = ...,
         payload: bytes = ...,
         worker_start_ns: int = ...,
         worker_end_ns: int = ...,
     ) -> None: ...
-    action_id: int
+    action_id: str
     success: bool
     payload: bytes
     worker_start_ns: int
@@ -116,23 +116,19 @@ class WorkflowNodeDispatch(_ProtoMessage):
 class RegisterWorkflowRequest(_ProtoMessage):
     def __init__(
         self,
-        database_url: str = ...,
         registration: WorkflowRegistration | None = ...,
     ) -> None: ...
-    database_url: str
     registration: WorkflowRegistration
 
 class RegisterWorkflowResponse(_ProtoMessage):
-    def __init__(self, workflow_version_id: int = ...) -> None: ...
-    workflow_version_id: int
+    def __init__(self, workflow_version_id: str = ...) -> None: ...
+    workflow_version_id: str
 
 class WaitForInstanceRequest(_ProtoMessage):
     def __init__(
         self,
-        database_url: str = ...,
         poll_interval_secs: float = ...,
     ) -> None: ...
-    database_url: str
     poll_interval_secs: float
 
 class WaitForInstanceResponse(_ProtoMessage):

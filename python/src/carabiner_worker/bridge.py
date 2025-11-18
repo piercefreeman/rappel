@@ -154,7 +154,7 @@ async def _workflow_stub() -> pb2_grpc.WorkflowServiceStub:
     return _GRPC_STUB  # type: ignore[return-value]
 
 
-async def run_instance(payload: bytes) -> int:
+async def run_instance(payload: bytes) -> str:
     """Register a workflow definition over the gRPC bridge."""
     async with ensure_singleton():
         stub = await _workflow_stub()
@@ -167,7 +167,7 @@ async def run_instance(payload: bytes) -> int:
         response = await stub.RegisterWorkflow(request, timeout=30.0)
     except aio.AioRpcError as exc:  # pragma: no cover
         raise RuntimeError(f"register_workflow failed: {exc}") from exc
-    return int(response.workflow_version_id)
+    return response.workflow_version_id
 
 
 async def wait_for_instance(poll_interval_secs: float = 1.0) -> Optional[bytes]:

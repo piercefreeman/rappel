@@ -6,9 +6,9 @@ use sha2::{Digest, Sha256};
 use sqlx::{Row, postgres::PgRow};
 use tokio::{runtime::Runtime, time::sleep};
 
-use crate::{db::Database, messages::proto::WorkflowRegistration};
+use crate::{WorkflowVersionId, db::Database, messages::proto::WorkflowRegistration};
 
-pub async fn run_instance_payload(database_url: &str, payload: &[u8]) -> Result<i64> {
+pub async fn run_instance_payload(database_url: &str, payload: &[u8]) -> Result<WorkflowVersionId> {
     let registration = WorkflowRegistration::decode(payload)
         .context("failed to decode workflow registration payload")?;
     let dag_def = registration
@@ -54,7 +54,7 @@ pub async fn wait_for_instance_poll(
     }
 }
 
-pub fn run_instance_blocking(database_url: &str, payload: Vec<u8>) -> Result<i64> {
+pub fn run_instance_blocking(database_url: &str, payload: Vec<u8>) -> Result<WorkflowVersionId> {
     let rt = Runtime::new()?;
     rt.block_on(run_instance_payload(database_url, &payload))
 }

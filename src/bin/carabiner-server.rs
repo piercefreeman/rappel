@@ -10,7 +10,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose};
 use carabiner::{
-    AppConfig,
+    AppConfig, WorkflowVersionId,
     db::{Database, WorkflowVersionDetail, WorkflowVersionSummary},
     instances,
     messages::proto::{
@@ -69,7 +69,7 @@ struct RegisterWorkflowHttpRequest {
 
 #[derive(Debug, Serialize)]
 struct RegisterWorkflowHttpResponse {
-    workflow_version_id: i64,
+    workflow_version_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,7 +244,7 @@ async fn list_workflows(State(state): State<HttpState>) -> Html<String> {
 
 async fn workflow_detail(
     State(state): State<HttpState>,
-    Path(version_id): Path<i64>,
+    Path(version_id): Path<WorkflowVersionId>,
 ) -> Html<String> {
     let templates = state.templates.clone();
     let database = state.database.clone();
@@ -258,7 +258,7 @@ async fn workflow_detail(
         Err(err) => {
             error!(
                 ?err,
-                workflow_version_id = version_id,
+                workflow_version_id = %version_id,
                 "failed to load workflow detail"
             );
             Html(render_error_page(
@@ -285,7 +285,7 @@ async fn register_workflow_http(
         .await
         .map_err(HttpError::internal)?;
     Ok(Json(RegisterWorkflowHttpResponse {
-        workflow_version_id: version_id,
+        workflow_version_id: version_id.to_string(),
     }))
 }
 
@@ -322,7 +322,7 @@ impl WorkflowService for WorkflowGrpcService {
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
         Ok(GrpcResponse::new(proto::RegisterWorkflowResponse {
-            workflow_version_id: version_id,
+            workflow_version_id: version_id.to_string(),
         }))
     }
 
@@ -352,7 +352,7 @@ fn render_home_page(templates: &Tera, workflows: &[WorkflowVersionSummary]) -> S
     let items = workflows
         .iter()
         .map(|workflow| HomeWorkflowContext {
-            id: workflow.id,
+            id: workflow.id.to_string(),
             name: workflow.workflow_name.clone(),
             hash: workflow.dag_hash.clone(),
             created_at: workflow
@@ -395,7 +395,7 @@ fn render_workflow_detail_page(templates: &Tera, workflow: &WorkflowVersionDetai
         })
         .collect();
     let info = WorkflowDetailMetadata {
-        id: workflow.id,
+        id: workflow.id.to_string(),
         name: workflow.workflow_name.clone(),
         hash: workflow.dag_hash.clone(),
         created_at: workflow
@@ -473,7 +473,7 @@ struct HomePageContext {
 
 #[derive(Serialize)]
 struct HomeWorkflowContext {
-    id: i64,
+    id: String,
     name: String,
     hash: String,
     created_at: String,
@@ -490,7 +490,7 @@ struct WorkflowDetailPageContext {
 
 #[derive(Serialize)]
 struct WorkflowDetailMetadata {
-    id: i64,
+    id: String,
     name: String,
     hash: String,
     created_at: String,

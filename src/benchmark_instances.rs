@@ -15,6 +15,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{Instrument, info, warn};
 
 use crate::{
+    WorkflowVersionId,
     benchmark_common::{BenchmarkResult, BenchmarkSummary, spawn_completion_worker},
     db::{CompletionRecord, Database},
     instances,
@@ -55,7 +56,7 @@ pub struct WorkflowBenchmarkHarness {
     _temp_dir: TempDir,
     _user_module: String,
     workflow_name: String,
-    workflow_version_id: i64,
+    workflow_version_id: WorkflowVersionId,
     dag_node_count: usize,
 }
 
@@ -162,8 +163,8 @@ impl WorkflowBenchmarkHarness {
                     let worker = self.workers.next_worker();
                     let span = tracing::debug_span!(
                         "dispatch",
-                        action_id = payload.action_id,
-                        instance_id = payload.instance_id,
+                        action_id = %payload.action_id,
+                        instance_id = %payload.instance_id,
                         sequence = payload.sequence
                     );
                     let fut: BoxFuture<'_, Result<RoundTripMetrics, MessageError>> =

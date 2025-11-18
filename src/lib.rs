@@ -17,3 +17,7 @@ pub use db::{Database, LedgerAction};
 pub use python_worker::{
     ActionDispatchPayload, PythonWorker, PythonWorkerConfig, PythonWorkerPool,
 };
+
+pub type WorkflowVersionId = uuid::Uuid;
+pub type WorkflowInstanceId = uuid::Uuid;
+pub type LedgerActionId = uuid::Uuid;

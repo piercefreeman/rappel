@@ -27,7 +27,7 @@ class Workflow:
 
     _workflow_dag: ClassVar[Optional[WorkflowDag]] = None
     _dag_lock: ClassVar[RLock] = RLock()
-    _workflow_version_id: ClassVar[Optional[int]] = None
+    _workflow_version_id: ClassVar[Optional[str]] = None
 
     async def run(self) -> Any:
         raise NotImplementedError

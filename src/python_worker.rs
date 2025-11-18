@@ -20,7 +20,10 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::messages::{self, MessageError, proto};
+use crate::{
+    LedgerActionId, WorkflowInstanceId,
+    messages::{self, MessageError, proto},
+};
 
 #[derive(Clone, Debug)]
 pub struct PythonWorkerConfig {
@@ -45,8 +48,8 @@ impl Default for PythonWorkerConfig {
 
 #[derive(Debug, Clone)]
 pub struct RoundTripMetrics {
-    pub action_id: i64,
-    pub instance_id: i64,
+    pub action_id: LedgerActionId,
+    pub instance_id: WorkflowInstanceId,
     pub delivery_id: u64,
     pub sequence: u32,
     pub ack_latency: Duration,
@@ -72,8 +75,8 @@ impl SharedState {
 
 #[derive(Debug, Clone)]
 pub struct ActionDispatchPayload {
-    pub action_id: i64,
-    pub instance_id: i64,
+    pub action_id: LedgerActionId,
+    pub instance_id: WorkflowInstanceId,
     pub sequence: i32,
     pub payload: Vec<u8>,
 }
@@ -161,8 +164,8 @@ impl PythonWorker {
         let delivery_id = self.next_delivery.fetch_add(1, Ordering::SeqCst);
         let send_instant = Instant::now();
         tracing::debug!(
-            action_id = dispatch.action_id,
-            instance_id = dispatch.instance_id,
+            action_id = %dispatch.action_id,
+            instance_id = %dispatch.instance_id,
             sequence = dispatch.sequence,
             payload_len = dispatch.payload.len(),
             "worker.send_action"
@@ -177,8 +180,8 @@ impl PythonWorker {
         }
 
         let command = proto::ActionDispatch {
-            action_id: dispatch.action_id as u64,
-            instance_id: dispatch.instance_id as u64,
+            action_id: dispatch.action_id.to_string(),
+            instance_id: dispatch.instance_id.to_string(),
             sequence: dispatch.sequence as u32,
             payload: dispatch.payload.clone(),
         };

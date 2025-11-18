@@ -11,6 +11,7 @@ use sqlx::{
 };
 
 use crate::{
+    LedgerActionId, WorkflowInstanceId, WorkflowVersionId,
     dag_state::{DagStateMachine, InstanceDagState},
     messages::proto::{
         WorkflowDagDefinition, WorkflowDagNode, WorkflowNodeContext, WorkflowNodeDispatch,
@@ -24,7 +25,7 @@ pub struct Database {
 
 async fn load_instance_node_state(
     tx: &mut Transaction<'_, Postgres>,
-    instance_id: i64,
+    instance_id: WorkflowInstanceId,
 ) -> Result<(HashSet<String>, HashSet<String>)> {
     let rows = sqlx::query(
         r#"
@@ -52,7 +53,7 @@ async fn load_instance_node_state(
 
 async fn build_variable_context(
     tx: &mut Transaction<'_, Postgres>,
-    instance_id: i64,
+    instance_id: WorkflowInstanceId,
     dag_nodes: &HashMap<String, WorkflowDagNode>,
 ) -> Result<HashMap<String, Vec<u8>>> {
     let rows = sqlx::query(
@@ -116,7 +117,7 @@ fn build_workflow_action_payload(
 
 #[derive(Debug, Clone)]
 pub struct CompletionRecord {
-    pub action_id: i64,
+    pub action_id: LedgerActionId,
     pub success: bool,
     pub delivery_id: u64,
     pub result_payload: Vec<u8>,
@@ -124,8 +125,8 @@ pub struct CompletionRecord {
 
 #[derive(Debug, Clone, FromRow)]
 pub struct LedgerAction {
-    pub id: i64,
-    pub instance_id: i64,
+    pub id: LedgerActionId,
+    pub instance_id: WorkflowInstanceId,
     pub partition_id: i32,
     pub action_seq: i32,
     pub payload: Vec<u8>,
@@ -133,10 +134,10 @@ pub struct LedgerAction {
 
 #[derive(Debug, Clone, FromRow)]
 struct WorkflowInstanceRow {
-    pub id: i64,
+    pub id: WorkflowInstanceId,
     pub partition_id: i32,
     pub workflow_name: String,
-    pub workflow_version_id: Option<i64>,
+    pub workflow_version_id: Option<WorkflowVersionId>,
     pub next_action_seq: i32,
     pub input_payload: Option<Vec<u8>>,
 }
@@ -149,7 +150,7 @@ struct WorkflowVersionRow {
 
 #[derive(Debug, Clone)]
 pub struct WorkflowVersionSummary {
-    pub id: i64,
+    pub id: WorkflowVersionId,
     pub workflow_name: String,
     pub dag_hash: String,
     pub created_at: DateTime<Utc>,
@@ -157,7 +158,7 @@ pub struct WorkflowVersionSummary {
 
 #[derive(Debug, Clone)]
 pub struct WorkflowVersionDetail {
-    pub id: i64,
+    pub id: WorkflowVersionId,
     pub workflow_name: String,
     pub dag_hash: String,
     pub concurrent: bool,
@@ -204,7 +205,7 @@ impl Database {
 
     pub async fn load_workflow_version(
         &self,
-        version_id: i64,
+        version_id: WorkflowVersionId,
     ) -> Result<Option<WorkflowVersionDetail>> {
         let row = sqlx::query(
             r#"
@@ -216,7 +217,7 @@ impl Database {
         .bind(version_id)
         .map(|row: PgRow| {
             (
-                row.get::<i64, _>("id"),
+                row.get::<WorkflowVersionId, _>("id"),
                 row.get::<String, _>("workflow_name"),
                 row.get::<String, _>("dag_hash"),
                 row.get::<Vec<u8>, _>("dag_proto"),
@@ -266,7 +267,7 @@ impl Database {
         let span = tracing::info_span!("db.seed_actions", partition_id, action_count);
         let _guard = span.enter();
         let mut tx = self.pool.begin().await?;
-        let instance_id: i64 = sqlx::query_scalar(
+        let instance_id: WorkflowInstanceId = sqlx::query_scalar(
             r#"
             INSERT INTO workflow_instances (partition_id, workflow_name, next_action_seq)
             VALUES ($1, $2, $3)
@@ -307,11 +308,11 @@ impl Database {
         &self,
         partition_id: i32,
         workflow_name: &str,
-        workflow_version_id: i64,
+        workflow_version_id: WorkflowVersionId,
         input_payload: Option<&[u8]>,
-    ) -> Result<i64> {
+    ) -> Result<WorkflowInstanceId> {
         let mut tx = self.pool.begin().await?;
-        let instance_id = sqlx::query_scalar::<_, i64>(
+        let instance_id = sqlx::query_scalar::<_, WorkflowInstanceId>(
             r#"
             INSERT INTO workflow_instances (
                 partition_id,
@@ -335,7 +336,10 @@ impl Database {
         Ok(instance_id)
     }
 
-    pub async fn schedule_workflow_instance(&self, instance_id: i64) -> Result<usize> {
+    pub async fn schedule_workflow_instance(
+        &self,
+        instance_id: WorkflowInstanceId,
+    ) -> Result<usize> {
         let mut tx = self.pool.begin().await?;
         let count = self
             .schedule_workflow_instance_tx(&mut tx, instance_id)
@@ -381,7 +385,7 @@ impl Database {
         }
         let span = tracing::debug_span!("db.mark_actions_batch", count = records.len());
         let _guard = span.enter();
-        let ids: Vec<i64> = records.iter().map(|r| r.action_id).collect();
+        let ids: Vec<LedgerActionId> = records.iter().map(|r| r.action_id).collect();
         let successes: Vec<bool> = records.iter().map(|r| r.success).collect();
         let deliveries: Vec<i64> = records.iter().map(|r| r.delivery_id as i64).collect();
         let payloads: Vec<Vec<u8>> = records.iter().map(|r| r.result_payload.clone()).collect();
@@ -390,7 +394,7 @@ impl Database {
             r#"
             WITH data AS (
                 SELECT *
-                FROM UNNEST($1::BIGINT[], $2::BOOL[], $3::BIGINT[], $4::BYTEA[])
+                FROM UNNEST($1::UUID[], $2::BOOL[], $3::BIGINT[], $4::BYTEA[])
                     AS t(action_id, success, delivery_id, result_payload)
             )
             UPDATE daemon_action_ledger AS dal
@@ -409,11 +413,16 @@ impl Database {
         .bind(&successes)
         .bind(&deliveries)
         .bind(&payloads)
-        .map(|row: PgRow| (row.get::<i64, _>(0), row.get::<Option<String>, _>(1)))
+        .map(|row: PgRow| {
+            (
+                row.get::<WorkflowInstanceId, _>(0),
+                row.get::<Option<String>, _>(1),
+            )
+        })
         .fetch_all(&mut *tx)
         .await?;
 
-        let mut workflow_instances = HashSet::new();
+        let mut workflow_instances: HashSet<WorkflowInstanceId> = HashSet::new();
         for row in updated {
             if row.1.is_some() {
                 workflow_instances.insert(row.0);
@@ -426,7 +435,7 @@ impl Database {
                 .await?;
             if inserted > 0 {
                 tracing::debug!(
-                    instance_id,
+                    instance_id = %instance_id,
                     inserted,
                     "workflow actions unlocked after completion"
                 );
@@ -443,9 +452,9 @@ impl Database {
         dag_hash: &str,
         dag_bytes: &[u8],
         concurrent: bool,
-    ) -> Result<i64> {
+    ) -> Result<WorkflowVersionId> {
         let mut tx = self.pool.begin().await?;
-        if let Some(existing_id) = sqlx::query_scalar::<_, i64>(
+        if let Some(existing_id) = sqlx::query_scalar::<_, WorkflowVersionId>(
             "SELECT id FROM workflow_versions WHERE workflow_name = $1 AND dag_hash = $2",
         )
         .bind(workflow_name)
@@ -457,7 +466,7 @@ impl Database {
             return Ok(existing_id);
         }
 
-        let id = sqlx::query_scalar::<_, i64>(
+        let id = sqlx::query_scalar::<_, WorkflowVersionId>(
             r#"
             INSERT INTO workflow_versions (workflow_name, dag_hash, dag_proto, concurrent)
             VALUES ($1, $2, $3, $4)
@@ -477,7 +486,7 @@ impl Database {
     async fn schedule_workflow_instance_tx(
         &self,
         tx: &mut Transaction<'_, Postgres>,
-        instance_id: i64,
+        instance_id: WorkflowInstanceId,
     ) -> Result<usize> {
         let instance = sqlx::query_as::<_, WorkflowInstanceRow>(
             r#"
@@ -491,12 +500,12 @@ impl Database {
         .fetch_optional(tx.as_mut())
         .await?;
         let Some(instance) = instance else {
-            tracing::warn!(instance_id, "workflow instance not found during scheduling");
+            tracing::warn!(instance_id = %instance_id, "workflow instance not found during scheduling");
             return Ok(0);
         };
         let Some(version_id) = instance.workflow_version_id else {
             tracing::debug!(
-                instance_id = instance.id,
+                instance_id = %instance.id,
                 "workflow instance missing version; skipping scheduling"
             );
             return Ok(0);
@@ -531,7 +540,7 @@ impl Database {
         for node in unlocked {
             let node_id = node.id.clone();
             let payload = build_workflow_action_payload(&node, &workflow_input, &context_values)?;
-            let _action_id: i64 = sqlx::query_scalar::<_, i64>(
+            let _action_id: LedgerActionId = sqlx::query_scalar::<_, LedgerActionId>(
                 r#"
                 INSERT INTO daemon_action_ledger (
                     instance_id,
@@ -562,7 +571,7 @@ impl Database {
                 .await?;
         }
         tracing::debug!(
-            instance_id = instance.id,
+            instance_id = %instance.id,
             workflow = instance.workflow_name,
             inserted,
             "queued workflow actions"

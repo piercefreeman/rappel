@@ -66,9 +66,9 @@ def test_workflow_registration_outside_pytest(monkeypatch: pytest.MonkeyPatch) -
     os.environ.pop("PYTEST_CURRENT_TEST", None)
     calls: list[bytes] = []
 
-    async def fake_run_instance(payload: bytes) -> int:
+    async def fake_run_instance(payload: bytes) -> str:
         calls.append(payload)
-        return 123
+        return "00000000-0000-0000-0000-000000000123"
 
     monkeypatch.setattr(bridge, "run_instance", fake_run_instance)
 
@@ -79,10 +79,10 @@ def test_workflow_registration_outside_pytest(monkeypatch: pytest.MonkeyPatch) -
 
     instance = ProductionWorkflow()
     version = asyncio.run(instance.run())
-    assert version == 123
+    assert version == "00000000-0000-0000-0000-000000000123"
     assert len(calls) == 1
     # Subsequent runs reuse cached version id and do not re-register.
     version_again = asyncio.run(instance.run())
-    assert version_again == 123
+    assert version_again == "00000000-0000-0000-0000-000000000123"
     assert len(calls) == 1
     os.environ["PYTEST_CURRENT_TEST"] = "true"
