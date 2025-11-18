@@ -129,3 +129,16 @@ $ cargo run --bin boot-carabiner-singleton
 The Python bridge automatically shells out to the helper unless you provide `CARABINER_SERVER_URL`
 (`CARABINER_GRPC_ADDR` for direct sockets) overrides. Once the ports are known it opens a gRPC channel to the
 `WorkflowService`, keeping the development story lightweight and free of PyO3 wheels.
+
+## Packaging
+
+Use the helper script to produce distributable wheels that bundle the Rust executables with the
+Python package:
+
+```
+$ scripts/build_wheel.py --out-dir target/wheels
+```
+
+The script compiles every Rust binary (release profile), stages the required entrypoints
+(`carabiner-server`, `boot-carabiner-singleton`) inside the Python package, and invokes
+`uv build --wheel` to produce an artifact suitable for publishing to PyPI.
