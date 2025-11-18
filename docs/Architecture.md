@@ -9,7 +9,7 @@ All Python library code is within one library - and all rust code is within one 
 
 ## python: client library
 
-Parse what users intend to run via their Workflow instances, send the DAG definition to the database for execution.
+Parse what users intend to run via their Workflow instances, send the DAG definition to the database for execution. This python client library talks to the client bridge through embedded FII.
 
 ## rust: client bridge
 
@@ -19,8 +19,8 @@ Takes care of versioning the workflow instance implementations. If the logic has
 
 ## rust: workflow runner
 
-Launch python interpreters in parallel, by default 1 per core so we can work around the blocking limitations in the process bound GIL
+Launch python interpreters in parallel, by default 1 per core so we can work around the blocking limitations in the process bound GIL. The rust workflow runner communicates to the python subprocesses with structured messages sent over stdin/stdout.
 
 ## python: worker runners
 
-Handling for the individual actions
+Executing each actions within a python runtime environment. Handles importing the necessary first/third party dependencies with importlib.

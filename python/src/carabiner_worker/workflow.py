@@ -133,6 +133,7 @@ def workflow(cls: type[TWorkflow]) -> type[TWorkflow]:
             cls._workflow_version_id = version
         return version
 
+    cls.__workflow_run_impl__ = run_impl
     cls.run = run_public  # type: ignore[assignment]
     workflow_registry.register(cls.short_name(), cls)
     return cls

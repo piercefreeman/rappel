@@ -27,26 +27,31 @@ class WorkflowDag:
 
 
 def build_workflow_dag(workflow_cls: type["Workflow"]) -> WorkflowDag:
-    module = inspect.getmodule(workflow_cls)
+    original_run = getattr(workflow_cls, "__workflow_run_impl__", None)
+    if original_run is None:
+        original_run = workflow_cls.__dict__.get("run")
+    if original_run is None:
+        raise ValueError(f"workflow {workflow_cls!r} missing run implementation")
+    module = inspect.getmodule(original_run)
     if module is None:
         raise ValueError(f"unable to locate module for workflow {workflow_cls!r}")
     module_source = inspect.getsource(module)
     module_index = ModuleIndex(module_source)
-    action_modules = _discover_action_names(module)
-    function_source = textwrap.dedent(inspect.getsource(workflow_cls.run))
-    builder = WorkflowDagBuilder(action_modules, module_index, function_source)
+    action_defs = _discover_action_names(module)
+    function_source = textwrap.dedent(inspect.getsource(original_run))
+    builder = WorkflowDagBuilder(action_defs, module_index, function_source)
     builder.visit(ast.parse(function_source))
     return WorkflowDag(builder.nodes)
 
 
-def _discover_action_names(module: Any) -> Dict[str, str]:
-    names: Dict[str, str] = {}
+def _discover_action_names(module: Any) -> Dict[str, Tuple[str, str]]:
+    names: Dict[str, Tuple[str, str]] = {}
     for attr_name in dir(module):
         attr = getattr(module, attr_name)
         action_name = getattr(attr, "__carabiner_action_name__", None)
         action_module = getattr(attr, "__carabiner_action_module__", None)
         if callable(attr) and action_name:
-            names[action_name] = action_module or module.__name__
+            names[attr_name] = (action_name, action_module or module.__name__)
     return names
 
 
@@ -85,12 +90,15 @@ class ModuleIndex:
 
 class WorkflowDagBuilder(ast.NodeVisitor):
     def __init__(
-        self, action_modules: Dict[str, str], module_index: ModuleIndex, source: str
+        self,
+        action_defs: Dict[str, Tuple[str, str]],
+        module_index: ModuleIndex,
+        source: str,
     ) -> None:
         self.nodes: List[DagNode] = []
         self._var_to_node: Dict[str, str] = {}
         self._counter = 0
-        self._action_modules = action_modules
+        self._action_defs = action_defs
         self._module_index = module_index
         self._source = source
         self._last_node_id: Optional[str] = None
@@ -159,7 +167,7 @@ class WorkflowDagBuilder(ast.NodeVisitor):
 
     def _is_action_func(self, func: ast.AST) -> bool:
         name = self._extract_name(func)
-        return bool(name and name in self._action_modules)
+        return bool(name and name in self._action_defs)
 
     def _match_gather_call(self, expr: ast.AST) -> Optional[ast.Call]:
         if not isinstance(expr, ast.Await):
@@ -268,10 +276,10 @@ class WorkflowDagBuilder(ast.NodeVisitor):
                 continue
             kwargs[kw.arg] = ast.unparse(kw.value)
             dependencies.extend(self._dependencies_from_expr(kw.value))
-        module_name = self._action_modules.get(name)
+        action_name, module_name = self._action_defs.get(name, (name, None))
         return DagNode(
             id=node_id,
-            action=name,
+            action=action_name,
             module=module_name,
             kwargs=kwargs,
             depends_on=sorted(set(dependencies)),

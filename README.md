@@ -48,3 +48,13 @@ $ cargo run --bin bench -- \
 ```
 
 Add `--json` to the parser if you prefer JSON output.
+
+## Building Python Wheels
+
+Since we have a rust base, you need to compile sources before using it during development. We use `maturin` for both the pyo3
+extension module and the CLI binaries. Use the helper script at the repo root:
+
+```
+$ ./build_wheel.sh develop          # installs the dev artifacts into your current environment
+$ ./build_wheel.sh release          # writes merged wheels into target/wheels/
+```

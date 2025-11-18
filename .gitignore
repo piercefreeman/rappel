@@ -212,4 +212,9 @@ __marimo__/
 
 /target
 
+# Build artifacts
+.merge-tmp/
+target/wheels/
+*.whl
+
 autospec
