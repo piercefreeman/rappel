@@ -211,3 +211,5 @@ __marimo__/
 # Added by cargo
 
 /target
+
+autospec
