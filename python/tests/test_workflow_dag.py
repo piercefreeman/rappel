@@ -8,7 +8,7 @@ import pytest
 
 from carabiner_worker.actions import action
 from carabiner_worker.workflow import Workflow
-from carabiner_worker.workflow_dag import WorkflowDag, build_workflow_dag
+from carabiner_worker.workflow_dag import RETURN_VARIABLE, WorkflowDag, build_workflow_dag
 
 
 def helper_threshold(record: "Record") -> bool:
@@ -71,6 +71,7 @@ def test_build_workflow_dag_with_python_block() -> None:
         "python_block",
         "summarize",
         "persist_summary",
+        "python_block",
     ]
     python_block = next(node for node in dag.nodes if node.action == "python_block")
     assert "for record in records" in python_block.kwargs["code"]
@@ -85,7 +86,8 @@ def test_build_workflow_dag_with_python_block() -> None:
     assert dag.nodes[1].wait_for_sync == [dag.nodes[0].id]
     assert dag.nodes[2].wait_for_sync == [dag.nodes[1].id]
     assert dag.nodes[0].produces == ["records"]
-    assert dag.nodes[-1].produces == []
+    assert dag.nodes[-1].produces == [RETURN_VARIABLE]
+    assert dag.return_variable == RETURN_VARIABLE
     assert dag.nodes[0].module == __name__
 
     # Execute the captured python block to ensure it remains valid.
@@ -152,7 +154,14 @@ class ConditionalWorkflow(Workflow):
 def test_conditional_action_branch_creates_merge_node() -> None:
     dag = build_workflow_dag(ConditionalWorkflow)
     actions = [node.action for node in dag.nodes]
-    assert actions == ["fetch_records", "summarize", "summarize", "python_block", "persist_summary"]
+    assert actions == [
+        "fetch_records",
+        "summarize",
+        "summarize",
+        "python_block",
+        "persist_summary",
+        "python_block",
+    ]
     true_branch = dag.nodes[1]
     false_branch = dag.nodes[2]
     assert true_branch.guard == "(len(records) > 1)"
@@ -163,6 +172,7 @@ def test_conditional_action_branch_creates_merge_node() -> None:
     assert merge_node.depends_on == sorted([true_branch.id, false_branch.id])
     final_node = dag.nodes[4]
     assert final_node.depends_on == [merge_node.id]
+    assert dag.nodes[-1].produces == [RETURN_VARIABLE]
 
 
 class MissingElseWorkflow(Workflow):
@@ -201,8 +211,8 @@ class GatherWorkflow(Workflow):
 def test_asyncio_gather_assignment_builds_collection_node() -> None:
     dag = build_workflow_dag(GatherWorkflow)
     actions = [node.action for node in dag.nodes]
-    assert actions == ["fetch_number", "fetch_number", "python_block", "summarize"]
-    first, second, collection, summary = dag.nodes
+    assert actions == ["fetch_number", "fetch_number", "python_block", "summarize", "python_block"]
+    first, second, collection, summary, _return_block = dag.nodes
     assert first.produces == ["numbers__item0"]
     assert second.produces == ["numbers__item1"]
     assert collection.kwargs["code"] == "numbers = [numbers__item0, numbers__item1]"
@@ -228,10 +238,16 @@ def test_list_comprehension_of_actions_expands_nodes_per_item() -> None:
         "double_number",
         "python_block",
         "summarize",
+        "python_block",
     ]
-    doubled_collection = dag.nodes[-2]
+    doubled_collection = next(
+        node
+        for node in dag.nodes
+        if node.action == "python_block"
+        and node.kwargs.get("code") == "doubled = [doubled__item0, doubled__item1]"
+    )
     assert doubled_collection.kwargs["code"] == "doubled = [doubled__item0, doubled__item1]"
-    summarize_node = dag.nodes[-1]
+    summarize_node = next(node for node in dag.nodes if node.action == "summarize")
     assert summarize_node.depends_on == [doubled_collection.id]
 
 
@@ -245,3 +261,25 @@ def test_actions_support_positional_arguments() -> None:
     node = dag.nodes[0]
     assert node.action == "positional_action"
     assert node.kwargs == {"prefix": "'greeting'", "count": "3"}
+
+
+class ReturnValueWorkflow(Workflow):
+    async def run(self) -> float:
+        total = await summarize(values=[1.0])
+        return total
+
+
+def test_return_variable_tracks_existing_assignment() -> None:
+    dag = build_workflow_dag(ReturnValueWorkflow)
+    assert dag.return_variable == "total"
+    assert dag.nodes[-1].action == "summarize"
+
+
+class InvalidReturnWorkflow(Workflow):
+    async def run(self) -> float:
+        return await summarize(values=[1.0])
+
+
+def test_return_statement_cannot_await() -> None:
+    with pytest.raises(ValueError, match="cannot directly await"):
+        build_workflow_dag(InvalidReturnWorkflow)

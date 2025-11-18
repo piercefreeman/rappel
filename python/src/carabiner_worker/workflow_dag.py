@@ -23,9 +23,13 @@ class DagNode:
     guard: Optional[str] = None
 
 
+RETURN_VARIABLE = "__workflow_return"
+
+
 @dataclass
 class WorkflowDag:
     nodes: List[DagNode]
+    return_variable: Optional[str] = None
 
 
 @dataclass
@@ -122,7 +126,8 @@ def build_workflow_dag(workflow_cls: type["Workflow"]) -> WorkflowDag:
     validator.visit(tree)
     builder = WorkflowDagBuilder(action_defs, module_index, function_source)
     builder.visit(tree)
-    return WorkflowDag(builder.nodes)
+    builder.ensure_return_variable()
+    return WorkflowDag(nodes=builder.nodes, return_variable=builder.return_variable)
 
 
 def _discover_action_names(module: Any) -> Dict[str, ActionDefinition]:
@@ -189,6 +194,7 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         self._source = source
         self._last_node_id: Optional[str] = None
         self._collections: Dict[str, List[str]] = {}
+        self._return_variable: Optional[str] = None
 
     # pylint: disable=too-many-return-statements
     def visit_Assign(self, node: ast.Assign) -> Any:
@@ -233,6 +239,27 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         if self._handle_conditional_actions(node):
             return
         self._capture_block(node)
+
+    def visit_Return(self, node: ast.Return) -> Any:
+        if self._return_variable is not None:
+            line = getattr(node, "lineno", "?")
+            raise ValueError(f"multiple return statements are not supported (line {line})")
+        if node.value is None:
+            self._return_variable = RETURN_VARIABLE
+            self._append_python_block(f"{RETURN_VARIABLE} = None", [RETURN_VARIABLE])
+            return
+        if isinstance(node.value, ast.Await):
+            line = getattr(node, "lineno", "?")
+            raise ValueError(
+                f"return statements cannot directly await values (line {line}); "
+                "assign to a variable first"
+            )
+        if isinstance(node.value, ast.Name) and node.value.id in self._var_to_node:
+            self._return_variable = node.value.id
+            return
+        snippet = f"{RETURN_VARIABLE} = {ast.unparse(node.value)}"
+        self._return_variable = RETURN_VARIABLE
+        self._append_python_block(snippet, [RETURN_VARIABLE])
 
     def _handle_conditional_actions(self, node: ast.If) -> bool:
         if not node.orelse:
@@ -472,10 +499,10 @@ class WorkflowDagBuilder(ast.NodeVisitor):
             compile(fallback, "<workflow_block>", "exec")
             return fallback
 
-    def _append_python_block(self, code: str, produces: List[str]) -> None:
+    def _append_python_block(self, code: str, produces: List[str]) -> str:
         snippet = textwrap.dedent(code).strip()
         if not snippet:
-            return
+            raise ValueError("python block requires non-empty code")
         block_id = self._new_node_id()
         deps: List[str] = []
         parsed = ast.parse(snippet)
@@ -491,12 +518,23 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         for name in produces:
             self._var_to_node[name] = block_id
         self._append_node(block_node)
+        return block_id
 
     def _append_node(self, node: DagNode) -> None:
         if self._last_node_id is not None:
             node.wait_for_sync = [self._last_node_id]
         self.nodes.append(node)
         self._last_node_id = node.id
+
+    def ensure_return_variable(self) -> None:
+        if self._return_variable is not None:
+            return
+        self._return_variable = RETURN_VARIABLE
+        self._append_python_block(f"{RETURN_VARIABLE} = None", [RETURN_VARIABLE])
+
+    @property
+    def return_variable(self) -> Optional[str]:
+        return self._return_variable
 
     def _flatten_targets(self, targets: List[ast.expr]) -> List[Optional[str]]:
         flat: List[Optional[str]] = []

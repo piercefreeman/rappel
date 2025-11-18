@@ -306,7 +306,7 @@ async fn workflow_executes_complex_flow() -> Result<()> {
         .context("missing complex workflow detail")?;
     let expected_actions = version_detail.dag.nodes.len();
 
-    let _instance_id = database
+    let instance_id = database
         .create_workflow_instance(
             PARTITION_ID,
             &version.workflow_name,
@@ -342,6 +342,15 @@ async fn workflow_executes_complex_flow() -> Result<()> {
         .transpose()?
         .context("expected primitive result")?;
     assert_eq!(message, "big:3,7");
+
+    let stored_result: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
+            .bind(instance_id)
+            .fetch_one(database.pool())
+            .await?;
+    let stored_payload = stored_result.context("missing workflow result payload")?;
+    let stored_message = parse_result(&stored_payload)?.context("expected primitive result")?;
+    assert_eq!(stored_message, "big:3,7");
 
     server.shutdown().await;
     Ok(())
