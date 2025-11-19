@@ -120,8 +120,9 @@ class WorkflowDagVisualizer:
         self._workflow_cls = workflow_cls
         self._dag = dag
         self._meta_label_width = 12
-        self._field_label_width = 14
-        self._indent = "    "
+        self._nodes_by_id = {node.id: node for node in dag.nodes}
+        self._adjacency, self._parents = self._build_adjacency()
+        self._detail_label_width = 12
 
     def render(self) -> str:
         lines = self._build_lines()
@@ -147,62 +148,109 @@ class WorkflowDagVisualizer:
         ]
         lines: list[str] = [line.rstrip() for line in meta_lines]
         lines.append("")
-        lines.append("Nodes:")
+        lines.append("Graph:")
         if not dag.nodes:
             lines.append("  <none>")
             return lines
         lines.append("")
+        visited: set[str] = set()
+        start_nodes = [node.id for node in dag.nodes if not self._parents[node.id]]
+        if not start_nodes:
+            start_nodes = [dag.nodes[0].id]
+        for idx, node_id in enumerate(start_nodes):
+            if idx:
+                lines.append("")
+            lines.extend(self._render_graph_node(node_id, prefix="", visited=visited))
+        for node in dag.nodes:
+            if node.id not in visited:
+                lines.append("")
+                lines.extend(self._render_graph_node(node.id, prefix="", visited=visited))
+        lines.append("")
+        lines.append("Details:")
+        lines.append("")
         for idx, node in enumerate(dag.nodes):
-            lines.extend(self._format_node_entry(node))
+            lines.extend(self._format_node_details(node))
             if idx < len(dag.nodes) - 1:
                 lines.append("")
         return lines
 
-    def _format_node_entry(self, node: DagNode) -> list[str]:
+    def _render_graph_node(self, node_id: str, prefix: str, visited: set[str]) -> list[str]:
+        node = self._nodes_by_id[node_id]
+        lines: list[str] = []
+        box = self._build_box_lines(node)
+        already_rendered = node_id in visited
+        for line in box:
+            lines.append(f"{prefix}{line}")
+        if already_rendered:
+            lines.append(f"{prefix}(see above)")
+            return lines
+        visited.add(node_id)
+        children = self._adjacency.get(node_id, [])
+        for idx, child_id in enumerate(children):
+            branch_prefix = prefix + "    "
+            connector = "└──▶" if idx == len(children) - 1 else "├──▶"
+            lines.append(f"{branch_prefix}{connector}")
+            child_prefix = prefix + ("    " if idx == len(children) - 1 else "│   ")
+            lines.extend(self._render_graph_node(child_id, child_prefix, visited))
+        return lines
+
+    def _format_node_details(self, node: DagNode) -> list[str]:
         header = f"{node.id}: {node.action}"
         if node.module:
             header = f"{header} [{node.module}]"
         lines = [header]
-        lines.extend(
-            self._format_field(
-                "depends_on",
-                self._format_sequence(node.depends_on),
-            )
+        indent = "    "
+        lines.append(
+            self._format_detail(indent, "depends_on", self._format_sequence(node.depends_on))
         )
-        lines.extend(
-            self._format_field(
-                "wait_for_sync",
-                self._format_sequence(node.wait_for_sync),
-            )
+        lines.append(
+            self._format_detail(indent, "wait_for", self._format_sequence(node.wait_for_sync))
         )
-        lines.extend(self._format_field("produces", self._format_sequence(node.produces)))
-        lines.extend(self._format_field("guard", node.guard or "-"))
-        lines.extend(self._format_kwargs(node.kwargs))
+        lines.append(self._format_detail(indent, "produces", self._format_sequence(node.produces)))
+        lines.append(self._format_detail(indent, "guard", node.guard or "-"))
+        lines.extend(self._format_kwargs(indent, node.kwargs))
         return lines
 
-    def _format_field(self, name: str, value: str) -> list[str]:
-        text = value if value.strip() else "-"
-        parts = text.splitlines() or ["-"]
-        prefix = f"{self._indent}{name:<{self._field_label_width}}: "
-        lines = [prefix + parts[0]]
-        continuation = f"{self._indent}{'':<{self._field_label_width}}  "
-        for part in parts[1:]:
-            lines.append(continuation + part)
-        return lines
+    def _format_detail(self, indent: str, label: str, value: str) -> str:
+        return f"{indent}{label:<{self._detail_label_width}}: {value}"
 
-    def _format_kwargs(self, kwargs: Dict[str, Any]) -> list[str]:
+    def _format_kwargs(self, indent: str, kwargs: Dict[str, Any]) -> list[str]:
         if not kwargs:
-            return self._format_field("kwargs", "-")
-        lines = [f"{self._indent}{'kwargs':<{self._field_label_width}}:"]
+            return [self._format_detail(indent, "kwargs", "-")]
+        lines = [f"{indent}{'kwargs':<{self._detail_label_width}}:"]
         for key in sorted(kwargs):
             rendered = self._stringify_value(kwargs[key])
             parts = rendered.splitlines() or ["-"]
             first = parts[0] or "-"
-            lines.append(f"{self._indent}  - {key}: {first}")
-            pad = f"{self._indent}    "
+            lines.append(f"{indent}  - {key}: {first}")
+            continuation = f"{indent}    "
             for part in parts[1:]:
-                lines.append(pad + part)
+                lines.append(continuation + part)
         return lines
+
+    def _build_box_lines(self, node: DagNode) -> list[str]:
+        labels = [node.id, node.action]
+        if node.module:
+            labels.append(f"[{node.module}]")
+        width = max(len(label) for label in labels)
+        horizontal = "+" + "-" * (width + 2) + "+"
+        lines = [horizontal]
+        for label in labels:
+            lines.append(f"| {label.ljust(width)} |")
+        lines.append(horizontal)
+        return lines
+
+    def _build_adjacency(self) -> tuple[Dict[str, list[str]], Dict[str, set[str]]]:
+        adjacency: Dict[str, list[str]] = {node.id: [] for node in self._dag.nodes}
+        parents: Dict[str, set[str]] = {node.id: set() for node in self._dag.nodes}
+        for node in self._dag.nodes:
+            for dep in list(dict.fromkeys(node.depends_on + node.wait_for_sync)):
+                if dep not in adjacency:
+                    continue
+                if node.id not in adjacency[dep]:
+                    adjacency[dep].append(node.id)
+                parents[node.id].add(dep)
+        return adjacency, parents
 
     @staticmethod
     def _format_sequence(values: list[str]) -> str:

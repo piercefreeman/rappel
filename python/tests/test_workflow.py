@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import io
 import os
+import sys
 from collections.abc import Iterator
 
 import pytest
@@ -113,16 +114,24 @@ def test_workflow_visualize_outputs_ascii_summary() -> None:
     buffer = io.StringIO()
     output = VisualizationWorkflow.visualize(stream=buffer)
     assert buffer.getvalue().rstrip("\n") == output
+
+    # print to stdout so we can visualize it
+    sys.stdout.write(output)
+    sys.stdout.flush()
+
     module_line = f"Workflow: {VisualizationWorkflow.__module__}.{VisualizationWorkflow.__name__}"
     assert module_line in output
     dag = VisualizationWorkflow.workflow_dag()
     expected_return_line = f"{'Return var':<12}: {dag.return_variable}"
     assert expected_return_line in output
-    node_headers = [f"{node.id}: {node.action}" for node in dag.nodes]
-    for header in node_headers:
-        assert header in output
+    assert "Graph:" in output
+    module_name = VisualizationWorkflow.__module__
+    assert f"| [{module_name}]" in output
+    assert "| node_0" in output
+    assert "| python_block" in output
+    assert "└──▶" in output
+    assert "Details:" in output
+    assert "node_0: viz_fetch_identifier" in output
+    assert "node_2: viz_store_value" in output
     assert "      - identifier: 'alpha'" in output
     assert "      - result: transformed" in output
-    transform_node = dag.nodes[1]
-    dep_line = f"    {'depends_on':<14}: {', '.join(transform_node.depends_on)}"
-    assert dep_line in output
