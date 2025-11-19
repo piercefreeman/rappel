@@ -42,11 +42,12 @@ pub async fn wait_for_instance_poll(
 ) -> Result<Option<Vec<u8>>> {
     let db = Database::connect(database_url).await?;
     loop {
-        let payload =
-            sqlx::query("SELECT payload FROM daemon_action_ledger ORDER BY id DESC LIMIT 1")
-                .map(|row: PgRow| row.get(0))
-                .fetch_optional(db.pool())
-                .await?;
+        let payload = sqlx::query(
+            "SELECT dispatch_payload FROM daemon_action_ledger ORDER BY id DESC LIMIT 1",
+        )
+        .map(|row: PgRow| row.get(0))
+        .fetch_optional(db.pool())
+        .await?;
         if payload.is_some() {
             return Ok(payload);
         }

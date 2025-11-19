@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package carabiner.messages;
 
+import "google/protobuf/struct.proto";
+
 // Basic transport messages for Rust <-> Python worker communication.
 enum MessageKind {
   MESSAGE_KIND_UNSPECIFIED = 0;
@@ -24,13 +26,13 @@ message ActionDispatch {
   string action_id = 1;
   string instance_id = 2;
   uint32 sequence = 3;
-  bytes payload = 4;
+  WorkflowNodeDispatch dispatch = 4;
 }
 
 message ActionResult {
   string action_id = 1;
   bool success = 2;
-  bytes payload = 3;
+  WorkflowArguments payload = 3;
   uint64 worker_start_ns = 4;
   uint64 worker_end_ns = 5;
 }
@@ -52,12 +54,19 @@ message WorkflowDagNode {
   repeated string produces = 6;
   string module = 7;
   string guard = 8;
+  repeated WorkflowExceptionEdge exception_edges = 9;
 }
 
 message WorkflowDagDefinition {
   bool concurrent = 1;
   repeated WorkflowDagNode nodes = 2;
   string return_variable = 3;
+}
+
+message WorkflowExceptionEdge {
+  string source_node_id = 1;
+  string exception_type = 2;
+  string exception_module = 3;
 }
 
 message WorkflowRegistration {
@@ -68,12 +77,69 @@ message WorkflowRegistration {
 
 message WorkflowNodeContext {
   string variable = 1;
-  bytes payload = 2;
+  WorkflowArguments payload = 2;
+  string workflow_node_id = 3;
+}
+
+// Workflow Argument Types
+message WorkflowArgumentValue {
+  oneof kind {
+    PrimitiveWorkflowArgument primitive = 1;
+    BaseModelWorkflowArgument basemodel = 2;
+    WorkflowErrorValue exception = 3;
+    WorkflowListArgument list_value = 4;
+    WorkflowTupleArgument tuple_value = 5;
+    WorkflowDictArgument dict_value = 6;
+  }
+}
+
+message WorkflowArgument {
+  string key = 1;
+  WorkflowArgumentValue value = 2;
+}
+
+message WorkflowArguments {
+  repeated WorkflowArgument arguments = 1;
+}
+
+message PrimitiveWorkflowArgument {
+  oneof kind {
+    string string_value = 1;
+    double double_value = 2;
+    sint64 int_value = 3;
+    bool bool_value = 4;
+    google.protobuf.NullValue null_value = 5;
+  }
+}
+
+message BaseModelWorkflowArgument {
+  string module = 1;
+  string name = 2;
+  google.protobuf.Struct data = 3;
+}
+
+message WorkflowErrorValue {
+  string type = 1;
+  string module = 2;
+  string message = 3;
+  string traceback = 4;
+}
+
+message WorkflowListArgument {
+  repeated WorkflowArgumentValue items = 1;
+}
+
+message WorkflowTupleArgument {
+  repeated WorkflowArgumentValue items = 1;
+}
+
+message WorkflowDictArgument {
+  repeated WorkflowArgument entries = 1;
 }
 
 message WorkflowNodeDispatch {
   WorkflowDagNode node = 1;
-  bytes workflow_input = 2;
+  WorkflowArguments workflow_input = 2;
   repeated WorkflowNodeContext context = 3;
 }
 

@@ -67,6 +67,13 @@ class Workflow:
             proto_node.kwargs.update(node.kwargs)
             if node.guard:
                 proto_node.guard = node.guard
+            for edge in node.exception_edges:
+                proto_edge = proto_node.exception_edges.add()
+                proto_edge.source_node_id = edge.source_node_id
+                if edge.exception_type:
+                    proto_edge.exception_type = edge.exception_type
+                if edge.exception_module:
+                    proto_edge.exception_module = edge.exception_module
             dag_definition.nodes.append(proto_node)
         if dag.return_variable:
             dag_definition.return_variable = dag.return_variable

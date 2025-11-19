@@ -100,6 +100,7 @@ mod tests {
             module: String::new(),
             produces: Vec::new(),
             guard: String::new(),
+            exception_edges: Vec::new(),
         }
     }
 
@@ -210,6 +211,7 @@ mod tests {
             module: String::new(),
             produces: Vec::new(),
             guard: "user_flag".to_string(),
+            exception_edges: Vec::new(),
         };
         let dag = WorkflowDagDefinition {
             concurrent: false,

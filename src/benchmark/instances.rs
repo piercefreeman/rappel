@@ -10,7 +10,6 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use prost::Message;
-use serde_json::json;
 use tempfile::TempDir;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{Instrument, info, warn};
@@ -23,7 +22,10 @@ use crate::{
     },
     db::{CompletionRecord, Database},
     instances,
-    messages::{MessageError, proto::WorkflowRegistration},
+    messages::{
+        MessageError,
+        proto::{self, WorkflowRegistration},
+    },
     server_worker::WorkerBridgeServer,
     worker::{ActionDispatchPayload, PythonWorkerConfig, PythonWorkerPool, RoundTripMetrics},
 };
@@ -130,10 +132,7 @@ impl WorkflowBenchmarkHarness {
 
     pub async fn run(&self, config: &WorkflowBenchmarkConfig) -> Result<BenchmarkSummary> {
         self.database.reset_partition(config.partition_id).await?;
-        let input_payload = serde_json::to_vec(&json!({
-            "batch_size": config.batch_size,
-            "payload_size": config.payload_size,
-        }))?;
+        let input_payload = build_workflow_input(config.batch_size, config.payload_size);
         for _ in 0..config.instance_count {
             self.database
                 .create_workflow_instance(
@@ -166,11 +165,14 @@ impl WorkflowBenchmarkHarness {
                     break;
                 }
                 for action in actions {
+                    let dispatch =
+                        proto::WorkflowNodeDispatch::decode(action.dispatch_payload.as_slice())
+                            .map_err(|err| anyhow!("failed to decode workflow dispatch: {err}"))?;
                     let payload = ActionDispatchPayload {
                         action_id: action.id,
                         instance_id: action.instance_id,
                         sequence: action.action_seq,
-                        payload: action.payload,
+                        dispatch,
                     };
                     let worker = self.workers.next_worker();
                     let span = tracing::debug_span!(
@@ -291,4 +293,33 @@ print(base64.b64encode(payload.SerializeToString()).decode(), end='')
         .decode(encoded.as_bytes())
         .context("decode workflow registration base64")?;
     Ok(bytes)
+}
+
+fn build_workflow_input(batch_size: usize, payload_size: usize) -> Vec<u8> {
+    let mut arguments = proto::WorkflowArguments {
+        arguments: Vec::new(),
+    };
+    arguments.arguments.push(proto::WorkflowArgument {
+        key: "batch_size".to_string(),
+        value: Some(primitive_argument(
+            proto::primitive_workflow_argument::Kind::IntValue(batch_size as i64),
+        )),
+    });
+    arguments.arguments.push(proto::WorkflowArgument {
+        key: "payload_size".to_string(),
+        value: Some(primitive_argument(
+            proto::primitive_workflow_argument::Kind::IntValue(payload_size as i64),
+        )),
+    });
+    arguments.encode_to_vec()
+}
+
+fn primitive_argument(
+    kind: proto::primitive_workflow_argument::Kind,
+) -> proto::WorkflowArgumentValue {
+    proto::WorkflowArgumentValue {
+        kind: Some(proto::workflow_argument_value::Kind::Primitive(
+            proto::PrimitiveWorkflowArgument { kind: Some(kind) },
+        )),
+    }
 }

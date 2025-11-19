@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result as AnyResult, anyhow};
+use prost::Message;
 use tokio::{
     process::{Child, Command},
     sync::{Mutex, mpsc, oneshot},
@@ -76,7 +77,7 @@ pub struct ActionDispatchPayload {
     pub action_id: LedgerActionId,
     pub instance_id: WorkflowInstanceId,
     pub sequence: i32,
-    pub payload: Vec<u8>,
+    pub dispatch: proto::WorkflowNodeDispatch,
 }
 
 pub struct PythonWorker {
@@ -110,6 +111,7 @@ impl PythonWorker {
             Ok(existing) if !existing.is_empty() => format!("{existing}:{joined_python_path}"),
             _ => joined_python_path,
         };
+        info!(python_path = %python_path, "configured python path for worker");
 
         let mut command = Command::new(&config.script_path);
         command
@@ -181,11 +183,18 @@ impl PythonWorker {
     ) -> Result<RoundTripMetrics, MessageError> {
         let delivery_id = self.next_delivery.fetch_add(1, Ordering::SeqCst);
         let send_instant = Instant::now();
+        let action_node = dispatch
+            .dispatch
+            .node
+            .as_ref()
+            .map(|node| (node.module.clone(), node.action.clone()))
+            .unwrap_or_default();
         tracing::debug!(
             action_id = %dispatch.action_id,
             instance_id = %dispatch.instance_id,
             sequence = dispatch.sequence,
-            payload_len = dispatch.payload.len(),
+            module = %action_node.0,
+            function = %action_node.1,
             "worker.send_action"
         );
         let (ack_tx, ack_rx) = oneshot::channel();
@@ -201,7 +210,7 @@ impl PythonWorker {
             action_id: dispatch.action_id.to_string(),
             instance_id: dispatch.instance_id.to_string(),
             sequence: dispatch.sequence as u32,
-            payload: dispatch.payload.clone(),
+            dispatch: Some(dispatch.dispatch.clone()),
         };
 
         let envelope = proto::Envelope {
@@ -237,7 +246,11 @@ impl PythonWorker {
             ack_latency,
             round_trip,
             worker_duration,
-            response_payload: response.payload,
+            response_payload: response
+                .payload
+                .as_ref()
+                .map(|payload| payload.encode_to_vec())
+                .unwrap_or_default(),
             success: response.success,
         })
     }

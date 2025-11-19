@@ -12,13 +12,11 @@ from typing import Any, AsyncIterator, cast
 
 import grpc
 
-from carabiner_worker.actions import (
-    ActionRunner,
-    serialize_error_payload,
-    serialize_result_payload,
-)
+from carabiner_worker.actions import serialize_error_payload, serialize_result_payload
 from proto import messages_pb2 as pb2
 from proto import messages_pb2_grpc as pb2_grpc
+
+from . import workflow_runtime
 
 LOGGER = logging.getLogger("carabiner.worker")
 aio = cast(Any, grpc).aio
@@ -69,19 +67,22 @@ async def _send_ack(outgoing: "asyncio.Queue[pb2.Envelope]", envelope: pb2.Envel
 
 async def _handle_dispatch(
     envelope: pb2.Envelope,
-    runner: ActionRunner,
     outgoing: "asyncio.Queue[pb2.Envelope]",
 ) -> None:
     await _send_ack(outgoing, envelope)
     dispatch = pb2.ActionDispatch()
     dispatch.ParseFromString(envelope.payload)
+    if dispatch.dispatch is None:
+        raise RuntimeError("action dispatch missing workflow payload")
 
     worker_start = time.perf_counter_ns()
     success = True
     action_name = "unknown"
     try:
-        invocation, result = await runner.run_serialized(dispatch.payload)
-        action_name = invocation.action
+        node = dispatch.dispatch.node
+        if node is not None and node.action:
+            action_name = node.action
+        result = await workflow_runtime.execute_node(dispatch.dispatch)
         response_payload = serialize_result_payload(result)
     except Exception as exc:  # noqa: BLE001 - propagate structured errors
         success = False
@@ -96,10 +97,10 @@ async def _handle_dispatch(
     response = pb2.ActionResult(
         action_id=dispatch.action_id,
         success=success,
-        payload=response_payload,
         worker_start_ns=worker_start,
         worker_end_ns=worker_end,
     )
+    response.payload.CopyFrom(response_payload)
     response_envelope = pb2.Envelope(
         delivery_id=envelope.delivery_id,
         partition_id=envelope.partition_id,
@@ -113,13 +114,12 @@ async def _handle_dispatch(
 async def _handle_incoming_stream(
     stub: pb2_grpc.WorkerBridgeStub,
     worker_id: int,
-    runner: ActionRunner,
     outgoing: "asyncio.Queue[pb2.Envelope]",
 ) -> None:
     async for envelope in stub.Attach(_outgoing_stream(outgoing, worker_id)):
         kind = envelope.kind
         if kind == pb2.MessageKind.MESSAGE_KIND_ACTION_DISPATCH:
-            await _handle_dispatch(envelope, runner, outgoing)
+            await _handle_dispatch(envelope, outgoing)
         elif kind == pb2.MessageKind.MESSAGE_KIND_HEARTBEAT:
             LOGGER.debug("Received heartbeat delivery=%s", envelope.delivery_id)
             await _send_ack(outgoing, envelope)
@@ -130,7 +130,6 @@ async def _handle_incoming_stream(
 
 async def _run_worker(args: argparse.Namespace) -> None:
     outgoing: "asyncio.Queue[pb2.Envelope]" = asyncio.Queue()
-    runner = ActionRunner()
     for module_name in args.user_module:
         if not module_name:
             continue
@@ -141,7 +140,7 @@ async def _run_worker(args: argparse.Namespace) -> None:
         stub = pb2_grpc.WorkerBridgeStub(channel)
         LOGGER.info("Worker %s connected to %s", args.worker_id, args.bridge)
         try:
-            await _handle_incoming_stream(stub, args.worker_id, runner, outgoing)
+            await _handle_incoming_stream(stub, args.worker_id, outgoing)
         except aio.AioRpcError as exc:  # pragma: no cover
             status = exc.code()
             LOGGER.error("Worker stream closed: %s", status)

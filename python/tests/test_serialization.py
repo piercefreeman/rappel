@@ -3,9 +3,7 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 from carabiner_worker.actions import (
-    deserialize_action_call,
     deserialize_result_payload,
-    serialize_action_call,
     serialize_error_payload,
     serialize_result_payload,
 )
@@ -13,17 +11,6 @@ from carabiner_worker.actions import (
 
 class SampleModel(BaseModel):
     payload: str
-
-
-def test_action_round_trip_with_basemodel() -> None:
-    payload = serialize_action_call(
-        "demo.module", "demo.echo", request=SampleModel(payload="hello")
-    )
-    invocation = deserialize_action_call(payload)
-    assert invocation.module == "demo.module"
-    assert invocation.action == "demo.echo"
-    assert isinstance(invocation.kwargs["request"], SampleModel)
-    assert invocation.kwargs["request"].payload == "hello"
 
 
 def test_result_round_trip_with_basemodel() -> None:
@@ -42,6 +29,28 @@ def test_error_payload_serialization() -> None:
     decoded = deserialize_result_payload(payload)
     assert decoded.result is None
     assert decoded.error is not None
-    assert decoded.error["action"] == "demo.echo"
     assert decoded.error["type"] == "RuntimeError"
+    assert decoded.error["module"] == "builtins"
     assert "boom" in decoded.error["message"]
+    assert "Traceback" in decoded.error["traceback"]
+
+
+def test_collections_round_trip() -> None:
+    payload = serialize_result_payload({"items": [1, 2, 3], "pair": (4, 5)})
+    decoded = deserialize_result_payload(payload)
+    assert decoded.error is None
+    assert decoded.result == {"items": [1, 2, 3], "pair": (4, 5)}
+
+
+def test_primitives_preserve_types() -> None:
+    payload = serialize_result_payload({"count": 5, "ratio": 2.5, "flag": True, "missing": None})
+    decoded = deserialize_result_payload(payload)
+    assert decoded.error is None
+    assert decoded.result is not None
+    result = decoded.result
+    assert isinstance(result["count"], int)
+    assert result["count"] == 5
+    assert isinstance(result["ratio"], float)
+    assert result["ratio"] == 2.5
+    assert result["flag"] is True
+    assert result["missing"] is None

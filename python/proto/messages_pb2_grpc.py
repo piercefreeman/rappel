@@ -5,24 +5,23 @@ import grpc
 
 from proto import messages_pb2 as messages__pb2
 
-GRPC_GENERATED_VERSION = "1.71.2"
+GRPC_GENERATED_VERSION = '1.71.2'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
 try:
     from grpc._utilities import first_version_is_lower
-
     _version_not_supported = first_version_is_lower(GRPC_VERSION, GRPC_GENERATED_VERSION)
 except ImportError:
     _version_not_supported = True
 
 if _version_not_supported:
     raise RuntimeError(
-        f"The grpc package installed is at version {GRPC_VERSION},"
-        + " but the generated code in messages_pb2_grpc.py depends on"
-        + f" grpcio>={GRPC_GENERATED_VERSION}."
-        + f" Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}"
-        + f" or downgrade your generated code using grpcio-tools<={GRPC_VERSION}."
+        f'The grpc package installed is at version {GRPC_VERSION},'
+        + ' but the generated code in messages_pb2_grpc.py depends on'
+        + f' grpcio>={GRPC_GENERATED_VERSION}.'
+        + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
+        + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
     )
 
 
@@ -36,17 +35,15 @@ class WorkflowServiceStub(object):
             channel: A grpc.Channel.
         """
         self.RegisterWorkflow = channel.unary_unary(
-            "/carabiner.messages.WorkflowService/RegisterWorkflow",
-            request_serializer=messages__pb2.RegisterWorkflowRequest.SerializeToString,
-            response_deserializer=messages__pb2.RegisterWorkflowResponse.FromString,
-            _registered_method=True,
-        )
+                '/carabiner.messages.WorkflowService/RegisterWorkflow',
+                request_serializer=messages__pb2.RegisterWorkflowRequest.SerializeToString,
+                response_deserializer=messages__pb2.RegisterWorkflowResponse.FromString,
+                _registered_method=True)
         self.WaitForInstance = channel.unary_unary(
-            "/carabiner.messages.WorkflowService/WaitForInstance",
-            request_serializer=messages__pb2.WaitForInstanceRequest.SerializeToString,
-            response_deserializer=messages__pb2.WaitForInstanceResponse.FromString,
-            _registered_method=True,
-        )
+                '/carabiner.messages.WorkflowService/WaitForInstance',
+                request_serializer=messages__pb2.WaitForInstanceRequest.SerializeToString,
+                response_deserializer=messages__pb2.WaitForInstanceResponse.FromString,
+                _registered_method=True)
 
 
 class WorkflowServiceServicer(object):
@@ -55,57 +52,54 @@ class WorkflowServiceServicer(object):
     def RegisterWorkflow(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details("Method not implemented!")
-        raise NotImplementedError("Method not implemented!")
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def WaitForInstance(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details("Method not implemented!")
-        raise NotImplementedError("Method not implemented!")
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
 
 def add_WorkflowServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
-        "RegisterWorkflow": grpc.unary_unary_rpc_method_handler(
-            servicer.RegisterWorkflow,
-            request_deserializer=messages__pb2.RegisterWorkflowRequest.FromString,
-            response_serializer=messages__pb2.RegisterWorkflowResponse.SerializeToString,
-        ),
-        "WaitForInstance": grpc.unary_unary_rpc_method_handler(
-            servicer.WaitForInstance,
-            request_deserializer=messages__pb2.WaitForInstanceRequest.FromString,
-            response_serializer=messages__pb2.WaitForInstanceResponse.SerializeToString,
-        ),
+            'RegisterWorkflow': grpc.unary_unary_rpc_method_handler(
+                    servicer.RegisterWorkflow,
+                    request_deserializer=messages__pb2.RegisterWorkflowRequest.FromString,
+                    response_serializer=messages__pb2.RegisterWorkflowResponse.SerializeToString,
+            ),
+            'WaitForInstance': grpc.unary_unary_rpc_method_handler(
+                    servicer.WaitForInstance,
+                    request_deserializer=messages__pb2.WaitForInstanceRequest.FromString,
+                    response_serializer=messages__pb2.WaitForInstanceResponse.SerializeToString,
+            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-        "carabiner.messages.WorkflowService", rpc_method_handlers
-    )
+            'carabiner.messages.WorkflowService', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers("carabiner.messages.WorkflowService", rpc_method_handlers)
+    server.add_registered_method_handlers('carabiner.messages.WorkflowService', rpc_method_handlers)
 
 
-# This class is part of an EXPERIMENTAL API.
+ # This class is part of an EXPERIMENTAL API.
 class WorkflowService(object):
     """Missing associated documentation comment in .proto file."""
 
     @staticmethod
-    def RegisterWorkflow(
-        request,
-        target,
-        options=(),
-        channel_credentials=None,
-        call_credentials=None,
-        insecure=False,
-        compression=None,
-        wait_for_ready=None,
-        timeout=None,
-        metadata=None,
-    ):
+    def RegisterWorkflow(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
         return grpc.experimental.unary_unary(
             request,
             target,
-            "/carabiner.messages.WorkflowService/RegisterWorkflow",
+            '/carabiner.messages.WorkflowService/RegisterWorkflow',
             messages__pb2.RegisterWorkflowRequest.SerializeToString,
             messages__pb2.RegisterWorkflowResponse.FromString,
             options,
@@ -116,26 +110,23 @@ class WorkflowService(object):
             wait_for_ready,
             timeout,
             metadata,
-            _registered_method=True,
-        )
+            _registered_method=True)
 
     @staticmethod
-    def WaitForInstance(
-        request,
-        target,
-        options=(),
-        channel_credentials=None,
-        call_credentials=None,
-        insecure=False,
-        compression=None,
-        wait_for_ready=None,
-        timeout=None,
-        metadata=None,
-    ):
+    def WaitForInstance(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
         return grpc.experimental.unary_unary(
             request,
             target,
-            "/carabiner.messages.WorkflowService/WaitForInstance",
+            '/carabiner.messages.WorkflowService/WaitForInstance',
             messages__pb2.WaitForInstanceRequest.SerializeToString,
             messages__pb2.WaitForInstanceResponse.FromString,
             options,
@@ -146,8 +137,7 @@ class WorkflowService(object):
             wait_for_ready,
             timeout,
             metadata,
-            _registered_method=True,
-        )
+            _registered_method=True)
 
 
 class WorkerBridgeStub(object):
@@ -160,11 +150,10 @@ class WorkerBridgeStub(object):
             channel: A grpc.Channel.
         """
         self.Attach = channel.stream_stream(
-            "/carabiner.messages.WorkerBridge/Attach",
-            request_serializer=messages__pb2.Envelope.SerializeToString,
-            response_deserializer=messages__pb2.Envelope.FromString,
-            _registered_method=True,
-        )
+                '/carabiner.messages.WorkerBridge/Attach',
+                request_serializer=messages__pb2.Envelope.SerializeToString,
+                response_deserializer=messages__pb2.Envelope.FromString,
+                _registered_method=True)
 
 
 class WorkerBridgeServicer(object):
@@ -173,46 +162,43 @@ class WorkerBridgeServicer(object):
     def Attach(self, request_iterator, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details("Method not implemented!")
-        raise NotImplementedError("Method not implemented!")
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
 
 def add_WorkerBridgeServicer_to_server(servicer, server):
     rpc_method_handlers = {
-        "Attach": grpc.stream_stream_rpc_method_handler(
-            servicer.Attach,
-            request_deserializer=messages__pb2.Envelope.FromString,
-            response_serializer=messages__pb2.Envelope.SerializeToString,
-        ),
+            'Attach': grpc.stream_stream_rpc_method_handler(
+                    servicer.Attach,
+                    request_deserializer=messages__pb2.Envelope.FromString,
+                    response_serializer=messages__pb2.Envelope.SerializeToString,
+            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-        "carabiner.messages.WorkerBridge", rpc_method_handlers
-    )
+            'carabiner.messages.WorkerBridge', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers("carabiner.messages.WorkerBridge", rpc_method_handlers)
+    server.add_registered_method_handlers('carabiner.messages.WorkerBridge', rpc_method_handlers)
 
 
-# This class is part of an EXPERIMENTAL API.
+ # This class is part of an EXPERIMENTAL API.
 class WorkerBridge(object):
     """Missing associated documentation comment in .proto file."""
 
     @staticmethod
-    def Attach(
-        request_iterator,
-        target,
-        options=(),
-        channel_credentials=None,
-        call_credentials=None,
-        insecure=False,
-        compression=None,
-        wait_for_ready=None,
-        timeout=None,
-        metadata=None,
-    ):
+    def Attach(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
         return grpc.experimental.stream_stream(
             request_iterator,
             target,
-            "/carabiner.messages.WorkerBridge/Attach",
+            '/carabiner.messages.WorkerBridge/Attach',
             messages__pb2.Envelope.SerializeToString,
             messages__pb2.Envelope.FromString,
             options,
@@ -223,5 +209,4 @@ class WorkerBridge(object):
             wait_for_ready,
             timeout,
             metadata,
-            _registered_method=True,
-        )
+            _registered_method=True)

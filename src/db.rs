@@ -1,10 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Utc};
 use prost::Message;
-use serde_json::json;
 use sqlx::{
     FromRow, PgPool, Postgres, Row, Transaction,
     postgres::{PgPoolOptions, PgRow},
@@ -14,7 +12,8 @@ use crate::{
     LedgerActionId, WorkflowInstanceId, WorkflowVersionId,
     dag_state::{DagStateMachine, InstanceDagState},
     messages::proto::{
-        WorkflowDagDefinition, WorkflowDagNode, WorkflowNodeContext, WorkflowNodeDispatch,
+        self, WorkflowArguments, WorkflowDagDefinition, WorkflowDagNode, WorkflowNodeContext,
+        WorkflowNodeDispatch,
     },
 };
 
@@ -27,7 +26,7 @@ async fn store_instance_result_if_complete(
     tx: &mut Transaction<'_, Postgres>,
     instance: &WorkflowInstanceRow,
     dag: &WorkflowDagDefinition,
-    context_values: &HashMap<String, Vec<u8>>,
+    context_values: &HashMap<String, Vec<(String, Vec<u8>)>>,
     completed_count: usize,
 ) -> Result<()> {
     if dag.nodes.len() != completed_count {
@@ -39,7 +38,19 @@ async fn store_instance_result_if_complete(
     if instance.result_payload.is_some() {
         return Ok(());
     }
-    let Some(payload) = context_values.get(&dag.return_variable) else {
+    let mut payload_opt: Option<Vec<u8>> = None;
+    for entries in context_values.values() {
+        for (variable, payload) in entries {
+            if variable == &dag.return_variable {
+                payload_opt = Some(payload.clone());
+                break;
+            }
+        }
+        if payload_opt.is_some() {
+            break;
+        }
+    }
+    let Some(payload) = payload_opt else {
         return Ok(());
     };
     sqlx::query("UPDATE workflow_instances SET result_payload = $2 WHERE id = $1")
@@ -82,7 +93,7 @@ async fn build_variable_context(
     tx: &mut Transaction<'_, Postgres>,
     instance_id: WorkflowInstanceId,
     dag_nodes: &HashMap<String, WorkflowDagNode>,
-) -> Result<HashMap<String, Vec<u8>>> {
+) -> Result<HashMap<String, Vec<(String, Vec<u8>)>>> {
     let rows = sqlx::query(
         r#"
         SELECT workflow_node_id, result_payload
@@ -94,7 +105,7 @@ async fn build_variable_context(
     .map(|row: PgRow| (row.get::<Option<String>, _>(0), row.get::<Option<Vec<u8>>, _>(1)))
     .fetch_all(tx.as_mut())
     .await?;
-    let mut context = HashMap::new();
+    let mut context: HashMap<String, Vec<(String, Vec<u8>)>> = HashMap::new();
     for (node_id_opt, payload_opt) in rows {
         let Some(node_id) = node_id_opt else {
             continue;
@@ -103,43 +114,74 @@ async fn build_variable_context(
             continue;
         };
         if let Some(node) = dag_nodes.get(&node_id) {
-            for variable in &node.produces {
-                context.insert(variable.clone(), payload.clone());
+            let entries = context.entry(node_id.clone()).or_default();
+            if node.produces.is_empty() {
+                entries.push((String::new(), payload.clone()));
+            } else {
+                for variable in &node.produces {
+                    entries.push((variable.clone(), payload.clone()));
+                }
             }
         }
     }
     Ok(context)
 }
 
-fn build_workflow_action_payload(
+fn build_workflow_node_dispatch(
     node: &WorkflowDagNode,
     workflow_input: &[u8],
-    context: &HashMap<String, Vec<u8>>,
-) -> Result<Vec<u8>> {
+    context: &HashMap<String, Vec<(String, Vec<u8>)>>,
+) -> Result<QueuedWorkflowNode> {
+    let workflow_args = decode_arguments(workflow_input, "workflow input")?;
     let mut dispatch = WorkflowNodeDispatch {
         node: Some(node.clone()),
-        workflow_input: workflow_input.to_vec(),
+        workflow_input: Some(workflow_args),
         context: Vec::new(),
     };
-    for (variable, payload) in context {
-        dispatch.context.push(WorkflowNodeContext {
-            variable: variable.clone(),
-            payload: payload.clone(),
-        });
-    }
-    let dispatch_bytes = dispatch.encode_to_vec();
-    let encoded = general_purpose::STANDARD.encode(dispatch_bytes);
-    let payload = json!({
-        "module": "carabiner_worker.workflow_runtime",
-        "action": "workflow.execute_node",
-        "kwargs": {
-            "dispatch_b64": {
-                "kind": "primitive",
-                "value": encoded,
+    let mut required: Vec<&str> = node.depends_on.iter().map(|s| s.as_str()).collect();
+    required.extend(node.wait_for_sync.iter().map(|s| s.as_str()));
+    let mut seen: HashSet<&str> = HashSet::new();
+    for dep in required {
+        if !seen.insert(dep) {
+            continue;
+        }
+        if let Some(entries) = context.get(dep) {
+            for (variable, payload) in entries {
+                let args = decode_arguments(payload, "context payload")?;
+                dispatch.context.push(WorkflowNodeContext {
+                    variable: variable.clone(),
+                    payload: Some(args),
+                    workflow_node_id: dep.to_string(),
+                });
             }
         }
-    });
-    Ok(serde_json::to_vec(&payload)?)
+    }
+    let module = if node.module.is_empty() {
+        "workflow".to_string()
+    } else {
+        node.module.clone()
+    };
+    let function_name = if node.action.is_empty() {
+        "action".to_string()
+    } else {
+        node.action.clone()
+    };
+
+    Ok(QueuedWorkflowNode {
+        module,
+        function_name,
+        dispatch,
+    })
+}
+
+fn decode_arguments(bytes: &[u8], label: &str) -> Result<WorkflowArguments> {
+    if bytes.is_empty() {
+        return Ok(WorkflowArguments {
+            arguments: Vec::new(),
+        });
+    }
+    WorkflowArguments::decode(bytes)
+        .with_context(|| format!("failed to decode {label} workflow arguments"))
 }
 
 #[derive(Debug, Clone)]
@@ -150,13 +192,22 @@ pub struct CompletionRecord {
     pub result_payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+struct QueuedWorkflowNode {
+    module: String,
+    function_name: String,
+    dispatch: proto::WorkflowNodeDispatch,
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct LedgerAction {
     pub id: LedgerActionId,
     pub instance_id: WorkflowInstanceId,
     pub partition_id: i32,
     pub action_seq: i32,
-    pub payload: Vec<u8>,
+    pub module: String,
+    pub function_name: String,
+    pub dispatch_payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -192,6 +243,43 @@ pub struct WorkflowVersionDetail {
     pub concurrent: bool,
     pub created_at: DateTime<Utc>,
     pub dag: WorkflowDagDefinition,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowInstanceSummary {
+    pub id: WorkflowInstanceId,
+    pub created_at: DateTime<Utc>,
+    pub completed_actions: i64,
+    pub total_actions: i64,
+    pub has_result: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowInstanceDetail {
+    pub instance: WorkflowInstanceRecord,
+    pub actions: Vec<WorkflowInstanceActionDetail>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowInstanceRecord {
+    pub id: WorkflowInstanceId,
+    pub workflow_version_id: Option<WorkflowVersionId>,
+    pub workflow_name: String,
+    pub created_at: DateTime<Utc>,
+    pub input_payload: Option<Vec<u8>>,
+    pub result_payload: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowInstanceActionDetail {
+    pub action_seq: i32,
+    pub workflow_node_id: Option<String>,
+    pub status: String,
+    pub success: Option<bool>,
+    pub module: String,
+    pub function_name: String,
+    pub dispatch_payload: Vec<u8>,
+    pub result_payload: Option<Vec<u8>>,
 }
 
 impl Database {
@@ -270,6 +358,96 @@ impl Database {
         }))
     }
 
+    pub async fn recent_instances_for_version(
+        &self,
+        version_id: WorkflowVersionId,
+        limit: i64,
+    ) -> Result<Vec<WorkflowInstanceSummary>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT wi.id,
+                   wi.created_at,
+                   wi.result_payload IS NOT NULL AS has_result,
+                   COUNT(dal.id) AS total_actions,
+                   COUNT(*) FILTER (WHERE dal.status = 'completed') AS completed_actions
+            FROM workflow_instances wi
+            LEFT JOIN daemon_action_ledger dal ON dal.instance_id = wi.id
+            WHERE wi.workflow_version_id = $1
+            GROUP BY wi.id
+            ORDER BY wi.created_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(version_id)
+        .bind(limit.max(1))
+        .map(|row: PgRow| WorkflowInstanceSummary {
+            id: row.get("id"),
+            created_at: row.get("created_at"),
+            completed_actions: row.get::<i64, _>("completed_actions"),
+            total_actions: row.get::<i64, _>("total_actions"),
+            has_result: row.get::<bool, _>("has_result"),
+        })
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn load_instance_with_actions(
+        &self,
+        instance_id: WorkflowInstanceId,
+    ) -> Result<Option<WorkflowInstanceDetail>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, workflow_name, workflow_version_id, created_at, input_payload, result_payload
+            FROM workflow_instances
+            WHERE id = $1
+            "#,
+        )
+        .bind(instance_id)
+        .map(|row: PgRow| WorkflowInstanceRecord {
+            id: row.get("id"),
+            workflow_name: row.get("workflow_name"),
+            workflow_version_id: row.get("workflow_version_id"),
+            created_at: row.get("created_at"),
+            input_payload: row.get("input_payload"),
+            result_payload: row.get("result_payload"),
+        })
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(instance) = row else {
+            return Ok(None);
+        };
+        let actions = sqlx::query(
+            r#"
+            SELECT action_seq,
+                   workflow_node_id,
+                   status,
+                   success,
+                   module,
+                   function_name,
+                   dispatch_payload,
+                   result_payload
+            FROM daemon_action_ledger
+            WHERE instance_id = $1
+            ORDER BY action_seq
+            "#,
+        )
+        .bind(instance_id)
+        .map(|row: PgRow| WorkflowInstanceActionDetail {
+            action_seq: row.get("action_seq"),
+            workflow_node_id: row.get("workflow_node_id"),
+            status: row.get("status"),
+            success: row.get("success"),
+            module: row.get("module"),
+            function_name: row.get("function_name"),
+            dispatch_payload: row.get("dispatch_payload"),
+            result_payload: row.get("result_payload"),
+        })
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(Some(WorkflowInstanceDetail { instance, actions }))
+    }
+
     pub async fn reset_partition(&self, partition_id: i32) -> Result<()> {
         let span = tracing::info_span!("db.reset_partition", partition_id);
         let _guard = span.enter();
@@ -290,7 +468,9 @@ impl Database {
         &self,
         partition_id: i32,
         action_count: usize,
-        payload: &[u8],
+        module: &str,
+        function_name: &str,
+        dispatch_payload: &[u8],
     ) -> Result<()> {
         let span = tracing::info_span!("db.seed_actions", partition_id, action_count);
         let _guard = span.enter();
@@ -316,14 +496,18 @@ impl Database {
                     partition_id,
                     action_seq,
                     status,
-                    payload
-                ) VALUES ($1, $2, $3, 'queued', $4)
+                    module,
+                    function_name,
+                    dispatch_payload
+                ) VALUES ($1, $2, $3, 'queued', $4, $5, $6)
                 "#,
             )
             .bind(instance_id)
             .bind(partition_id)
             .bind(seq as i32)
-            .bind(payload)
+            .bind(module)
+            .bind(function_name)
+            .bind(dispatch_payload)
             .execute(&mut *tx)
             .await?;
         }
@@ -397,7 +581,13 @@ impl Database {
             SET status = 'dispatched', dispatched_at = NOW()
             FROM next_actions
             WHERE dal.id = next_actions.id
-            RETURNING dal.id, dal.instance_id, dal.partition_id, dal.action_seq, dal.payload
+            RETURNING dal.id,
+                     dal.instance_id,
+                     dal.partition_id,
+                     dal.action_seq,
+                     dal.module,
+                     dal.function_name,
+                     dal.dispatch_payload
             "#,
         )
         .bind(partition_id)
@@ -576,7 +766,9 @@ impl Database {
         let mut inserted = 0usize;
         for node in unlocked {
             let node_id = node.id.clone();
-            let payload = build_workflow_action_payload(&node, &workflow_input, &context_values)?;
+            let node_dispatch =
+                build_workflow_node_dispatch(&node, &workflow_input, &context_values)?;
+            let dispatch_bytes = node_dispatch.dispatch.encode_to_vec();
             let _action_id: LedgerActionId = sqlx::query_scalar::<_, LedgerActionId>(
                 r#"
                 INSERT INTO daemon_action_ledger (
@@ -584,16 +776,20 @@ impl Database {
                     partition_id,
                     action_seq,
                     status,
-                    payload,
+                    module,
+                    function_name,
+                    dispatch_payload,
                     workflow_node_id
-                ) VALUES ($1, $2, $3, 'queued', $4, $5)
+                ) VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7)
                 RETURNING id
                 "#,
             )
             .bind(instance.id)
             .bind(instance.partition_id)
             .bind(next_sequence)
-            .bind(payload)
+            .bind(&node_dispatch.module)
+            .bind(&node_dispatch.function_name)
+            .bind(&dispatch_bytes)
             .bind(node_id)
             .fetch_one(tx.as_mut())
             .await?;

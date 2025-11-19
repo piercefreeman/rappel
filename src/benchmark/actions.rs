@@ -1,18 +1,20 @@
 use std::{
+    collections::{BTreeMap, HashMap},
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
-use serde_json::json;
+use prost::Message;
+use prost_types::{Struct as ProstStruct, Value as ProstValue, value::Kind as ProstValueKind};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{Instrument, info, warn};
 
 use crate::{
     benchmark::common::{BenchmarkResult, BenchmarkSummary, spawn_completion_worker},
     db::{CompletionRecord, Database},
-    messages::MessageError,
+    messages::{MessageError, proto},
     server_worker::WorkerBridgeServer,
     worker::{ActionDispatchPayload, PythonWorkerConfig, PythonWorkerPool, RoundTripMetrics},
 };
@@ -71,9 +73,15 @@ impl BenchmarkHarness {
 
     pub async fn run(&self, config: &HarnessConfig) -> Result<BenchmarkSummary> {
         self.database.reset_partition(config.partition_id).await?;
-        let encoded_payload = build_benchmark_payload(config.payload_size);
+        let encoded_payload = build_benchmark_dispatch(config.payload_size)?;
         self.database
-            .seed_actions(config.partition_id, config.total_messages, &encoded_payload)
+            .seed_actions(
+                config.partition_id,
+                config.total_messages,
+                BENCHMARK_USER_MODULE,
+                BENCHMARK_ACTION,
+                &encoded_payload,
+            )
             .await?;
 
         let total = config.total_messages;
@@ -98,11 +106,14 @@ impl BenchmarkHarness {
                 }
 
                 for action in actions {
+                    let dispatch =
+                        proto::WorkflowNodeDispatch::decode(action.dispatch_payload.as_slice())
+                            .map_err(|err| anyhow!("failed to decode benchmark dispatch: {err}"))?;
                     let payload = ActionDispatchPayload {
                         action_id: action.id,
                         instance_id: action.instance_id,
                         sequence: action.action_seq,
-                        payload: action.payload,
+                        dispatch,
                     };
                     let worker = self.workers.next_worker();
                     let span = tracing::debug_span!(
@@ -190,22 +201,45 @@ impl BenchmarkHarness {
     }
 }
 
-fn build_benchmark_payload(payload_size: usize) -> Vec<u8> {
+fn build_benchmark_dispatch(payload_size: usize) -> Result<Vec<u8>> {
     let payload_data = "x".repeat(payload_size);
-    let invocation = json!({
-        "action": BENCHMARK_ACTION,
-        "kwargs": {
-            "request": {
-                "kind": "basemodel",
-                "model": {
-                    "module": BENCHMARK_USER_MODULE,
-                    "name": BENCHMARK_REQUEST_MODEL,
-                },
-                "data": {
-                    "payload": payload_data,
-                }
-            }
-        }
-    });
-    serde_json::to_vec(&invocation).expect("serialize benchmark payload")
+    let mut struct_fields = BTreeMap::new();
+    struct_fields.insert(
+        "payload".to_string(),
+        ProstValue {
+            kind: Some(ProstValueKind::StringValue(payload_data)),
+        },
+    );
+    let basemodel = proto::BaseModelWorkflowArgument {
+        module: BENCHMARK_USER_MODULE.to_string(),
+        name: BENCHMARK_REQUEST_MODEL.to_string(),
+        data: Some(ProstStruct {
+            fields: struct_fields,
+        }),
+    };
+    let argument_value = proto::WorkflowArgumentValue {
+        kind: Some(proto::workflow_argument_value::Kind::Basemodel(basemodel)),
+    };
+    let arguments = proto::WorkflowArguments {
+        arguments: vec![proto::WorkflowArgument {
+            key: "request".to_string(),
+            value: Some(argument_value),
+        }],
+    };
+    let mut kwargs = HashMap::new();
+    kwargs.insert("request".to_string(), "request".to_string());
+    let node = proto::WorkflowDagNode {
+        id: "benchmark".to_string(),
+        action: BENCHMARK_ACTION.to_string(),
+        module: BENCHMARK_USER_MODULE.to_string(),
+        produces: vec!["result".to_string()],
+        kwargs,
+        ..Default::default()
+    };
+    let dispatch = proto::WorkflowNodeDispatch {
+        node: Some(node),
+        workflow_input: Some(arguments),
+        context: Vec::new(),
+    };
+    Ok(dispatch.encode_to_vec())
 }
