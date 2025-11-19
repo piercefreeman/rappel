@@ -5,8 +5,8 @@ from typing import Any, cast
 
 import pytest
 
-from carabiner_worker import action
-from carabiner_worker import registry as action_registry
+from rappel_worker import action
+from rappel_worker import registry as action_registry
 
 
 @pytest.fixture(autouse=True)
