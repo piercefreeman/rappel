@@ -65,6 +65,7 @@ def serialize_error_payload(action: str, exc: BaseException) -> bytes:
         "error": {
             "action": action,
             "type": exc.__class__.__name__,
+            "module": exc.__class__.__module__,
             "message": str(exc),
             "traceback": traceback.format_exc(),
         }

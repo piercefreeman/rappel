@@ -7,3 +7,4 @@
 ## Unit Tests
 
 - Run python tests with `uv run pytest`
+- To run the rust integration tests you'll have to do something like: source .env && cargo test ...

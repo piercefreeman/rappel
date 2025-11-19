@@ -275,6 +275,27 @@ def test_return_variable_tracks_existing_assignment() -> None:
     assert dag.nodes[-1].action == "summarize"
 
 
+class TryExceptWorkflow(Workflow):
+    async def run(self) -> None:
+        try:
+            await fetch_number(idx=1)
+            await double_number(value=2)
+        except ValueError:
+            await persist_summary(total=0.0)
+
+
+def test_try_except_builds_exception_edges() -> None:
+    dag = build_workflow_dag(TryExceptWorkflow)
+    assert isinstance(dag, WorkflowDag)
+    try_nodes = [node for node in dag.nodes if node.action in {"fetch_number", "double_number"}]
+    assert len(try_nodes) == 2
+    assert try_nodes[0].guard is None
+    assert "__workflow_exceptions" in (try_nodes[1].guard or "")
+    handler = next(node for node in dag.nodes if node.action == "persist_summary")
+    assert handler.exception_edges
+    assert handler.guard is not None and "__workflow_exceptions" in handler.guard
+
+
 class InvalidReturnWorkflow(Workflow):
     async def run(self) -> float:
         return await summarize(values=[1.0])

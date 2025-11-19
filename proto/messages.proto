@@ -52,12 +52,19 @@ message WorkflowDagNode {
   repeated string produces = 6;
   string module = 7;
   string guard = 8;
+  repeated WorkflowExceptionEdge exception_edges = 9;
 }
 
 message WorkflowDagDefinition {
   bool concurrent = 1;
   repeated WorkflowDagNode nodes = 2;
   string return_variable = 3;
+}
+
+message WorkflowExceptionEdge {
+  string source_node_id = 1;
+  string exception_type = 2;
+  string exception_module = 3;
 }
 
 message WorkflowRegistration {
@@ -69,6 +76,7 @@ message WorkflowRegistration {
 message WorkflowNodeContext {
   string variable = 1;
   bytes payload = 2;
+  string workflow_node_id = 3;
 }
 
 message WorkflowNodeDispatch {

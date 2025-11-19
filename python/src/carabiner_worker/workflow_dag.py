@@ -21,6 +21,7 @@ class DagNode:
     wait_for_sync: List[str] = field(default_factory=list)
     produces: List[str] = field(default_factory=list)
     guard: Optional[str] = None
+    exception_edges: List["ExceptionEdge"] = field(default_factory=list)
 
 
 RETURN_VARIABLE = "__workflow_return"
@@ -37,6 +38,13 @@ class ActionDefinition:
     action_name: str
     module_name: Optional[str]
     signature: inspect.Signature
+
+
+@dataclass
+class ExceptionEdge:
+    source_node_id: str
+    exception_type: Optional[str] = None
+    exception_module: Optional[str] = None
 
 
 def _extract_action_name(expr: ast.AST) -> Optional[str]:
@@ -106,6 +114,23 @@ class _ActionReferenceValidator(ast.NodeVisitor):
 class _ConditionalBranch:
     call: ast.Call
     target: Optional[str]
+
+
+@dataclass
+class _ExceptionTypeSpec:
+    module: Optional[str]
+    type_name: Optional[str]
+
+
+@dataclass
+class _TryScope:
+    nodes: List[str] = field(default_factory=list)
+
+
+@dataclass
+class _ExceptionHandlerContext:
+    try_nodes: List[str]
+    specs: List[_ExceptionTypeSpec]
 
 
 def build_workflow_dag(workflow_cls: type["Workflow"]) -> WorkflowDag:
@@ -195,6 +220,8 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         self._last_node_id: Optional[str] = None
         self._collections: Dict[str, List[str]] = {}
         self._return_variable: Optional[str] = None
+        self._try_stack: List[_TryScope] = []
+        self._handler_stack: List[_ExceptionHandlerContext] = []
 
     # pylint: disable=too-many-return-statements
     def visit_Assign(self, node: ast.Assign) -> Any:
@@ -239,6 +266,38 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         if self._handle_conditional_actions(node):
             return
         self._capture_block(node)
+
+    def visit_Try(self, node: ast.Try) -> Any:
+        if not node.handlers:
+            line = getattr(node, "lineno", "?")
+            raise ValueError(f"try statement without except handler (line {line})")
+        if node.finalbody:
+            line = getattr(node, "lineno", "?")
+            raise ValueError(f"finally blocks are not supported (line {line})")
+        scope = _TryScope()
+        self._try_stack.append(scope)
+        for stmt in node.body:
+            self.visit(stmt)
+        self._try_stack.pop()
+        try_nodes = list(scope.nodes)
+        if not try_nodes:
+            line = getattr(node, "lineno", "?")
+            raise ValueError(f"try block must contain at least one action (line {line})")
+        for handler in node.handlers:
+            if handler.name:
+                line = getattr(handler, "lineno", "?")
+                raise ValueError(
+                    f"except clauses cannot bind exceptions (line {line}); use explicit actions"
+                )
+            specs = self._parse_exception_specs(handler.type)
+            context = _ExceptionHandlerContext(try_nodes=try_nodes, specs=specs)
+            self._handler_stack.append(context)
+            for stmt in handler.body:
+                self.visit(stmt)
+            self._handler_stack.pop()
+        if node.orelse:
+            line = getattr(node, "lineno", "?")
+            raise ValueError(f"try/else clauses are not supported (line {line})")
 
     def visit_Return(self, node: ast.Return) -> Any:
         if self._return_variable is not None:
@@ -523,8 +582,118 @@ class WorkflowDagBuilder(ast.NodeVisitor):
     def _append_node(self, node: DagNode) -> None:
         if self._last_node_id is not None:
             node.wait_for_sync = [self._last_node_id]
+        self._apply_try_guards(node)
+        self._apply_handler_metadata(node)
         self.nodes.append(node)
         self._last_node_id = node.id
+
+    def _apply_try_guards(self, node: DagNode) -> None:
+        if not self._try_stack:
+            return
+        prior_ids: List[List[str]] = [list(scope.nodes) for scope in self._try_stack]
+        clauses = [self._format_no_exception_guard(ids) for ids in prior_ids if ids]
+        guard_expr = self._combine_guards(clauses)
+        if guard_expr:
+            node.guard = self._combine_guard(node.guard, guard_expr)
+        for scope in self._try_stack:
+            scope.nodes.append(node.id)
+
+    def _apply_handler_metadata(self, node: DagNode) -> None:
+        if not self._handler_stack:
+            return
+        handler = self._handler_stack[-1]
+        guard_expr = self._format_handler_guard(handler)
+        if guard_expr:
+            node.guard = self._combine_guard(node.guard, guard_expr)
+        node.exception_edges.extend(self._build_exception_edges(handler))
+
+    def _combine_guard(self, existing: Optional[str], extra: Optional[str]) -> Optional[str]:
+        if not extra:
+            return existing
+        if not existing:
+            return extra
+        return f"({existing}) and ({extra})"
+
+    def _combine_guards(self, clauses: List[Optional[str]]) -> Optional[str]:
+        active = [clause for clause in clauses if clause]
+        if not active:
+            return None
+        expr = active[0]
+        for clause in active[1:]:
+            expr = f"({expr}) and ({clause})"
+        return expr
+
+    def _format_no_exception_guard(self, node_ids: List[str]) -> Optional[str]:
+        if not node_ids:
+            return None
+        if len(node_ids) == 1:
+            node_id = node_ids[0]
+            return f"__workflow_exceptions.get({node_id!r}) is None"
+        joined = ", ".join(repr(node_id) for node_id in node_ids)
+        return f"all(__workflow_exceptions.get(__node) is None for __node in ({joined},))"
+
+    def _format_handler_guard(self, handler: _ExceptionHandlerContext) -> Optional[str]:
+        clauses: List[str] = []
+        for source in handler.try_nodes:
+            base = f"__workflow_exceptions.get({source!r})"
+            if not handler.specs:
+                clauses.append(f"({base} is not None)")
+                continue
+            for spec in handler.specs:
+                segments = [f"{base} is not None"]
+                if spec.type_name:
+                    segments.append(f"{base}.get('type') == {spec.type_name!r}")
+                if spec.module:
+                    segments.append(f"{base}.get('module') == {spec.module!r}")
+                clause = " and ".join(segments)
+                clauses.append(f"({clause})")
+        if not clauses:
+            return None
+        expr = clauses[0]
+        for clause in clauses[1:]:
+            expr = f"({expr}) or ({clause})"
+        return expr
+
+    def _build_exception_edges(self, handler: _ExceptionHandlerContext) -> List[ExceptionEdge]:
+        edges: List[ExceptionEdge] = []
+        for source in handler.try_nodes:
+            if not handler.specs:
+                edges.append(ExceptionEdge(source_node_id=source))
+                continue
+            for spec in handler.specs:
+                edges.append(
+                    ExceptionEdge(
+                        source_node_id=source,
+                        exception_type=spec.type_name,
+                        exception_module=spec.module,
+                    )
+                )
+        return edges
+
+    def _parse_exception_specs(self, expr: Optional[ast.expr]) -> List[_ExceptionTypeSpec]:
+        if expr is None:
+            return [_ExceptionTypeSpec(module=None, type_name=None)]
+        if isinstance(expr, ast.Tuple):
+            specs: List[_ExceptionTypeSpec] = []
+            for element in expr.elts:
+                specs.extend(self._parse_exception_specs(element))
+            return specs
+        if isinstance(expr, ast.Name):
+            return [_ExceptionTypeSpec(module=None, type_name=expr.id)]
+        if isinstance(expr, ast.Attribute):
+            parts: List[str] = []
+            current: ast.AST = expr
+            while isinstance(current, ast.Attribute):
+                parts.append(current.attr)
+                current = current.value
+            if isinstance(current, ast.Name):
+                parts.append(current.id)
+                parts.reverse()
+                module = ".".join(parts[:-1]) if len(parts) > 1 else None
+                type_name = parts[-1]
+                return [_ExceptionTypeSpec(module=module, type_name=type_name)]
+        line = getattr(expr, "lineno", "?")
+        raise ValueError(f"unsupported exception reference near line {line}")
 
     def ensure_return_variable(self) -> None:
         if self._return_variable is not None:

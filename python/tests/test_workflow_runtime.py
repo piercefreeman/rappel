@@ -5,7 +5,7 @@ import base64
 from typing import List
 
 from carabiner_worker import registry as action_registry
-from carabiner_worker.actions import action, serialize_result_payload
+from carabiner_worker.actions import action, serialize_error_payload, serialize_result_payload
 from carabiner_worker.workflow_runtime import WorkflowNodeResult, execute_node
 from proto import messages_pb2 as pb2
 
@@ -16,6 +16,11 @@ _guard_calls: List[str] = []
 async def guarded_noop() -> str:
     _guard_calls.append("ran")
     return "ok"
+
+
+@action
+async def exception_handler() -> str:
+    return "handled"
 
 
 def _build_dispatch(flag: bool) -> str:
@@ -31,6 +36,30 @@ def _build_dispatch(flag: bool) -> str:
     dispatch = pb2.WorkflowNodeDispatch(node=node, workflow_input=b"")
     payload = serialize_result_payload(flag)
     dispatch.context.append(pb2.WorkflowNodeContext(variable="flag", payload=payload))
+    return base64.b64encode(dispatch.SerializeToString()).decode("utf-8")
+
+
+def _build_exception_dispatch(include_error: bool) -> str:
+    if action_registry.get("exception_handler") is None:
+        action_registry.register("exception_handler", exception_handler)
+    node = pb2.WorkflowDagNode(
+        id="node_handler",
+        action="exception_handler",
+        module=__name__,
+    )
+    node.produces.append("value")
+    node.guard = "__workflow_exceptions.get('node_source') is not None"
+    edge = node.exception_edges.add()
+    edge.source_node_id = "node_source"
+    edge.exception_type = "RuntimeError"
+    dispatch = pb2.WorkflowNodeDispatch(node=node, workflow_input=b"")
+    if include_error:
+        payload = serialize_error_payload("source", RuntimeError("boom"))
+    else:
+        payload = serialize_result_payload("noop")
+    dispatch.context.append(
+        pb2.WorkflowNodeContext(variable="", payload=payload, workflow_node_id="node_source")
+    )
     return base64.b64encode(dispatch.SerializeToString()).decode("utf-8")
 
 
@@ -50,3 +79,17 @@ def test_execute_node_runs_guarded_action_when_true() -> None:
     assert isinstance(result, WorkflowNodeResult)
     assert result.variables == {"result": "ok"}
     assert _guard_calls == ["ran"]
+
+
+def test_execute_node_handles_exception_when_edge_matches() -> None:
+    payload = _build_exception_dispatch(include_error=True)
+    result = asyncio.run(execute_node(payload))
+    assert isinstance(result, WorkflowNodeResult)
+    assert result.variables == {"value": "handled"}
+
+
+def test_execute_node_skips_exception_handler_without_error() -> None:
+    payload = _build_exception_dispatch(include_error=False)
+    result = asyncio.run(execute_node(payload))
+    assert isinstance(result, WorkflowNodeResult)
+    assert result.variables == {}

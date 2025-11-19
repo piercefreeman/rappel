@@ -27,7 +27,7 @@ async fn store_instance_result_if_complete(
     tx: &mut Transaction<'_, Postgres>,
     instance: &WorkflowInstanceRow,
     dag: &WorkflowDagDefinition,
-    context_values: &HashMap<String, Vec<u8>>,
+    context_values: &HashMap<String, Vec<(String, Vec<u8>)>>,
     completed_count: usize,
 ) -> Result<()> {
     if dag.nodes.len() != completed_count {
@@ -39,7 +39,19 @@ async fn store_instance_result_if_complete(
     if instance.result_payload.is_some() {
         return Ok(());
     }
-    let Some(payload) = context_values.get(&dag.return_variable) else {
+    let mut payload_opt: Option<Vec<u8>> = None;
+    for entries in context_values.values() {
+        for (variable, payload) in entries {
+            if variable == &dag.return_variable {
+                payload_opt = Some(payload.clone());
+                break;
+            }
+        }
+        if payload_opt.is_some() {
+            break;
+        }
+    }
+    let Some(payload) = payload_opt else {
         return Ok(());
     };
     sqlx::query("UPDATE workflow_instances SET result_payload = $2 WHERE id = $1")
@@ -82,7 +94,7 @@ async fn build_variable_context(
     tx: &mut Transaction<'_, Postgres>,
     instance_id: WorkflowInstanceId,
     dag_nodes: &HashMap<String, WorkflowDagNode>,
-) -> Result<HashMap<String, Vec<u8>>> {
+) -> Result<HashMap<String, Vec<(String, Vec<u8>)>>> {
     let rows = sqlx::query(
         r#"
         SELECT workflow_node_id, result_payload
@@ -94,7 +106,7 @@ async fn build_variable_context(
     .map(|row: PgRow| (row.get::<Option<String>, _>(0), row.get::<Option<Vec<u8>>, _>(1)))
     .fetch_all(tx.as_mut())
     .await?;
-    let mut context = HashMap::new();
+    let mut context: HashMap<String, Vec<(String, Vec<u8>)>> = HashMap::new();
     for (node_id_opt, payload_opt) in rows {
         let Some(node_id) = node_id_opt else {
             continue;
@@ -103,8 +115,13 @@ async fn build_variable_context(
             continue;
         };
         if let Some(node) = dag_nodes.get(&node_id) {
-            for variable in &node.produces {
-                context.insert(variable.clone(), payload.clone());
+            let entries = context.entry(node_id.clone()).or_default();
+            if node.produces.is_empty() {
+                entries.push((String::new(), payload.clone()));
+            } else {
+                for variable in &node.produces {
+                    entries.push((variable.clone(), payload.clone()));
+                }
             }
         }
     }
@@ -114,18 +131,29 @@ async fn build_variable_context(
 fn build_workflow_action_payload(
     node: &WorkflowDagNode,
     workflow_input: &[u8],
-    context: &HashMap<String, Vec<u8>>,
+    context: &HashMap<String, Vec<(String, Vec<u8>)>>,
 ) -> Result<Vec<u8>> {
     let mut dispatch = WorkflowNodeDispatch {
         node: Some(node.clone()),
         workflow_input: workflow_input.to_vec(),
         context: Vec::new(),
     };
-    for (variable, payload) in context {
-        dispatch.context.push(WorkflowNodeContext {
-            variable: variable.clone(),
-            payload: payload.clone(),
-        });
+    let mut required: Vec<&str> = node.depends_on.iter().map(|s| s.as_str()).collect();
+    required.extend(node.wait_for_sync.iter().map(|s| s.as_str()));
+    let mut seen: HashSet<&str> = HashSet::new();
+    for dep in required {
+        if !seen.insert(dep) {
+            continue;
+        }
+        if let Some(entries) = context.get(dep) {
+            for (variable, payload) in entries {
+                dispatch.context.push(WorkflowNodeContext {
+                    variable: variable.clone(),
+                    payload: payload.clone(),
+                    workflow_node_id: dep.to_string(),
+                });
+            }
+        }
     }
     let dispatch_bytes = dispatch.encode_to_vec();
     let encoded = general_purpose::STANDARD.encode(dispatch_bytes);

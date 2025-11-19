@@ -44,4 +44,5 @@ def test_error_payload_serialization() -> None:
     assert decoded.error is not None
     assert decoded.error["action"] == "demo.echo"
     assert decoded.error["type"] == "RuntimeError"
+    assert decoded.error["module"] == "builtins"
     assert "boom" in decoded.error["message"]

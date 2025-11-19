@@ -1,4 +1,4 @@
-from typing import Protocol
+from typing import Iterator, Protocol
 
 class _ProtoMessage(Protocol):
     def SerializeToString(self) -> bytes: ...
@@ -61,6 +61,21 @@ class WorkerHello(_ProtoMessage):
     def __init__(self, worker_id: int = ...) -> None: ...
     worker_id: int
 
+class WorkflowExceptionEdge(_ProtoMessage):
+    def __init__(
+        self,
+        source_node_id: str = ...,
+        exception_type: str = ...,
+        exception_module: str = ...,
+    ) -> None: ...
+    source_node_id: str
+    exception_type: str
+    exception_module: str
+
+class _ExceptionEdgeContainer(Protocol):
+    def add(self) -> WorkflowExceptionEdge: ...
+    def __iter__(self) -> Iterator[WorkflowExceptionEdge]: ...
+
 class WorkflowDagNode(_ProtoMessage):
     def __init__(
         self,
@@ -72,6 +87,7 @@ class WorkflowDagNode(_ProtoMessage):
         produces: list[str] | None = ...,
         module: str = ...,
         guard: str = ...,
+        exception_edges: list[WorkflowExceptionEdge] | None = ...,
     ) -> None: ...
     id: str
     action: str
@@ -81,6 +97,7 @@ class WorkflowDagNode(_ProtoMessage):
     produces: list[str]
     module: str
     guard: str
+    exception_edges: _ExceptionEdgeContainer
 
 class WorkflowDagDefinition(_ProtoMessage):
     def __init__(
@@ -105,9 +122,15 @@ class WorkflowRegistration(_ProtoMessage):
     dag_hash: str
 
 class WorkflowNodeContext(_ProtoMessage):
-    def __init__(self, variable: str = ..., payload: bytes = ...) -> None: ...
+    def __init__(
+        self,
+        variable: str = ...,
+        payload: bytes = ...,
+        workflow_node_id: str = ...,
+    ) -> None: ...
     variable: str
     payload: bytes
+    workflow_node_id: str
 
 class WorkflowNodeDispatch(_ProtoMessage):
     def __init__(
