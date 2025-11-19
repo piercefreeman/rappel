@@ -5,6 +5,7 @@ pub mod db;
 pub mod instances;
 pub mod messages;
 pub mod server_client;
+pub mod server_web;
 pub mod server_worker;
 pub mod worker;
 
