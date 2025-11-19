@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import importlib
-import json
 from typing import Any, Dict, Tuple
 
 from pydantic import BaseModel
@@ -14,16 +13,15 @@ from proto import messages_pb2 as pb2
 
 from .actions import action, deserialize_result_payload
 from .registry import registry
+from .serialization import arguments_to_kwargs
 
 
 class WorkflowNodeResult(BaseModel):
     variables: Dict[str, Any]
 
 
-def _decode_workflow_input(payload: bytes) -> dict[str, Any]:
-    if not payload:
-        return {}
-    return json.loads(payload.decode("utf-8"))
+def _decode_workflow_input(payload: pb2.WorkflowArguments | None) -> dict[str, Any]:
+    return arguments_to_kwargs(payload)
 
 
 def _build_context(
@@ -171,13 +169,3 @@ async def execute_node(dispatch_b64: str) -> Any:
         else:
             result_map = {}
     return WorkflowNodeResult(variables=result_map)
-
-
-def build_dispatch_payload(
-    node: pb2.WorkflowDagNode, context: dict[str, bytes], workflow_input: bytes
-) -> bytes:
-    dispatch = pb2.WorkflowNodeDispatch(node=node, workflow_input=workflow_input)
-    for variable, payload in context.items():
-        entry = pb2.WorkflowNodeContext(variable=variable, payload=payload)
-        dispatch.context.append(entry)
-    return dispatch.SerializeToString()

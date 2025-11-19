@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use prost::Message;
-use serde_json::json;
+use prost_types::{Value as ProstValue, value::Kind as ProstValueKind};
 use tempfile::TempDir;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{Instrument, info, warn};
@@ -23,7 +23,10 @@ use crate::{
     },
     db::{CompletionRecord, Database},
     instances,
-    messages::{MessageError, proto::WorkflowRegistration},
+    messages::{
+        MessageError,
+        proto::{self, WorkflowRegistration},
+    },
     server_worker::WorkerBridgeServer,
     worker::{ActionDispatchPayload, PythonWorkerConfig, PythonWorkerPool, RoundTripMetrics},
 };
@@ -130,10 +133,7 @@ impl WorkflowBenchmarkHarness {
 
     pub async fn run(&self, config: &WorkflowBenchmarkConfig) -> Result<BenchmarkSummary> {
         self.database.reset_partition(config.partition_id).await?;
-        let input_payload = serde_json::to_vec(&json!({
-            "batch_size": config.batch_size,
-            "payload_size": config.payload_size,
-        }))?;
+        let input_payload = build_workflow_input(config.batch_size, config.payload_size);
         for _ in 0..config.instance_count {
             self.database
                 .create_workflow_instance(
@@ -170,7 +170,9 @@ impl WorkflowBenchmarkHarness {
                         action_id: action.id,
                         instance_id: action.instance_id,
                         sequence: action.action_seq,
-                        payload: action.payload,
+                        module: action.module.clone(),
+                        function_name: action.function_name.clone(),
+                        kwargs_payload: action.kwargs_payload.clone(),
                     };
                     let worker = self.workers.next_worker();
                     let span = tracing::debug_span!(
@@ -291,4 +293,33 @@ print(base64.b64encode(payload.SerializeToString()).decode(), end='')
         .decode(encoded.as_bytes())
         .context("decode workflow registration base64")?;
     Ok(bytes)
+}
+
+fn build_workflow_input(batch_size: usize, payload_size: usize) -> Vec<u8> {
+    let mut arguments = proto::WorkflowArguments {
+        arguments: Vec::new(),
+    };
+    arguments.arguments.push(proto::WorkflowArgument {
+        key: "batch_size".to_string(),
+        value: Some(primitive_argument(ProstValueKind::NumberValue(
+            batch_size as f64,
+        ))),
+    });
+    arguments.arguments.push(proto::WorkflowArgument {
+        key: "payload_size".to_string(),
+        value: Some(primitive_argument(ProstValueKind::NumberValue(
+            payload_size as f64,
+        ))),
+    });
+    arguments.encode_to_vec()
+}
+
+fn primitive_argument(kind: ProstValueKind) -> proto::WorkflowArgumentValue {
+    proto::WorkflowArgumentValue {
+        kind: Some(proto::workflow_argument_value::Kind::Primitive(
+            proto::PrimitiveWorkflowArgument {
+                value: Some(ProstValue { kind: Some(kind) }),
+            },
+        )),
+    }
 }

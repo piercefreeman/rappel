@@ -75,12 +75,14 @@ async def _handle_dispatch(
     await _send_ack(outgoing, envelope)
     dispatch = pb2.ActionDispatch()
     dispatch.ParseFromString(envelope.payload)
+    if dispatch.invocation is None:
+        raise RuntimeError("action dispatch missing invocation payload")
 
     worker_start = time.perf_counter_ns()
     success = True
     action_name = "unknown"
     try:
-        invocation, result = await runner.run_serialized(dispatch.payload)
+        invocation, result = await runner.run_invocation(dispatch.invocation)
         action_name = invocation.action
         response_payload = serialize_result_payload(result)
     except Exception as exc:  # noqa: BLE001 - propagate structured errors
@@ -96,10 +98,10 @@ async def _handle_dispatch(
     response = pb2.ActionResult(
         action_id=dispatch.action_id,
         success=success,
-        payload=response_payload,
         worker_start_ns=worker_start,
         worker_end_ns=worker_end,
     )
+    response.payload.CopyFrom(response_payload)
     response_envelope = pb2.Envelope(
         delivery_id=envelope.delivery_id,
         partition_id=envelope.partition_id,

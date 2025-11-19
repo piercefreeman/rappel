@@ -9,7 +9,13 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
+use prost::Message;
+use prost_types::{
+    ListValue as ProstListValue, Struct as ProstStruct, Value as ProstValue,
+    value::Kind as ProstValueKind,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::{self, Map as JsonMap, Value as JsonValue};
 use tera::{Context as TeraContext, Tera};
 use tokio::net::TcpListener;
 use tracing::error;
@@ -21,6 +27,7 @@ use crate::{
         WorkflowVersionDetail, WorkflowVersionSummary,
     },
     instances,
+    messages::proto,
     server_client::{HEALTH_PATH, REGISTER_PATH, WAIT_PATH, sanitize_interval},
 };
 
@@ -450,18 +457,10 @@ fn render_workflow_run_page(
             if let Some(record) = action_map.get(&node.id) {
                 WorkflowRunNodeContext {
                     id: node.id.clone(),
-                    action: if node.action.is_empty() {
-                        "action".to_string()
-                    } else {
-                        node.action.clone()
-                    },
-                    module: if node.module.is_empty() {
-                        "workflow".to_string()
-                    } else {
-                        node.module.clone()
-                    },
+                    action: record.function_name.clone(),
+                    module: record.module.clone(),
                     status: describe_action_status(record),
-                    request_payload: format_payload(&record.payload),
+                    request_payload: format_payload(&record.kwargs_payload),
                     response_payload: format_optional_payload(&record.result_payload),
                 }
             } else {
@@ -514,26 +513,117 @@ fn format_payload(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return "-".to_string();
     }
-    if let Ok(text) = std::str::from_utf8(bytes) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
-            && let Ok(pretty) = serde_json::to_string_pretty(&value)
-        {
-            return pretty;
+    match proto::WorkflowArguments::decode(bytes) {
+        Ok(arguments) => {
+            let value = workflow_arguments_to_json(&arguments);
+            serde_json::to_string_pretty(&value).unwrap_or_else(|_| "-".to_string())
         }
-        let trimmed = text.trim();
-        return if trimmed.is_empty() {
-            "-".to_string()
-        } else {
-            trimmed.to_string()
-        };
+        Err(_) => general_purpose::STANDARD.encode(bytes),
     }
-    general_purpose::STANDARD.encode(bytes)
 }
 
 fn format_optional_payload(value: &Option<Vec<u8>>) -> String {
     match value {
         Some(bytes) => format_payload(bytes),
         None => "-".to_string(),
+    }
+}
+
+fn workflow_arguments_to_json(arguments: &proto::WorkflowArguments) -> JsonValue {
+    let mut map = JsonMap::new();
+    for argument in &arguments.arguments {
+        if let Some(value) = argument.value.as_ref() {
+            map.insert(argument.key.clone(), workflow_argument_value_to_json(value));
+        }
+    }
+    JsonValue::Object(map)
+}
+
+fn workflow_argument_value_to_json(value: &proto::WorkflowArgumentValue) -> JsonValue {
+    use proto::workflow_argument_value::Kind;
+    match value.kind.as_ref() {
+        Some(Kind::Primitive(primitive)) => primitive
+            .value
+            .as_ref()
+            .map(prost_value_to_json)
+            .unwrap_or(JsonValue::Null),
+        Some(Kind::Basemodel(model)) => {
+            let mut map = JsonMap::new();
+            map.insert(
+                "module".to_string(),
+                JsonValue::String(model.module.clone()),
+            );
+            map.insert("name".to_string(), JsonValue::String(model.name.clone()));
+            let data = model
+                .data
+                .as_ref()
+                .map(struct_to_json)
+                .unwrap_or(JsonValue::Null);
+            map.insert("data".to_string(), data);
+            JsonValue::Object(map)
+        }
+        Some(Kind::Exception(err)) => {
+            let mut map = JsonMap::new();
+            map.insert("type".to_string(), JsonValue::String(err.r#type.clone()));
+            map.insert("module".to_string(), JsonValue::String(err.module.clone()));
+            map.insert(
+                "message".to_string(),
+                JsonValue::String(err.message.clone()),
+            );
+            map.insert(
+                "traceback".to_string(),
+                JsonValue::String(err.traceback.clone()),
+            );
+            JsonValue::Object(map)
+        }
+        Some(Kind::ListValue(list)) => JsonValue::Array(
+            list.items
+                .iter()
+                .map(workflow_argument_value_to_json)
+                .collect(),
+        ),
+        Some(Kind::TupleValue(list)) => JsonValue::Array(
+            list.items
+                .iter()
+                .map(workflow_argument_value_to_json)
+                .collect(),
+        ),
+        Some(Kind::DictValue(dict)) => {
+            let mut map = JsonMap::new();
+            for entry in &dict.entries {
+                if let Some(value) = entry.value.as_ref() {
+                    map.insert(entry.key.clone(), workflow_argument_value_to_json(value));
+                }
+            }
+            JsonValue::Object(map)
+        }
+        None => JsonValue::Null,
+    }
+}
+
+fn struct_to_json(data: &ProstStruct) -> JsonValue {
+    let mut map = JsonMap::new();
+    for (key, value) in &data.fields {
+        map.insert(key.clone(), prost_value_to_json(value));
+    }
+    JsonValue::Object(map)
+}
+
+fn list_to_json(list: &ProstListValue) -> JsonValue {
+    JsonValue::Array(list.values.iter().map(prost_value_to_json).collect())
+}
+
+fn prost_value_to_json(value: &ProstValue) -> JsonValue {
+    match value.kind.as_ref() {
+        Some(ProstValueKind::NullValue(_)) => JsonValue::Null,
+        Some(ProstValueKind::NumberValue(number)) => {
+            serde_json::Number::from_f64(*number).map_or(JsonValue::Null, JsonValue::Number)
+        }
+        Some(ProstValueKind::StringValue(text)) => JsonValue::String(text.clone()),
+        Some(ProstValueKind::BoolValue(flag)) => JsonValue::Bool(*flag),
+        Some(ProstValueKind::StructValue(struct_value)) => struct_to_json(struct_value),
+        Some(ProstValueKind::ListValue(list_value)) => list_to_json(list_value),
+        None => JsonValue::Null,
     }
 }
 

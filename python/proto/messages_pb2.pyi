@@ -6,6 +6,7 @@ Value = Any
 class _ProtoMessage(Protocol):
     def SerializeToString(self) -> bytes: ...
     def ParseFromString(self, data: bytes) -> None: ...
+    def CopyFrom(self, other: _ProtoMessage) -> None: ...
 
 class Ack(_ProtoMessage):
     def __init__(self, acked_delivery_id: int = ...) -> None: ...
@@ -17,25 +18,25 @@ class ActionDispatch(_ProtoMessage):
         action_id: str = ...,
         instance_id: str = ...,
         sequence: int = ...,
-        payload: bytes = ...,
+        invocation: WorkflowInvocation | None = ...,
     ) -> None: ...
     action_id: str
     instance_id: str
     sequence: int
-    payload: bytes
+    invocation: WorkflowInvocation
 
 class ActionResult(_ProtoMessage):
     def __init__(
         self,
         action_id: str = ...,
         success: bool = ...,
-        payload: bytes = ...,
+        payload: WorkflowArguments | None = ...,
         worker_start_ns: int = ...,
         worker_end_ns: int = ...,
     ) -> None: ...
     action_id: str
     success: bool
-    payload: bytes
+    payload: WorkflowArguments
     worker_start_ns: int
     worker_end_ns: int
 
@@ -78,6 +79,18 @@ class WorkflowExceptionEdge(_ProtoMessage):
 class _ExceptionEdgeContainer(Protocol):
     def add(self) -> WorkflowExceptionEdge: ...
     def __iter__(self) -> Iterator[WorkflowExceptionEdge]: ...
+
+class _WorkflowArgumentContainer(Protocol):
+    def add(self) -> "WorkflowArgument": ...
+    def __iter__(self) -> Iterator["WorkflowArgument"]: ...
+
+class _WorkflowArgumentValueContainer(Protocol):
+    def add(self) -> "WorkflowArgumentValue": ...
+    def __iter__(self) -> Iterator["WorkflowArgumentValue"]: ...
+
+class _WorkflowNodeContextContainer(Protocol):
+    def add(self) -> "WorkflowNodeContext": ...
+    def __iter__(self) -> Iterator["WorkflowNodeContext"]: ...
 
 class WorkflowDagNode(_ProtoMessage):
     def __init__(
@@ -128,11 +141,11 @@ class WorkflowNodeContext(_ProtoMessage):
     def __init__(
         self,
         variable: str = ...,
-        payload: bytes = ...,
+        payload: WorkflowArguments | None = ...,
         workflow_node_id: str = ...,
     ) -> None: ...
     variable: str
-    payload: bytes
+    payload: WorkflowArguments
     workflow_node_id: str
 
 class WorkflowArgumentValue(_ProtoMessage):
@@ -141,10 +154,32 @@ class WorkflowArgumentValue(_ProtoMessage):
         primitive: PrimitiveWorkflowArgument | None = ...,
         basemodel: BaseModelWorkflowArgument | None = ...,
         exception: WorkflowErrorValue | None = ...,
+        list_value: WorkflowListArgument | None = ...,
+        tuple_value: WorkflowTupleArgument | None = ...,
+        dict_value: WorkflowDictArgument | None = ...,
     ) -> None: ...
     primitive: PrimitiveWorkflowArgument
     basemodel: BaseModelWorkflowArgument
     exception: WorkflowErrorValue
+    list_value: WorkflowListArgument
+    tuple_value: WorkflowTupleArgument
+    dict_value: WorkflowDictArgument
+
+class WorkflowArgument(_ProtoMessage):
+    def __init__(
+        self,
+        key: str = ...,
+        value: WorkflowArgumentValue | None = ...,
+    ) -> None: ...
+    key: str
+    value: WorkflowArgumentValue
+
+class WorkflowArguments(_ProtoMessage):
+    def __init__(
+        self,
+        arguments: list[WorkflowArgument] | None = ...,
+    ) -> None: ...
+    arguments: _WorkflowArgumentContainer
 
 class PrimitiveWorkflowArgument(_ProtoMessage):
     def __init__(self, value: Value | None = ...) -> None: ...
@@ -169,16 +204,39 @@ class WorkflowErrorValue(_ProtoMessage):
     message: str
     traceback: str
 
+class WorkflowListArgument(_ProtoMessage):
+    def __init__(self, items: list[WorkflowArgumentValue] | None = ...) -> None: ...
+    items: _WorkflowArgumentValueContainer
+
+class WorkflowTupleArgument(_ProtoMessage):
+    def __init__(self, items: list[WorkflowArgumentValue] | None = ...) -> None: ...
+    items: _WorkflowArgumentValueContainer
+
+class WorkflowDictArgument(_ProtoMessage):
+    def __init__(self, entries: list[WorkflowArgument] | None = ...) -> None: ...
+    entries: _WorkflowArgumentContainer
+
+class WorkflowInvocation(_ProtoMessage):
+    def __init__(
+        self,
+        module: str = ...,
+        function_name: str = ...,
+        kwargs: WorkflowArguments | None = ...,
+    ) -> None: ...
+    module: str
+    function_name: str
+    kwargs: WorkflowArguments
+
 class WorkflowNodeDispatch(_ProtoMessage):
     def __init__(
         self,
         node: WorkflowDagNode | None = ...,
-        workflow_input: bytes = ...,
+        workflow_input: WorkflowArguments | None = ...,
         context: list[WorkflowNodeContext] | None = ...,
     ) -> None: ...
     node: WorkflowDagNode
-    workflow_input: bytes
-    context: list[WorkflowNodeContext]
+    workflow_input: WorkflowArguments
+    context: _WorkflowNodeContextContainer
 
 class RegisterWorkflowRequest(_ProtoMessage):
     def __init__(

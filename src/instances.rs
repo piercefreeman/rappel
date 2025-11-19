@@ -43,7 +43,7 @@ pub async fn wait_for_instance_poll(
     let db = Database::connect(database_url).await?;
     loop {
         let payload =
-            sqlx::query("SELECT payload FROM daemon_action_ledger ORDER BY id DESC LIMIT 1")
+            sqlx::query("SELECT kwargs_payload FROM daemon_action_ledger ORDER BY id DESC LIMIT 1")
                 .map(|row: PgRow| row.get(0))
                 .fetch_optional(db.pool())
                 .await?;

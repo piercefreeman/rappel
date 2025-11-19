@@ -9,13 +9,17 @@ use std::{
 use crate::{
     Database, PythonWorkerConfig, PythonWorkerPool,
     db::CompletionRecord,
+    messages::proto,
     server_client::{self, ServerConfig},
     server_worker::WorkerBridgeServer,
     worker::{ActionDispatchPayload, RoundTripMetrics},
 };
 use anyhow::{Context, Result, anyhow};
+use prost::Message;
+use prost_types::{Value as ProstValue, value::Kind as ProstValueKind};
 use reqwest::Client;
-use tokio::{task::JoinHandle, time::sleep};
+use once_cell::sync::Lazy;
+use tokio::{sync::Mutex, task::JoinHandle, time::sleep};
 mod common;
 use self::common::run_in_env;
 const PARTITION_ID: i32 = 91;
@@ -139,7 +143,9 @@ async fn dispatch_all_actions(
                 action_id: action.id,
                 instance_id: action.instance_id,
                 sequence: action.action_seq,
-                payload: action.payload,
+                module: action.module.clone(),
+                function_name: action.function_name.clone(),
+                kwargs_payload: action.kwargs_payload.clone(),
             };
             let worker = pool.next_worker();
             let metrics = worker.send_action(payload).await?;
@@ -161,51 +167,132 @@ fn to_completion_record(metrics: RoundTripMetrics) -> CompletionRecord {
     }
 }
 
-fn parse_result(payload: &[u8]) -> Result<Option<String>> {
-    let value: serde_json::Value = serde_json::from_slice(payload)?;
-    let result = value
-        .get("result")
-        .ok_or_else(|| anyhow!("missing result payload"))?;
-    decode_encoded_value(result)
+fn encode_workflow_input(pairs: &[(&str, &str)]) -> Vec<u8> {
+    let mut arguments = proto::WorkflowArguments {
+        arguments: Vec::new(),
+    };
+    for (key, value) in pairs {
+        arguments.arguments.push(proto::WorkflowArgument {
+            key: (*key).to_string(),
+            value: Some(proto::WorkflowArgumentValue {
+                kind: Some(proto::workflow_argument_value::Kind::Primitive(
+                    proto::PrimitiveWorkflowArgument {
+                        value: Some(ProstValue {
+                            kind: Some(ProstValueKind::StringValue((*value).to_string())),
+                        }),
+                    },
+                )),
+            }),
+        });
+    }
+    arguments.encode_to_vec()
 }
 
-fn decode_encoded_value(value: &serde_json::Value) -> Result<Option<String>> {
-    if let Some(text) = value.as_str() {
-        return Ok(Some(text.to_string()));
+fn parse_result(payload: &[u8]) -> Result<Option<String>> {
+    if payload.is_empty() {
+        return Ok(None);
     }
-    if let Some(primitive) = value.get("primitive") {
-        return Ok(primitive
-            .get("value")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()));
-    }
-    if let Some(basemodel) = value.get("basemodel") {
-        if let Some(vars) = basemodel
-            .get("data")
-            .and_then(|v| v.get("variables"))
-            .and_then(|v| v.as_object())
+    let arguments = proto::WorkflowArguments::decode(payload)
+        .map_err(|err| anyhow!("decode workflow arguments: {err}"))?;
+    for argument in arguments.arguments {
+        if argument.key == "result"
+            && let Some(value) = argument.value.as_ref()
         {
-            for entry in vars.values() {
-                if let Some(result) = decode_encoded_value(entry)? {
+            return decode_argument_value(value);
+        }
+        if argument.key == "error"
+            && let Some(value) = argument.value.as_ref()
+        {
+            return Ok(extract_string_from_value(value));
+        }
+    }
+    Err(anyhow!("missing result payload"))
+}
+
+fn decode_argument_value(value: &proto::WorkflowArgumentValue) -> Result<Option<String>> {
+    use proto::workflow_argument_value::Kind;
+    match value.kind.as_ref() {
+        Some(Kind::Primitive(primitive)) => {
+            Ok(primitive.value.as_ref().and_then(extract_string_from_prost))
+        }
+        Some(Kind::Basemodel(model)) => {
+            if let Some(struct_data) = model.data.as_ref()
+                && let Some(variables) = struct_data.fields.get("variables")
+                && let Some(ProstValueKind::StructValue(struct_value)) = variables.kind.as_ref()
+            {
+                for entry in struct_value.fields.values() {
+                    if let Some(result) = extract_string_from_prost(entry) {
+                        return Ok(Some(result));
+                    }
+                }
+            }
+            Ok(None)
+        }
+        Some(Kind::Exception(err)) => Ok(Some(err.message.clone())),
+        Some(Kind::ListValue(list)) => {
+            for entry in &list.items {
+                if let Some(result) = decode_argument_value(entry)? {
                     return Ok(Some(result));
                 }
             }
+            Ok(None)
         }
-        return Ok(None);
+        Some(Kind::TupleValue(list)) => {
+            for entry in &list.items {
+                if let Some(result) = decode_argument_value(entry)? {
+                    return Ok(Some(result));
+                }
+            }
+            Ok(None)
+        }
+        Some(Kind::DictValue(dict)) => {
+            for entry in &dict.entries {
+                if let Some(value) = entry.value.as_ref()
+                    && let Some(result) = decode_argument_value(value)?
+                {
+                    return Ok(Some(result));
+                }
+            }
+            Ok(None)
+        }
+        None => Ok(None),
     }
-    if let Some(exception) = value.get("exception") {
-        return Ok(exception
-            .get("message")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()));
+}
+
+fn extract_string_from_value(value: &proto::WorkflowArgumentValue) -> Option<String> {
+    decode_argument_value(value).ok().flatten()
+}
+
+fn extract_string_from_prost(value: &ProstValue) -> Option<String> {
+    match value.kind.as_ref()? {
+        ProstValueKind::StringValue(text) => Some(text.clone()),
+        ProstValueKind::StructValue(struct_value) => {
+            for entry in struct_value.fields.values() {
+                if let Some(result) = extract_string_from_prost(entry) {
+                    return Some(result);
+                }
+            }
+            None
+        }
+        ProstValueKind::ListValue(list_value) => {
+            for entry in &list_value.values {
+                if let Some(result) = extract_string_from_prost(entry) {
+                    return Some(result);
+                }
+            }
+            None
+        }
+        _ => None,
     }
-    Ok(None)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_executes_end_to_end() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let _ = dotenvy::dotenv();
+    // Run these integration tests serially so the shared temp python envs don't race
+    // and unload worker modules mid-run. Once workers isolate their PYTHONPATH we can drop this lock.
+    let _test_lock = TEST_SERIAL_GUARD.lock().await;
     let database_url = match env::var("DATABASE_URL") {
         Ok(url) => url,
         Err(_) => {
@@ -229,6 +316,7 @@ async fn workflow_executes_end_to_end() -> Result<()> {
         ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
     ];
     let python_env = run_in_env(&files, &[], &env_pairs, "register.py").await?;
+    assert!(python_env.path().join("integration_module.py").exists());
 
     let versions = database.list_workflow_versions().await?;
     let version = versions
@@ -241,12 +329,13 @@ async fn workflow_executes_end_to_end() -> Result<()> {
         .context("missing workflow version detail")?;
     let expected_actions = version_detail.dag.nodes.len();
 
+    let workflow_input = encode_workflow_input(&[("input", "world")]);
     let _instance_id = database
         .create_workflow_instance(
             PARTITION_ID,
             &version.workflow_name,
             version.id,
-            Some(br#"{"input":"world"}"#),
+            Some(&workflow_input),
         )
         .await?;
 
@@ -286,6 +375,7 @@ async fn workflow_executes_end_to_end() -> Result<()> {
 async fn workflow_executes_complex_flow() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let _ = dotenvy::dotenv();
+    let _test_lock = TEST_SERIAL_GUARD.lock().await;
     let database_url = match env::var("DATABASE_URL") {
         Ok(url) => url,
         Err(_) => {
@@ -309,6 +399,7 @@ async fn workflow_executes_complex_flow() -> Result<()> {
         ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
     ];
     let python_env = run_in_env(&files, &[], &env_pairs, "register_complex.py").await?;
+    assert!(python_env.path().join("integration_complex.py").exists());
 
     let versions = database.list_workflow_versions().await?;
     let version = versions
@@ -321,12 +412,13 @@ async fn workflow_executes_complex_flow() -> Result<()> {
         .context("missing complex workflow detail")?;
     let expected_actions = version_detail.dag.nodes.len();
 
+    let complex_input = encode_workflow_input(&[("input", "unused")]);
     let instance_id = database
         .create_workflow_instance(
             PARTITION_ID,
             &version.workflow_name,
             version.id,
-            Some(br#"{"input":"unused"}"#),
+            Some(&complex_input),
         )
         .await?;
 
@@ -356,7 +448,8 @@ async fn workflow_executes_complex_flow() -> Result<()> {
         .find_map(|metrics| parse_result(&metrics.response_payload).transpose())
         .transpose()?
         .context("expected primitive result")?;
-    assert_eq!(message, "big:3,7");
+    // Workflow argument primitives travel as f64, so int math produces .0 suffix now.
+    assert_eq!(message, "big:3.0,7.0");
 
     let stored_result: Option<Vec<u8>> =
         sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
@@ -365,7 +458,7 @@ async fn workflow_executes_complex_flow() -> Result<()> {
             .await?;
     let stored_payload = stored_result.context("missing workflow result payload")?;
     let stored_message = parse_result(&stored_payload)?.context("expected primitive result")?;
-    assert_eq!(stored_message, "big:3,7");
+    assert_eq!(stored_message, "big:3.0,7.0");
 
     server.shutdown().await;
     Ok(())
@@ -375,6 +468,7 @@ async fn workflow_executes_complex_flow() -> Result<()> {
 async fn workflow_handles_exception_flow() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let _ = dotenvy::dotenv();
+    let _test_lock = TEST_SERIAL_GUARD.lock().await;
     let database_url = match env::var("DATABASE_URL") {
         Ok(url) => url,
         Err(_) => {
@@ -398,6 +492,7 @@ async fn workflow_handles_exception_flow() -> Result<()> {
         ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
     ];
     let python_env = run_in_env(&files, &[], &env_pairs, "register_exception.py").await?;
+    assert!(python_env.path().join("integration_exception.py").exists());
 
     let versions = database.list_workflow_versions().await?;
     let version = versions
@@ -410,12 +505,13 @@ async fn workflow_handles_exception_flow() -> Result<()> {
         .context("missing exception workflow detail")?;
     let expected_actions = version_detail.dag.nodes.len();
 
+    let exception_input = encode_workflow_input(&[("mode", "exception")]);
     let instance_id = database
         .create_workflow_instance(
             PARTITION_ID,
             &version.workflow_name,
             version.id,
-            Some(br#"{"mode":"exception"}"#),
+            Some(&exception_input),
         )
         .await?;
 
@@ -459,3 +555,4 @@ async fn workflow_handles_exception_flow() -> Result<()> {
     server.shutdown().await;
     Ok(())
 }
+static TEST_SERIAL_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));

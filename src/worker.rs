@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result as AnyResult, anyhow};
+use prost::Message;
 use tokio::{
     process::{Child, Command},
     sync::{Mutex, mpsc, oneshot},
@@ -76,7 +77,9 @@ pub struct ActionDispatchPayload {
     pub action_id: LedgerActionId,
     pub instance_id: WorkflowInstanceId,
     pub sequence: i32,
-    pub payload: Vec<u8>,
+    pub module: String,
+    pub function_name: String,
+    pub kwargs_payload: Vec<u8>,
 }
 
 pub struct PythonWorker {
@@ -110,6 +113,7 @@ impl PythonWorker {
             Ok(existing) if !existing.is_empty() => format!("{existing}:{joined_python_path}"),
             _ => joined_python_path,
         };
+        info!(python_path = %python_path, "configured python path for worker");
 
         let mut command = Command::new(&config.script_path);
         command
@@ -185,7 +189,8 @@ impl PythonWorker {
             action_id = %dispatch.action_id,
             instance_id = %dispatch.instance_id,
             sequence = dispatch.sequence,
-            payload_len = dispatch.payload.len(),
+            module = %dispatch.module,
+            function = %dispatch.function_name,
             "worker.send_action"
         );
         let (ack_tx, ack_rx) = oneshot::channel();
@@ -197,11 +202,23 @@ impl PythonWorker {
             shared.pending_responses.insert(delivery_id, response_tx);
         }
 
+        let kwargs = if dispatch.kwargs_payload.is_empty() {
+            proto::WorkflowArguments {
+                arguments: Vec::new(),
+            }
+        } else {
+            proto::WorkflowArguments::decode(dispatch.kwargs_payload.as_slice())
+                .map_err(MessageError::Decode)?
+        };
         let command = proto::ActionDispatch {
             action_id: dispatch.action_id.to_string(),
             instance_id: dispatch.instance_id.to_string(),
             sequence: dispatch.sequence as u32,
-            payload: dispatch.payload.clone(),
+            invocation: Some(proto::WorkflowInvocation {
+                module: dispatch.module.clone(),
+                function_name: dispatch.function_name.clone(),
+                kwargs: Some(kwargs),
+            }),
         };
 
         let envelope = proto::Envelope {
@@ -237,7 +254,11 @@ impl PythonWorker {
             ack_latency,
             round_trip,
             worker_duration,
-            response_payload: response.payload,
+            response_payload: response
+                .payload
+                .as_ref()
+                .map(|payload| payload.encode_to_vec())
+                .unwrap_or_default(),
             success: response.success,
         })
     }

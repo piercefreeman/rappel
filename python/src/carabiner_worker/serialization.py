@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import json
 import traceback
 from typing import Any
 
@@ -17,38 +16,41 @@ NULL_VALUE = struct_pb2.NULL_VALUE  # type: ignore[attr-defined]
 PRIMITIVE_TYPES = (str, int, float, bool, type(None))
 
 
-def dumps(value: Any) -> dict[str, Any]:
-    """Serialize a Python value into the workflow argument schema."""
+def dumps(value: Any) -> pb2.WorkflowArgumentValue:
+    """Serialize a Python value into a WorkflowArgumentValue message."""
 
-    message = _to_argument_value(value)
-    return json_format.MessageToDict(message, preserving_proto_field_name=True)
+    return _to_argument_value(value)
 
 
 def loads(data: Any) -> Any:
     """Deserialize a workflow argument payload into a Python object."""
 
-    if isinstance(data, dict):
+    if isinstance(data, pb2.WorkflowArgumentValue):
+        argument = data
+    elif isinstance(data, dict):
         argument = pb2.WorkflowArgumentValue()
         json_format.ParseDict(data, argument)
-    elif isinstance(data, pb2.WorkflowArgumentValue):
-        argument = data
     else:
         raise TypeError("argument value payload must be a dict or ArgumentValue message")
     return _from_argument_value(argument)
 
 
-def dump_envelope(obj: Any) -> bytes:
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+def build_arguments_from_kwargs(kwargs: dict[str, Any]) -> pb2.WorkflowArguments:
+    arguments = pb2.WorkflowArguments()
+    for key, value in kwargs.items():
+        entry = arguments.arguments.add()
+        entry.key = key
+        entry.value.CopyFrom(dumps(value))
+    return arguments
 
 
-def load_envelope(payload: bytes) -> Any:
-    if isinstance(payload, bytes):
-        text = payload.decode("utf-8")
-    elif isinstance(payload, str):  # pragma: no cover - convenience path
-        text = payload
-    else:
-        raise TypeError("payload must be bytes or str")
-    return json.loads(text)
+def arguments_to_kwargs(arguments: pb2.WorkflowArguments | None) -> dict[str, Any]:
+    if arguments is None:
+        return {}
+    result: dict[str, Any] = {}
+    for entry in arguments.arguments:
+        result[entry.key] = loads(entry.value)
+    return result
 
 
 def _to_argument_value(value: Any) -> pb2.WorkflowArgumentValue:
@@ -72,6 +74,24 @@ def _to_argument_value(value: Any) -> pb2.WorkflowArgumentValue:
         struct.update(model_data)
         argument.basemodel.data.CopyFrom(struct)
         return argument
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("workflow dict keys must be strings")
+            entry = argument.dict_value.entries.add()
+            entry.key = key
+            entry.value.CopyFrom(_to_argument_value(item))
+        return argument
+    if isinstance(value, list):
+        for item in value:
+            item_value = argument.list_value.items.add()
+            item_value.CopyFrom(_to_argument_value(item))
+        return argument
+    if isinstance(value, tuple):
+        for item in value:
+            item_value = argument.tuple_value.items.add()
+            item_value.CopyFrom(_to_argument_value(item))
+        return argument
     raise TypeError(f"unsupported value type {type(value)!r}")
 
 
@@ -91,6 +111,15 @@ def _from_argument_value(argument: pb2.WorkflowArgumentValue) -> Any:
             "message": argument.exception.message,
             "traceback": argument.exception.traceback,
         }
+    if kind == "list_value":
+        return [_from_argument_value(item) for item in argument.list_value.items]
+    if kind == "tuple_value":
+        return tuple(_from_argument_value(item) for item in argument.tuple_value.items)
+    if kind == "dict_value":
+        result: dict[str, Any] = {}
+        for entry in argument.dict_value.entries:
+            result[entry.key] = _from_argument_value(entry.value)
+        return result
     raise ValueError("argument value missing kind discriminator")
 
 

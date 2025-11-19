@@ -33,9 +33,12 @@ def _build_dispatch(flag: bool) -> str:
         guard="flag",
     )
     node.produces.append("result")
-    dispatch = pb2.WorkflowNodeDispatch(node=node, workflow_input=b"")
+    dispatch = pb2.WorkflowNodeDispatch(node=node)
+    dispatch.workflow_input.CopyFrom(pb2.WorkflowArguments())
     payload = serialize_result_payload(flag)
-    dispatch.context.append(pb2.WorkflowNodeContext(variable="flag", payload=payload))
+    entry = dispatch.context.add()
+    entry.variable = "flag"
+    entry.payload.CopyFrom(payload)
     return base64.b64encode(dispatch.SerializeToString()).decode("utf-8")
 
 
@@ -52,14 +55,16 @@ def _build_exception_dispatch(include_error: bool) -> str:
     edge = node.exception_edges.add()
     edge.source_node_id = "node_source"
     edge.exception_type = "RuntimeError"
-    dispatch = pb2.WorkflowNodeDispatch(node=node, workflow_input=b"")
+    dispatch = pb2.WorkflowNodeDispatch(node=node)
+    dispatch.workflow_input.CopyFrom(pb2.WorkflowArguments())
     if include_error:
         payload = serialize_error_payload("source", RuntimeError("boom"))
     else:
         payload = serialize_result_payload("noop")
-    dispatch.context.append(
-        pb2.WorkflowNodeContext(variable="", payload=payload, workflow_node_id="node_source")
-    )
+    entry = dispatch.context.add()
+    entry.variable = ""
+    entry.workflow_node_id = "node_source"
+    entry.payload.CopyFrom(payload)
     return base64.b64encode(dispatch.SerializeToString()).decode("utf-8")
 
 

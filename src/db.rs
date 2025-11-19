@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Utc};
 use prost::Message;
-use serde_json::json;
+use prost_types::{Value as ProstValue, value::Kind as ProstValueKind};
 use sqlx::{
     FromRow, PgPool, Postgres, Row, Transaction,
     postgres::{PgPoolOptions, PgRow},
@@ -14,7 +14,9 @@ use crate::{
     LedgerActionId, WorkflowInstanceId, WorkflowVersionId,
     dag_state::{DagStateMachine, InstanceDagState},
     messages::proto::{
-        WorkflowDagDefinition, WorkflowDagNode, WorkflowNodeContext, WorkflowNodeDispatch,
+        self, PrimitiveWorkflowArgument, WorkflowArgument, WorkflowArgumentValue,
+        WorkflowArguments, WorkflowDagDefinition, WorkflowDagNode, WorkflowNodeContext,
+        WorkflowNodeDispatch,
     },
 };
 
@@ -132,10 +134,11 @@ fn build_workflow_action_payload(
     node: &WorkflowDagNode,
     workflow_input: &[u8],
     context: &HashMap<String, Vec<(String, Vec<u8>)>>,
-) -> Result<Vec<u8>> {
+) -> Result<ActionInvocationPayload> {
+    let workflow_args = decode_arguments(workflow_input, "workflow input")?;
     let mut dispatch = WorkflowNodeDispatch {
         node: Some(node.clone()),
-        workflow_input: workflow_input.to_vec(),
+        workflow_input: Some(workflow_args),
         context: Vec::new(),
     };
     let mut required: Vec<&str> = node.depends_on.iter().map(|s| s.as_str()).collect();
@@ -147,9 +150,10 @@ fn build_workflow_action_payload(
         }
         if let Some(entries) = context.get(dep) {
             for (variable, payload) in entries {
+                let args = decode_arguments(payload, "context payload")?;
                 dispatch.context.push(WorkflowNodeContext {
                     variable: variable.clone(),
-                    payload: payload.clone(),
+                    payload: Some(args),
                     workflow_node_id: dep.to_string(),
                 });
             }
@@ -157,18 +161,39 @@ fn build_workflow_action_payload(
     }
     let dispatch_bytes = dispatch.encode_to_vec();
     let encoded = general_purpose::STANDARD.encode(dispatch_bytes);
-    let payload = json!({
-        "module": "carabiner_worker.workflow_runtime",
-        "action": "workflow.execute_node",
-        "kwargs": {
-            "dispatch_b64": {
-                "primitive": {
-                    "value": encoded,
-                }
-            }
-        }
-    });
-    Ok(serde_json::to_vec(&payload)?)
+    let kwargs = build_string_argument("dispatch_b64", encoded).encode_to_vec();
+    Ok(ActionInvocationPayload {
+        module: "carabiner_worker.workflow_runtime".to_string(),
+        function_name: "workflow.execute_node".to_string(),
+        kwargs,
+    })
+}
+
+fn decode_arguments(bytes: &[u8], label: &str) -> Result<WorkflowArguments> {
+    if bytes.is_empty() {
+        return Ok(WorkflowArguments {
+            arguments: Vec::new(),
+        });
+    }
+    WorkflowArguments::decode(bytes)
+        .with_context(|| format!("failed to decode {label} workflow arguments"))
+}
+
+fn build_string_argument(key: &str, value: String) -> WorkflowArguments {
+    let primitive = PrimitiveWorkflowArgument {
+        value: Some(ProstValue {
+            kind: Some(ProstValueKind::StringValue(value)),
+        }),
+    };
+    let argument_value = WorkflowArgumentValue {
+        kind: Some(proto::workflow_argument_value::Kind::Primitive(primitive)),
+    };
+    WorkflowArguments {
+        arguments: vec![WorkflowArgument {
+            key: key.to_string(),
+            value: Some(argument_value),
+        }],
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -179,13 +204,22 @@ pub struct CompletionRecord {
     pub result_payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+struct ActionInvocationPayload {
+    module: String,
+    function_name: String,
+    kwargs: Vec<u8>,
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct LedgerAction {
     pub id: LedgerActionId,
     pub instance_id: WorkflowInstanceId,
     pub partition_id: i32,
     pub action_seq: i32,
-    pub payload: Vec<u8>,
+    pub module: String,
+    pub function_name: String,
+    pub kwargs_payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -254,7 +288,9 @@ pub struct WorkflowInstanceActionDetail {
     pub workflow_node_id: Option<String>,
     pub status: String,
     pub success: Option<bool>,
-    pub payload: Vec<u8>,
+    pub module: String,
+    pub function_name: String,
+    pub kwargs_payload: Vec<u8>,
     pub result_payload: Option<Vec<u8>>,
 }
 
@@ -395,7 +431,14 @@ impl Database {
         };
         let actions = sqlx::query(
             r#"
-            SELECT action_seq, workflow_node_id, status, success, payload, result_payload
+            SELECT action_seq,
+                   workflow_node_id,
+                   status,
+                   success,
+                   module,
+                   function_name,
+                   kwargs_payload,
+                   result_payload
             FROM daemon_action_ledger
             WHERE instance_id = $1
             ORDER BY action_seq
@@ -407,7 +450,9 @@ impl Database {
             workflow_node_id: row.get("workflow_node_id"),
             status: row.get("status"),
             success: row.get("success"),
-            payload: row.get::<Vec<u8>, _>("payload"),
+            module: row.get("module"),
+            function_name: row.get("function_name"),
+            kwargs_payload: row.get("kwargs_payload"),
             result_payload: row.get("result_payload"),
         })
         .fetch_all(&self.pool)
@@ -435,7 +480,9 @@ impl Database {
         &self,
         partition_id: i32,
         action_count: usize,
-        payload: &[u8],
+        module: &str,
+        function_name: &str,
+        kwargs_payload: &[u8],
     ) -> Result<()> {
         let span = tracing::info_span!("db.seed_actions", partition_id, action_count);
         let _guard = span.enter();
@@ -461,14 +508,18 @@ impl Database {
                     partition_id,
                     action_seq,
                     status,
-                    payload
-                ) VALUES ($1, $2, $3, 'queued', $4)
+                    module,
+                    function_name,
+                    kwargs_payload
+                ) VALUES ($1, $2, $3, 'queued', $4, $5, $6)
                 "#,
             )
             .bind(instance_id)
             .bind(partition_id)
             .bind(seq as i32)
-            .bind(payload)
+            .bind(module)
+            .bind(function_name)
+            .bind(kwargs_payload)
             .execute(&mut *tx)
             .await?;
         }
@@ -542,7 +593,13 @@ impl Database {
             SET status = 'dispatched', dispatched_at = NOW()
             FROM next_actions
             WHERE dal.id = next_actions.id
-            RETURNING dal.id, dal.instance_id, dal.partition_id, dal.action_seq, dal.payload
+            RETURNING dal.id,
+                      dal.instance_id,
+                      dal.partition_id,
+                      dal.action_seq,
+                      dal.module,
+                      dal.function_name,
+                      dal.kwargs_payload
             "#,
         )
         .bind(partition_id)
@@ -721,7 +778,8 @@ impl Database {
         let mut inserted = 0usize;
         for node in unlocked {
             let node_id = node.id.clone();
-            let payload = build_workflow_action_payload(&node, &workflow_input, &context_values)?;
+            let invocation =
+                build_workflow_action_payload(&node, &workflow_input, &context_values)?;
             let _action_id: LedgerActionId = sqlx::query_scalar::<_, LedgerActionId>(
                 r#"
                 INSERT INTO daemon_action_ledger (
@@ -729,16 +787,20 @@ impl Database {
                     partition_id,
                     action_seq,
                     status,
-                    payload,
+                    module,
+                    function_name,
+                    kwargs_payload,
                     workflow_node_id
-                ) VALUES ($1, $2, $3, 'queued', $4, $5)
+                ) VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7)
                 RETURNING id
                 "#,
             )
             .bind(instance.id)
             .bind(instance.partition_id)
             .bind(next_sequence)
-            .bind(payload)
+            .bind(&invocation.module)
+            .bind(&invocation.function_name)
+            .bind(&invocation.kwargs)
             .bind(node_id)
             .fetch_one(tx.as_mut())
             .await?;

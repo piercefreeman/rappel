@@ -46,3 +46,10 @@ def test_error_payload_serialization() -> None:
     assert decoded.error["module"] == "builtins"
     assert "boom" in decoded.error["message"]
     assert "Traceback" in decoded.error["traceback"]
+
+
+def test_collections_round_trip() -> None:
+    payload = serialize_result_payload({"items": [1, 2, 3], "pair": (4, 5)})
+    decoded = deserialize_result_payload(payload)
+    assert decoded.error is None
+    assert decoded.result == {"items": [1, 2, 3], "pair": (4, 5)}
