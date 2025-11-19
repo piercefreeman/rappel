@@ -589,14 +589,13 @@ async fn stale_worker_completion_is_ignored() -> Result<()> {
         dispatch_token: Some(stale_token),
     };
     database.mark_actions_batch(&[stale_record]).await?;
-    let row = sqlx::query!(
-        "SELECT status, result_payload FROM daemon_action_ledger WHERE id = $1",
-        action.id
-    )
-    .fetch_one(database.pool())
-    .await?;
-    assert_eq!(row.status, "dispatched");
-    assert!(row.result_payload.is_none());
+    let (status, payload): (String, Option<Vec<u8>>) =
+        sqlx::query_as("SELECT status, result_payload FROM daemon_action_ledger WHERE id = $1")
+            .bind(action.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(status, "dispatched");
+    assert!(payload.is_none());
 
     let mut result_args = proto::WorkflowArguments {
         arguments: Vec::new(),
@@ -621,14 +620,13 @@ async fn stale_worker_completion_is_ignored() -> Result<()> {
         dispatch_token: Some(fresh_token),
     };
     database.mark_actions_batch(&[valid_record]).await?;
-    let row = sqlx::query!(
-        "SELECT status, result_payload FROM daemon_action_ledger WHERE id = $1",
-        action.id
-    )
-    .fetch_one(database.pool())
-    .await?;
-    assert_eq!(row.status, "completed");
-    assert!(row.result_payload.is_some());
+    let (status, payload): (String, Option<Vec<u8>>) =
+        sqlx::query_as("SELECT status, result_payload FROM daemon_action_ledger WHERE id = $1")
+            .bind(action.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(status, "completed");
+    assert!(payload.is_some());
     Ok(())
 }
 
