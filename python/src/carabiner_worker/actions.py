@@ -62,7 +62,9 @@ def action(*, name: Optional[str] = None) -> Callable[[TAsync], TAsync]: ...
 
 
 def action(
-    func: Optional[TAsync] = None, *, name: Optional[str] = None
+    func: Optional[TAsync] = None,
+    *,
+    name: Optional[str] = None,
 ) -> Callable[[TAsync], TAsync] | TAsync:
     """Decorator for registering async actions."""
 

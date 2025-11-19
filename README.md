@@ -1,10 +1,12 @@
-# carabiner
+# rappel
+
+![Rappel Logo](https://raw.githubusercontent.com/piercefreeman/rappel/main/media/header.png)
 
 carabiner is a library to let you build durable background tasks that withstand device restarts, task crashes, and long-running jobs. It's built for Python and Postgres without any additional deploy time requirements.
 
 ## Usage
 
-An example is worth a thousand words:
+An example is worth a thousand words. Here's how you define your workflow:
 
 ```python
 from dataclasses import dataclass
@@ -20,11 +22,14 @@ class GreetingWorkflow(Workflow):
         user = await fetch_user(self.user_id)      # first action
         summary = await build_greetings(user)      # second action, chained
         return summary
+```
 
+And here's how you describe your distributed actions:
 
+```python
 @action
 async def fetch_user(user_id: str) -> User:
-    ...  # e.g. load from database
+    return await my_db.get(User, user_id)
 
 
 @action
@@ -114,6 +119,15 @@ Workflows can get much more complex than the example above:
         pretty = _format_currency(summary.transactions.total)
     ```
 
+### Error handling
+
+To build truly robust background tasks, you need to consider how things can go wrong. Actions can 'fail' in a few ways. This is supported by our `.run_action` syntax that allows users to provide additional parameters to modify the execution bounds on each action.
+
+1. Action explicitly throws an error and we want to retry it. Caused by intermittent database connectivity / overloaded webservers / or simply buggy code will throw an error.
+1. Actions raise an error that is a really a CarabinerTimeout. This indicates that we dequeued the task but weren't able to complete it in the time allocated. This could be because we dequeued the task, started work on it, then the server crashed. Or it could still be running in the background but simply took too much time. Either way we will raise a synthetic error that is representative of this execution.
+
+By default we will only try explicit actions one time if there is an explicit exception raised. We will try them infinite times in the case of a timeout since this is usually caused by cross device coordination issues.
+
 ## Configuration
 
 The main carabiner configuration is done through env vars, which is what you'll typically use in production when using a docker deployment pipeline. If we can't find an environment parameter we will fallback to looking for an .env that specifies it within your local filesystem.
@@ -144,12 +158,31 @@ Nothing on the market provides this balance - `carabiner` aims to try. We don't 
 
 ## Other options
 
+**When should you use Carabiner?**
+
+- You're already using Python & Postgres for the core of your stack, either with Mountaineer or FastAPI
+- You have a lot of async heavy logic that needs to be durable and can be retried (3rd party API calls, db jobs, etc)
+- You want something that works the same locally as when deployed remotely
+- You want background job code to plug and play with your existing unit test & static analysis stack
+- You are focused on getting to product market fit versus scale
+
+Performance is a top priority of carabiner. That's why it's written with a Rust core, is lightweight on your database connection by minimizing connections to ~1 per machine host, and runs continuous benchmarks on CI. But still - there's only so much we can do with Postgres as our backing store. And that's okay! Once you start to tax Postgres' capabilities you're probably at the scale where you should switch to a more complicated architecture.
+
+**When shouldn't you?**
+
+- You have particularly latency sensitive background jobs, where you need <100ms acknowledgement and handling of each task.
+- You have a huge scale of concurrent background jobs, order of magnitude >50k actions being coordinated at the same time.
+- You have tried some existing task coordinators and need to scale your solution to the next 10x worth of traffic.
+
 There is no shortage of robust background queues in Python, including ones that scale to millions of requests a second:
 
 1. Temporal.io
 2. Celery/RabbitMQ
+3. Redis
 
-Almost all of these require a dedicated task broker that you host alongside your app. This usually isn't a huge deal during POCs, but they all have a ton of knobs and dials so you can performance tune it to your own environment. It's also yet another thing in which to build a competency. Cloud hosting of most of these are billed per-event and can get very expensive depending on how you orchestrate your jobs.
+Almost all of these require a dedicated task broker that you host alongside your app. This usually isn't a huge deal during POCs but can get complex as you need to performance tune it for production. Cloud hosting of most of these are billed per-event and can get very expensive depending on how you orchestrate your jobs.
+
+Open source solutions like RabbitMQ have been battle tested over decades & large companies like Temporal are able to throw a lot of resources towards optimization. Both of these solutions are great choices - just intended to solve for different scopes. Expect an associated higher amount of setup and management complexity.
 
 ## Local Server Runtime
 

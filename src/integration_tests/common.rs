@@ -2,11 +2,14 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Stdio,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
 use tempfile::TempDir;
-use tokio::process::Command;
+use tokio::{process::Command, time::timeout};
+
+const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn run_in_env(
     files: &[(&str, &str)],
@@ -43,7 +46,7 @@ dependencies = [
 "#
     );
     fs::write(env_dir.path().join("pyproject.toml"), pyproject)?;
-    run_shell(env_dir.path(), "uv sync", &[]).await?;
+    run_shell(env_dir.path(), "uv sync", &[], None).await?;
 
     let mut run_envs = env_vars.to_vec();
     let mut python_paths = vec![repo_python.join("src"), repo_python.clone()];
@@ -59,12 +62,18 @@ dependencies = [
         env_dir.path(),
         &format!("uv run python {entrypoint}"),
         &run_envs,
+        Some(SCRIPT_TIMEOUT),
     )
     .await?;
     Ok(env_dir)
 }
 
-async fn run_shell(cwd: &Path, command: &str, envs: &[(&str, String)]) -> Result<()> {
+async fn run_shell(
+    cwd: &Path,
+    command: &str,
+    envs: &[(&str, String)],
+    timeout_limit: Option<Duration>,
+) -> Result<()> {
     let mut cmd = Command::new("bash");
     cmd.arg("-lc")
         .arg(command)
@@ -75,7 +84,25 @@ async fn run_shell(cwd: &Path, command: &str, envs: &[(&str, String)]) -> Result
     for (key, value) in envs {
         cmd.env(key, value);
     }
-    let status = cmd.status().await?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn `{command}`"))?;
+    let wait_future = child.wait();
+    let status = if let Some(limit) = timeout_limit {
+        match timeout(limit, wait_future).await {
+            Ok(result) => result?,
+            Err(_) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(anyhow!(
+                    "command `{command}` timed out after {}s",
+                    limit.as_secs()
+                ));
+            }
+        }
+    } else {
+        wait_future.await?
+    };
     if status.success() {
         Ok(())
     } else {

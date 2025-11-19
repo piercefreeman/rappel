@@ -27,6 +27,10 @@ message ActionDispatch {
   string instance_id = 2;
   uint32 sequence = 3;
   WorkflowNodeDispatch dispatch = 4;
+  optional uint32 timeout_seconds = 5;
+  optional uint32 max_retries = 6;
+  optional uint32 attempt_number = 7;
+  optional string dispatch_token = 8;
 }
 
 message ActionResult {
@@ -35,6 +39,7 @@ message ActionResult {
   WorkflowArguments payload = 3;
   uint64 worker_start_ns = 4;
   uint64 worker_end_ns = 5;
+  optional string dispatch_token = 6;
 }
 
 message Ack {
@@ -55,6 +60,9 @@ message WorkflowDagNode {
   string module = 7;
   string guard = 8;
   repeated WorkflowExceptionEdge exception_edges = 9;
+  optional uint32 timeout_seconds = 10;
+  optional uint32 max_retries = 11;
+  optional uint32 timeout_retry_limit = 12;
 }
 
 message WorkflowDagDefinition {

@@ -101,6 +101,9 @@ mod tests {
             produces: Vec::new(),
             guard: String::new(),
             exception_edges: Vec::new(),
+            timeout_seconds: None,
+            max_retries: None,
+            timeout_retry_limit: None,
         }
     }
 
@@ -212,6 +215,9 @@ mod tests {
             produces: Vec::new(),
             guard: "user_flag".to_string(),
             exception_edges: Vec::new(),
+            timeout_seconds: None,
+            max_retries: None,
+            timeout_retry_limit: None,
         };
         let dag = WorkflowDagDefinition {
             concurrent: false,

@@ -93,9 +93,17 @@ class ActionDispatch(google.protobuf.message.Message):
     INSTANCE_ID_FIELD_NUMBER: builtins.int
     SEQUENCE_FIELD_NUMBER: builtins.int
     DISPATCH_FIELD_NUMBER: builtins.int
+    TIMEOUT_SECONDS_FIELD_NUMBER: builtins.int
+    MAX_RETRIES_FIELD_NUMBER: builtins.int
+    ATTEMPT_NUMBER_FIELD_NUMBER: builtins.int
+    DISPATCH_TOKEN_FIELD_NUMBER: builtins.int
     action_id: builtins.str
     instance_id: builtins.str
     sequence: builtins.int
+    timeout_seconds: builtins.int
+    max_retries: builtins.int
+    attempt_number: builtins.int
+    dispatch_token: builtins.str
     @property
     def dispatch(self) -> Global___WorkflowNodeDispatch: ...
     def __init__(
@@ -105,21 +113,79 @@ class ActionDispatch(google.protobuf.message.Message):
         instance_id: builtins.str = ...,
         sequence: builtins.int = ...,
         dispatch: Global___WorkflowNodeDispatch | None = ...,
+        timeout_seconds: builtins.int | None = ...,
+        max_retries: builtins.int | None = ...,
+        attempt_number: builtins.int | None = ...,
+        dispatch_token: builtins.str | None = ...,
     ) -> None: ...
-    def HasField(self, field_name: typing.Literal["dispatch", b"dispatch"]) -> builtins.bool: ...
+    def HasField(
+        self,
+        field_name: typing.Literal[
+            "_attempt_number",
+            b"_attempt_number",
+            "_dispatch_token",
+            b"_dispatch_token",
+            "_max_retries",
+            b"_max_retries",
+            "_timeout_seconds",
+            b"_timeout_seconds",
+            "attempt_number",
+            b"attempt_number",
+            "dispatch",
+            b"dispatch",
+            "dispatch_token",
+            b"dispatch_token",
+            "max_retries",
+            b"max_retries",
+            "timeout_seconds",
+            b"timeout_seconds",
+        ],
+    ) -> builtins.bool: ...
     def ClearField(
         self,
         field_name: typing.Literal[
+            "_attempt_number",
+            b"_attempt_number",
+            "_dispatch_token",
+            b"_dispatch_token",
+            "_max_retries",
+            b"_max_retries",
+            "_timeout_seconds",
+            b"_timeout_seconds",
             "action_id",
             b"action_id",
+            "attempt_number",
+            b"attempt_number",
             "dispatch",
             b"dispatch",
+            "dispatch_token",
+            b"dispatch_token",
             "instance_id",
             b"instance_id",
+            "max_retries",
+            b"max_retries",
             "sequence",
             b"sequence",
+            "timeout_seconds",
+            b"timeout_seconds",
         ],
     ) -> None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_attempt_number", b"_attempt_number"]
+    ) -> typing.Literal["attempt_number"] | None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_dispatch_token", b"_dispatch_token"]
+    ) -> typing.Literal["dispatch_token"] | None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_max_retries", b"_max_retries"]
+    ) -> typing.Literal["max_retries"] | None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_timeout_seconds", b"_timeout_seconds"]
+    ) -> typing.Literal["timeout_seconds"] | None: ...
 
 Global___ActionDispatch: typing_extensions.TypeAlias = ActionDispatch
 
@@ -132,10 +198,12 @@ class ActionResult(google.protobuf.message.Message):
     PAYLOAD_FIELD_NUMBER: builtins.int
     WORKER_START_NS_FIELD_NUMBER: builtins.int
     WORKER_END_NS_FIELD_NUMBER: builtins.int
+    DISPATCH_TOKEN_FIELD_NUMBER: builtins.int
     action_id: builtins.str
     success: builtins.bool
     worker_start_ns: builtins.int
     worker_end_ns: builtins.int
+    dispatch_token: builtins.str
     @property
     def payload(self) -> Global___WorkflowArguments: ...
     def __init__(
@@ -146,13 +214,28 @@ class ActionResult(google.protobuf.message.Message):
         payload: Global___WorkflowArguments | None = ...,
         worker_start_ns: builtins.int = ...,
         worker_end_ns: builtins.int = ...,
+        dispatch_token: builtins.str | None = ...,
     ) -> None: ...
-    def HasField(self, field_name: typing.Literal["payload", b"payload"]) -> builtins.bool: ...
+    def HasField(
+        self,
+        field_name: typing.Literal[
+            "_dispatch_token",
+            b"_dispatch_token",
+            "dispatch_token",
+            b"dispatch_token",
+            "payload",
+            b"payload",
+        ],
+    ) -> builtins.bool: ...
     def ClearField(
         self,
         field_name: typing.Literal[
+            "_dispatch_token",
+            b"_dispatch_token",
             "action_id",
             b"action_id",
+            "dispatch_token",
+            b"dispatch_token",
             "payload",
             b"payload",
             "success",
@@ -163,6 +246,9 @@ class ActionResult(google.protobuf.message.Message):
             b"worker_start_ns",
         ],
     ) -> None: ...
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_dispatch_token", b"_dispatch_token"]
+    ) -> typing.Literal["dispatch_token"] | None: ...
 
 Global___ActionResult: typing_extensions.TypeAlias = ActionResult
 
@@ -229,10 +315,16 @@ class WorkflowDagNode(google.protobuf.message.Message):
     MODULE_FIELD_NUMBER: builtins.int
     GUARD_FIELD_NUMBER: builtins.int
     EXCEPTION_EDGES_FIELD_NUMBER: builtins.int
+    TIMEOUT_SECONDS_FIELD_NUMBER: builtins.int
+    MAX_RETRIES_FIELD_NUMBER: builtins.int
+    TIMEOUT_RETRY_LIMIT_FIELD_NUMBER: builtins.int
     id: builtins.str
     action: builtins.str
     module: builtins.str
     guard: builtins.str
+    timeout_seconds: builtins.int
+    max_retries: builtins.int
+    timeout_retry_limit: builtins.int
     @property
     def kwargs(
         self,
@@ -267,10 +359,36 @@ class WorkflowDagNode(google.protobuf.message.Message):
         module: builtins.str = ...,
         guard: builtins.str = ...,
         exception_edges: collections.abc.Iterable[Global___WorkflowExceptionEdge] | None = ...,
+        timeout_seconds: builtins.int | None = ...,
+        max_retries: builtins.int | None = ...,
+        timeout_retry_limit: builtins.int | None = ...,
     ) -> None: ...
+    def HasField(
+        self,
+        field_name: typing.Literal[
+            "_max_retries",
+            b"_max_retries",
+            "_timeout_retry_limit",
+            b"_timeout_retry_limit",
+            "_timeout_seconds",
+            b"_timeout_seconds",
+            "max_retries",
+            b"max_retries",
+            "timeout_retry_limit",
+            b"timeout_retry_limit",
+            "timeout_seconds",
+            b"timeout_seconds",
+        ],
+    ) -> builtins.bool: ...
     def ClearField(
         self,
         field_name: typing.Literal[
+            "_max_retries",
+            b"_max_retries",
+            "_timeout_retry_limit",
+            b"_timeout_retry_limit",
+            "_timeout_seconds",
+            b"_timeout_seconds",
             "action",
             b"action",
             "depends_on",
@@ -283,14 +401,32 @@ class WorkflowDagNode(google.protobuf.message.Message):
             b"id",
             "kwargs",
             b"kwargs",
+            "max_retries",
+            b"max_retries",
             "module",
             b"module",
             "produces",
             b"produces",
+            "timeout_retry_limit",
+            b"timeout_retry_limit",
+            "timeout_seconds",
+            b"timeout_seconds",
             "wait_for_sync",
             b"wait_for_sync",
         ],
     ) -> None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_max_retries", b"_max_retries"]
+    ) -> typing.Literal["max_retries"] | None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_timeout_retry_limit", b"_timeout_retry_limit"]
+    ) -> typing.Literal["timeout_retry_limit"] | None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_timeout_seconds", b"_timeout_seconds"]
+    ) -> typing.Literal["timeout_seconds"] | None: ...
 
 Global___WorkflowDagNode: typing_extensions.TypeAlias = WorkflowDagNode
 

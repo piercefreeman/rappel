@@ -208,6 +208,10 @@ impl DispatcherTask {
             instance_id: action.instance_id,
             sequence: action.action_seq,
             dispatch,
+            timeout_seconds: action.timeout_seconds,
+            max_retries: action.max_retries,
+            attempt_number: action.attempt_number,
+            dispatch_token: action.delivery_token,
         };
         let worker = worker_pool.next_worker();
         match worker.send_action(payload).await {
@@ -217,6 +221,7 @@ impl DispatcherTask {
                     success: metrics.success,
                     delivery_id: metrics.delivery_id,
                     result_payload: metrics.response_payload,
+                    dispatch_token: metrics.dispatch_token,
                 };
                 if let Err(err) = completion_tx.send(record).await {
                     warn!(?err, "completion channel closed, dropping record");
@@ -285,6 +290,11 @@ impl DispatcherTask {
     }
 
     async fn check_timeouts(&self) -> Result<()> {
+        let limit = self.config.batch_size.max(1);
+        let count = self.database.mark_timed_out_actions(limit).await?;
+        if count > 0 {
+            info!(count, "marked timed out actions");
+        }
         Ok(())
     }
 }

@@ -7,6 +7,7 @@ use sqlx::{
     FromRow, PgPool, Postgres, Row, Transaction,
     postgres::{PgPoolOptions, PgRow},
 };
+use uuid::Uuid;
 
 use crate::{
     LedgerActionId, WorkflowInstanceId, WorkflowVersionId,
@@ -16,6 +17,12 @@ use crate::{
         WorkflowNodeDispatch,
     },
 };
+
+const DEFAULT_ACTION_TIMEOUT_SECS: i32 = 300;
+const DEFAULT_ACTION_MAX_RETRIES: i32 = 1;
+const DEFAULT_TIMEOUT_RETRY_LIMIT: i32 = i32::MAX;
+const EXHAUSTED_EXCEPTION_TYPE: &str = "ExhaustedRetries";
+const EXHAUSTED_EXCEPTION_MODULE: &str = "carabiner.exceptions";
 
 #[derive(Clone)]
 pub struct Database {
@@ -166,11 +173,23 @@ fn build_workflow_node_dispatch(
     } else {
         node.action.clone()
     };
+    let timeout_seconds = node
+        .timeout_seconds
+        .unwrap_or(DEFAULT_ACTION_TIMEOUT_SECS as u32) as i32;
+    let max_retries = node
+        .max_retries
+        .unwrap_or(DEFAULT_ACTION_MAX_RETRIES as u32) as i32;
+    let timeout_retry_limit = node
+        .timeout_retry_limit
+        .unwrap_or(DEFAULT_TIMEOUT_RETRY_LIMIT as u32) as i32;
 
     Ok(QueuedWorkflowNode {
         module,
         function_name,
         dispatch,
+        timeout_seconds,
+        max_retries,
+        timeout_retry_limit,
     })
 }
 
@@ -184,12 +203,69 @@ fn decode_arguments(bytes: &[u8], label: &str) -> Result<WorkflowArguments> {
         .with_context(|| format!("failed to decode {label} workflow arguments"))
 }
 
+fn extract_error_message(payload: &[u8]) -> Option<String> {
+    if payload.is_empty() {
+        return None;
+    }
+    let arguments = proto::WorkflowArguments::decode(payload).ok()?;
+    for argument in arguments.arguments {
+        if argument.key == "error"
+            && let Some(value) = argument.value
+            && let Some(kind) = value.kind
+            && let proto::workflow_argument_value::Kind::Exception(exc) = kind
+        {
+            return Some(exc.message);
+        }
+    }
+    None
+}
+
+fn encode_exception_payload(type_name: &str, module: &str, message: &str) -> Vec<u8> {
+    let mut arguments = proto::WorkflowArguments {
+        arguments: Vec::new(),
+    };
+    let error_value = proto::WorkflowArgumentValue {
+        kind: Some(proto::workflow_argument_value::Kind::Exception(
+            proto::WorkflowErrorValue {
+                message: message.to_string(),
+                module: module.to_string(),
+                r#type: type_name.to_string(),
+                traceback: String::new(),
+            },
+        )),
+    };
+    arguments.arguments.push(proto::WorkflowArgument {
+        key: "error".to_string(),
+        value: Some(error_value),
+    });
+    arguments.encode_to_vec()
+}
+
+fn encode_exhausted_retries_payload(
+    action: &str,
+    attempts: i32,
+    last_error: Option<&str>,
+) -> Vec<u8> {
+    let message = match last_error {
+        Some(reason) if !reason.is_empty() => {
+            format!("action {action} exhausted retries after {attempts} attempts: {reason}")
+        }
+        _ => format!("action {action} exhausted retries after {attempts} attempts"),
+    };
+    encode_exception_payload(
+        EXHAUSTED_EXCEPTION_TYPE,
+        EXHAUSTED_EXCEPTION_MODULE,
+        &message,
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct CompletionRecord {
     pub action_id: LedgerActionId,
     pub success: bool,
     pub delivery_id: u64,
     pub result_payload: Vec<u8>,
+    pub dispatch_token: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +273,22 @@ struct QueuedWorkflowNode {
     module: String,
     function_name: String,
     dispatch: proto::WorkflowNodeDispatch,
+    timeout_seconds: i32,
+    max_retries: i32,
+    timeout_retry_limit: i32,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct ExhaustedActionRow {
+    action_id: LedgerActionId,
+    instance_id: WorkflowInstanceId,
+    workflow_node_id: Option<String>,
+    function_name: String,
+    attempt_number: i32,
+    last_error: Option<String>,
+    status: String,
+    max_retries: i32,
+    timeout_retry_limit: i32,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -208,6 +300,12 @@ pub struct LedgerAction {
     pub module: String,
     pub function_name: String,
     pub dispatch_payload: Vec<u8>,
+    pub timeout_seconds: i32,
+    pub max_retries: i32,
+    pub attempt_number: i32,
+    pub delivery_token: Uuid,
+    pub timeout_retry_limit: i32,
+    pub retry_kind: String,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -462,6 +560,142 @@ impl Database {
         Ok(())
     }
 
+    async fn promote_exhausted_actions_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        action_ids: &[LedgerActionId],
+    ) -> Result<Vec<(WorkflowInstanceId, Option<String>)>> {
+        if action_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_as::<_, ExhaustedActionRow>(
+            r#"
+            SELECT
+                id AS action_id,
+                instance_id,
+                workflow_node_id,
+                function_name,
+                attempt_number,
+                last_error,
+                status,
+                max_retries,
+                timeout_retry_limit
+            FROM daemon_action_ledger
+            WHERE id = ANY($1)
+              AND (
+                  (status = 'failed' AND attempt_number + 1 >= max_retries)
+                  OR (status = 'timed_out' AND attempt_number + 1 >= timeout_retry_limit)
+              )
+            "#,
+        )
+        .bind(action_ids)
+        .fetch_all(tx.as_mut())
+        .await?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut scheduled: Vec<(WorkflowInstanceId, Option<String>)> = Vec::new();
+        for row in rows {
+            let limit = if row.status == "timed_out" {
+                row.timeout_retry_limit
+            } else {
+                row.max_retries
+            };
+            let attempts = row.attempt_number + 1;
+            let capped_attempts = attempts.min(limit.max(1));
+            let payload = encode_exhausted_retries_payload(
+                &row.function_name,
+                capped_attempts,
+                row.last_error.as_deref(),
+            );
+            sqlx::query(
+                r#"
+                UPDATE daemon_action_ledger
+                SET status = 'completed',
+                    success = false,
+                    completed_at = NOW(),
+                    acked_at = COALESCE(acked_at, NOW()),
+                    result_payload = $2,
+                    deadline_at = NULL,
+                    delivery_token = NULL
+                WHERE id = $1
+                "#,
+            )
+            .bind(row.action_id)
+            .bind(&payload)
+            .execute(tx.as_mut())
+            .await?;
+            scheduled.push((row.instance_id, row.workflow_node_id));
+        }
+        Ok(scheduled)
+    }
+
+    async fn requeue_failed_actions_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        action_ids: &[LedgerActionId],
+    ) -> Result<usize> {
+        if action_ids.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            r#"
+            UPDATE daemon_action_ledger
+            SET status = 'queued',
+                attempt_number = attempt_number + 1,
+                dispatched_at = NULL,
+                acked_at = NULL,
+                deadline_at = NULL,
+                delivery_id = NULL,
+                scheduled_at = NOW(),
+                result_payload = NULL,
+                success = NULL,
+                delivery_token = NULL,
+                retry_kind = 'failure'
+            WHERE id = ANY($1)
+              AND status = 'failed'
+              AND attempt_number + 1 < max_retries
+            "#,
+        )
+        .bind(action_ids)
+        .execute(tx.as_mut())
+        .await?;
+        Ok(result.rows_affected() as usize)
+    }
+
+    async fn requeue_timed_out_actions_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        action_ids: &[LedgerActionId],
+    ) -> Result<usize> {
+        if action_ids.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            r#"
+            UPDATE daemon_action_ledger
+            SET status = 'queued',
+                attempt_number = attempt_number + 1,
+                dispatched_at = NULL,
+                acked_at = NULL,
+                deadline_at = NULL,
+                delivery_id = NULL,
+                scheduled_at = NOW(),
+                result_payload = NULL,
+                success = NULL,
+                delivery_token = NULL,
+                retry_kind = 'timeout'
+            WHERE id = ANY($1)
+              AND status = 'timed_out'
+              AND attempt_number + 1 < timeout_retry_limit
+            "#,
+        )
+        .bind(action_ids)
+        .execute(tx.as_mut())
+        .await?;
+        Ok(result.rows_affected() as usize)
+    }
+
     pub async fn seed_actions(
         &self,
         action_count: usize,
@@ -495,8 +729,28 @@ impl Database {
                     status,
                     module,
                     function_name,
-                    dispatch_payload
-                ) VALUES ($1, $2, $3, 'queued', $4, $5, $6)
+                    dispatch_payload,
+                    timeout_seconds,
+                    max_retries,
+                    timeout_retry_limit,
+                    attempt_number,
+                    scheduled_at,
+                    retry_kind
+                ) VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    'queued',
+                    $4,
+                    $5,
+                    $6,
+                    $7,
+                    $8,
+                    $9,
+                    0,
+                    NOW(),
+                    'failure'
+                )
                 "#,
             )
             .bind(instance_id)
@@ -505,6 +759,9 @@ impl Database {
             .bind(module)
             .bind(function_name)
             .bind(dispatch_payload)
+            .bind(DEFAULT_ACTION_TIMEOUT_SECS)
+            .bind(DEFAULT_ACTION_MAX_RETRIES)
+            .bind(DEFAULT_TIMEOUT_RETRY_LIMIT)
             .execute(&mut *tx)
             .await?;
         }
@@ -565,12 +822,23 @@ impl Database {
                 SELECT id
                 FROM daemon_action_ledger
                 WHERE status = 'queued'
-                ORDER BY action_seq
+                  AND scheduled_at <= NOW()
+                  AND (
+                      (retry_kind = 'timeout' AND attempt_number < timeout_retry_limit)
+                      OR (retry_kind <> 'timeout' AND attempt_number < max_retries)
+                  )
+                ORDER BY scheduled_at, action_seq
                 FOR UPDATE SKIP LOCKED
                 LIMIT $1
             )
             UPDATE daemon_action_ledger AS dal
-            SET status = 'dispatched', dispatched_at = NOW()
+            SET status = 'dispatched',
+                dispatched_at = NOW(),
+                deadline_at = CASE
+                    WHEN dal.timeout_seconds > 0 THEN NOW() + dal.timeout_seconds * INTERVAL '1 second'
+                    ELSE NULL
+                END,
+                delivery_token = gen_random_uuid()
             FROM next_actions
             WHERE dal.id = next_actions.id
             RETURNING dal.id,
@@ -579,7 +847,13 @@ impl Database {
                      dal.action_seq,
                      dal.module,
                      dal.function_name,
-                     dal.dispatch_payload
+                     dal.dispatch_payload,
+                     dal.timeout_seconds,
+                     dal.max_retries,
+                     dal.attempt_number,
+                     dal.delivery_token,
+                     dal.timeout_retry_limit,
+                     dal.retry_kind
             "#,
         )
         .bind(limit)
@@ -607,7 +881,13 @@ impl Database {
             SET status = 'queued',
                 dispatched_at = NULL,
                 acked_at = NULL,
-                delivery_id = NULL
+                delivery_id = NULL,
+                deadline_at = NULL,
+                scheduled_at = NOW(),
+                result_payload = NULL,
+                success = NULL,
+                delivery_token = NULL,
+                retry_kind = 'failure'
             WHERE id = $1
             "#,
         )
@@ -617,53 +897,224 @@ impl Database {
         Ok(())
     }
 
+    pub async fn mark_timed_out_actions(&self, limit: i64) -> Result<usize> {
+        let mut tx = self.pool.begin().await?;
+        let timed_out_ids: Vec<LedgerActionId> = sqlx::query_scalar(
+            r#"
+            WITH overdue AS (
+                SELECT id
+                FROM daemon_action_ledger
+                WHERE status = 'dispatched'
+                  AND deadline_at IS NOT NULL
+                  AND deadline_at < NOW()
+                ORDER BY deadline_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT $1
+            )
+            UPDATE daemon_action_ledger AS dal
+            SET status = 'timed_out',
+                last_error = COALESCE(dal.last_error, 'action timed out'),
+                deadline_at = NULL
+            FROM overdue
+            WHERE dal.id = overdue.id
+            RETURNING dal.id
+            "#,
+        )
+        .bind(limit.max(1))
+        .fetch_all(&mut *tx)
+        .await?;
+        if timed_out_ids.is_empty() {
+            tx.commit().await?;
+            return Ok(0);
+        }
+        let exhausted = self
+            .promote_exhausted_actions_tx(&mut tx, &timed_out_ids)
+            .await?;
+        let requeued = self
+            .requeue_timed_out_actions_tx(&mut tx, &timed_out_ids)
+            .await?;
+        if requeued > 0 {
+            tracing::debug!(count = requeued, "requeued timed out actions");
+        }
+        let mut workflow_instances: HashSet<WorkflowInstanceId> = HashSet::new();
+        for (instance_id, node_id) in exhausted {
+            if node_id.is_some() {
+                workflow_instances.insert(instance_id);
+            }
+        }
+        for instance_id in workflow_instances {
+            let inserted = self
+                .schedule_workflow_instance_tx(&mut tx, instance_id)
+                .await?;
+            if inserted > 0 {
+                tracing::debug!(
+                    instance_id = %instance_id,
+                    inserted,
+                    "workflow actions unlocked after exhausting retries"
+                );
+            }
+        }
+        tx.commit().await?;
+        Ok(timed_out_ids.len())
+    }
+
     pub async fn mark_actions_batch(&self, records: &[CompletionRecord]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
         let span = tracing::debug_span!("db.mark_actions_batch", count = records.len());
         let _guard = span.enter();
-        let ids: Vec<LedgerActionId> = records.iter().map(|r| r.action_id).collect();
-        let successes: Vec<bool> = records.iter().map(|r| r.success).collect();
-        let deliveries: Vec<i64> = records.iter().map(|r| r.delivery_id as i64).collect();
-        let payloads: Vec<Vec<u8>> = records.iter().map(|r| r.result_payload.clone()).collect();
+        let successes_with_tokens: Vec<(&CompletionRecord, Uuid)> = records
+            .iter()
+            .filter(|r| r.success)
+            .filter_map(|record| record.dispatch_token.map(|token| (record, token)))
+            .collect();
+        let dropped_successes =
+            records.iter().filter(|r| r.success).count() - successes_with_tokens.len();
+        if dropped_successes > 0 {
+            tracing::debug!(
+                count = dropped_successes,
+                "dropping successful completions missing dispatch tokens"
+            );
+        }
+        let failures_with_tokens: Vec<(&CompletionRecord, Uuid)> = records
+            .iter()
+            .filter(|r| !r.success)
+            .filter_map(|record| record.dispatch_token.map(|token| (record, token)))
+            .collect();
+        let dropped_failures =
+            records.iter().filter(|r| !r.success).count() - failures_with_tokens.len();
+        if dropped_failures > 0 {
+            tracing::debug!(
+                count = dropped_failures,
+                "dropping failed completions missing dispatch tokens"
+            );
+        }
         let mut tx = self.pool.begin().await?;
-        let updated = sqlx::query(
-            r#"
-            WITH data AS (
-                SELECT *
-                FROM UNNEST($1::UUID[], $2::BOOL[], $3::BIGINT[], $4::BYTEA[])
-                    AS t(action_id, success, delivery_id, result_payload)
-            )
-            UPDATE daemon_action_ledger AS dal
-            SET status = 'completed',
-                success = data.success,
-                completed_at = NOW(),
-                acked_at = COALESCE(dal.acked_at, NOW()),
-                delivery_id = data.delivery_id,
-                result_payload = data.result_payload
-            FROM data
-            WHERE dal.id = data.action_id
-            RETURNING dal.instance_id, dal.workflow_node_id
-            "#,
-        )
-        .bind(&ids)
-        .bind(&successes)
-        .bind(&deliveries)
-        .bind(&payloads)
-        .map(|row: PgRow| {
-            (
-                row.get::<WorkflowInstanceId, _>(0),
-                row.get::<Option<String>, _>(1),
-            )
-        })
-        .fetch_all(&mut *tx)
-        .await?;
-
         let mut workflow_instances: HashSet<WorkflowInstanceId> = HashSet::new();
-        for row in updated {
-            if row.1.is_some() {
-                workflow_instances.insert(row.0);
+        if !successes_with_tokens.is_empty() {
+            let ids: Vec<LedgerActionId> = successes_with_tokens
+                .iter()
+                .map(|(record, _)| record.action_id)
+                .collect();
+            let deliveries: Vec<i64> = successes_with_tokens
+                .iter()
+                .map(|(record, _)| record.delivery_id as i64)
+                .collect();
+            let payloads: Vec<Vec<u8>> = successes_with_tokens
+                .iter()
+                .map(|(record, _)| record.result_payload.clone())
+                .collect();
+            let tokens: Vec<Uuid> = successes_with_tokens
+                .iter()
+                .map(|(_, token)| *token)
+                .collect();
+            let updated = sqlx::query(
+                r#"
+                WITH data AS (
+                    SELECT *
+                    FROM UNNEST($1::UUID[], $2::UUID[], $3::BIGINT[], $4::BYTEA[])
+                        AS t(action_id, dispatch_token, delivery_id, result_payload)
+                )
+                UPDATE daemon_action_ledger AS dal
+                SET status = 'completed',
+                    success = true,
+                    completed_at = NOW(),
+                    acked_at = COALESCE(dal.acked_at, NOW()),
+                    delivery_id = data.delivery_id,
+                    result_payload = data.result_payload,
+                    deadline_at = NULL,
+                    delivery_token = NULL
+                FROM data
+                WHERE dal.id = data.action_id
+                  AND dal.delivery_token = data.dispatch_token
+                RETURNING dal.instance_id, dal.workflow_node_id
+                "#,
+            )
+            .bind(&ids)
+            .bind(&tokens)
+            .bind(&deliveries)
+            .bind(&payloads)
+            .map(|row: PgRow| {
+                (
+                    row.get::<WorkflowInstanceId, _>(0),
+                    row.get::<Option<String>, _>(1),
+                )
+            })
+            .fetch_all(&mut *tx)
+            .await?;
+            for row in updated {
+                if row.1.is_some() {
+                    workflow_instances.insert(row.0);
+                }
+            }
+        }
+
+        if !failures_with_tokens.is_empty() {
+            let failure_ids: Vec<LedgerActionId> = failures_with_tokens
+                .iter()
+                .map(|(record, _)| record.action_id)
+                .collect();
+            let deliveries: Vec<i64> = failures_with_tokens
+                .iter()
+                .map(|(record, _)| record.delivery_id as i64)
+                .collect();
+            let payloads: Vec<Vec<u8>> = failures_with_tokens
+                .iter()
+                .map(|(record, _)| record.result_payload.clone())
+                .collect();
+            let errors: Vec<String> = failures_with_tokens
+                .iter()
+                .map(|(record, _)| {
+                    extract_error_message(&record.result_payload)
+                        .unwrap_or_else(|| "action failed".to_string())
+                })
+                .collect();
+            let tokens: Vec<Uuid> = failures_with_tokens
+                .iter()
+                .map(|(_, token)| *token)
+                .collect();
+            sqlx::query(
+                r#"
+                WITH data AS (
+                    SELECT *
+                    FROM UNNEST($1::UUID[], $2::UUID[], $3::BIGINT[], $4::BYTEA[], $5::TEXT[])
+                        AS t(action_id, dispatch_token, delivery_id, result_payload, last_error)
+                )
+                UPDATE daemon_action_ledger AS dal
+                SET status = 'failed',
+                    success = false,
+                    acked_at = COALESCE(dal.acked_at, NOW()),
+                    delivery_id = data.delivery_id,
+                    result_payload = data.result_payload,
+                    last_error = NULLIF(data.last_error, ''),
+                    deadline_at = NULL,
+                    delivery_token = NULL
+                FROM data
+                WHERE dal.id = data.action_id
+                  AND dal.delivery_token = data.dispatch_token
+                "#,
+            )
+            .bind(&failure_ids)
+            .bind(&tokens)
+            .bind(&deliveries)
+            .bind(&payloads)
+            .bind(&errors)
+            .execute(&mut *tx)
+            .await?;
+            let exhausted = self
+                .promote_exhausted_actions_tx(&mut tx, &failure_ids)
+                .await?;
+            for (instance_id, node_id) in exhausted {
+                if node_id.is_some() {
+                    workflow_instances.insert(instance_id);
+                }
+            }
+            let requeued = self
+                .requeue_failed_actions_tx(&mut tx, &failure_ids)
+                .await?;
+            if requeued > 0 {
+                tracing::debug!(count = requeued, "requeued failed actions");
             }
         }
 
@@ -799,8 +1250,29 @@ impl Database {
                     module,
                     function_name,
                     dispatch_payload,
-                    workflow_node_id
-                ) VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7)
+                    workflow_node_id,
+                    timeout_seconds,
+                    max_retries,
+                    timeout_retry_limit,
+                    attempt_number,
+                    scheduled_at,
+                    retry_kind
+                ) VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    'queued',
+                    $4,
+                    $5,
+                    $6,
+                    $7,
+                    $8,
+                    $9,
+                    $10,
+                    0,
+                    NOW(),
+                    'failure'
+                )
                 RETURNING id
                 "#,
             )
@@ -811,6 +1283,9 @@ impl Database {
             .bind(&node_dispatch.function_name)
             .bind(&dispatch_bytes)
             .bind(node_id)
+            .bind(node_dispatch.timeout_seconds)
+            .bind(node_dispatch.max_retries)
+            .bind(node_dispatch.timeout_retry_limit)
             .fetch_one(tx.as_mut())
             .await?;
             inserted += 1;
@@ -830,5 +1305,105 @@ impl Database {
             "queued workflow actions"
         );
         Ok(inserted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message;
+    use sqlx::{PgPool, postgres::PgPoolOptions};
+
+    async fn setup_test_pool() -> Result<Option<PgPool>> {
+        let _ = dotenvy::dotenv();
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) => {
+                eprintln!("skipping db tests: DATABASE_URL not set");
+                return Ok(None);
+            }
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        Ok(Some(pool))
+    }
+
+    async fn reset_tables(pool: &PgPool) -> Result<()> {
+        sqlx::query("TRUNCATE daemon_action_ledger, workflow_instances, workflow_versions CASCADE")
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    fn encode_error_payload(message: &str) -> Vec<u8> {
+        encode_exception_payload("RuntimeError", "tests", message)
+    }
+
+    #[tokio::test]
+    async fn explicit_failure_does_not_retry_by_default() -> Result<()> {
+        let Some(pool) = setup_test_pool().await? else {
+            return Ok(());
+        };
+        reset_tables(&pool).await?;
+        let database = Database { pool: pool.clone() };
+        let dispatch = proto::WorkflowNodeDispatch {
+            node: None,
+            workflow_input: None,
+            context: Vec::new(),
+        };
+        let payload = dispatch.encode_to_vec();
+        database
+            .seed_actions(1, "tests", "action", &payload)
+            .await?;
+        let mut actions = database.dispatch_actions(1).await?;
+        let action = actions.pop().expect("dispatched action");
+        let record = CompletionRecord {
+            action_id: action.id,
+            success: false,
+            delivery_id: 1,
+            result_payload: encode_error_payload("boom"),
+            dispatch_token: Some(action.delivery_token),
+        };
+        database.mark_actions_batch(&[record]).await?;
+        let queued: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM daemon_action_ledger WHERE status = 'queued'")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(queued, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timeout_retries_are_unbounded_by_default() -> Result<()> {
+        let Some(pool) = setup_test_pool().await? else {
+            return Ok(());
+        };
+        reset_tables(&pool).await?;
+        let database = Database { pool: pool.clone() };
+        let dispatch = proto::WorkflowNodeDispatch {
+            node: None,
+            workflow_input: None,
+            context: Vec::new(),
+        };
+        let payload = dispatch.encode_to_vec();
+        database
+            .seed_actions(1, "tests", "action", &payload)
+            .await?;
+        let mut actions = database.dispatch_actions(1).await?;
+        let action = actions.pop().expect("dispatched action");
+        sqlx::query(
+            "UPDATE daemon_action_ledger SET deadline_at = NOW() - INTERVAL '5 seconds' WHERE id = $1",
+        )
+        .bind(action.id)
+        .execute(database.pool())
+        .await?;
+        let timed_out = database.mark_timed_out_actions(10).await?;
+        assert_eq!(timed_out, 1);
+        let redispatched = database.dispatch_actions(1).await?;
+        assert_eq!(redispatched.len(), 1);
+        Ok(())
     }
 }

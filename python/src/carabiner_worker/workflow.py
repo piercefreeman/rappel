@@ -5,9 +5,11 @@ import inspect
 import logging
 import os
 import sys
+from dataclasses import dataclass
+from datetime import timedelta
 from functools import wraps
 from threading import RLock
-from typing import Any, ClassVar, Dict, Optional, Sequence, TextIO, TypeVar
+from typing import Any, Awaitable, ClassVar, Dict, Optional, Sequence, TextIO, TypeVar
 
 from proto import messages_pb2 as pb2
 
@@ -19,6 +21,19 @@ from .workflow_dag import DagNode, WorkflowDag, build_workflow_dag
 logger = logging.getLogger(__name__)
 
 TWorkflow = TypeVar("TWorkflow", bound="Workflow")
+TResult = TypeVar("TResult")
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    attempts: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class BackoffPolicy:
+    base_delay: float = 0.0
+    multiplier: float = 2.0
+    max_delay: Optional[float] = None
 
 
 class Workflow:
@@ -37,6 +52,25 @@ class Workflow:
 
     async def run(self) -> Any:
         raise NotImplementedError
+
+    async def run_action(
+        self,
+        awaitable: Awaitable[TResult],
+        *,
+        retry: Optional[RetryPolicy] = None,
+        backoff: Optional[BackoffPolicy] = None,
+        timeout: Optional[float | int | timedelta] = None,
+    ) -> TResult:
+        """Helper that simply awaits the provided action coroutine.
+
+        The retry, backoff, and timeout arguments are consumed by the workflow
+        compiler rather than the runtime execution path.
+        """
+
+        # Parameters are intentionally unused at runtime; the workflow compiler
+        # inspects the AST to record them.
+        del retry, backoff, timeout
+        return await awaitable
 
     @classmethod
     def short_name(cls) -> str:
@@ -68,6 +102,10 @@ class Workflow:
             proto_node.kwargs.update(node.kwargs)
             if node.guard:
                 proto_node.guard = node.guard
+            if node.timeout_seconds is not None:
+                proto_node.timeout_seconds = node.timeout_seconds
+            if node.max_retries is not None:
+                proto_node.max_retries = node.max_retries
             for edge in node.exception_edges:
                 proto_edge = proto_node.exception_edges.add()
                 proto_edge.source_node_id = edge.source_node_id
@@ -337,6 +375,12 @@ def workflow(cls: type[TWorkflow]) -> type[TWorkflow]:
         payload = cls._build_registration_payload()
         run_result = await bridge.run_instance(payload.SerializeToString())
         cls._workflow_version_id = run_result.workflow_version_id
+        if _skip_wait_for_instance():
+            logger.info(
+                "Skipping wait_for_instance for workflow %s due to CARABINER_SKIP_WAIT_FOR_INSTANCE",
+                cls.short_name(),
+            )
+            return None
         result_bytes = await bridge.wait_for_instance(
             instance_id=run_result.workflow_instance_id,
             poll_interval_secs=1.0,
@@ -360,3 +404,10 @@ def workflow(cls: type[TWorkflow]) -> type[TWorkflow]:
 
 def _running_under_pytest() -> bool:
     return bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
+def _skip_wait_for_instance() -> bool:
+    value = os.environ.get("CARABINER_SKIP_WAIT_FOR_INSTANCE")
+    if not value:
+        return False
+    return value.strip().lower() not in {"0", "false", "no"}
