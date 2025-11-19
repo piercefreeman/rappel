@@ -145,6 +145,9 @@ async fn dispatch_all_actions(
                 instance_id: action.instance_id,
                 sequence: action.action_seq,
                 dispatch,
+                timeout_seconds: action.timeout_seconds,
+                max_retries: action.max_retries,
+                attempt_number: action.attempt_number,
             };
             let worker = pool.next_worker();
             let metrics = worker.send_action(payload).await?;

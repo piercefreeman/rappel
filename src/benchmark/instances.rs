@@ -167,6 +167,9 @@ impl WorkflowBenchmarkHarness {
                         instance_id: action.instance_id,
                         sequence: action.action_seq,
                         dispatch,
+                        timeout_seconds: action.timeout_seconds,
+                        max_retries: action.max_retries,
+                        attempt_number: action.attempt_number,
                     };
                     let worker = self.workers.next_worker();
                     let span = tracing::debug_span!(

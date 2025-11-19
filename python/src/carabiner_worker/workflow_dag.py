@@ -22,6 +22,8 @@ class DagNode:
     produces: List[str] = field(default_factory=list)
     guard: Optional[str] = None
     exception_edges: List["ExceptionEdge"] = field(default_factory=list)
+    timeout_seconds: Optional[int] = None
+    max_retries: Optional[int] = None
 
 
 RETURN_VARIABLE = "__workflow_return"
@@ -38,6 +40,8 @@ class ActionDefinition:
     action_name: str
     module_name: Optional[str]
     signature: inspect.Signature
+    timeout_seconds: Optional[int] = None
+    max_retries: Optional[int] = None
 
 
 @dataclass
@@ -161,12 +165,16 @@ def _discover_action_names(module: Any) -> Dict[str, ActionDefinition]:
         attr = getattr(module, attr_name)
         action_name = getattr(attr, "__carabiner_action_name__", None)
         action_module = getattr(attr, "__carabiner_action_module__", None)
+        timeout_seconds = getattr(attr, "__carabiner_timeout_seconds__", None)
+        max_retries = getattr(attr, "__carabiner_max_retries__", None)
         if callable(attr) and action_name:
             signature = inspect.signature(attr)
             names[attr_name] = ActionDefinition(
                 action_name=action_name,
                 module_name=action_module or module.__name__,
                 signature=signature,
+                timeout_seconds=timeout_seconds,
+                max_retries=max_retries,
             )
     return names
 
@@ -827,6 +835,8 @@ class WorkflowDagBuilder(ast.NodeVisitor):
             depends_on=sorted(set(dependencies)),
             produces=[target] if target else [],
             guard=guard,
+            timeout_seconds=action_def.timeout_seconds if action_def else None,
+            max_retries=action_def.max_retries if action_def else None,
         )
 
     def _map_positional_args(

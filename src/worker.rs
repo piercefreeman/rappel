@@ -76,6 +76,9 @@ pub struct ActionDispatchPayload {
     pub instance_id: WorkflowInstanceId,
     pub sequence: i32,
     pub dispatch: proto::WorkflowNodeDispatch,
+    pub timeout_seconds: i32,
+    pub max_retries: i32,
+    pub attempt_number: i32,
 }
 
 pub struct PythonWorker {
@@ -207,6 +210,9 @@ impl PythonWorker {
             instance_id: dispatch.instance_id.to_string(),
             sequence: dispatch.sequence as u32,
             dispatch: Some(dispatch.dispatch.clone()),
+            timeout_seconds: Some(dispatch.timeout_seconds.max(0) as u32),
+            max_retries: Some(dispatch.max_retries.max(0) as u32),
+            attempt_number: Some(dispatch.attempt_number.max(0) as u32),
         };
 
         let envelope = proto::Envelope {

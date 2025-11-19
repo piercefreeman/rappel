@@ -68,6 +68,10 @@ class Workflow:
             proto_node.kwargs.update(node.kwargs)
             if node.guard:
                 proto_node.guard = node.guard
+            if node.timeout_seconds is not None:
+                proto_node.timeout_seconds = node.timeout_seconds
+            if node.max_retries is not None:
+                proto_node.max_retries = node.max_retries
             for edge in node.exception_edges:
                 proto_edge = proto_node.exception_edges.add()
                 proto_edge.source_node_id = edge.source_node_id

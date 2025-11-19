@@ -74,6 +74,7 @@ async def _handle_dispatch(
     dispatch.ParseFromString(envelope.payload)
     if dispatch.dispatch is None:
         raise RuntimeError("action dispatch missing workflow payload")
+    timeout_seconds = dispatch.timeout_seconds if dispatch.HasField("timeout_seconds") else 0
 
     worker_start = time.perf_counter_ns()
     success = True
@@ -82,8 +83,24 @@ async def _handle_dispatch(
         node = dispatch.dispatch.node
         if node is not None and node.action:
             action_name = node.action
-        result = await workflow_runtime.execute_node(dispatch.dispatch)
+        if timeout_seconds > 0:
+            result = await asyncio.wait_for(
+                workflow_runtime.execute_node(dispatch.dispatch), timeout=timeout_seconds
+            )
+        else:
+            result = await workflow_runtime.execute_node(dispatch.dispatch)
         response_payload = serialize_result_payload(result)
+    except asyncio.TimeoutError:
+        success = False
+        error = TimeoutError(f"action {action_name} timed out after {timeout_seconds} seconds")
+        response_payload = serialize_error_payload(action_name, error)
+        LOGGER.warning(
+            "Action %s timed out after %ss for action_id=%s sequence=%s",
+            action_name,
+            timeout_seconds,
+            dispatch.action_id,
+            dispatch.sequence,
+        )
     except Exception as exc:  # noqa: BLE001 - propagate structured errors
         success = False
         response_payload = serialize_error_payload(action_name, exc)
