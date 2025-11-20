@@ -81,6 +81,7 @@ message WorkflowRegistration {
   string workflow_name = 1;
   WorkflowDagDefinition dag = 2;
   string dag_hash = 3;
+  WorkflowArguments initial_context = 4;
 }
 
 message WorkflowNodeContext {
@@ -123,7 +124,7 @@ message PrimitiveWorkflowArgument {
 message BaseModelWorkflowArgument {
   string module = 1;
   string name = 2;
-  google.protobuf.Struct data = 3;
+  WorkflowDictArgument data = 3;
 }
 
 message WorkflowErrorValue {

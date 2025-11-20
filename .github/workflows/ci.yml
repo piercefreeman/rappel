@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
   pull_request:
 
 jobs:
@@ -13,7 +14,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v1
+        uses: astral-sh/setup-uv@v7
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -29,7 +30,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v1
+        uses: astral-sh/setup-uv@v7
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -97,7 +98,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v1
+        uses: astral-sh/setup-uv@v7
 
       - name: Install protoc & clients
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler postgresql-client
@@ -118,3 +119,123 @@ jobs:
         env:
           DATABASE_URL: postgresql://mountaineer:mountaineer@localhost:5432/mountaineer_daemons
         run: cargo test workflow_executes_complex_flow -- --nocapture
+
+  example-app-tests:
+    runs-on: ubuntu-latest
+    needs: [python-tests, rust-tests]
+    timeout-minutes: 20
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(toJson(github.event.pull_request.labels), 'full-build'))
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test example_app
+        working-directory: example_app
+        run: make docker-test
+
+  build-wheel:
+    runs-on: ${{ matrix.os }}
+    needs: [python-tests, rust-tests]
+    timeout-minutes: 20
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(toJson(github.event.pull_request.labels), 'full-build'))
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: choco install protoc --version=25.1 -y
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Update project version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: uv run scripts/update_version.py ${{ github.ref_name }}
+
+      - name: Build wheel artifact
+        run: uv run scripts/build_wheel.py --out-dir target/wheels
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rappel-wheel-${{ runner.os }}
+          path: target/wheels/*.whl
+
+  package-release:
+    runs-on: ubuntu-latest
+    needs: build-wheel
+    timeout-minutes: 20
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(toJson(github.event.pull_request.labels), 'full-build'))
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Download Linux wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: rappel-wheel-Linux
+          path: artifacts/linux
+
+      - name: Download macOS wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: rappel-wheel-macOS
+          path: artifacts/macos
+
+      - name: Download Windows wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: rappel-wheel-Windows
+          path: artifacts/windows
+
+      - name: Assemble wheels
+        run: |
+          uv run scripts/assemble_wheels.py \
+            --output target/release-wheels \
+            linux=artifacts/linux \
+            macos=artifacts/macos \
+            windows=artifacts/windows
+
+      - name: Upload consolidated wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: rappel-wheels
+          path: target/release-wheels
+
+      - name: Publish Linux wheel to PyPI
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: target/release-wheels/linux
+
+      - name: Publish macOS wheel to PyPI
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: target/release-wheels/macos
+
+      - name: Publish Windows wheel to PyPI
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: target/release-wheels/windows

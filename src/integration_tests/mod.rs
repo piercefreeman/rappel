@@ -17,7 +17,6 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use once_cell::sync::Lazy;
 use prost::Message;
-use prost_types::{Value as ProstValue, value::Kind as ProstValueKind};
 use reqwest::Client;
 use tokio::{sync::Mutex, task::JoinHandle, time::sleep};
 mod common;
@@ -124,17 +123,11 @@ async fn cleanup_database(db: &Database) -> Result<()> {
 }
 
 async fn purge_empty_input_instances(db: &Database) -> Result<()> {
-    sqlx::query(
-        r#"
-        DELETE FROM daemon_action_ledger
-        WHERE instance_id IN (
-            SELECT id FROM workflow_instances WHERE input_payload IS NULL
-        )
-        "#,
-    )
-    .execute(db.pool())
-    .await?;
-    sqlx::query("DELETE FROM workflow_instances WHERE input_payload IS NULL")
+    // In integration tests, just clear all instances and actions to start fresh
+    sqlx::query("DELETE FROM daemon_action_ledger")
+        .execute(db.pool())
+        .await?;
+    sqlx::query("DELETE FROM workflow_instances")
         .execute(db.pool())
         .await?;
     Ok(())
@@ -146,7 +139,9 @@ async fn dispatch_all_actions(
     target_actions: usize,
 ) -> Result<Vec<RoundTripMetrics>> {
     let mut completed = Vec::new();
-    while completed.len() < target_actions {
+    let mut max_iterations = target_actions * 10; // Safety limit to prevent infinite loops
+    while completed.len() < target_actions && max_iterations > 0 {
+        max_iterations -= 1;
         let actions = database.dispatch_actions(16).await?;
         if actions.is_empty() {
             sleep(Duration::from_millis(50)).await;
@@ -235,12 +230,22 @@ fn decode_argument_value(value: &proto::WorkflowArgumentValue) -> Result<Option<
     match value.kind.as_ref() {
         Some(Kind::Primitive(primitive)) => Ok(primitive_value_to_string(primitive)),
         Some(Kind::Basemodel(model)) => {
-            if let Some(struct_data) = model.data.as_ref()
-                && let Some(variables) = struct_data.fields.get("variables")
-                && let Some(ProstValueKind::StructValue(struct_value)) = variables.kind.as_ref()
-            {
-                for entry in struct_value.fields.values() {
-                    if let Some(result) = extract_string_from_prost(entry) {
+            if let Some(dict_data) = model.data.as_ref() {
+                // Look for "variables" key in the dict
+                if let Some(variables_entry) =
+                    dict_data.entries.iter().find(|e| e.key == "variables")
+                    && let Some(variables_value) = &variables_entry.value
+                {
+                    // Recursively decode the variables value
+                    if let Some(result) = decode_argument_value(variables_value)? {
+                        return Ok(Some(result));
+                    }
+                }
+                // Also check other entries
+                for entry in &dict_data.entries {
+                    if let Some(entry_value) = &entry.value
+                        && let Some(result) = decode_argument_value(entry_value)?
+                    {
                         return Ok(Some(result));
                     }
                 }
@@ -290,31 +295,6 @@ fn primitive_value_to_string(value: &proto::PrimitiveWorkflowArgument) -> Option
         Kind::IntValue(number) => Some(number.to_string()),
         Kind::BoolValue(flag) => Some(flag.to_string()),
         Kind::NullValue(_) => None,
-    }
-}
-
-fn extract_string_from_prost(value: &ProstValue) -> Option<String> {
-    match value.kind.as_ref()? {
-        ProstValueKind::StringValue(text) => Some(text.clone()),
-        ProstValueKind::NumberValue(number) => Some(number.to_string()),
-        ProstValueKind::BoolValue(flag) => Some(flag.to_string()),
-        ProstValueKind::StructValue(struct_value) => {
-            for entry in struct_value.fields.values() {
-                if let Some(result) = extract_string_from_prost(entry) {
-                    return Some(result);
-                }
-            }
-            None
-        }
-        ProstValueKind::ListValue(list_value) => {
-            for entry in &list_value.values {
-                if let Some(result) = extract_string_from_prost(entry) {
-                    return Some(result);
-                }
-            }
-            None
-        }
-        _ => None,
     }
 }
 
@@ -486,7 +466,7 @@ async fn workflow_executes_complex_flow() -> Result<()> {
             .await?;
     let stored_payload = stored_result.context("missing workflow result payload")?;
     let stored_message = parse_result(&stored_payload)?.context("expected primitive result")?;
-    assert_eq!(stored_message, "big:3.0,7.0");
+    assert_eq!(stored_message, "big:3,7");
 
     server.shutdown().await;
     Ok(())

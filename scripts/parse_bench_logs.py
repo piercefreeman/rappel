@@ -2,7 +2,7 @@
 # /// script
 # dependencies = ["click>=8", "rich>=13"]
 # ///
-from __future__ import annotations
+
 
 import re
 from dataclasses import dataclass

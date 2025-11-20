@@ -1,11 +1,11 @@
-from __future__ import annotations
-
 import asyncio
 import os
 import shlex
 import subprocess
+import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Lock, RLock
 from typing import AsyncIterator, Optional
 from urllib.parse import urlparse
@@ -15,8 +15,10 @@ from grpc import aio  # type: ignore[attr-defined]
 
 from proto import messages_pb2 as pb2
 from proto import messages_pb2_grpc as pb2_grpc
+from rappel.logger import configure as configure_logger
 
 DEFAULT_HOST = "127.0.0.1"
+LOGGER = configure_logger("rappel.bridge")
 
 _PORT_LOCK = RLock()
 _CACHED_PORT: Optional[int] = None
@@ -36,8 +38,10 @@ class RunInstanceResult:
 def _boot_command() -> list[str]:
     override = os.environ.get("CARABINER_BOOT_COMMAND")
     if override:
+        LOGGER.debug("Using CARABINER_BOOT_COMMAND=%s", override)
         return shlex.split(override)
     binary = os.environ.get("CARABINER_BOOT_BINARY", "boot-rappel-singleton")
+    LOGGER.debug("Using CARABINER_BOOT_BINARY=%s", binary)
     return [binary]
 
 
@@ -65,20 +69,41 @@ def _env_port_override() -> Optional[int]:
 
 def _boot_singleton_blocking() -> int:
     command = _boot_command()
-    try:
-        result = subprocess.run(
-            command,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as exc:  # pragma: no cover
-        raise RuntimeError("unable to boot rappel server") from exc
-    output = result.stdout.strip()
-    try:
-        return int(output)
-    except ValueError as exc:  # pragma: no cover
-        raise RuntimeError(f"boot command returned invalid port: {output}") from exc
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt") as f:
+        output_file = Path(f.name)
+
+        command.extend(["--output-file", str(output_file)])
+        LOGGER.info("Booting rappel singleton via: %s", " ".join(command))
+
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                timeout=10,
+            )
+        except subprocess.TimeoutExpired as exc:  # pragma: no cover
+            LOGGER.error("boot command timed out after %s seconds", exc.timeout)
+            raise RuntimeError("unable to boot rappel server") from exc
+        except subprocess.CalledProcessError as exc:  # pragma: no cover
+            LOGGER.error("boot command failed: %s", exc)
+            raise RuntimeError("unable to boot rappel server") from exc
+        except OSError as exc:  # pragma: no cover
+            LOGGER.error("unable to spawn boot command: %s", exc)
+            raise RuntimeError("unable to boot rappel server") from exc
+
+        try:
+            # We use a file as a message passer because passing a PIPE to the singleton launcher
+            # will block our code indefinitely
+            # The singleton launches the webserver subprocess to inherit the stdin/stdout that the
+            # singleton launcher receives; which means that in the case of a PIPE it would pass that
+            # pipe to the subprocess and therefore never correctly close the file descriptor and signal
+            # exit process status to Python.
+            port_str = output_file.read_text().strip()
+            port = int(port_str)
+            LOGGER.info("boot command reported singleton port %s", port)
+            return port
+        except (ValueError, FileNotFoundError) as exc:  # pragma: no cover
+            raise RuntimeError(f"unable to read port from output file: {exc}") from exc
 
 
 def _resolve_port() -> int:
@@ -108,7 +133,9 @@ async def _ensure_port_async() -> int:
         if cached is not None:
             return cached
         loop = asyncio.get_running_loop()
+        LOGGER.info("No cached singleton found, booting new instance")
         port = await loop.run_in_executor(None, _boot_singleton_blocking)
+        LOGGER.info("Singleton ready on port %s", port)
         return _remember_port(port)
 
 

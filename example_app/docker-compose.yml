@@ -1,0 +1,50 @@
+version: "3.9"
+
+x-app-build: &app-build
+  context: ..
+  dockerfile: example_app/Dockerfile
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: rappel_example
+      POSTGRES_USER: rappel
+      POSTGRES_PASSWORD: rappel
+    ports:
+      - "5435:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rappel"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  daemons:
+    build: *app-build
+    image: rappel-example-app
+    command: ["start-workers"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://rappel:rappel@postgres:5432/rappel_example
+      CARABINER_USER_MODULE: example_app.workflows
+      CARABINER_WORKER_COUNT: 2
+      RAPPEL_LOG_LEVEL: debug
+
+  webapp:
+    build: *app-build
+    image: rappel-example-app
+    depends_on:
+      daemons:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://rappel:rappel@postgres:5432/rappel_example
+      RAPPEL_LOG_LEVEL: debug
+    ports:
+      - "8000:8000"
+
+volumes:
+  postgres-data: {}

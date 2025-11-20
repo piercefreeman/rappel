@@ -10,10 +10,6 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose};
 use prost::Message;
-use prost_types::{
-    ListValue as ProstListValue, Struct as ProstStruct, Value as ProstValue,
-    value::Kind as ProstValueKind,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Map as JsonMap, Value as JsonValue};
 use tera::{Context as TeraContext, Tera};
@@ -675,7 +671,7 @@ fn workflow_argument_value_to_json(value: &proto::WorkflowArgumentValue) -> Json
             let data = model
                 .data
                 .as_ref()
-                .map(struct_to_json)
+                .map(dict_to_json)
                 .unwrap_or(JsonValue::Null);
             map.insert("data".to_string(), data);
             JsonValue::Object(map)
@@ -732,30 +728,14 @@ fn primitive_argument_to_json(value: &proto::PrimitiveWorkflowArgument) -> JsonV
     }
 }
 
-fn struct_to_json(data: &ProstStruct) -> JsonValue {
+fn dict_to_json(data: &proto::WorkflowDictArgument) -> JsonValue {
     let mut map = JsonMap::new();
-    for (key, value) in &data.fields {
-        map.insert(key.clone(), prost_value_to_json(value));
+    for entry in &data.entries {
+        if let Some(value) = &entry.value {
+            map.insert(entry.key.clone(), workflow_argument_value_to_json(value));
+        }
     }
     JsonValue::Object(map)
-}
-
-fn list_to_json(list: &ProstListValue) -> JsonValue {
-    JsonValue::Array(list.values.iter().map(prost_value_to_json).collect())
-}
-
-fn prost_value_to_json(value: &ProstValue) -> JsonValue {
-    match value.kind.as_ref() {
-        Some(ProstValueKind::NullValue(_)) => JsonValue::Null,
-        Some(ProstValueKind::NumberValue(number)) => {
-            serde_json::Number::from_f64(*number).map_or(JsonValue::Null, JsonValue::Number)
-        }
-        Some(ProstValueKind::StringValue(text)) => JsonValue::String(text.clone()),
-        Some(ProstValueKind::BoolValue(flag)) => JsonValue::Bool(*flag),
-        Some(ProstValueKind::StructValue(struct_value)) => struct_to_json(struct_value),
-        Some(ProstValueKind::ListValue(list_value)) => list_to_json(list_value),
-        None => JsonValue::Null,
-    }
 }
 
 fn build_workflow_metadata(workflow: &WorkflowVersionDetail) -> WorkflowDetailMetadata {

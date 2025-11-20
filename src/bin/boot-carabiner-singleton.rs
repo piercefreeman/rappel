@@ -1,5 +1,6 @@
 use std::{
-    io,
+    fs, io,
+    path::PathBuf,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -33,6 +34,9 @@ struct Args {
     /// Seconds to wait for a spawned server to report healthy.
     #[arg(long, default_value_t = 10)]
     health_timeout_secs: u64,
+    /// Optional file path to write the port number to.
+    #[arg(long)]
+    output_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +62,7 @@ async fn main() -> Result<()> {
         host,
         server_bin,
         health_timeout_secs,
+        output_file,
     } = Args::parse();
     let client = Client::builder().build()?;
 
@@ -65,7 +70,7 @@ async fn main() -> Result<()> {
     for _ in 0..max_ports {
         match probe_health(&client, &host, port).await? {
             HealthStatus::Matching => {
-                println!("{port}");
+                write_port(port, &output_file)?;
                 return Ok(());
             }
             HealthStatus::Different => {
@@ -87,7 +92,7 @@ async fn main() -> Result<()> {
                         )
                         .await?;
                         if healthy {
-                            println!("{port}");
+                            write_port(port, &output_file)?;
                             return Ok(());
                         } else {
                             let _ = child.kill();
@@ -170,4 +175,14 @@ fn spawn_server(bin: &str, host: &str, http_port: u16) -> Result<Child> {
         io::ErrorKind::NotFound => anyhow!("{bin} not found in PATH"),
         _ => anyhow!(err),
     })
+}
+
+fn write_port(port: u16, output_file: &Option<PathBuf>) -> Result<()> {
+    if let Some(path) = output_file {
+        fs::write(path, port.to_string()).context("failed to write port to output file")?;
+        debug!(?path, port, "wrote port to output file");
+    } else {
+        println!("{port}");
+    }
+    Ok(())
 }

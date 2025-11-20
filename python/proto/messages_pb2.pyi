@@ -499,22 +499,35 @@ class WorkflowRegistration(google.protobuf.message.Message):
     WORKFLOW_NAME_FIELD_NUMBER: builtins.int
     DAG_FIELD_NUMBER: builtins.int
     DAG_HASH_FIELD_NUMBER: builtins.int
+    INITIAL_CONTEXT_FIELD_NUMBER: builtins.int
     workflow_name: builtins.str
     dag_hash: builtins.str
     @property
     def dag(self) -> Global___WorkflowDagDefinition: ...
+    @property
+    def initial_context(self) -> Global___WorkflowArguments: ...
     def __init__(
         self,
         *,
         workflow_name: builtins.str = ...,
         dag: Global___WorkflowDagDefinition | None = ...,
         dag_hash: builtins.str = ...,
+        initial_context: Global___WorkflowArguments | None = ...,
     ) -> None: ...
-    def HasField(self, field_name: typing.Literal["dag", b"dag"]) -> builtins.bool: ...
+    def HasField(
+        self, field_name: typing.Literal["dag", b"dag", "initial_context", b"initial_context"]
+    ) -> builtins.bool: ...
     def ClearField(
         self,
         field_name: typing.Literal[
-            "dag", b"dag", "dag_hash", b"dag_hash", "workflow_name", b"workflow_name"
+            "dag",
+            b"dag",
+            "dag_hash",
+            b"dag_hash",
+            "initial_context",
+            b"initial_context",
+            "workflow_name",
+            b"workflow_name",
         ],
     ) -> None: ...
 
@@ -747,13 +760,13 @@ class BaseModelWorkflowArgument(google.protobuf.message.Message):
     module: builtins.str
     name: builtins.str
     @property
-    def data(self) -> google.protobuf.struct_pb2.Struct: ...
+    def data(self) -> Global___WorkflowDictArgument: ...
     def __init__(
         self,
         *,
         module: builtins.str = ...,
         name: builtins.str = ...,
-        data: google.protobuf.struct_pb2.Struct | None = ...,
+        data: Global___WorkflowDictArgument | None = ...,
     ) -> None: ...
     def HasField(self, field_name: typing.Literal["data", b"data"]) -> builtins.bool: ...
     def ClearField(
