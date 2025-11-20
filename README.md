@@ -57,6 +57,7 @@ Workflows can get much more complex than the example above:
     async def run(self):
       await self.run_action(
         inconsistent_action(0.5),
+        # control handling of failures
         retry=RetryPolicy(attempts=50),
         backoff=BackoffPolicy(base_delay=5),
         timeout=timedelta(minutes=10)

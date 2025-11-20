@@ -124,7 +124,7 @@ message PrimitiveWorkflowArgument {
 message BaseModelWorkflowArgument {
   string module = 1;
   string name = 2;
-  google.protobuf.Struct data = 3;
+  WorkflowDictArgument data = 3;
 }
 
 message WorkflowErrorValue {

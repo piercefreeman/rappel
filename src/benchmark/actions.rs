@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -7,7 +7,6 @@ use std::{
 use anyhow::{Result, anyhow};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use prost::Message;
-use prost_types::{Struct as ProstStruct, Value as ProstValue, value::Kind as ProstValueKind};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{Instrument, info, warn};
 
@@ -202,18 +201,29 @@ impl BenchmarkHarness {
 
 fn build_benchmark_dispatch(payload_size: usize) -> Result<Vec<u8>> {
     let payload_data = "x".repeat(payload_size);
-    let mut struct_fields = BTreeMap::new();
-    struct_fields.insert(
-        "payload".to_string(),
-        ProstValue {
-            kind: Some(ProstValueKind::StringValue(payload_data)),
-        },
-    );
+
+    // Build string primitive for payload value
+    let payload_primitive = proto::PrimitiveWorkflowArgument {
+        kind: Some(proto::primitive_workflow_argument::Kind::StringValue(
+            payload_data,
+        )),
+    };
+    let payload_value = proto::WorkflowArgumentValue {
+        kind: Some(proto::workflow_argument_value::Kind::Primitive(
+            payload_primitive,
+        )),
+    };
+
+    // Build dict for BaseModel data
+    let dict_entries = vec![proto::WorkflowArgument {
+        key: "payload".to_string(),
+        value: Some(payload_value),
+    }];
     let basemodel = proto::BaseModelWorkflowArgument {
         module: BENCHMARK_USER_MODULE.to_string(),
         name: BENCHMARK_REQUEST_MODEL.to_string(),
-        data: Some(ProstStruct {
-            fields: struct_fields,
+        data: Some(proto::WorkflowDictArgument {
+            entries: dict_entries,
         }),
     };
     let argument_value = proto::WorkflowArgumentValue {

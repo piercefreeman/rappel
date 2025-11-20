@@ -760,13 +760,13 @@ class BaseModelWorkflowArgument(google.protobuf.message.Message):
     module: builtins.str
     name: builtins.str
     @property
-    def data(self) -> google.protobuf.struct_pb2.Struct: ...
+    def data(self) -> Global___WorkflowDictArgument: ...
     def __init__(
         self,
         *,
         module: builtins.str = ...,
         name: builtins.str = ...,
-        data: google.protobuf.struct_pb2.Struct | None = ...,
+        data: Global___WorkflowDictArgument | None = ...,
     ) -> None: ...
     def HasField(self, field_name: typing.Literal["data", b"data"]) -> builtins.bool: ...
     def ClearField(

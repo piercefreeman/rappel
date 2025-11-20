@@ -17,7 +17,6 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use once_cell::sync::Lazy;
 use prost::Message;
-use prost_types::{Value as ProstValue, value::Kind as ProstValueKind};
 use reqwest::Client;
 use tokio::{sync::Mutex, task::JoinHandle, time::sleep};
 mod common;
@@ -239,12 +238,22 @@ fn decode_argument_value(value: &proto::WorkflowArgumentValue) -> Result<Option<
     match value.kind.as_ref() {
         Some(Kind::Primitive(primitive)) => Ok(primitive_value_to_string(primitive)),
         Some(Kind::Basemodel(model)) => {
-            if let Some(struct_data) = model.data.as_ref()
-                && let Some(variables) = struct_data.fields.get("variables")
-                && let Some(ProstValueKind::StructValue(struct_value)) = variables.kind.as_ref()
-            {
-                for entry in struct_value.fields.values() {
-                    if let Some(result) = extract_string_from_prost(entry) {
+            if let Some(dict_data) = model.data.as_ref() {
+                // Look for "variables" key in the dict
+                if let Some(variables_entry) =
+                    dict_data.entries.iter().find(|e| e.key == "variables")
+                    && let Some(variables_value) = &variables_entry.value
+                {
+                    // Recursively decode the variables value
+                    if let Some(result) = decode_argument_value(variables_value)? {
+                        return Ok(Some(result));
+                    }
+                }
+                // Also check other entries
+                for entry in &dict_data.entries {
+                    if let Some(entry_value) = &entry.value
+                        && let Some(result) = decode_argument_value(entry_value)?
+                    {
                         return Ok(Some(result));
                     }
                 }
@@ -294,31 +303,6 @@ fn primitive_value_to_string(value: &proto::PrimitiveWorkflowArgument) -> Option
         Kind::IntValue(number) => Some(number.to_string()),
         Kind::BoolValue(flag) => Some(flag.to_string()),
         Kind::NullValue(_) => None,
-    }
-}
-
-fn extract_string_from_prost(value: &ProstValue) -> Option<String> {
-    match value.kind.as_ref()? {
-        ProstValueKind::StringValue(text) => Some(text.clone()),
-        ProstValueKind::NumberValue(number) => Some(number.to_string()),
-        ProstValueKind::BoolValue(flag) => Some(flag.to_string()),
-        ProstValueKind::StructValue(struct_value) => {
-            for entry in struct_value.fields.values() {
-                if let Some(result) = extract_string_from_prost(entry) {
-                    return Some(result);
-                }
-            }
-            None
-        }
-        ProstValueKind::ListValue(list_value) => {
-            for entry in &list_value.values {
-                if let Some(result) = extract_string_from_prost(entry) {
-                    return Some(result);
-                }
-            }
-            None
-        }
-        _ => None,
     }
 }
 

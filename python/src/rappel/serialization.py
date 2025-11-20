@@ -7,7 +7,6 @@ from pydantic import BaseModel
 
 from proto import messages_pb2 as pb2
 
-Struct = struct_pb2.Struct  # type: ignore[attr-defined]
 NULL_VALUE = struct_pb2.NULL_VALUE  # type: ignore[attr-defined]
 
 PRIMITIVE_TYPES = (str, int, float, bool, type(None))
@@ -67,9 +66,11 @@ def _to_argument_value(value: Any) -> pb2.WorkflowArgumentValue:
         model_data = _serialize_model_data(value)
         argument.basemodel.module = model_class.__module__
         argument.basemodel.name = model_class.__qualname__
-        struct = Struct()
-        struct.update(model_data)
-        argument.basemodel.data.CopyFrom(struct)
+        # Serialize as dict to preserve types (Struct converts all numbers to float)
+        for key, item in model_data.items():
+            entry = argument.basemodel.data.entries.add()
+            entry.key = key
+            entry.value.CopyFrom(_to_argument_value(item))
         return argument
     if isinstance(value, dict):
         for key, item in value.items():
@@ -99,7 +100,10 @@ def _from_argument_value(argument: pb2.WorkflowArgumentValue) -> Any:
     if kind == "basemodel":
         module = argument.basemodel.module
         name = argument.basemodel.name
-        data = json_format.MessageToDict(argument.basemodel.data, preserving_proto_field_name=True)
+        # Deserialize dict entries to preserve types
+        data: dict[str, Any] = {}
+        for entry in argument.basemodel.data.entries:
+            data[entry.key] = _from_argument_value(entry.value)
         return _instantiate_serialized_model(module, name, data)
     if kind == "exception":
         return {
