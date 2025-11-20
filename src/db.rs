@@ -1343,6 +1343,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn explicit_failure_does_not_retry_by_default() -> Result<()> {
         let Some(pool) = setup_test_pool().await? else {
             return Ok(());
@@ -1377,6 +1378,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn timeout_retries_are_unbounded_by_default() -> Result<()> {
         let Some(pool) = setup_test_pool().await? else {
             return Ok(());

@@ -15,10 +15,10 @@ use crate::{
     worker::{ActionDispatchPayload, RoundTripMetrics},
 };
 use anyhow::{Context, Result, anyhow};
-use once_cell::sync::Lazy;
 use prost::Message;
 use reqwest::Client;
-use tokio::{sync::Mutex, task::JoinHandle, time::sleep};
+use serial_test::serial;
+use tokio::{task::JoinHandle, time::sleep};
 mod common;
 use self::common::run_in_env;
 const INTEGRATION_MODULE: &str = "integration_module";
@@ -312,12 +312,10 @@ fn primitive_value_to_string(value: &proto::PrimitiveWorkflowArgument) -> Option
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn workflow_executes_end_to_end() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let _ = dotenvy::dotenv();
-    // Run these integration tests serially so the shared temp python envs don't race
-    // and unload worker modules mid-run. Once workers isolate their PYTHONPATH we can drop this lock.
-    let _test_lock = TEST_SERIAL_GUARD.lock().await;
     let database_url = match env::var("DATABASE_URL") {
         Ok(url) => url,
         Err(_) => {
@@ -400,10 +398,10 @@ async fn workflow_executes_end_to_end() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn workflow_executes_complex_flow() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let _ = dotenvy::dotenv();
-    let _test_lock = TEST_SERIAL_GUARD.lock().await;
     let database_url = match env::var("DATABASE_URL") {
         Ok(url) => url,
         Err(_) => {
@@ -486,10 +484,10 @@ async fn workflow_executes_complex_flow() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn workflow_executes_looped_actions() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let _ = dotenvy::dotenv();
-    let _test_lock = TEST_SERIAL_GUARD.lock().await;
     let database_url = match env::var("DATABASE_URL") {
         Ok(url) => url,
         Err(_) => {
@@ -573,10 +571,10 @@ async fn workflow_executes_looped_actions() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn workflow_handles_exception_flow() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let _ = dotenvy::dotenv();
-    let _test_lock = TEST_SERIAL_GUARD.lock().await;
     let database_url = match env::var("DATABASE_URL") {
         Ok(url) => url,
         Err(_) => {
@@ -683,6 +681,7 @@ async fn workflow_handles_exception_flow() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn stale_worker_completion_is_ignored() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let _ = dotenvy::dotenv();
@@ -760,5 +759,3 @@ async fn stale_worker_completion_is_ignored() -> Result<()> {
     assert!(payload.is_some());
     Ok(())
 }
-
-static TEST_SERIAL_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));

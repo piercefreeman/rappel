@@ -28,4 +28,5 @@ class LoopWorkflow(Workflow):
             local_value = f"{seed}-local"
             finalized = await decorate_item(item=local_value)
             outputs.append(finalized)
-        return await finalize_payload(items=outputs)
+        result = await finalize_payload(items=outputs)
+        return result

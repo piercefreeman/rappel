@@ -73,6 +73,7 @@ def _to_argument_value(value: Any) -> pb2.WorkflowArgumentValue:
             entry.value.CopyFrom(_to_argument_value(item))
         return argument
     if isinstance(value, dict):
+        argument.dict_value.SetInParent()
         for key, item in value.items():
             if not isinstance(key, str):
                 raise TypeError("workflow dict keys must be strings")
@@ -81,11 +82,13 @@ def _to_argument_value(value: Any) -> pb2.WorkflowArgumentValue:
             entry.value.CopyFrom(_to_argument_value(item))
         return argument
     if isinstance(value, list):
+        argument.list_value.SetInParent()
         for item in value:
             item_value = argument.list_value.items.add()
             item_value.CopyFrom(_to_argument_value(item))
         return argument
     if isinstance(value, tuple):
+        argument.tuple_value.SetInParent()
         for item in value:
             item_value = argument.tuple_value.items.add()
             item_value.CopyFrom(_to_argument_value(item))
