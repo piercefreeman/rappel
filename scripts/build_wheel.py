@@ -10,16 +10,26 @@ import os
 import shutil
 import subprocess
 import sys
+import zipfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import click
 from rich.console import Console
 
-BIN_TARGETS = [
-    "rappel-server",
-    "boot-rappel-singleton",
-]
+
+@dataclass(frozen=True)
+class EntryPoint:
+    built_name: str
+    packaged_name: str
+
+
+ENTRYPOINTS: Sequence[EntryPoint] = (
+    EntryPoint("carabiner-server", "rappel-server"),
+    EntryPoint("boot-carabiner-singleton", "boot-rappel-singleton"),
+    EntryPoint("start_workers", "start_workers"),
+)
 
 console = Console()
 
@@ -34,11 +44,11 @@ def copy_binaries(repo_root: Path, stage_dir: Path) -> list[Path]:
     stage_dir.mkdir(parents=True, exist_ok=True)
     copied: list[Path] = []
     suffix = ".exe" if sys.platform == "win32" else ""
-    for name in BIN_TARGETS:
-        src = target_dir / f"{name}{suffix}"
+    for entry in ENTRYPOINTS:
+        src = target_dir / f"{entry.built_name}{suffix}"
         if not src.exists():
             raise FileNotFoundError(f"Missing compiled binary: {src}")
-        dest = stage_dir / f"{name}{suffix}"
+        dest = stage_dir / f"{entry.packaged_name}{suffix}"
         shutil.copy2(src, dest)
         os.chmod(dest, 0o755)
         copied.append(dest)
@@ -51,6 +61,24 @@ def cleanup_paths(paths: Iterable[Path], stage_dir: Path) -> None:
             path.unlink()
     if stage_dir.exists() and not any(stage_dir.iterdir()):
         stage_dir.rmdir()
+
+
+def assert_entrypoints_in_wheel(out_dir: Path) -> None:
+    wheels = sorted(out_dir.glob("*.whl"))
+    if not wheels:
+        raise FileNotFoundError(f"No wheels found in {out_dir}")
+    suffix = ".exe" if sys.platform == "win32" else ""
+    expected = {
+        f"rappel/bin/{entry.packaged_name}{suffix}" for entry in ENTRYPOINTS
+    }
+    for wheel in wheels:
+        with zipfile.ZipFile(wheel) as archive:
+            contents = set(archive.namelist())
+        missing = sorted(expected - contents)
+        if missing:
+            raise RuntimeError(
+                f"{wheel.name} is missing required entrypoints: {', '.join(missing)}"
+            )
 
 
 @click.command()
@@ -87,6 +115,7 @@ def main(out_dir: str) -> None:
             ],
             cwd=repo_root,
         )
+        assert_entrypoints_in_wheel(out_path)
         console.log(f"[bold green]Wheel written to {out_path}")
     finally:
         console.log("[green]Cleaning staged binaries ...")

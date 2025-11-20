@@ -128,6 +128,10 @@ To build truly robust background tasks, you need to consider how things can go w
 
 By default we will only try explicit actions one time if there is an explicit exception raised. We will try them infinite times in the case of a timeout since this is usually caused by cross device coordination issues.
 
+## Project Status
+
+Rappel is in an early alpha.
+
 ## Configuration
 
 The main rappel configuration is done through env vars, which is what you'll typically use in production when using a docker deployment pipeline. If we can't find an environment parameter we will fallback to looking for an .env that specifies it within your local filesystem.
@@ -184,7 +188,31 @@ Almost all of these require a dedicated task broker that you host alongside your
 
 Open source solutions like RabbitMQ have been battle tested over decades & large companies like Temporal are able to throw a lot of resources towards optimization. Both of these solutions are great choices - just intended to solve for different scopes. Expect an associated higher amount of setup and management complexity.
 
-## Local Server Runtime
+## Worker Pool
+
+`start_workers` is the main invocation point to boot your worker cluster on a new node. It launches the gRPC bridge plus a polling dispatcher that streams
+queued actions from Postgres into the Python workers. You should use this as your docker entrypoint:
+
+```bash
+$ cargo run --bin start_workers
+```
+
+## Development
+
+### Packaging
+
+Use the helper script to produce distributable wheels that bundle the Rust executables with the
+Python package:
+
+```bash
+$ uv run scripts/build_wheel.py --out-dir target/wheels
+```
+
+The script compiles every Rust binary (release profile), stages the required entrypoints
+(`rappel-server`, `boot-rappel-singleton`) inside the Python package, and invokes
+`uv build --wheel` to produce an artifact suitable for publishing to PyPI.
+
+### Local Server Runtime
 
 The Rust runtime exposes both HTTP and gRPC APIs via the `rappel-server` binary:
 
@@ -205,20 +233,7 @@ The Python bridge automatically shells out to the helper unless you provide `CAR
 (`CARABINER_GRPC_ADDR` for direct sockets) overrides. Once the ports are known it opens a gRPC channel to the
 `WorkflowService`.
 
-## Packaging
-
-Use the helper script to produce distributable wheels that bundle the Rust executables with the
-Python package:
-
-```bash
-$ uv run scripts/build_wheel.py --out-dir target/wheels
-```
-
-The script compiles every Rust binary (release profile), stages the required entrypoints
-(`rappel-server`, `boot-rappel-singleton`) inside the Python package, and invokes
-`uv build --wheel` to produce an artifact suitable for publishing to PyPI.
-
-## Benchmarking
+### Benchmarking
 
 Stream benchmark output directly into our parser to summarize throughput and latency samples:
 
@@ -233,12 +248,3 @@ $ cargo run --bin bench -- \
 ```
 
 Add `--json` to the parser if you prefer JSON output.
-
-## Worker Pool Runtime
-
-`start_workers` launches the gRPC bridge plus a polling dispatcher that streams
-queued actions from Postgres into the Python workers:
-
-```bash
-$ cargo run --bin start_workers
-```

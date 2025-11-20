@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Rappel Workflow Demo</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        max-width: 720px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+      }
+      form {
+        display: flex;
+        gap: 0.75rem;
+        align-items: center;
+        margin-bottom: 1.5rem;
+      }
+      input {
+        width: 5rem;
+        padding: 0.4rem;
+      }
+      button {
+        padding: 0.5rem 1rem;
+        border-radius: 0.4rem;
+        border: none;
+        background: #0f172a;
+        color: white;
+        cursor: pointer;
+      }
+      #result {
+        border: 1px solid #cbd5f5;
+        border-radius: 0.75rem;
+        padding: 1rem;
+        background: #f8fafc;
+      }
+      .error {
+        color: #b91c1c;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Workflow Playground</h1>
+    <p>
+      Submit a number between 1 and 10. The request blocks until the rappel
+      workflow finishes on the daemon container.
+    </p>
+    <form id="task-form">
+      <label for="number">Number:</label>
+      <input type="number" id="number" name="number" min="1" max="10" value="{{ default_number }}" />
+      <button type="submit">Run Workflow</button>
+    </form>
+    <p id="status"></p>
+    <section id="result" hidden>
+      <h2>Results</h2>
+      <p><strong>Factorial</strong>: <span id="factorial"></span></p>
+      <p><strong>Fibonacci</strong>: <span id="fibonacci"></span></p>
+      <p><strong>Summary</strong>: <span id="summary"></span></p>
+    </section>
+    <script>
+      const form = document.getElementById("task-form");
+      const status = document.getElementById("status");
+      const resultBlock = document.getElementById("result");
+      const factorial = document.getElementById("factorial");
+      const fibonacci = document.getElementById("fibonacci");
+      const summary = document.getElementById("summary");
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const number = Number(new FormData(form).get("number"));
+        if (!Number.isFinite(number)) {
+          return;
+        }
+        status.textContent = "Dispatching workflow...";
+        status.classList.remove("error");
+        resultBlock.hidden = true;
+
+        try {
+          const response = await fetch("/api/tasks", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ number }),
+          });
+          if (!response.ok) {
+            const payload = await response.json().catch(() => ({}));
+            const detail = payload.detail ?? response.statusText;
+            throw new Error(detail);
+          }
+          const payload = await response.json();
+          factorial.textContent = payload.factorial;
+          fibonacci.textContent = payload.fibonacci;
+          summary.textContent = payload.summary;
+          resultBlock.hidden = false;
+          status.textContent = "Workflow completed";
+        } catch (error) {
+          status.textContent = `Failed: ${error.message}`;
+          status.classList.add("error");
+        }
+      });
+    </script>
+  </body>
+</html>

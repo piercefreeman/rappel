@@ -1,0 +1,10 @@
+.git
+.mypy_cache
+.pytest_cache
+.ruff_cache
+target
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.whl
