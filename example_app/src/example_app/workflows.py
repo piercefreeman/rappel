@@ -1,6 +1,6 @@
 """Workflow definitions used by the sample FastAPI app."""
 
-from __future__ import annotations
+
 
 import asyncio
 from pydantic import BaseModel, Field
@@ -64,16 +64,13 @@ async def summarize_outcome(
 class ExampleMathWorkflow(Workflow):
     """Workflow that fans out across simple math actions."""
 
-    def __init__(self, number: int) -> None:
-        self.number = number
-
-    async def run(self) -> ComputationResult:
+    async def run(self, number: int) -> ComputationResult:
         factorial_value, fib_value = await asyncio.gather(
-            compute_factorial(self.number),
-            compute_fibonacci(self.number),
+            compute_factorial(number),
+            compute_fibonacci(number),
         )
         result = await summarize_outcome(
-            input_number=self.number,
+            input_number=number,
             factorial_value=factorial_value,
             fibonacci_value=fib_value,
         )

@@ -1,7 +1,5 @@
 """Runtime helpers for executing workflow DAG nodes inside the worker."""
 
-from __future__ import annotations
-
 import asyncio
 import importlib
 from typing import Any, Dict, Tuple

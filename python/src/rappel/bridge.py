@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import asyncio
 import os
 import shlex
@@ -71,11 +69,12 @@ def _env_port_override() -> Optional[int]:
 
 def _boot_singleton_blocking() -> int:
     command = _boot_command()
-    with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt") as f:
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt") as f:
         output_file = Path(f.name)
-    try:
+
         command.extend(["--output-file", str(output_file)])
         LOGGER.info("Booting rappel singleton via: %s", " ".join(command))
+
         try:
             subprocess.run(
                 command,
@@ -84,7 +83,6 @@ def _boot_singleton_blocking() -> int:
             )
         except subprocess.TimeoutExpired as exc:  # pragma: no cover
             LOGGER.error("boot command timed out after %s seconds", exc.timeout)
-            _log_process_snapshot()
             raise RuntimeError("unable to boot rappel server") from exc
         except subprocess.CalledProcessError as exc:  # pragma: no cover
             LOGGER.error("boot command failed: %s", exc)
@@ -92,6 +90,7 @@ def _boot_singleton_blocking() -> int:
         except OSError as exc:  # pragma: no cover
             LOGGER.error("unable to spawn boot command: %s", exc)
             raise RuntimeError("unable to boot rappel server") from exc
+
         try:
             # We use a file as a message passer because passing a PIPE to the singleton launcher
             # will block our code indefinitely
@@ -105,25 +104,6 @@ def _boot_singleton_blocking() -> int:
             return port
         except (ValueError, FileNotFoundError) as exc:  # pragma: no cover
             raise RuntimeError(f"unable to read port from output file: {exc}") from exc
-    finally:
-        output_file.unlink(missing_ok=True)
-
-
-def _log_process_snapshot() -> None:
-    commands = [["ps", "aux"], ["ps", "-ef"], ["tasklist"]]
-    for cmd in commands:
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        except FileNotFoundError:
-            continue
-        except subprocess.SubprocessError:
-            continue
-        if proc.returncode == 0 and proc.stdout:
-            lines = proc.stdout.strip().splitlines()
-            preview = "\n".join(lines[:20])
-            LOGGER.warning("Process snapshot via %s:\n%s", " ".join(cmd), preview)
-            return
-    LOGGER.warning("Process snapshot unavailable; no suitable command found")
 
 
 def _resolve_port() -> int:

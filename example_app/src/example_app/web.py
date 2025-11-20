@@ -1,6 +1,6 @@
 """FastAPI surface for the rappel example app."""
 
-from __future__ import annotations
+
 
 from pathlib import Path
 
@@ -28,6 +28,6 @@ async def index(request: Request) -> HTMLResponse:
 
 @app.post("/api/tasks", response_model=ComputationResult)
 async def run_task(payload: ComputationRequest) -> ComputationResult:
-    workflow = ExampleMathWorkflow(number=payload.number)
-    result = await workflow.run()
+    workflow = ExampleMathWorkflow()
+    result = await workflow.run(number=payload.number)
     return result

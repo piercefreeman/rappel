@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Post-process generated protobuf files to enforce package-relative imports."""
 
-from __future__ import annotations
+
 
 from pathlib import Path
 

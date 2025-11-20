@@ -1,6 +1,6 @@
 """Shared helpers for benchmark fixtures."""
 
-from __future__ import annotations
+
 
 from pydantic import BaseModel
 

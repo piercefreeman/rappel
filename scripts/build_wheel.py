@@ -4,7 +4,7 @@
 # ///
 """Build a distributable wheel that bundles Rust binaries and Python package."""
 
-from __future__ import annotations
+
 
 import base64
 import hashlib

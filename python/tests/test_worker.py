@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import asyncio
 
 from proto import messages_pb2 as pb2
