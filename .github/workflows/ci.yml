@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
   pull_request:
 
 jobs:
@@ -118,3 +119,39 @@ jobs:
         env:
           DATABASE_URL: postgresql://mountaineer:mountaineer@localhost:5432/mountaineer_daemons
         run: cargo test workflow_executes_complex_flow -- --nocapture
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [python-tests, rust-tests]
+    timeout-minutes: 20
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(toJson(github.event.pull_request.labels), 'full-build'))
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Update project version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: uv run .github/scripts/update_version.py ${{ github.ref_name }}
+
+      - name: Build wheel artifact
+        run: uv run scripts/build_wheel.py --out-dir target/wheels
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rappel-wheel
+          path: target/wheels/*.whl
+
+      - name: Publish to PyPI
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: target/wheels
