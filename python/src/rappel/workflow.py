@@ -102,6 +102,15 @@ class Workflow:
                 produces=list(node.produces),
             )
             proto_node.kwargs.update(node.kwargs)
+            if node.loop:
+                proto_node.loop.iterable_expr = node.loop.iterable_expr
+                proto_node.loop.loop_var = node.loop.loop_var
+                proto_node.loop.accumulator = node.loop.accumulator
+                proto_node.loop.preamble = node.loop.preamble or ""
+                proto_node.loop.body_action = node.loop.body_action
+                if node.loop.body_module:
+                    proto_node.loop.body_module = node.loop.body_module
+                proto_node.loop.body_kwargs.update(node.loop.body_kwargs)
             if node.guard:
                 proto_node.guard = node.guard
             if node.timeout_seconds is not None:

@@ -40,6 +40,7 @@ message ActionResult {
   uint64 worker_start_ns = 4;
   uint64 worker_end_ns = 5;
   optional string dispatch_token = 6;
+  optional WorkflowNodeControl control = 7;
 }
 
 message Ack {
@@ -63,6 +64,7 @@ message WorkflowDagNode {
   optional uint32 timeout_seconds = 10;
   optional uint32 max_retries = 11;
   optional uint32 timeout_retry_limit = 12;
+  optional WorkflowLoopSpec loop = 13;
 }
 
 message WorkflowDagDefinition {
@@ -75,6 +77,30 @@ message WorkflowExceptionEdge {
   string source_node_id = 1;
   string exception_type = 2;
   string exception_module = 3;
+}
+
+message WorkflowLoopSpec {
+  string iterable_expr = 1;
+  string loop_var = 2;
+  string accumulator = 3;
+  string preamble = 4;
+  string body_action = 5;
+  string body_module = 6;
+  map<string, string> body_kwargs = 7;
+}
+
+message WorkflowLoopControl {
+  string node_id = 1;
+  uint32 next_index = 2;
+  bool has_next = 3;
+  string accumulator = 4;
+  WorkflowArgumentValue accumulator_value = 5;
+}
+
+message WorkflowNodeControl {
+  oneof kind {
+    WorkflowLoopControl loop = 1;
+  }
 }
 
 message WorkflowRegistration {

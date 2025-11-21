@@ -134,6 +134,7 @@ impl BenchmarkHarness {
                         delivery_id: metrics.delivery_id,
                         result_payload: metrics.response_payload.clone(),
                         dispatch_token: metrics.dispatch_token,
+                        control: metrics.control.clone(),
                     };
                     if let Err(err) = self.completion_tx.send(record).await {
                         warn!(?err, "completion channel closed");

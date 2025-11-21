@@ -2,7 +2,8 @@
 
 import asyncio
 import importlib
-from typing import Any, Dict, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Mapping, Tuple
 
 from pydantic import BaseModel
 
@@ -10,11 +11,19 @@ from proto import messages_pb2 as pb2
 
 from .actions import deserialize_result_payload
 from .registry import registry
-from .serialization import arguments_to_kwargs
+from .serialization import arguments_to_kwargs, dumps
+
+_LOOP_INDEX_VAR = "__loop_index"
 
 
 class WorkflowNodeResult(BaseModel):
     variables: Dict[str, Any]
+
+
+@dataclass
+class NodeExecutionResult:
+    result: Any
+    control: pb2.WorkflowNodeControl | None = None
 
 
 def _decode_workflow_input(payload: pb2.WorkflowArguments | None) -> dict[str, Any]:
@@ -59,6 +68,15 @@ def _evaluate_kwargs(node: pb2.WorkflowDagNode, context: dict[str, Any]) -> Dict
     namespace = {**context}
     evaluated: Dict[str, Any] = {}
     for key, expr in node.kwargs.items():
+        evaluated[key] = eval(expr, {}, namespace)  # noqa: S307 - controlled input
+    return evaluated
+
+
+def _evaluate_loop_kwargs(
+    raw_kwargs: Mapping[str, str], namespace: dict[str, Any]
+) -> Dict[str, Any]:
+    evaluated: Dict[str, Any] = {}
+    for key, expr in raw_kwargs.items():
         evaluated[key] = eval(expr, {}, namespace)  # noqa: S307 - controlled input
     return evaluated
 
@@ -139,17 +157,97 @@ def _execute_python_block(node: pb2.WorkflowDagNode, context: dict[str, Any]) ->
     return result
 
 
-async def execute_node(dispatch: pb2.WorkflowNodeDispatch) -> WorkflowNodeResult:
+async def _execute_loop_controller(
+    node: pb2.WorkflowDagNode, context: dict[str, Any]
+) -> NodeExecutionResult:
+    if not node.HasField("loop"):
+        raise RuntimeError("loop node missing specification")
+    loop_spec = node.loop
+    iterable_expr = loop_spec.iterable_expr
+    loop_var = loop_spec.loop_var
+    accumulator_name = loop_spec.accumulator
+    body_action = loop_spec.body_action
+    body_kwargs_map = dict(loop_spec.body_kwargs)
+    preamble = loop_spec.preamble or ""
+    body_module = loop_spec.body_module or ""
+    if not iterable_expr or not loop_var or not accumulator_name or not body_action:
+        raise RuntimeError("loop node missing required metadata")
+
+    namespace = dict(context)
+    items = list(eval(iterable_expr, {}, namespace))  # noqa: S307 - controlled input
+    raw_accumulator = context.get(accumulator_name, [])
+    accumulator: list[Any] = []
+    if isinstance(raw_accumulator, list):
+        accumulator = list(raw_accumulator)
+    elif raw_accumulator:
+        try:
+            accumulator = list(raw_accumulator)
+        except TypeError:
+            accumulator = [raw_accumulator]
+    raw_index = context.get(_LOOP_INDEX_VAR, 0)
+    try:
+        loop_index = int(raw_index) if raw_index is not None else 0
+    except (TypeError, ValueError):
+        loop_index = 0
+    if loop_index >= len(items):
+        return NodeExecutionResult(
+            result=WorkflowNodeResult(
+                variables={
+                    accumulator_name: accumulator,
+                    _LOOP_INDEX_VAR: loop_index,
+                }
+            )
+        )
+
+    namespace[loop_var] = items[loop_index]
+    if preamble:
+        exec(preamble, namespace)  # noqa: S102 - controlled by workflow author
+    evaluated_kwargs = _evaluate_loop_kwargs(body_kwargs_map, namespace)
+    if body_module:
+        importlib.import_module(body_module)
+    handler = registry.get(body_action)
+    if handler is None:
+        raise RuntimeError(f"action '{body_action}' not registered")
+    value = handler(**evaluated_kwargs)
+    if asyncio.iscoroutine(value):
+        value = await value
+    accumulator.append(value)
+    next_index = loop_index + 1
+    continue_loop = next_index < len(items)
+    control = pb2.WorkflowNodeControl(
+        loop=pb2.WorkflowLoopControl(
+            node_id=node.id,
+            next_index=next_index,
+            has_next=continue_loop,
+            accumulator=accumulator_name,
+            accumulator_value=dumps(accumulator),
+        )
+    )
+    return NodeExecutionResult(
+        result=WorkflowNodeResult(
+            variables={
+                accumulator_name: accumulator,
+                _LOOP_INDEX_VAR: next_index,
+            }
+        ),
+        control=control,
+    )
+
+
+async def execute_node(dispatch: pb2.WorkflowNodeDispatch) -> NodeExecutionResult:
     context, exceptions = _build_context(dispatch)
     node = dispatch.node
     if node is None:
         raise RuntimeError("workflow dispatch missing node definition")
     if not _guard_allows_execution(node, context):
-        return WorkflowNodeResult(variables={})
+        return NodeExecutionResult(result=WorkflowNodeResult(variables={}))
     matched_sources = _matching_exception_sources(node, exceptions)
     _validate_exception_context(node, exceptions, matched_sources)
     if node.action == "python_block":
         result_map = _execute_python_block(node, context)
+        return NodeExecutionResult(result=WorkflowNodeResult(variables=result_map))
+    elif node.action == "loop":
+        return await _execute_loop_controller(node, context)
     else:
         _ensure_action_module(node)
         handler = registry.get(node.action)
@@ -163,4 +261,4 @@ async def execute_node(dispatch: pb2.WorkflowNodeDispatch) -> WorkflowNodeResult
             result_map = {node.produces[0]: value}
         else:
             result_map = {}
-    return WorkflowNodeResult(variables=result_map)
+    return NodeExecutionResult(result=WorkflowNodeResult(variables=result_map))

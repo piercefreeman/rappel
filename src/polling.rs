@@ -222,6 +222,7 @@ impl DispatcherTask {
                     delivery_id: metrics.delivery_id,
                     result_payload: metrics.response_payload,
                     dispatch_token: metrics.dispatch_token,
+                    control: metrics.control,
                 };
                 if let Err(err) = completion_tx.send(record).await {
                     warn!(?err, "completion channel closed, dropping record");
@@ -271,10 +272,27 @@ impl DispatcherTask {
         }
         let mut pending = Vec::new();
         std::mem::swap(buffer, &mut pending);
-        if let Err(err) = database.mark_actions_batch(&pending).await {
+        let mut regular: Vec<CompletionRecord> = Vec::with_capacity(pending.len());
+        for record in pending {
+            if record.success
+                && let Some(control) = record.control.as_ref()
+                && matches!(
+                    control.kind,
+                    Some(proto::workflow_node_control::Kind::Loop(_))
+                )
+                && database
+                    .requeue_loop_iteration(&record, control)
+                    .await
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            regular.push(record);
+        }
+        if let Err(err) = database.mark_actions_batch(&regular).await {
             metrics::counter!("rappel_dispatch_errors_total").increment(1);
             error!(?err, "failed to mark action batch, retrying");
-            buffer.extend(pending);
+            buffer.extend(regular);
             sleep(Duration::from_millis(100)).await;
         }
     }

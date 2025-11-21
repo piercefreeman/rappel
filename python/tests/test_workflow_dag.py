@@ -266,7 +266,7 @@ class ForLoopActionWorkflow(Workflow):
         await summarize(values=results)
 
 
-def test_for_loop_actions_expand_per_item_nodes() -> None:
+def test_for_loop_builds_loop_controller_node() -> None:
     dag = build_workflow_dag(ForLoopActionWorkflow)
     actions = [node.action for node in dag.nodes]
     assert actions == [
@@ -274,26 +274,22 @@ def test_for_loop_actions_expand_per_item_nodes() -> None:
         "fetch_number",
         "python_block",
         "python_block",
-        "python_block",
-        "double_number",
-        "python_block",
-        "python_block",
-        "double_number",
-        "python_block",
+        "loop",
         "summarize",
         "python_block",
     ]
-    first_double = dag.nodes[5]
-    second_double = dag.nodes[8]
-    assert first_double.depends_on == [dag.nodes[4].id]
-    assert second_double.depends_on == [dag.nodes[7].id]
-    first_append = dag.nodes[6]
-    assert dag.nodes[3].id in first_append.depends_on
-    assert first_double.id in first_append.depends_on
-    last_append = dag.nodes[9]
-    summarize_node = dag.nodes[10]
-    assert summarize_node.depends_on == [last_append.id]
-    assert dag.return_variable == RETURN_VARIABLE
+    controller = next(node for node in dag.nodes if node.action == "loop")
+    assert controller.produces == ["results"]
+    assert controller.loop is not None
+    assert controller.loop.iterable_expr == "numbers"
+    assert controller.loop.loop_var == "number"
+    assert controller.loop.body_kwargs == {"value": "expanded"}
+    assert controller.loop.accumulator == "results"
+    assert "expanded = number + 1" in (controller.loop.preamble or "")
+    numbers_node = next(node for node in dag.nodes if node.produces == ["numbers"])
+    assert controller.depends_on == [numbers_node.id]
+    summarize_node = next(node for node in dag.nodes if node.action == "summarize")
+    assert summarize_node.depends_on == [controller.id]
 
 
 class PositionalArgsWorkflow(Workflow):

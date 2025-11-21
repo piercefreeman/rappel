@@ -23,6 +23,7 @@ class DagNode:
     timeout_seconds: Optional[int] = None
     max_retries: Optional[int] = None
     timeout_retry_limit: Optional[int] = None
+    loop: Optional["LoopSpec"] = None
 
 
 RETURN_VARIABLE = "__workflow_return"
@@ -60,6 +61,17 @@ class ExceptionEdge:
     source_node_id: str
     exception_type: Optional[str] = None
     exception_module: Optional[str] = None
+
+
+@dataclass
+class LoopSpec:
+    iterable_expr: str
+    loop_var: str
+    accumulator: str
+    body_action: str
+    body_kwargs: Dict[str, str]
+    preamble: Optional[str] = None
+    body_module: Optional[str] = None
 
 
 def _extract_action_name(expr: ast.AST) -> Optional[str]:
@@ -275,6 +287,8 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_For(self, node: ast.For) -> Any:
+        if self._handle_loop_controller(node):
+            return
         if self._handle_action_for_loop(node):
             return
         self._capture_block(node)
@@ -403,6 +417,126 @@ class WorkflowDagBuilder(ast.NodeVisitor):
             self._collections.pop(true_branch.target, None)
             self._append_node(merge_node)
         return True
+
+    def _handle_loop_controller(self, node: ast.For) -> bool:
+        if node.orelse or not isinstance(node.target, ast.Name):
+            return False
+        parsed = self._parse_loop_controller_body(node.body)
+        if parsed is None:
+            return False
+        preamble, action_call, accumulator = parsed
+        loop_var = node.target.id
+        iterable_expr = ast.unparse(node.iter)
+        dependencies = self._dependencies_from_expr(node.iter)
+        for stmt in preamble:
+            dependencies.extend(self._dependencies_from_node(stmt))
+        body_kwargs, kw_deps, action_name, action_module = self._loop_body_metadata(action_call)
+        dependencies.extend(kw_deps)
+        loop_spec = LoopSpec(
+            iterable_expr=iterable_expr,
+            loop_var=loop_var,
+            accumulator=accumulator,
+            body_action=action_name,
+            body_kwargs=body_kwargs,
+            preamble=self._format_preamble_snippet(preamble) if preamble else None,
+            body_module=action_module,
+        )
+        dag_node = DagNode(
+            id=self._new_node_id(),
+            action="loop",
+            kwargs={},
+            depends_on=sorted(set(dependencies)),
+            produces=[accumulator],
+            module="rappel.workflow_runtime",
+            loop=loop_spec,
+        )
+        self._var_to_node[accumulator] = dag_node.id
+        self._collections.pop(accumulator, None)
+        self._append_node(dag_node)
+        return True
+
+    def _parse_loop_controller_body(
+        self, body: List[ast.stmt]
+    ) -> Optional[Tuple[List[ast.stmt], ParsedActionCall, str]]:
+        if len(body) < 2:
+            return None
+        append_target = self._extract_append_target(body[-1])
+        if append_target is None:
+            return None
+        accumulator, appended_value = append_target
+        if not isinstance(appended_value, ast.Name):
+            return None
+        action_stmt = body[-2]
+        if not isinstance(action_stmt, ast.Assign):
+            return None
+        if len(action_stmt.targets) != 1 or not isinstance(action_stmt.targets[0], ast.Name):
+            return None
+        if action_stmt.targets[0].id != appended_value.id:
+            return None
+        action_call = self._extract_action_call(action_stmt.value)
+        if action_call is None:
+            return None
+        preamble = body[:-2]
+        for stmt in preamble:
+            if self._branch_contains_action([stmt]):
+                return None
+        return preamble, action_call, accumulator
+
+    def _extract_append_target(self, stmt: ast.stmt) -> Optional[Tuple[str, ast.AST]]:
+        if not isinstance(stmt, ast.Expr):
+            return None
+        call = stmt.value
+        if not isinstance(call, ast.Call):
+            return None
+        func = call.func
+        if not isinstance(func, ast.Attribute):
+            return None
+        if func.attr != "append" or not isinstance(func.value, ast.Name):
+            return None
+        if not call.args or len(call.args) != 1:
+            return None
+        return func.value.id, call.args[0]
+
+    def _loop_body_metadata(
+        self, parsed_call: ParsedActionCall
+    ) -> Tuple[Dict[str, str], List[str], str, Optional[str]]:
+        call = parsed_call.call
+        name = self._format_call_name(call.func)
+        kwargs: Dict[str, str] = {}
+        dependencies: List[str] = []
+        for kw in call.keywords:
+            if kw.arg is None:
+                continue
+            kwargs[kw.arg] = ast.unparse(kw.value)
+            dependencies.extend(self._dependencies_from_expr(kw.value))
+        action_def = self._action_defs.get(name)
+        used_keys = set(kwargs)
+        if call.args:
+            if action_def is None:
+                line = call.lineno if hasattr(call, "lineno") else "?"
+                raise ValueError(
+                    f"action '{name}' uses positional arguments but metadata is unavailable (line {line})"
+                )
+            arg_mappings = self._map_positional_args(call, action_def, used_keys)
+            for key, expr in arg_mappings:
+                kwargs[key] = expr
+                dependencies.extend(self._dependencies_from_expr(ast.parse(expr, mode="eval").body))
+        if action_def:
+            action_name = action_def.action_name
+            module_name = action_def.module_name
+        else:
+            action_name = name
+            module_name = None
+        return kwargs, dependencies, action_name, module_name
+
+    def _format_preamble_snippet(self, preamble: List[ast.stmt]) -> str:
+        snippets: List[str] = []
+        for stmt in preamble:
+            snippet = ast.get_source_segment(self._source, stmt) or ast.unparse(stmt)
+            normalized = self._normalize_block_snippet(snippet, stmt)
+            if normalized:
+                snippets.append(normalized)
+        return "\n".join(snippets)
 
     def _handle_action_for_loop(self, node: ast.For) -> bool:
         if node.orelse:

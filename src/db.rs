@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use prost::Message;
 use sqlx::{
@@ -23,6 +23,7 @@ const DEFAULT_ACTION_MAX_RETRIES: i32 = 1;
 const DEFAULT_TIMEOUT_RETRY_LIMIT: i32 = i32::MAX;
 const EXHAUSTED_EXCEPTION_TYPE: &str = "ExhaustedRetries";
 const EXHAUSTED_EXCEPTION_MODULE: &str = "rappel.exceptions";
+const LOOP_INDEX_VAR: &str = "__loop_index";
 
 #[derive(Clone)]
 pub struct Database {
@@ -259,6 +260,25 @@ fn encode_exhausted_retries_payload(
     )
 }
 
+fn encode_result_arguments(value: proto::WorkflowArgumentValue) -> WorkflowArguments {
+    WorkflowArguments {
+        arguments: vec![proto::WorkflowArgument {
+            key: "result".to_string(),
+            value: Some(value),
+        }],
+    }
+}
+
+fn encode_int_result(value: i64) -> WorkflowArguments {
+    let primitive = proto::PrimitiveWorkflowArgument {
+        kind: Some(proto::primitive_workflow_argument::Kind::IntValue(value)),
+    };
+    let argument_value = proto::WorkflowArgumentValue {
+        kind: Some(proto::workflow_argument_value::Kind::Primitive(primitive)),
+    };
+    encode_result_arguments(argument_value)
+}
+
 #[derive(Debug, Clone)]
 pub struct CompletionRecord {
     pub action_id: LedgerActionId,
@@ -266,6 +286,7 @@ pub struct CompletionRecord {
     pub delivery_id: u64,
     pub result_payload: Vec<u8>,
     pub dispatch_token: Option<Uuid>,
+    pub control: Option<proto::WorkflowNodeControl>,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +310,15 @@ struct ExhaustedActionRow {
     status: String,
     max_retries: i32,
     timeout_retry_limit: i32,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct LoopActionRow {
+    instance_id: WorkflowInstanceId,
+    function_name: String,
+    dispatch_payload: Vec<u8>,
+    next_action_seq: i32,
+    workflow_node_id: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -381,6 +411,154 @@ pub struct WorkflowInstanceActionDetail {
 }
 
 impl Database {
+    pub async fn requeue_loop_iteration(
+        &self,
+        record: &CompletionRecord,
+        control: &proto::WorkflowNodeControl,
+    ) -> Result<bool> {
+        let Some(loop_control) = control.kind.as_ref().map(|kind| match kind {
+            proto::workflow_node_control::Kind::Loop(ctrl) => ctrl,
+        }) else {
+            return Ok(false);
+        };
+        if !loop_control.has_next {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await?;
+        let row = if let Some(dispatch_token) = record.dispatch_token {
+            sqlx::query_as::<_, LoopActionRow>(
+                r#"
+                SELECT dal.instance_id,
+                       dal.function_name,
+                       dal.dispatch_payload,
+                       wi.next_action_seq,
+                       dal.workflow_node_id
+                FROM daemon_action_ledger AS dal
+                JOIN workflow_instances wi ON wi.id = dal.instance_id
+                WHERE dal.id = $1
+                  AND dal.delivery_token = $2
+                  AND dal.status = 'dispatched'
+                FOR UPDATE OF dal, wi
+                "#,
+            )
+            .bind(record.action_id)
+            .bind(dispatch_token)
+            .fetch_optional(tx.as_mut())
+            .await?
+        } else {
+            sqlx::query_as::<_, LoopActionRow>(
+                r#"
+                SELECT dal.instance_id,
+                       dal.function_name,
+                       dal.dispatch_payload,
+                       wi.next_action_seq,
+                       dal.workflow_node_id
+                FROM daemon_action_ledger AS dal
+                JOIN workflow_instances wi ON wi.id = dal.instance_id
+                WHERE dal.id = $1
+                  AND dal.status = 'dispatched'
+                FOR UPDATE OF dal, wi
+                "#,
+            )
+            .bind(record.action_id)
+            .fetch_optional(tx.as_mut())
+            .await?
+        };
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        if row.function_name != "loop" {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let mut dispatch = proto::WorkflowNodeDispatch::decode(row.dispatch_payload.as_slice())
+            .context("failed to decode stored loop dispatch")?;
+        let node = dispatch
+            .node
+            .as_ref()
+            .ok_or_else(|| anyhow!("loop dispatch missing node definition"))?;
+        let node_id = node.id.clone();
+        if let Some(row_node_id) = row.workflow_node_id.as_ref()
+            && row_node_id != &node_id
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let Some(loop_spec) = node.r#loop.as_ref() else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let Some(accumulator_value) = loop_control.accumulator_value.as_ref() else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        if loop_control.accumulator.is_empty() || loop_spec.accumulator != loop_control.accumulator
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        if accumulator_value.kind.is_none() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        dispatch.context.retain(|ctx| {
+            ctx.variable != loop_control.accumulator && ctx.variable != LOOP_INDEX_VAR
+        });
+        let accumulator_payload = encode_result_arguments(accumulator_value.clone());
+        let loop_index_payload = encode_int_result(loop_control.next_index as i64);
+        dispatch.context.push(WorkflowNodeContext {
+            variable: loop_control.accumulator.clone(),
+            payload: Some(accumulator_payload),
+            workflow_node_id: node_id.clone(),
+        });
+        dispatch.context.push(WorkflowNodeContext {
+            variable: LOOP_INDEX_VAR.to_string(),
+            payload: Some(loop_index_payload),
+            workflow_node_id: node_id,
+        });
+        let dispatch_bytes = dispatch.encode_to_vec();
+        let next_seq = row.next_action_seq;
+        sqlx::query(
+            "UPDATE workflow_instances SET next_action_seq = $2 WHERE id = $1 AND next_action_seq <= $2",
+        )
+        .bind(row.instance_id)
+        .bind(next_seq + 1)
+        .execute(tx.as_mut())
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE daemon_action_ledger
+            SET status = 'queued',
+                scheduled_at = NOW(),
+                dispatched_at = NULL,
+                acked_at = COALESCE(acked_at, NOW()),
+                deadline_at = NULL,
+                delivery_id = NULL,
+                delivery_token = NULL,
+                action_seq = $2,
+                dispatch_payload = $3,
+                result_payload = $4,
+                success = NULL,
+                retry_kind = 'failure'
+            WHERE id = $1
+            "#,
+        )
+        .bind(record.action_id)
+        .bind(next_seq)
+        .bind(&dispatch_bytes)
+        .bind(&record.result_payload)
+        .execute(tx.as_mut())
+        .await?;
+        tx.commit().await?;
+        tracing::debug!(
+            action_id = %record.action_id,
+            next_index = loop_control.next_index,
+            "requeued loop iteration"
+        );
+        Ok(true)
+    }
+
     pub async fn connect(database_url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(10)
@@ -964,34 +1142,37 @@ impl Database {
         }
         let span = tracing::debug_span!("db.mark_actions_batch", count = records.len());
         let _guard = span.enter();
-        let successes_with_tokens: Vec<(&CompletionRecord, Uuid)> = records
-            .iter()
-            .filter(|r| r.success)
-            .filter_map(|record| record.dispatch_token.map(|token| (record, token)))
-            .collect();
-        let dropped_successes =
-            records.iter().filter(|r| r.success).count() - successes_with_tokens.len();
+        let mut tx = self.pool.begin().await?;
+        let mut workflow_instances: HashSet<WorkflowInstanceId> = HashSet::new();
+        let mut successes_with_tokens: Vec<(&CompletionRecord, Uuid)> = Vec::new();
+        let mut failures_with_tokens: Vec<(&CompletionRecord, Uuid)> = Vec::new();
+        let mut dropped_successes = 0usize;
+        let mut dropped_failures = 0usize;
+        for record in records {
+            if record.success {
+                if let Some(token) = record.dispatch_token {
+                    successes_with_tokens.push((record, token));
+                } else {
+                    dropped_successes += 1;
+                }
+            } else if let Some(token) = record.dispatch_token {
+                failures_with_tokens.push((record, token));
+            } else {
+                dropped_failures += 1;
+            }
+        }
         if dropped_successes > 0 {
             tracing::debug!(
                 count = dropped_successes,
                 "dropping successful completions missing dispatch tokens"
             );
         }
-        let failures_with_tokens: Vec<(&CompletionRecord, Uuid)> = records
-            .iter()
-            .filter(|r| !r.success)
-            .filter_map(|record| record.dispatch_token.map(|token| (record, token)))
-            .collect();
-        let dropped_failures =
-            records.iter().filter(|r| !r.success).count() - failures_with_tokens.len();
         if dropped_failures > 0 {
             tracing::debug!(
                 count = dropped_failures,
                 "dropping failed completions missing dispatch tokens"
             );
         }
-        let mut tx = self.pool.begin().await?;
-        let mut workflow_instances: HashSet<WorkflowInstanceId> = HashSet::new();
         if !successes_with_tokens.is_empty() {
             let ids: Vec<LedgerActionId> = successes_with_tokens
                 .iter()
@@ -1367,6 +1548,7 @@ mod tests {
             delivery_id: 1,
             result_payload: encode_error_payload("boom"),
             dispatch_token: Some(action.delivery_token),
+            control: None,
         };
         database.mark_actions_batch(&[record]).await?;
         let queued: i64 =

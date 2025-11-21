@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use crate::db::{CompletionRecord, Database};
+use crate::{
+    db::{CompletionRecord, Database},
+    messages::proto,
+};
 use tokio::{sync::mpsc, task::JoinHandle, time};
 use tracing::{info, warn};
 
@@ -101,9 +104,7 @@ pub fn spawn_completion_worker(
                         Some(record) => {
                             buffer.push(record);
                             if buffer.len() >= BATCH_SIZE {
-                                if let Err(err) = database.mark_actions_batch(&buffer).await {
-                                    warn!(?err, "failed to flush completion batch");
-                                }
+                                flush_batch(&database, &mut buffer).await;
                                 buffer.clear();
                             }
                         }
@@ -117,18 +118,39 @@ pub fn spawn_completion_worker(
                         }
                         continue;
                     }
-                    if let Err(err) = database.mark_actions_batch(&buffer).await {
-                        warn!(?err, "failed to flush completion batch");
-                    }
+                    flush_batch(&database, &mut buffer).await;
                     buffer.clear();
                 }
             }
         }
-        if !buffer.is_empty()
-            && let Err(err) = database.mark_actions_batch(&buffer).await
-        {
-            warn!(?err, "failed to flush completion batch");
+        if !buffer.is_empty() {
+            flush_batch(&database, &mut buffer).await;
         }
     });
     (tx, handle)
+}
+
+async fn flush_batch(database: &Database, buffer: &mut Vec<CompletionRecord>) {
+    let mut pending = Vec::new();
+    std::mem::swap(buffer, &mut pending);
+    let mut regular: Vec<CompletionRecord> = Vec::with_capacity(pending.len());
+    for record in pending {
+        if record.success
+            && let Some(control) = record.control.as_ref()
+            && matches!(
+                control.kind,
+                Some(proto::workflow_node_control::Kind::Loop(_))
+            )
+            && database
+                .requeue_loop_iteration(&record, control)
+                .await
+                .unwrap_or(false)
+        {
+            continue;
+        }
+        regular.push(record);
+    }
+    if let Err(err) = database.mark_actions_batch(&regular).await {
+        warn!(?err, "failed to flush completion batch");
+    }
 }

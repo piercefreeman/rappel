@@ -199,6 +199,7 @@ class ActionResult(google.protobuf.message.Message):
     WORKER_START_NS_FIELD_NUMBER: builtins.int
     WORKER_END_NS_FIELD_NUMBER: builtins.int
     DISPATCH_TOKEN_FIELD_NUMBER: builtins.int
+    CONTROL_FIELD_NUMBER: builtins.int
     action_id: builtins.str
     success: builtins.bool
     worker_start_ns: builtins.int
@@ -206,6 +207,8 @@ class ActionResult(google.protobuf.message.Message):
     dispatch_token: builtins.str
     @property
     def payload(self) -> Global___WorkflowArguments: ...
+    @property
+    def control(self) -> Global___WorkflowNodeControl: ...
     def __init__(
         self,
         *,
@@ -215,12 +218,17 @@ class ActionResult(google.protobuf.message.Message):
         worker_start_ns: builtins.int = ...,
         worker_end_ns: builtins.int = ...,
         dispatch_token: builtins.str | None = ...,
+        control: Global___WorkflowNodeControl | None = ...,
     ) -> None: ...
     def HasField(
         self,
         field_name: typing.Literal[
+            "_control",
+            b"_control",
             "_dispatch_token",
             b"_dispatch_token",
+            "control",
+            b"control",
             "dispatch_token",
             b"dispatch_token",
             "payload",
@@ -230,10 +238,14 @@ class ActionResult(google.protobuf.message.Message):
     def ClearField(
         self,
         field_name: typing.Literal[
+            "_control",
+            b"_control",
             "_dispatch_token",
             b"_dispatch_token",
             "action_id",
             b"action_id",
+            "control",
+            b"control",
             "dispatch_token",
             b"dispatch_token",
             "payload",
@@ -246,6 +258,11 @@ class ActionResult(google.protobuf.message.Message):
             b"worker_start_ns",
         ],
     ) -> None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_control", b"_control"]
+    ) -> typing.Literal["control"] | None: ...
+    @typing.overload
     def WhichOneof(
         self, oneof_group: typing.Literal["_dispatch_token", b"_dispatch_token"]
     ) -> typing.Literal["dispatch_token"] | None: ...
@@ -318,6 +335,7 @@ class WorkflowDagNode(google.protobuf.message.Message):
     TIMEOUT_SECONDS_FIELD_NUMBER: builtins.int
     MAX_RETRIES_FIELD_NUMBER: builtins.int
     TIMEOUT_RETRY_LIMIT_FIELD_NUMBER: builtins.int
+    LOOP_FIELD_NUMBER: builtins.int
     id: builtins.str
     action: builtins.str
     module: builtins.str
@@ -347,6 +365,8 @@ class WorkflowDagNode(google.protobuf.message.Message):
     ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[
         Global___WorkflowExceptionEdge
     ]: ...
+    @property
+    def loop(self) -> Global___WorkflowLoopSpec: ...
     def __init__(
         self,
         *,
@@ -362,16 +382,21 @@ class WorkflowDagNode(google.protobuf.message.Message):
         timeout_seconds: builtins.int | None = ...,
         max_retries: builtins.int | None = ...,
         timeout_retry_limit: builtins.int | None = ...,
+        loop: Global___WorkflowLoopSpec | None = ...,
     ) -> None: ...
     def HasField(
         self,
         field_name: typing.Literal[
+            "_loop",
+            b"_loop",
             "_max_retries",
             b"_max_retries",
             "_timeout_retry_limit",
             b"_timeout_retry_limit",
             "_timeout_seconds",
             b"_timeout_seconds",
+            "loop",
+            b"loop",
             "max_retries",
             b"max_retries",
             "timeout_retry_limit",
@@ -383,6 +408,8 @@ class WorkflowDagNode(google.protobuf.message.Message):
     def ClearField(
         self,
         field_name: typing.Literal[
+            "_loop",
+            b"_loop",
             "_max_retries",
             b"_max_retries",
             "_timeout_retry_limit",
@@ -401,6 +428,8 @@ class WorkflowDagNode(google.protobuf.message.Message):
             b"id",
             "kwargs",
             b"kwargs",
+            "loop",
+            b"loop",
             "max_retries",
             b"max_retries",
             "module",
@@ -415,6 +444,10 @@ class WorkflowDagNode(google.protobuf.message.Message):
             b"wait_for_sync",
         ],
     ) -> None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_loop", b"_loop"]
+    ) -> typing.Literal["loop"] | None: ...
     @typing.overload
     def WhichOneof(
         self, oneof_group: typing.Literal["_max_retries", b"_max_retries"]
@@ -491,6 +524,145 @@ class WorkflowExceptionEdge(google.protobuf.message.Message):
     ) -> None: ...
 
 Global___WorkflowExceptionEdge: typing_extensions.TypeAlias = WorkflowExceptionEdge
+
+@typing.final
+class WorkflowLoopSpec(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    @typing.final
+    class BodyKwargsEntry(google.protobuf.message.Message):
+        DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+        KEY_FIELD_NUMBER: builtins.int
+        VALUE_FIELD_NUMBER: builtins.int
+        key: builtins.str
+        value: builtins.str
+        def __init__(
+            self,
+            *,
+            key: builtins.str = ...,
+            value: builtins.str = ...,
+        ) -> None: ...
+        def ClearField(
+            self, field_name: typing.Literal["key", b"key", "value", b"value"]
+        ) -> None: ...
+
+    ITERABLE_EXPR_FIELD_NUMBER: builtins.int
+    LOOP_VAR_FIELD_NUMBER: builtins.int
+    ACCUMULATOR_FIELD_NUMBER: builtins.int
+    PREAMBLE_FIELD_NUMBER: builtins.int
+    BODY_ACTION_FIELD_NUMBER: builtins.int
+    BODY_MODULE_FIELD_NUMBER: builtins.int
+    BODY_KWARGS_FIELD_NUMBER: builtins.int
+    iterable_expr: builtins.str
+    loop_var: builtins.str
+    accumulator: builtins.str
+    preamble: builtins.str
+    body_action: builtins.str
+    body_module: builtins.str
+    @property
+    def body_kwargs(
+        self,
+    ) -> google.protobuf.internal.containers.ScalarMap[builtins.str, builtins.str]: ...
+    def __init__(
+        self,
+        *,
+        iterable_expr: builtins.str = ...,
+        loop_var: builtins.str = ...,
+        accumulator: builtins.str = ...,
+        preamble: builtins.str = ...,
+        body_action: builtins.str = ...,
+        body_module: builtins.str = ...,
+        body_kwargs: collections.abc.Mapping[builtins.str, builtins.str] | None = ...,
+    ) -> None: ...
+    def ClearField(
+        self,
+        field_name: typing.Literal[
+            "accumulator",
+            b"accumulator",
+            "body_action",
+            b"body_action",
+            "body_kwargs",
+            b"body_kwargs",
+            "body_module",
+            b"body_module",
+            "iterable_expr",
+            b"iterable_expr",
+            "loop_var",
+            b"loop_var",
+            "preamble",
+            b"preamble",
+        ],
+    ) -> None: ...
+
+Global___WorkflowLoopSpec: typing_extensions.TypeAlias = WorkflowLoopSpec
+
+@typing.final
+class WorkflowLoopControl(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    NODE_ID_FIELD_NUMBER: builtins.int
+    NEXT_INDEX_FIELD_NUMBER: builtins.int
+    HAS_NEXT_FIELD_NUMBER: builtins.int
+    ACCUMULATOR_FIELD_NUMBER: builtins.int
+    ACCUMULATOR_VALUE_FIELD_NUMBER: builtins.int
+    node_id: builtins.str
+    next_index: builtins.int
+    has_next: builtins.bool
+    accumulator: builtins.str
+    @property
+    def accumulator_value(self) -> Global___WorkflowArgumentValue: ...
+    def __init__(
+        self,
+        *,
+        node_id: builtins.str = ...,
+        next_index: builtins.int = ...,
+        has_next: builtins.bool = ...,
+        accumulator: builtins.str = ...,
+        accumulator_value: Global___WorkflowArgumentValue | None = ...,
+    ) -> None: ...
+    def HasField(
+        self, field_name: typing.Literal["accumulator_value", b"accumulator_value"]
+    ) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing.Literal[
+            "accumulator",
+            b"accumulator",
+            "accumulator_value",
+            b"accumulator_value",
+            "has_next",
+            b"has_next",
+            "next_index",
+            b"next_index",
+            "node_id",
+            b"node_id",
+        ],
+    ) -> None: ...
+
+Global___WorkflowLoopControl: typing_extensions.TypeAlias = WorkflowLoopControl
+
+@typing.final
+class WorkflowNodeControl(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    LOOP_FIELD_NUMBER: builtins.int
+    @property
+    def loop(self) -> Global___WorkflowLoopControl: ...
+    def __init__(
+        self,
+        *,
+        loop: Global___WorkflowLoopControl | None = ...,
+    ) -> None: ...
+    def HasField(
+        self, field_name: typing.Literal["kind", b"kind", "loop", b"loop"]
+    ) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["kind", b"kind", "loop", b"loop"]) -> None: ...
+    def WhichOneof(
+        self, oneof_group: typing.Literal["kind", b"kind"]
+    ) -> typing.Literal["loop"] | None: ...
+
+Global___WorkflowNodeControl: typing_extensions.TypeAlias = WorkflowNodeControl
 
 @typing.final
 class WorkflowRegistration(google.protobuf.message.Message):

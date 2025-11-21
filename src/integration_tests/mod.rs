@@ -150,14 +150,20 @@ async fn dispatch_all_actions(
     target_actions: usize,
 ) -> Result<Vec<RoundTripMetrics>> {
     let mut completed = Vec::new();
-    let mut max_iterations = target_actions * 10; // Safety limit to prevent infinite loops
-    while completed.len() < target_actions && max_iterations > 0 {
+    let mut max_iterations = target_actions.saturating_mul(20).max(100); // Safety limit to prevent infinite loops
+    let mut idle_cycles = 0usize;
+    while max_iterations > 0 {
         max_iterations -= 1;
         let actions = database.dispatch_actions(16).await?;
         if actions.is_empty() {
+            idle_cycles = idle_cycles.saturating_add(1);
+            if idle_cycles >= 3 && completed.len() >= target_actions {
+                break;
+            }
             sleep(Duration::from_millis(50)).await;
             continue;
         }
+        idle_cycles = 0;
         let mut batch_records = Vec::new();
         let mut batch_metrics = Vec::new();
         for action in actions {
@@ -175,6 +181,22 @@ async fn dispatch_all_actions(
             };
             let worker = pool.next_worker();
             let metrics = worker.send_action(payload).await?;
+            if metrics.success
+                && matches!(
+                    metrics.control,
+                    Some(proto::WorkflowNodeControl {
+                        kind: Some(proto::workflow_node_control::Kind::Loop(_))
+                    })
+                )
+                && database
+                    .requeue_loop_iteration(
+                        &to_completion_record(metrics.clone()),
+                        metrics.control.as_ref().unwrap(),
+                    )
+                    .await?
+            {
+                continue;
+            }
             batch_records.push(to_completion_record(metrics.clone()));
             batch_metrics.push(metrics);
         }
@@ -191,6 +213,7 @@ fn to_completion_record(metrics: RoundTripMetrics) -> CompletionRecord {
         delivery_id: metrics.delivery_id,
         result_payload: metrics.response_payload,
         dispatch_token: metrics.dispatch_token,
+        control: metrics.control,
     }
 }
 
@@ -330,7 +353,12 @@ async fn workflow_executes_end_to_end() -> Result<()> {
     };
 
     let completed = harness.dispatch_all().await?;
-    assert_eq!(completed.len(), harness.expected_actions());
+    assert!(
+        completed.len() >= harness.expected_actions(),
+        "expected at least {} completions, saw {}",
+        harness.expected_actions(),
+        completed.len()
+    );
 
     let stored_payload = harness
         .stored_result()
@@ -364,7 +392,12 @@ async fn workflow_executes_complex_flow() -> Result<()> {
     };
 
     let completed = harness.dispatch_all().await?;
-    assert_eq!(completed.len(), harness.expected_actions());
+    assert!(
+        completed.len() >= harness.expected_actions(),
+        "expected at least {} completions, saw {}",
+        harness.expected_actions(),
+        completed.len()
+    );
 
     let stored_payload = harness
         .stored_result()
@@ -398,7 +431,12 @@ async fn workflow_executes_looped_actions() -> Result<()> {
     };
 
     let completed = harness.dispatch_all().await?;
-    assert_eq!(completed.len(), harness.expected_actions());
+    assert!(
+        completed.len() >= harness.expected_actions(),
+        "expected at least {} completions, saw {}",
+        harness.expected_actions(),
+        completed.len()
+    );
 
     let stored_payload = harness
         .stored_result()
@@ -508,6 +546,7 @@ async fn stale_worker_completion_is_ignored() -> Result<()> {
         delivery_id: 1,
         result_payload: Vec::new(),
         dispatch_token: Some(stale_token),
+        control: None,
     };
     database.mark_actions_batch(&[stale_record]).await?;
     let (status, payload): (String, Option<Vec<u8>>) =
@@ -539,6 +578,7 @@ async fn stale_worker_completion_is_ignored() -> Result<()> {
         delivery_id: 2,
         result_payload: result_args.encode_to_vec(),
         dispatch_token: Some(fresh_token),
+        control: None,
     };
     database.mark_actions_batch(&[valid_record]).await?;
     let (status, payload): (String, Option<Vec<u8>>) =

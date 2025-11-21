@@ -78,17 +78,18 @@ async def _handle_dispatch(
     worker_start = time.perf_counter_ns()
     success = True
     action_name = "unknown"
+    execution: workflow_runtime.NodeExecutionResult | None = None
     try:
         node = dispatch.dispatch.node
         if node is not None and node.action:
             action_name = node.action
         if timeout_seconds > 0:
-            result = await asyncio.wait_for(
+            execution = await asyncio.wait_for(
                 workflow_runtime.execute_node(dispatch.dispatch), timeout=timeout_seconds
             )
         else:
-            result = await workflow_runtime.execute_node(dispatch.dispatch)
-        response_payload = serialize_result_payload(result)
+            execution = await workflow_runtime.execute_node(dispatch.dispatch)
+        response_payload = serialize_result_payload(execution.result)
     except asyncio.TimeoutError:
         success = False
         error = TimeoutError(f"action {action_name} timed out after {timeout_seconds} seconds")
@@ -119,6 +120,8 @@ async def _handle_dispatch(
     response.payload.CopyFrom(response_payload)
     if dispatch.dispatch_token:
         response.dispatch_token = dispatch.dispatch_token
+    if execution is not None and execution.control is not None:
+        response.control.CopyFrom(execution.control)
     response_envelope = pb2.Envelope(
         delivery_id=envelope.delivery_id,
         partition_id=envelope.partition_id,
