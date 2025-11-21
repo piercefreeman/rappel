@@ -1,17 +1,14 @@
 use std::{
     env,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
-    sync::Arc,
     time::Duration,
 };
 
 use crate::{
-    Database, PythonWorkerConfig, PythonWorkerPool,
+    Database, PythonWorkerPool,
     db::CompletionRecord,
     messages::proto,
     server_client::{self, ServerConfig},
-    server_worker::WorkerBridgeServer,
     worker::{ActionDispatchPayload, RoundTripMetrics},
 };
 use anyhow::{Context, Result, anyhow};
@@ -20,7 +17,8 @@ use reqwest::Client;
 use serial_test::serial;
 use tokio::{task::JoinHandle, time::sleep};
 mod common;
-use self::common::run_in_env;
+mod harness;
+use self::harness::{WorkflowHarness, WorkflowHarnessConfig};
 const INTEGRATION_MODULE: &str = "integration_module";
 const INTEGRATION_MODULE_SOURCE: &str = include_str!("fixtures/integration_module.py");
 const INTEGRATION_COMPLEX_MODULE: &str = include_str!("fixtures/integration_complex.py");
@@ -316,84 +314,32 @@ fn primitive_value_to_string(value: &proto::PrimitiveWorkflowArgument) -> Option
 async fn workflow_executes_end_to_end() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let _ = dotenvy::dotenv();
-    let database_url = match env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => {
-            eprintln!("skipping integration test: DATABASE_URL not set");
-            return Ok(());
-        }
+    let Some(harness) = WorkflowHarness::new(WorkflowHarnessConfig {
+        files: &[
+            ("integration_module.py", INTEGRATION_MODULE_SOURCE),
+            ("register.py", REGISTER_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "integrationworkflow",
+        user_module: INTEGRATION_MODULE,
+        inputs: &[("input", "world")],
+    })
+    .await?
+    else {
+        return Ok(());
     };
-    let database = Database::connect(&database_url).await?;
-    cleanup_database(&database).await?;
 
-    let server = TestServer::spawn(database_url.clone()).await?;
-    wait_for_health(server.http_addr).await?;
+    let completed = harness.dispatch_all().await?;
+    assert_eq!(completed.len(), harness.expected_actions());
 
-    let files = vec![
-        ("integration_module.py", INTEGRATION_MODULE_SOURCE),
-        ("register.py", REGISTER_SCRIPT),
-    ];
-    let env_pairs = vec![
-        ("CARABINER_GRPC_ADDR", server.grpc_addr.to_string()),
-        ("CARABINER_SERVER_PORT", server.http_addr.port().to_string()),
-        ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
-        ("CARABINER_SKIP_WAIT_FOR_INSTANCE", "1".to_string()),
-    ];
-    let python_env = run_in_env(&files, &[], &env_pairs, "register.py").await?;
-    assert!(python_env.path().join("integration_module.py").exists());
-    purge_empty_input_instances(&database).await?;
-
-    let versions = database.list_workflow_versions().await?;
-    let version = versions
-        .iter()
-        .find(|v| v.workflow_name == "integrationworkflow")
-        .context("integration workflow missing")?;
-    let version_detail = database
-        .load_workflow_version(version.id)
+    let stored_payload = harness
+        .stored_result()
         .await?
-        .context("missing workflow version detail")?;
-    let expected_actions = version_detail.dag.nodes.len();
-
-    let workflow_input = encode_workflow_input(&[("input", "world")]);
-    let instance_id = database
-        .create_workflow_instance(&version.workflow_name, version.id, Some(&workflow_input))
-        .await?;
-
-    let worker_server: Arc<WorkerBridgeServer> = WorkerBridgeServer::start(None).await?;
-    let worker_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("python")
-        .join(".venv")
-        .join("bin")
-        .join("rappel-worker");
-    let worker_config = PythonWorkerConfig {
-        script_path: worker_script,
-        user_module: INTEGRATION_MODULE.to_string(),
-        extra_python_paths: vec![python_env.path().to_path_buf()],
-    };
-    let pool = PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_server)).await?;
-
-    let completed = dispatch_all_actions(&database, &pool, expected_actions).await?;
-    assert_eq!(completed.len(), expected_actions);
-
-    pool.shutdown().await?;
-    worker_server.shutdown().await;
-
-    let manual_metrics: Vec<_> = completed
-        .iter()
-        .filter(|metrics| metrics.instance_id == instance_id)
-        .collect();
-    assert_eq!(manual_metrics.len(), expected_actions);
-
-    let stored_result: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
-            .bind(instance_id)
-            .fetch_one(database.pool())
-            .await?;
-    let stored_payload = stored_result.context("missing workflow result payload")?;
+        .context("missing workflow result payload")?;
     let message = parse_result(&stored_payload)?.context("expected primitive result")?;
     assert_eq!(message, "hello world");
 
-    server.shutdown().await;
+    harness.shutdown().await?;
     Ok(())
 }
 
@@ -402,84 +348,32 @@ async fn workflow_executes_end_to_end() -> Result<()> {
 async fn workflow_executes_complex_flow() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let _ = dotenvy::dotenv();
-    let database_url = match env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => {
-            eprintln!("skipping integration test: DATABASE_URL not set");
-            return Ok(());
-        }
+    let Some(harness) = WorkflowHarness::new(WorkflowHarnessConfig {
+        files: &[
+            ("integration_complex.py", INTEGRATION_COMPLEX_MODULE),
+            ("register_complex.py", REGISTER_COMPLEX_SCRIPT),
+        ],
+        entrypoint: "register_complex.py",
+        workflow_name: "complexworkflow",
+        user_module: "integration_complex",
+        inputs: &[("input", "unused")],
+    })
+    .await?
+    else {
+        return Ok(());
     };
-    let database = Database::connect(&database_url).await?;
-    cleanup_database(&database).await?;
 
-    let server = TestServer::spawn(database_url.clone()).await?;
-    wait_for_health(server.http_addr).await?;
+    let completed = harness.dispatch_all().await?;
+    assert_eq!(completed.len(), harness.expected_actions());
 
-    let files = vec![
-        ("integration_complex.py", INTEGRATION_COMPLEX_MODULE),
-        ("register_complex.py", REGISTER_COMPLEX_SCRIPT),
-    ];
-    let env_pairs = vec![
-        ("CARABINER_GRPC_ADDR", server.grpc_addr.to_string()),
-        ("CARABINER_SERVER_PORT", server.http_addr.port().to_string()),
-        ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
-        ("CARABINER_SKIP_WAIT_FOR_INSTANCE", "1".to_string()),
-    ];
-    let python_env = run_in_env(&files, &[], &env_pairs, "register_complex.py").await?;
-    assert!(python_env.path().join("integration_complex.py").exists());
-    purge_empty_input_instances(&database).await?;
-
-    let versions = database.list_workflow_versions().await?;
-    let version = versions
-        .iter()
-        .find(|v| v.workflow_name == "complexworkflow")
-        .context("complex workflow missing")?;
-    let version_detail = database
-        .load_workflow_version(version.id)
+    let stored_payload = harness
+        .stored_result()
         .await?
-        .context("missing complex workflow detail")?;
-    let expected_actions = version_detail.dag.nodes.len();
-
-    let complex_input = encode_workflow_input(&[("input", "unused")]);
-    let instance_id = database
-        .create_workflow_instance(&version.workflow_name, version.id, Some(&complex_input))
-        .await?;
-
-    let worker_server: Arc<WorkerBridgeServer> = WorkerBridgeServer::start(None).await?;
-    let worker_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("python")
-        .join(".venv")
-        .join("bin")
-        .join("rappel-worker");
-    let worker_config = PythonWorkerConfig {
-        script_path: worker_script,
-        user_module: "integration_complex".to_string(),
-        extra_python_paths: vec![python_env.path().to_path_buf()],
-    };
-    let pool = PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_server)).await?;
-
-    let completed = dispatch_all_actions(&database, &pool, expected_actions).await?;
-    assert_eq!(completed.len(), expected_actions);
-
-    pool.shutdown().await?;
-    worker_server.shutdown().await;
-
-    let manual_metrics: Vec<_> = completed
-        .iter()
-        .filter(|metrics| metrics.instance_id == instance_id)
-        .collect();
-    assert_eq!(manual_metrics.len(), expected_actions);
-
-    let stored_result: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
-            .bind(instance_id)
-            .fetch_one(database.pool())
-            .await?;
-    let stored_payload = stored_result.context("missing workflow result payload")?;
+        .context("missing workflow result payload")?;
     let stored_message = parse_result(&stored_payload)?.context("expected primitive result")?;
     assert_eq!(stored_message, "big:3,7");
 
-    server.shutdown().await;
+    harness.shutdown().await?;
     Ok(())
 }
 
@@ -488,85 +382,33 @@ async fn workflow_executes_complex_flow() -> Result<()> {
 async fn workflow_executes_looped_actions() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let _ = dotenvy::dotenv();
-    let database_url = match env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => {
-            eprintln!("skipping integration test: DATABASE_URL not set");
-            return Ok(());
-        }
+    let Some(harness) = WorkflowHarness::new(WorkflowHarnessConfig {
+        files: &[
+            ("integration_loop.py", INTEGRATION_LOOP_MODULE_SOURCE),
+            ("register_loop.py", REGISTER_LOOP_SCRIPT),
+        ],
+        entrypoint: "register_loop.py",
+        workflow_name: "loopworkflow",
+        user_module: INTEGRATION_LOOP_MODULE,
+        inputs: &[("input", "unused")],
+    })
+    .await?
+    else {
+        return Ok(());
     };
-    let database = Database::connect(&database_url).await?;
-    cleanup_database(&database).await?;
 
-    let server = TestServer::spawn(database_url.clone()).await?;
-    wait_for_health(server.http_addr).await?;
+    let completed = harness.dispatch_all().await?;
+    assert_eq!(completed.len(), harness.expected_actions());
 
-    let files = vec![
-        ("integration_loop.py", INTEGRATION_LOOP_MODULE_SOURCE),
-        ("register_loop.py", REGISTER_LOOP_SCRIPT),
-    ];
-    let env_pairs = vec![
-        ("CARABINER_GRPC_ADDR", server.grpc_addr.to_string()),
-        ("CARABINER_SERVER_PORT", server.http_addr.port().to_string()),
-        ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
-        ("CARABINER_SKIP_WAIT_FOR_INSTANCE", "1".to_string()),
-    ];
-    let python_env = run_in_env(&files, &[], &env_pairs, "register_loop.py").await?;
-    assert!(python_env.path().join("integration_loop.py").exists());
-    purge_empty_input_instances(&database).await?;
-
-    let versions = database.list_workflow_versions().await?;
-    let version = versions
-        .iter()
-        .find(|v| v.workflow_name == "loopworkflow")
-        .context("loop workflow missing")?;
-    let version_detail = database
-        .load_workflow_version(version.id)
+    let stored_payload = harness
+        .stored_result()
         .await?
-        .context("missing loop workflow detail")?;
-    let expected_actions = version_detail.dag.nodes.len();
-
-    let loop_input = encode_workflow_input(&[("input", "unused")]);
-    let instance_id = database
-        .create_workflow_instance(&version.workflow_name, version.id, Some(&loop_input))
-        .await?;
-
-    let worker_server: Arc<WorkerBridgeServer> = WorkerBridgeServer::start(None).await?;
-    let worker_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("python")
-        .join(".venv")
-        .join("bin")
-        .join("rappel-worker");
-    let worker_config = PythonWorkerConfig {
-        script_path: worker_script,
-        user_module: INTEGRATION_LOOP_MODULE.to_string(),
-        extra_python_paths: vec![python_env.path().to_path_buf()],
-    };
-    let pool = PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_server)).await?;
-
-    let completed = dispatch_all_actions(&database, &pool, expected_actions).await?;
-    assert_eq!(completed.len(), expected_actions);
-
-    pool.shutdown().await?;
-    worker_server.shutdown().await;
-
-    let manual_metrics: Vec<_> = completed
-        .iter()
-        .filter(|metrics| metrics.instance_id == instance_id)
-        .collect();
-    assert_eq!(manual_metrics.len(), expected_actions);
-
-    let stored_result: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
-            .bind(instance_id)
-            .fetch_one(database.pool())
-            .await?;
-    let stored_payload = stored_result.context("missing workflow result payload")?;
+        .context("missing workflow result payload")?;
     let parsed_result =
         parse_result(&stored_payload)?.context("expected primitive workflow result")?;
     assert_eq!(parsed_result, "alpha-local-decorated,beta-local-decorated");
 
-    server.shutdown().await;
+    harness.shutdown().await?;
     Ok(())
 }
 
@@ -575,75 +417,26 @@ async fn workflow_executes_looped_actions() -> Result<()> {
 async fn workflow_handles_exception_flow() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let _ = dotenvy::dotenv();
-    let database_url = match env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => {
-            eprintln!("skipping integration test: DATABASE_URL not set");
-            return Ok(());
-        }
+    let Some(harness) = WorkflowHarness::new(WorkflowHarnessConfig {
+        files: &[
+            ("integration_exception.py", INTEGRATION_EXCEPTION_MODULE),
+            ("register_exception.py", REGISTER_EXCEPTION_SCRIPT),
+        ],
+        entrypoint: "register_exception.py",
+        workflow_name: "exceptionworkflow",
+        user_module: "integration_exception",
+        inputs: &[("mode", "exception")],
+    })
+    .await?
+    else {
+        return Ok(());
     };
-    let database = Database::connect(&database_url).await?;
-    cleanup_database(&database).await?;
 
-    let server = TestServer::spawn(database_url.clone()).await?;
-    wait_for_health(server.http_addr).await?;
+    let completed = harness.dispatch_all().await?;
+    assert_eq!(completed.len(), harness.expected_actions());
 
-    let files = vec![
-        ("integration_exception.py", INTEGRATION_EXCEPTION_MODULE),
-        ("register_exception.py", REGISTER_EXCEPTION_SCRIPT),
-    ];
-    let env_pairs = vec![
-        ("CARABINER_GRPC_ADDR", server.grpc_addr.to_string()),
-        ("CARABINER_SERVER_PORT", server.http_addr.port().to_string()),
-        ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
-        ("CARABINER_SKIP_WAIT_FOR_INSTANCE", "1".to_string()),
-    ];
-    let python_env = run_in_env(&files, &[], &env_pairs, "register_exception.py").await?;
-    assert!(python_env.path().join("integration_exception.py").exists());
-    purge_empty_input_instances(&database).await?;
-
-    let versions = database.list_workflow_versions().await?;
-    let version = versions
-        .iter()
-        .find(|v| v.workflow_name == "exceptionworkflow")
-        .context("exception workflow missing")?;
-    let version_detail = database
-        .load_workflow_version(version.id)
-        .await?
-        .context("missing exception workflow detail")?;
-    let expected_actions = version_detail.dag.nodes.len();
-
-    let exception_input = encode_workflow_input(&[("mode", "exception")]);
-    let instance_id = database
-        .create_workflow_instance(&version.workflow_name, version.id, Some(&exception_input))
-        .await?;
-
-    let worker_server: Arc<WorkerBridgeServer> = WorkerBridgeServer::start(None).await?;
-    let worker_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("python")
-        .join(".venv")
-        .join("bin")
-        .join("rappel-worker");
-    let worker_config = PythonWorkerConfig {
-        script_path: worker_script,
-        user_module: "integration_exception".to_string(),
-        extra_python_paths: vec![python_env.path().to_path_buf()],
-    };
-    let pool = PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_server)).await?;
-
-    let completed = dispatch_all_actions(&database, &pool, expected_actions).await?;
-    assert_eq!(completed.len(), expected_actions);
-
-    pool.shutdown().await?;
-    worker_server.shutdown().await;
-
-    let manual_metrics: Vec<_> = completed
-        .iter()
-        .filter(|metrics| metrics.instance_id == instance_id)
-        .collect();
-    assert_eq!(manual_metrics.len(), expected_actions);
-
-    let cleanup_node = version_detail
+    let cleanup_node = harness
+        .version_detail()
         .dag
         .nodes
         .iter()
@@ -653,9 +446,9 @@ async fn workflow_handles_exception_flow() -> Result<()> {
         sqlx::query_as(
             "SELECT status, success, result_payload FROM daemon_action_ledger WHERE instance_id = $1 AND workflow_node_id = $2",
         )
-        .bind(instance_id)
+        .bind(harness.instance_id())
         .bind(&cleanup_node.id)
-        .fetch_one(database.pool())
+        .fetch_one(harness.database().pool())
         .await?;
     assert_eq!(cleanup_status, "completed");
     assert!(
@@ -665,18 +458,16 @@ async fn workflow_handles_exception_flow() -> Result<()> {
     let cleanup_payload = cleanup_result.context("cleanup result payload missing")?;
     assert!(!cleanup_payload.is_empty(), "cleanup payload missing bytes");
 
-    let stored_result: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
-            .bind(instance_id)
-            .fetch_one(database.pool())
-            .await?;
-    let stored_payload = stored_result.context("missing workflow result payload")?;
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .context("missing workflow result payload")?;
     assert!(
         !stored_payload.is_empty(),
         "workflow result payload missing bytes"
     );
 
-    server.shutdown().await;
+    harness.shutdown().await?;
     Ok(())
 }
 
