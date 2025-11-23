@@ -1,5 +1,7 @@
+pub mod ast_eval;
 pub mod benchmark;
 pub mod config;
+pub mod context;
 pub mod dag_state;
 pub mod db;
 pub mod instances;

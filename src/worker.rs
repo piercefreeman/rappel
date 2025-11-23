@@ -56,6 +56,7 @@ pub struct RoundTripMetrics {
     pub response_payload: Vec<u8>,
     pub success: bool,
     pub dispatch_token: Option<Uuid>,
+    pub control: Option<proto::WorkflowNodeControl>,
 }
 
 struct SharedState {
@@ -102,6 +103,10 @@ impl PythonWorker {
             let src_dir = package_root.join("src");
             if src_dir.exists() {
                 module_paths.push(src_dir);
+            }
+            let proto_dir = package_root.join("proto");
+            if proto_dir.exists() {
+                module_paths.push(proto_dir);
             }
         }
         module_paths.extend(config.extra_python_paths.clone());
@@ -262,6 +267,7 @@ impl PythonWorker {
                 .dispatch_token
                 .as_ref()
                 .and_then(|token| Uuid::parse_str(token).ok()),
+            control: response.control.clone(),
         })
     }
 

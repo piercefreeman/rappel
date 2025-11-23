@@ -40,6 +40,7 @@ message ActionResult {
   uint64 worker_start_ns = 4;
   uint64 worker_end_ns = 5;
   optional string dispatch_token = 6;
+  optional WorkflowNodeControl control = 7;
 }
 
 message Ack {
@@ -63,6 +64,8 @@ message WorkflowDagNode {
   optional uint32 timeout_seconds = 10;
   optional uint32 max_retries = 11;
   optional uint32 timeout_retry_limit = 12;
+  optional WorkflowLoopSpec loop = 13;
+  optional WorkflowNodeAst ast = 14;
 }
 
 message WorkflowDagDefinition {
@@ -75,6 +78,188 @@ message WorkflowExceptionEdge {
   string source_node_id = 1;
   string exception_type = 2;
   string exception_module = 3;
+}
+
+message WorkflowLoopSpec {
+  string iterable_expr = 1;
+  string loop_var = 2;
+  string accumulator = 3;
+  string preamble = 4;
+  string body_action = 5;
+  string body_module = 6;
+  map<string, string> body_kwargs = 7;
+}
+
+message WorkflowLoopControl {
+  string node_id = 1;
+  uint32 next_index = 2;
+  bool has_next = 3;
+  string accumulator = 4;
+  WorkflowArgumentValue accumulator_value = 5;
+}
+
+message WorkflowNodeControl {
+  oneof kind {
+    WorkflowLoopControl loop = 1;
+  }
+}
+
+// Serialized Python AST for control flow/evaluation
+message WorkflowNodeAst {
+  map<string, Expr> kwargs = 1;
+  optional Expr guard = 2;
+  optional LoopAst loop = 3;
+}
+
+message LoopAst {
+  Expr iterable = 1;
+  string loop_var = 2;
+  string accumulator = 3;
+  repeated Stmt preamble = 4;
+  ActionAst body_action = 5;
+}
+
+message ActionAst {
+  string action_name = 1;
+  string module_name = 2;
+  repeated Keyword keywords = 3;
+}
+
+message Keyword {
+  string arg = 1;
+  Expr value = 2;
+}
+
+message Stmt {
+  oneof kind {
+    Assign assign = 1;
+    Expr expr = 2;
+  }
+}
+
+message Assign {
+  repeated Expr targets = 1;
+  Expr value = 2;
+}
+
+message Expr {
+  oneof kind {
+    Name name = 1;
+    Constant constant = 2;
+    Attribute attribute = 3;
+    Subscript subscript = 4;
+    BinOp bin_op = 5;
+    BoolOp bool_op = 6;
+    Compare compare = 7;
+    Call call = 8;
+    List list = 9;
+    Tuple tuple = 10;
+    Dict dict = 11;
+    UnaryOp unary_op = 12;
+  }
+}
+
+message Name {
+  string id = 1;
+}
+
+message Constant {
+  oneof value {
+    string string_value = 1;
+    double float_value = 2;
+    sint64 int_value = 3;
+    bool bool_value = 4;
+    bool is_none = 5; // true if None
+  }
+}
+
+message Attribute {
+  Expr value = 1;
+  string attr = 2;
+}
+
+message Subscript {
+  Expr value = 1;
+  Expr slice = 2;
+}
+
+message BinOp {
+  Expr left = 1;
+  BinOpKind op = 2;
+  Expr right = 3;
+}
+
+enum BinOpKind {
+  BIN_OP_KIND_UNSPECIFIED = 0;
+  BIN_OP_KIND_ADD = 1;
+  BIN_OP_KIND_SUB = 2;
+  BIN_OP_KIND_MULT = 3;
+  BIN_OP_KIND_DIV = 4;
+  BIN_OP_KIND_MOD = 5;
+  BIN_OP_KIND_FLOORDIV = 6;
+  BIN_OP_KIND_POW = 7;
+}
+
+message BoolOp {
+  BoolOpKind op = 1;
+  repeated Expr values = 2;
+}
+
+enum BoolOpKind {
+  BOOL_OP_KIND_UNSPECIFIED = 0;
+  BOOL_OP_KIND_AND = 1;
+  BOOL_OP_KIND_OR = 2;
+}
+
+message Compare {
+  Expr left = 1;
+  repeated CmpOpKind ops = 2;
+  repeated Expr comparators = 3;
+}
+
+enum CmpOpKind {
+  CMP_OP_KIND_UNSPECIFIED = 0;
+  CMP_OP_KIND_EQ = 1;
+  CMP_OP_KIND_NOT_EQ = 2;
+  CMP_OP_KIND_LT = 3;
+  CMP_OP_KIND_LT_E = 4;
+  CMP_OP_KIND_GT = 5;
+  CMP_OP_KIND_GT_E = 6;
+  CMP_OP_KIND_IN = 7;
+  CMP_OP_KIND_NOT_IN = 8;
+  CMP_OP_KIND_IS = 9;
+  CMP_OP_KIND_IS_NOT = 10;
+}
+
+message Call {
+  Expr func = 1;
+  repeated Expr args = 2;
+  repeated Keyword keywords = 3;
+}
+
+message UnaryOp {
+  UnaryOpKind op = 1;
+  Expr operand = 2;
+}
+
+enum UnaryOpKind {
+  UNARY_OP_KIND_UNSPECIFIED = 0;
+  UNARY_OP_KIND_USUB = 1;
+  UNARY_OP_KIND_UADD = 2;
+  UNARY_OP_KIND_NOT = 3;
+}
+
+message List {
+  repeated Expr elts = 1;
+}
+
+message Tuple {
+  repeated Expr elts = 1;
+}
+
+message Dict {
+  repeated Expr keys = 1;
+  repeated Expr values = 2;
 }
 
 message WorkflowRegistration {
@@ -150,6 +335,7 @@ message WorkflowNodeDispatch {
   WorkflowDagNode node = 1;
   WorkflowArguments workflow_input = 2;
   repeated WorkflowNodeContext context = 3;
+  WorkflowArguments resolved_kwargs = 4;
 }
 
 message RegisterWorkflowRequest {

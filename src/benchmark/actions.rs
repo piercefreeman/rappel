@@ -134,6 +134,7 @@ impl BenchmarkHarness {
                         delivery_id: metrics.delivery_id,
                         result_payload: metrics.response_payload.clone(),
                         dispatch_token: metrics.dispatch_token,
+                        control: metrics.control.clone(),
                     };
                     if let Err(err) = self.completion_tx.send(record).await {
                         warn!(?err, "completion channel closed");
@@ -249,6 +250,7 @@ fn build_benchmark_dispatch(payload_size: usize) -> Result<Vec<u8>> {
         node: Some(node),
         workflow_input: Some(arguments),
         context: Vec::new(),
+        resolved_kwargs: None,
     };
     Ok(dispatch.encode_to_vec())
 }

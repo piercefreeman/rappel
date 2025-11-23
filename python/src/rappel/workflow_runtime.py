@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 
 from pydantic import BaseModel
@@ -15,6 +16,12 @@ from .serialization import arguments_to_kwargs
 
 class WorkflowNodeResult(BaseModel):
     variables: Dict[str, Any]
+
+
+@dataclass
+class NodeExecutionResult:
+    result: Any
+    control: pb2.WorkflowNodeControl | None = None
 
 
 def _decode_workflow_input(payload: pb2.WorkflowArguments | None) -> dict[str, Any]:
@@ -61,14 +68,6 @@ def _evaluate_kwargs(node: pb2.WorkflowDagNode, context: dict[str, Any]) -> Dict
     for key, expr in node.kwargs.items():
         evaluated[key] = eval(expr, {}, namespace)  # noqa: S307 - controlled input
     return evaluated
-
-
-def _guard_allows_execution(node: pb2.WorkflowDagNode, context: dict[str, Any]) -> bool:
-    guard_expr = getattr(node, "guard", "")
-    if not guard_expr:
-        return True
-    namespace = {**context}
-    return bool(eval(guard_expr, {}, namespace))  # noqa: S307 - controlled input
 
 
 def _matching_exception_sources(
@@ -139,28 +138,27 @@ def _execute_python_block(node: pb2.WorkflowDagNode, context: dict[str, Any]) ->
     return result
 
 
-async def execute_node(dispatch: pb2.WorkflowNodeDispatch) -> WorkflowNodeResult:
+async def execute_node(dispatch: pb2.WorkflowNodeDispatch) -> NodeExecutionResult:
     context, exceptions = _build_context(dispatch)
     node = dispatch.node
     if node is None:
         raise RuntimeError("workflow dispatch missing node definition")
-    if not _guard_allows_execution(node, context):
-        return WorkflowNodeResult(variables={})
     matched_sources = _matching_exception_sources(node, exceptions)
     _validate_exception_context(node, exceptions, matched_sources)
+    resolved_kwargs = {}
+    if dispatch.HasField("resolved_kwargs"):
+        resolved_kwargs = arguments_to_kwargs(dispatch.resolved_kwargs)
     if node.action == "python_block":
         result_map = _execute_python_block(node, context)
-    else:
-        _ensure_action_module(node)
-        handler = registry.get(node.action)
-        if handler is None:
-            raise RuntimeError(f"action '{node.action}' not registered")
-        kwargs = _evaluate_kwargs(node, context)
-        value = handler(**kwargs)
-        if asyncio.iscoroutine(value):
-            value = await value
-        if node.produces:
-            result_map = {node.produces[0]: value}
-        else:
-            result_map = {}
-    return WorkflowNodeResult(variables=result_map)
+        return NodeExecutionResult(result=WorkflowNodeResult(variables=result_map))
+    if node.action == "loop":
+        raise RuntimeError("loop nodes must be handled in the scheduler")
+    _ensure_action_module(node)
+    handler = registry.get(node.action)
+    if handler is None:
+        raise RuntimeError(f"action '{node.action}' not registered")
+    kwargs = resolved_kwargs or _evaluate_kwargs(node, context)
+    value = handler(**kwargs)
+    if asyncio.iscoroutine(value):
+        value = await value
+    return NodeExecutionResult(result=value)

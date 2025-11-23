@@ -48,6 +48,112 @@ MESSAGE_KIND_HEARTBEAT: MessageKind.ValueType  # 4
 MESSAGE_KIND_WORKER_HELLO: MessageKind.ValueType  # 5
 Global___MessageKind: typing_extensions.TypeAlias = MessageKind
 
+class _BinOpKind:
+    ValueType = typing.NewType("ValueType", builtins.int)
+    V: typing_extensions.TypeAlias = ValueType
+
+class _BinOpKindEnumTypeWrapper(
+    google.protobuf.internal.enum_type_wrapper._EnumTypeWrapper[_BinOpKind.ValueType], builtins.type
+):
+    DESCRIPTOR: google.protobuf.descriptor.EnumDescriptor
+    BIN_OP_KIND_UNSPECIFIED: _BinOpKind.ValueType  # 0
+    BIN_OP_KIND_ADD: _BinOpKind.ValueType  # 1
+    BIN_OP_KIND_SUB: _BinOpKind.ValueType  # 2
+    BIN_OP_KIND_MULT: _BinOpKind.ValueType  # 3
+    BIN_OP_KIND_DIV: _BinOpKind.ValueType  # 4
+    BIN_OP_KIND_MOD: _BinOpKind.ValueType  # 5
+    BIN_OP_KIND_FLOORDIV: _BinOpKind.ValueType  # 6
+    BIN_OP_KIND_POW: _BinOpKind.ValueType  # 7
+
+class BinOpKind(_BinOpKind, metaclass=_BinOpKindEnumTypeWrapper): ...
+
+BIN_OP_KIND_UNSPECIFIED: BinOpKind.ValueType  # 0
+BIN_OP_KIND_ADD: BinOpKind.ValueType  # 1
+BIN_OP_KIND_SUB: BinOpKind.ValueType  # 2
+BIN_OP_KIND_MULT: BinOpKind.ValueType  # 3
+BIN_OP_KIND_DIV: BinOpKind.ValueType  # 4
+BIN_OP_KIND_MOD: BinOpKind.ValueType  # 5
+BIN_OP_KIND_FLOORDIV: BinOpKind.ValueType  # 6
+BIN_OP_KIND_POW: BinOpKind.ValueType  # 7
+Global___BinOpKind: typing_extensions.TypeAlias = BinOpKind
+
+class _BoolOpKind:
+    ValueType = typing.NewType("ValueType", builtins.int)
+    V: typing_extensions.TypeAlias = ValueType
+
+class _BoolOpKindEnumTypeWrapper(
+    google.protobuf.internal.enum_type_wrapper._EnumTypeWrapper[_BoolOpKind.ValueType],
+    builtins.type,
+):
+    DESCRIPTOR: google.protobuf.descriptor.EnumDescriptor
+    BOOL_OP_KIND_UNSPECIFIED: _BoolOpKind.ValueType  # 0
+    BOOL_OP_KIND_AND: _BoolOpKind.ValueType  # 1
+    BOOL_OP_KIND_OR: _BoolOpKind.ValueType  # 2
+
+class BoolOpKind(_BoolOpKind, metaclass=_BoolOpKindEnumTypeWrapper): ...
+
+BOOL_OP_KIND_UNSPECIFIED: BoolOpKind.ValueType  # 0
+BOOL_OP_KIND_AND: BoolOpKind.ValueType  # 1
+BOOL_OP_KIND_OR: BoolOpKind.ValueType  # 2
+Global___BoolOpKind: typing_extensions.TypeAlias = BoolOpKind
+
+class _CmpOpKind:
+    ValueType = typing.NewType("ValueType", builtins.int)
+    V: typing_extensions.TypeAlias = ValueType
+
+class _CmpOpKindEnumTypeWrapper(
+    google.protobuf.internal.enum_type_wrapper._EnumTypeWrapper[_CmpOpKind.ValueType], builtins.type
+):
+    DESCRIPTOR: google.protobuf.descriptor.EnumDescriptor
+    CMP_OP_KIND_UNSPECIFIED: _CmpOpKind.ValueType  # 0
+    CMP_OP_KIND_EQ: _CmpOpKind.ValueType  # 1
+    CMP_OP_KIND_NOT_EQ: _CmpOpKind.ValueType  # 2
+    CMP_OP_KIND_LT: _CmpOpKind.ValueType  # 3
+    CMP_OP_KIND_LT_E: _CmpOpKind.ValueType  # 4
+    CMP_OP_KIND_GT: _CmpOpKind.ValueType  # 5
+    CMP_OP_KIND_GT_E: _CmpOpKind.ValueType  # 6
+    CMP_OP_KIND_IN: _CmpOpKind.ValueType  # 7
+    CMP_OP_KIND_NOT_IN: _CmpOpKind.ValueType  # 8
+    CMP_OP_KIND_IS: _CmpOpKind.ValueType  # 9
+    CMP_OP_KIND_IS_NOT: _CmpOpKind.ValueType  # 10
+
+class CmpOpKind(_CmpOpKind, metaclass=_CmpOpKindEnumTypeWrapper): ...
+
+CMP_OP_KIND_UNSPECIFIED: CmpOpKind.ValueType  # 0
+CMP_OP_KIND_EQ: CmpOpKind.ValueType  # 1
+CMP_OP_KIND_NOT_EQ: CmpOpKind.ValueType  # 2
+CMP_OP_KIND_LT: CmpOpKind.ValueType  # 3
+CMP_OP_KIND_LT_E: CmpOpKind.ValueType  # 4
+CMP_OP_KIND_GT: CmpOpKind.ValueType  # 5
+CMP_OP_KIND_GT_E: CmpOpKind.ValueType  # 6
+CMP_OP_KIND_IN: CmpOpKind.ValueType  # 7
+CMP_OP_KIND_NOT_IN: CmpOpKind.ValueType  # 8
+CMP_OP_KIND_IS: CmpOpKind.ValueType  # 9
+CMP_OP_KIND_IS_NOT: CmpOpKind.ValueType  # 10
+Global___CmpOpKind: typing_extensions.TypeAlias = CmpOpKind
+
+class _UnaryOpKind:
+    ValueType = typing.NewType("ValueType", builtins.int)
+    V: typing_extensions.TypeAlias = ValueType
+
+class _UnaryOpKindEnumTypeWrapper(
+    google.protobuf.internal.enum_type_wrapper._EnumTypeWrapper[_UnaryOpKind.ValueType],
+    builtins.type,
+):
+    DESCRIPTOR: google.protobuf.descriptor.EnumDescriptor
+    UNARY_OP_KIND_UNSPECIFIED: _UnaryOpKind.ValueType  # 0
+    UNARY_OP_KIND_USUB: _UnaryOpKind.ValueType  # 1
+    UNARY_OP_KIND_UADD: _UnaryOpKind.ValueType  # 2
+    UNARY_OP_KIND_NOT: _UnaryOpKind.ValueType  # 3
+
+class UnaryOpKind(_UnaryOpKind, metaclass=_UnaryOpKindEnumTypeWrapper): ...
+
+UNARY_OP_KIND_UNSPECIFIED: UnaryOpKind.ValueType  # 0
+UNARY_OP_KIND_USUB: UnaryOpKind.ValueType  # 1
+UNARY_OP_KIND_UADD: UnaryOpKind.ValueType  # 2
+UNARY_OP_KIND_NOT: UnaryOpKind.ValueType  # 3
+Global___UnaryOpKind: typing_extensions.TypeAlias = UnaryOpKind
+
 @typing.final
 class Envelope(google.protobuf.message.Message):
     DESCRIPTOR: google.protobuf.descriptor.Descriptor
@@ -199,6 +305,7 @@ class ActionResult(google.protobuf.message.Message):
     WORKER_START_NS_FIELD_NUMBER: builtins.int
     WORKER_END_NS_FIELD_NUMBER: builtins.int
     DISPATCH_TOKEN_FIELD_NUMBER: builtins.int
+    CONTROL_FIELD_NUMBER: builtins.int
     action_id: builtins.str
     success: builtins.bool
     worker_start_ns: builtins.int
@@ -206,6 +313,8 @@ class ActionResult(google.protobuf.message.Message):
     dispatch_token: builtins.str
     @property
     def payload(self) -> Global___WorkflowArguments: ...
+    @property
+    def control(self) -> Global___WorkflowNodeControl: ...
     def __init__(
         self,
         *,
@@ -215,12 +324,17 @@ class ActionResult(google.protobuf.message.Message):
         worker_start_ns: builtins.int = ...,
         worker_end_ns: builtins.int = ...,
         dispatch_token: builtins.str | None = ...,
+        control: Global___WorkflowNodeControl | None = ...,
     ) -> None: ...
     def HasField(
         self,
         field_name: typing.Literal[
+            "_control",
+            b"_control",
             "_dispatch_token",
             b"_dispatch_token",
+            "control",
+            b"control",
             "dispatch_token",
             b"dispatch_token",
             "payload",
@@ -230,10 +344,14 @@ class ActionResult(google.protobuf.message.Message):
     def ClearField(
         self,
         field_name: typing.Literal[
+            "_control",
+            b"_control",
             "_dispatch_token",
             b"_dispatch_token",
             "action_id",
             b"action_id",
+            "control",
+            b"control",
             "dispatch_token",
             b"dispatch_token",
             "payload",
@@ -246,6 +364,11 @@ class ActionResult(google.protobuf.message.Message):
             b"worker_start_ns",
         ],
     ) -> None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_control", b"_control"]
+    ) -> typing.Literal["control"] | None: ...
+    @typing.overload
     def WhichOneof(
         self, oneof_group: typing.Literal["_dispatch_token", b"_dispatch_token"]
     ) -> typing.Literal["dispatch_token"] | None: ...
@@ -318,6 +441,8 @@ class WorkflowDagNode(google.protobuf.message.Message):
     TIMEOUT_SECONDS_FIELD_NUMBER: builtins.int
     MAX_RETRIES_FIELD_NUMBER: builtins.int
     TIMEOUT_RETRY_LIMIT_FIELD_NUMBER: builtins.int
+    LOOP_FIELD_NUMBER: builtins.int
+    AST_FIELD_NUMBER: builtins.int
     id: builtins.str
     action: builtins.str
     module: builtins.str
@@ -347,6 +472,10 @@ class WorkflowDagNode(google.protobuf.message.Message):
     ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[
         Global___WorkflowExceptionEdge
     ]: ...
+    @property
+    def loop(self) -> Global___WorkflowLoopSpec: ...
+    @property
+    def ast(self) -> Global___WorkflowNodeAst: ...
     def __init__(
         self,
         *,
@@ -362,16 +491,26 @@ class WorkflowDagNode(google.protobuf.message.Message):
         timeout_seconds: builtins.int | None = ...,
         max_retries: builtins.int | None = ...,
         timeout_retry_limit: builtins.int | None = ...,
+        loop: Global___WorkflowLoopSpec | None = ...,
+        ast: Global___WorkflowNodeAst | None = ...,
     ) -> None: ...
     def HasField(
         self,
         field_name: typing.Literal[
+            "_ast",
+            b"_ast",
+            "_loop",
+            b"_loop",
             "_max_retries",
             b"_max_retries",
             "_timeout_retry_limit",
             b"_timeout_retry_limit",
             "_timeout_seconds",
             b"_timeout_seconds",
+            "ast",
+            b"ast",
+            "loop",
+            b"loop",
             "max_retries",
             b"max_retries",
             "timeout_retry_limit",
@@ -383,6 +522,10 @@ class WorkflowDagNode(google.protobuf.message.Message):
     def ClearField(
         self,
         field_name: typing.Literal[
+            "_ast",
+            b"_ast",
+            "_loop",
+            b"_loop",
             "_max_retries",
             b"_max_retries",
             "_timeout_retry_limit",
@@ -391,6 +534,8 @@ class WorkflowDagNode(google.protobuf.message.Message):
             b"_timeout_seconds",
             "action",
             b"action",
+            "ast",
+            b"ast",
             "depends_on",
             b"depends_on",
             "exception_edges",
@@ -401,6 +546,8 @@ class WorkflowDagNode(google.protobuf.message.Message):
             b"id",
             "kwargs",
             b"kwargs",
+            "loop",
+            b"loop",
             "max_retries",
             b"max_retries",
             "module",
@@ -415,6 +562,14 @@ class WorkflowDagNode(google.protobuf.message.Message):
             b"wait_for_sync",
         ],
     ) -> None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_ast", b"_ast"]
+    ) -> typing.Literal["ast"] | None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_loop", b"_loop"]
+    ) -> typing.Literal["loop"] | None: ...
     @typing.overload
     def WhichOneof(
         self, oneof_group: typing.Literal["_max_retries", b"_max_retries"]
@@ -491,6 +646,838 @@ class WorkflowExceptionEdge(google.protobuf.message.Message):
     ) -> None: ...
 
 Global___WorkflowExceptionEdge: typing_extensions.TypeAlias = WorkflowExceptionEdge
+
+@typing.final
+class WorkflowLoopSpec(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    @typing.final
+    class BodyKwargsEntry(google.protobuf.message.Message):
+        DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+        KEY_FIELD_NUMBER: builtins.int
+        VALUE_FIELD_NUMBER: builtins.int
+        key: builtins.str
+        value: builtins.str
+        def __init__(
+            self,
+            *,
+            key: builtins.str = ...,
+            value: builtins.str = ...,
+        ) -> None: ...
+        def ClearField(
+            self, field_name: typing.Literal["key", b"key", "value", b"value"]
+        ) -> None: ...
+
+    ITERABLE_EXPR_FIELD_NUMBER: builtins.int
+    LOOP_VAR_FIELD_NUMBER: builtins.int
+    ACCUMULATOR_FIELD_NUMBER: builtins.int
+    PREAMBLE_FIELD_NUMBER: builtins.int
+    BODY_ACTION_FIELD_NUMBER: builtins.int
+    BODY_MODULE_FIELD_NUMBER: builtins.int
+    BODY_KWARGS_FIELD_NUMBER: builtins.int
+    iterable_expr: builtins.str
+    loop_var: builtins.str
+    accumulator: builtins.str
+    preamble: builtins.str
+    body_action: builtins.str
+    body_module: builtins.str
+    @property
+    def body_kwargs(
+        self,
+    ) -> google.protobuf.internal.containers.ScalarMap[builtins.str, builtins.str]: ...
+    def __init__(
+        self,
+        *,
+        iterable_expr: builtins.str = ...,
+        loop_var: builtins.str = ...,
+        accumulator: builtins.str = ...,
+        preamble: builtins.str = ...,
+        body_action: builtins.str = ...,
+        body_module: builtins.str = ...,
+        body_kwargs: collections.abc.Mapping[builtins.str, builtins.str] | None = ...,
+    ) -> None: ...
+    def ClearField(
+        self,
+        field_name: typing.Literal[
+            "accumulator",
+            b"accumulator",
+            "body_action",
+            b"body_action",
+            "body_kwargs",
+            b"body_kwargs",
+            "body_module",
+            b"body_module",
+            "iterable_expr",
+            b"iterable_expr",
+            "loop_var",
+            b"loop_var",
+            "preamble",
+            b"preamble",
+        ],
+    ) -> None: ...
+
+Global___WorkflowLoopSpec: typing_extensions.TypeAlias = WorkflowLoopSpec
+
+@typing.final
+class WorkflowLoopControl(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    NODE_ID_FIELD_NUMBER: builtins.int
+    NEXT_INDEX_FIELD_NUMBER: builtins.int
+    HAS_NEXT_FIELD_NUMBER: builtins.int
+    ACCUMULATOR_FIELD_NUMBER: builtins.int
+    ACCUMULATOR_VALUE_FIELD_NUMBER: builtins.int
+    node_id: builtins.str
+    next_index: builtins.int
+    has_next: builtins.bool
+    accumulator: builtins.str
+    @property
+    def accumulator_value(self) -> Global___WorkflowArgumentValue: ...
+    def __init__(
+        self,
+        *,
+        node_id: builtins.str = ...,
+        next_index: builtins.int = ...,
+        has_next: builtins.bool = ...,
+        accumulator: builtins.str = ...,
+        accumulator_value: Global___WorkflowArgumentValue | None = ...,
+    ) -> None: ...
+    def HasField(
+        self, field_name: typing.Literal["accumulator_value", b"accumulator_value"]
+    ) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing.Literal[
+            "accumulator",
+            b"accumulator",
+            "accumulator_value",
+            b"accumulator_value",
+            "has_next",
+            b"has_next",
+            "next_index",
+            b"next_index",
+            "node_id",
+            b"node_id",
+        ],
+    ) -> None: ...
+
+Global___WorkflowLoopControl: typing_extensions.TypeAlias = WorkflowLoopControl
+
+@typing.final
+class WorkflowNodeControl(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    LOOP_FIELD_NUMBER: builtins.int
+    @property
+    def loop(self) -> Global___WorkflowLoopControl: ...
+    def __init__(
+        self,
+        *,
+        loop: Global___WorkflowLoopControl | None = ...,
+    ) -> None: ...
+    def HasField(
+        self, field_name: typing.Literal["kind", b"kind", "loop", b"loop"]
+    ) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["kind", b"kind", "loop", b"loop"]) -> None: ...
+    def WhichOneof(
+        self, oneof_group: typing.Literal["kind", b"kind"]
+    ) -> typing.Literal["loop"] | None: ...
+
+Global___WorkflowNodeControl: typing_extensions.TypeAlias = WorkflowNodeControl
+
+@typing.final
+class WorkflowNodeAst(google.protobuf.message.Message):
+    """Serialized Python AST for control flow/evaluation"""
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    @typing.final
+    class KwargsEntry(google.protobuf.message.Message):
+        DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+        KEY_FIELD_NUMBER: builtins.int
+        VALUE_FIELD_NUMBER: builtins.int
+        key: builtins.str
+        @property
+        def value(self) -> Global___Expr: ...
+        def __init__(
+            self,
+            *,
+            key: builtins.str = ...,
+            value: Global___Expr | None = ...,
+        ) -> None: ...
+        def HasField(self, field_name: typing.Literal["value", b"value"]) -> builtins.bool: ...
+        def ClearField(
+            self, field_name: typing.Literal["key", b"key", "value", b"value"]
+        ) -> None: ...
+
+    KWARGS_FIELD_NUMBER: builtins.int
+    GUARD_FIELD_NUMBER: builtins.int
+    LOOP_FIELD_NUMBER: builtins.int
+    @property
+    def kwargs(
+        self,
+    ) -> google.protobuf.internal.containers.MessageMap[builtins.str, Global___Expr]: ...
+    @property
+    def guard(self) -> Global___Expr: ...
+    @property
+    def loop(self) -> Global___LoopAst: ...
+    def __init__(
+        self,
+        *,
+        kwargs: collections.abc.Mapping[builtins.str, Global___Expr] | None = ...,
+        guard: Global___Expr | None = ...,
+        loop: Global___LoopAst | None = ...,
+    ) -> None: ...
+    def HasField(
+        self,
+        field_name: typing.Literal[
+            "_guard", b"_guard", "_loop", b"_loop", "guard", b"guard", "loop", b"loop"
+        ],
+    ) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing.Literal[
+            "_guard",
+            b"_guard",
+            "_loop",
+            b"_loop",
+            "guard",
+            b"guard",
+            "kwargs",
+            b"kwargs",
+            "loop",
+            b"loop",
+        ],
+    ) -> None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_guard", b"_guard"]
+    ) -> typing.Literal["guard"] | None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_loop", b"_loop"]
+    ) -> typing.Literal["loop"] | None: ...
+
+Global___WorkflowNodeAst: typing_extensions.TypeAlias = WorkflowNodeAst
+
+@typing.final
+class LoopAst(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    ITERABLE_FIELD_NUMBER: builtins.int
+    LOOP_VAR_FIELD_NUMBER: builtins.int
+    ACCUMULATOR_FIELD_NUMBER: builtins.int
+    PREAMBLE_FIELD_NUMBER: builtins.int
+    BODY_ACTION_FIELD_NUMBER: builtins.int
+    loop_var: builtins.str
+    accumulator: builtins.str
+    @property
+    def iterable(self) -> Global___Expr: ...
+    @property
+    def preamble(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[Global___Stmt]: ...
+    @property
+    def body_action(self) -> Global___ActionAst: ...
+    def __init__(
+        self,
+        *,
+        iterable: Global___Expr | None = ...,
+        loop_var: builtins.str = ...,
+        accumulator: builtins.str = ...,
+        preamble: collections.abc.Iterable[Global___Stmt] | None = ...,
+        body_action: Global___ActionAst | None = ...,
+    ) -> None: ...
+    def HasField(
+        self, field_name: typing.Literal["body_action", b"body_action", "iterable", b"iterable"]
+    ) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing.Literal[
+            "accumulator",
+            b"accumulator",
+            "body_action",
+            b"body_action",
+            "iterable",
+            b"iterable",
+            "loop_var",
+            b"loop_var",
+            "preamble",
+            b"preamble",
+        ],
+    ) -> None: ...
+
+Global___LoopAst: typing_extensions.TypeAlias = LoopAst
+
+@typing.final
+class ActionAst(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    ACTION_NAME_FIELD_NUMBER: builtins.int
+    MODULE_NAME_FIELD_NUMBER: builtins.int
+    KEYWORDS_FIELD_NUMBER: builtins.int
+    action_name: builtins.str
+    module_name: builtins.str
+    @property
+    def keywords(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[Global___Keyword]: ...
+    def __init__(
+        self,
+        *,
+        action_name: builtins.str = ...,
+        module_name: builtins.str = ...,
+        keywords: collections.abc.Iterable[Global___Keyword] | None = ...,
+    ) -> None: ...
+    def ClearField(
+        self,
+        field_name: typing.Literal[
+            "action_name", b"action_name", "keywords", b"keywords", "module_name", b"module_name"
+        ],
+    ) -> None: ...
+
+Global___ActionAst: typing_extensions.TypeAlias = ActionAst
+
+@typing.final
+class Keyword(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    ARG_FIELD_NUMBER: builtins.int
+    VALUE_FIELD_NUMBER: builtins.int
+    arg: builtins.str
+    @property
+    def value(self) -> Global___Expr: ...
+    def __init__(
+        self,
+        *,
+        arg: builtins.str = ...,
+        value: Global___Expr | None = ...,
+    ) -> None: ...
+    def HasField(self, field_name: typing.Literal["value", b"value"]) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["arg", b"arg", "value", b"value"]) -> None: ...
+
+Global___Keyword: typing_extensions.TypeAlias = Keyword
+
+@typing.final
+class Stmt(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    ASSIGN_FIELD_NUMBER: builtins.int
+    EXPR_FIELD_NUMBER: builtins.int
+    @property
+    def assign(self) -> Global___Assign: ...
+    @property
+    def expr(self) -> Global___Expr: ...
+    def __init__(
+        self,
+        *,
+        assign: Global___Assign | None = ...,
+        expr: Global___Expr | None = ...,
+    ) -> None: ...
+    def HasField(
+        self, field_name: typing.Literal["assign", b"assign", "expr", b"expr", "kind", b"kind"]
+    ) -> builtins.bool: ...
+    def ClearField(
+        self, field_name: typing.Literal["assign", b"assign", "expr", b"expr", "kind", b"kind"]
+    ) -> None: ...
+    def WhichOneof(
+        self, oneof_group: typing.Literal["kind", b"kind"]
+    ) -> typing.Literal["assign", "expr"] | None: ...
+
+Global___Stmt: typing_extensions.TypeAlias = Stmt
+
+@typing.final
+class Assign(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    TARGETS_FIELD_NUMBER: builtins.int
+    VALUE_FIELD_NUMBER: builtins.int
+    @property
+    def targets(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[Global___Expr]: ...
+    @property
+    def value(self) -> Global___Expr: ...
+    def __init__(
+        self,
+        *,
+        targets: collections.abc.Iterable[Global___Expr] | None = ...,
+        value: Global___Expr | None = ...,
+    ) -> None: ...
+    def HasField(self, field_name: typing.Literal["value", b"value"]) -> builtins.bool: ...
+    def ClearField(
+        self, field_name: typing.Literal["targets", b"targets", "value", b"value"]
+    ) -> None: ...
+
+Global___Assign: typing_extensions.TypeAlias = Assign
+
+@typing.final
+class Expr(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    NAME_FIELD_NUMBER: builtins.int
+    CONSTANT_FIELD_NUMBER: builtins.int
+    ATTRIBUTE_FIELD_NUMBER: builtins.int
+    SUBSCRIPT_FIELD_NUMBER: builtins.int
+    BIN_OP_FIELD_NUMBER: builtins.int
+    BOOL_OP_FIELD_NUMBER: builtins.int
+    COMPARE_FIELD_NUMBER: builtins.int
+    CALL_FIELD_NUMBER: builtins.int
+    LIST_FIELD_NUMBER: builtins.int
+    TUPLE_FIELD_NUMBER: builtins.int
+    DICT_FIELD_NUMBER: builtins.int
+    UNARY_OP_FIELD_NUMBER: builtins.int
+    @property
+    def name(self) -> Global___Name: ...
+    @property
+    def constant(self) -> Global___Constant: ...
+    @property
+    def attribute(self) -> Global___Attribute: ...
+    @property
+    def subscript(self) -> Global___Subscript: ...
+    @property
+    def bin_op(self) -> Global___BinOp: ...
+    @property
+    def bool_op(self) -> Global___BoolOp: ...
+    @property
+    def compare(self) -> Global___Compare: ...
+    @property
+    def call(self) -> Global___Call: ...
+    @property
+    def list(self) -> Global___List: ...
+    @property
+    def tuple(self) -> Global___Tuple: ...
+    @property
+    def dict(self) -> Global___Dict: ...
+    @property
+    def unary_op(self) -> Global___UnaryOp: ...
+    def __init__(
+        self,
+        *,
+        name: Global___Name | None = ...,
+        constant: Global___Constant | None = ...,
+        attribute: Global___Attribute | None = ...,
+        subscript: Global___Subscript | None = ...,
+        bin_op: Global___BinOp | None = ...,
+        bool_op: Global___BoolOp | None = ...,
+        compare: Global___Compare | None = ...,
+        call: Global___Call | None = ...,
+        list: Global___List | None = ...,
+        tuple: Global___Tuple | None = ...,
+        dict: Global___Dict | None = ...,
+        unary_op: Global___UnaryOp | None = ...,
+    ) -> None: ...
+    def HasField(
+        self,
+        field_name: typing.Literal[
+            "attribute",
+            b"attribute",
+            "bin_op",
+            b"bin_op",
+            "bool_op",
+            b"bool_op",
+            "call",
+            b"call",
+            "compare",
+            b"compare",
+            "constant",
+            b"constant",
+            "dict",
+            b"dict",
+            "kind",
+            b"kind",
+            "list",
+            b"list",
+            "name",
+            b"name",
+            "subscript",
+            b"subscript",
+            "tuple",
+            b"tuple",
+            "unary_op",
+            b"unary_op",
+        ],
+    ) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing.Literal[
+            "attribute",
+            b"attribute",
+            "bin_op",
+            b"bin_op",
+            "bool_op",
+            b"bool_op",
+            "call",
+            b"call",
+            "compare",
+            b"compare",
+            "constant",
+            b"constant",
+            "dict",
+            b"dict",
+            "kind",
+            b"kind",
+            "list",
+            b"list",
+            "name",
+            b"name",
+            "subscript",
+            b"subscript",
+            "tuple",
+            b"tuple",
+            "unary_op",
+            b"unary_op",
+        ],
+    ) -> None: ...
+    def WhichOneof(
+        self, oneof_group: typing.Literal["kind", b"kind"]
+    ) -> (
+        typing.Literal[
+            "name",
+            "constant",
+            "attribute",
+            "subscript",
+            "bin_op",
+            "bool_op",
+            "compare",
+            "call",
+            "list",
+            "tuple",
+            "dict",
+            "unary_op",
+        ]
+        | None
+    ): ...
+
+Global___Expr: typing_extensions.TypeAlias = Expr
+
+@typing.final
+class Name(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    ID_FIELD_NUMBER: builtins.int
+    id: builtins.str
+    def __init__(
+        self,
+        *,
+        id: builtins.str = ...,
+    ) -> None: ...
+    def ClearField(self, field_name: typing.Literal["id", b"id"]) -> None: ...
+
+Global___Name: typing_extensions.TypeAlias = Name
+
+@typing.final
+class Constant(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    STRING_VALUE_FIELD_NUMBER: builtins.int
+    FLOAT_VALUE_FIELD_NUMBER: builtins.int
+    INT_VALUE_FIELD_NUMBER: builtins.int
+    BOOL_VALUE_FIELD_NUMBER: builtins.int
+    IS_NONE_FIELD_NUMBER: builtins.int
+    string_value: builtins.str
+    float_value: builtins.float
+    int_value: builtins.int
+    bool_value: builtins.bool
+    is_none: builtins.bool
+    """true if None"""
+    def __init__(
+        self,
+        *,
+        string_value: builtins.str = ...,
+        float_value: builtins.float = ...,
+        int_value: builtins.int = ...,
+        bool_value: builtins.bool = ...,
+        is_none: builtins.bool = ...,
+    ) -> None: ...
+    def HasField(
+        self,
+        field_name: typing.Literal[
+            "bool_value",
+            b"bool_value",
+            "float_value",
+            b"float_value",
+            "int_value",
+            b"int_value",
+            "is_none",
+            b"is_none",
+            "string_value",
+            b"string_value",
+            "value",
+            b"value",
+        ],
+    ) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing.Literal[
+            "bool_value",
+            b"bool_value",
+            "float_value",
+            b"float_value",
+            "int_value",
+            b"int_value",
+            "is_none",
+            b"is_none",
+            "string_value",
+            b"string_value",
+            "value",
+            b"value",
+        ],
+    ) -> None: ...
+    def WhichOneof(
+        self, oneof_group: typing.Literal["value", b"value"]
+    ) -> (
+        typing.Literal["string_value", "float_value", "int_value", "bool_value", "is_none"] | None
+    ): ...
+
+Global___Constant: typing_extensions.TypeAlias = Constant
+
+@typing.final
+class Attribute(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    VALUE_FIELD_NUMBER: builtins.int
+    ATTR_FIELD_NUMBER: builtins.int
+    attr: builtins.str
+    @property
+    def value(self) -> Global___Expr: ...
+    def __init__(
+        self,
+        *,
+        value: Global___Expr | None = ...,
+        attr: builtins.str = ...,
+    ) -> None: ...
+    def HasField(self, field_name: typing.Literal["value", b"value"]) -> builtins.bool: ...
+    def ClearField(
+        self, field_name: typing.Literal["attr", b"attr", "value", b"value"]
+    ) -> None: ...
+
+Global___Attribute: typing_extensions.TypeAlias = Attribute
+
+@typing.final
+class Subscript(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    VALUE_FIELD_NUMBER: builtins.int
+    SLICE_FIELD_NUMBER: builtins.int
+    @property
+    def value(self) -> Global___Expr: ...
+    @property
+    def slice(self) -> Global___Expr: ...
+    def __init__(
+        self,
+        *,
+        value: Global___Expr | None = ...,
+        slice: Global___Expr | None = ...,
+    ) -> None: ...
+    def HasField(
+        self, field_name: typing.Literal["slice", b"slice", "value", b"value"]
+    ) -> builtins.bool: ...
+    def ClearField(
+        self, field_name: typing.Literal["slice", b"slice", "value", b"value"]
+    ) -> None: ...
+
+Global___Subscript: typing_extensions.TypeAlias = Subscript
+
+@typing.final
+class BinOp(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    LEFT_FIELD_NUMBER: builtins.int
+    OP_FIELD_NUMBER: builtins.int
+    RIGHT_FIELD_NUMBER: builtins.int
+    op: Global___BinOpKind.ValueType
+    @property
+    def left(self) -> Global___Expr: ...
+    @property
+    def right(self) -> Global___Expr: ...
+    def __init__(
+        self,
+        *,
+        left: Global___Expr | None = ...,
+        op: Global___BinOpKind.ValueType = ...,
+        right: Global___Expr | None = ...,
+    ) -> None: ...
+    def HasField(
+        self, field_name: typing.Literal["left", b"left", "right", b"right"]
+    ) -> builtins.bool: ...
+    def ClearField(
+        self, field_name: typing.Literal["left", b"left", "op", b"op", "right", b"right"]
+    ) -> None: ...
+
+Global___BinOp: typing_extensions.TypeAlias = BinOp
+
+@typing.final
+class BoolOp(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    OP_FIELD_NUMBER: builtins.int
+    VALUES_FIELD_NUMBER: builtins.int
+    op: Global___BoolOpKind.ValueType
+    @property
+    def values(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[Global___Expr]: ...
+    def __init__(
+        self,
+        *,
+        op: Global___BoolOpKind.ValueType = ...,
+        values: collections.abc.Iterable[Global___Expr] | None = ...,
+    ) -> None: ...
+    def ClearField(self, field_name: typing.Literal["op", b"op", "values", b"values"]) -> None: ...
+
+Global___BoolOp: typing_extensions.TypeAlias = BoolOp
+
+@typing.final
+class Compare(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    LEFT_FIELD_NUMBER: builtins.int
+    OPS_FIELD_NUMBER: builtins.int
+    COMPARATORS_FIELD_NUMBER: builtins.int
+    @property
+    def left(self) -> Global___Expr: ...
+    @property
+    def ops(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedScalarFieldContainer[
+        Global___CmpOpKind.ValueType
+    ]: ...
+    @property
+    def comparators(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[Global___Expr]: ...
+    def __init__(
+        self,
+        *,
+        left: Global___Expr | None = ...,
+        ops: collections.abc.Iterable[Global___CmpOpKind.ValueType] | None = ...,
+        comparators: collections.abc.Iterable[Global___Expr] | None = ...,
+    ) -> None: ...
+    def HasField(self, field_name: typing.Literal["left", b"left"]) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing.Literal["comparators", b"comparators", "left", b"left", "ops", b"ops"],
+    ) -> None: ...
+
+Global___Compare: typing_extensions.TypeAlias = Compare
+
+@typing.final
+class Call(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    FUNC_FIELD_NUMBER: builtins.int
+    ARGS_FIELD_NUMBER: builtins.int
+    KEYWORDS_FIELD_NUMBER: builtins.int
+    @property
+    def func(self) -> Global___Expr: ...
+    @property
+    def args(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[Global___Expr]: ...
+    @property
+    def keywords(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[Global___Keyword]: ...
+    def __init__(
+        self,
+        *,
+        func: Global___Expr | None = ...,
+        args: collections.abc.Iterable[Global___Expr] | None = ...,
+        keywords: collections.abc.Iterable[Global___Keyword] | None = ...,
+    ) -> None: ...
+    def HasField(self, field_name: typing.Literal["func", b"func"]) -> builtins.bool: ...
+    def ClearField(
+        self, field_name: typing.Literal["args", b"args", "func", b"func", "keywords", b"keywords"]
+    ) -> None: ...
+
+Global___Call: typing_extensions.TypeAlias = Call
+
+@typing.final
+class UnaryOp(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    OP_FIELD_NUMBER: builtins.int
+    OPERAND_FIELD_NUMBER: builtins.int
+    op: Global___UnaryOpKind.ValueType
+    @property
+    def operand(self) -> Global___Expr: ...
+    def __init__(
+        self,
+        *,
+        op: Global___UnaryOpKind.ValueType = ...,
+        operand: Global___Expr | None = ...,
+    ) -> None: ...
+    def HasField(self, field_name: typing.Literal["operand", b"operand"]) -> builtins.bool: ...
+    def ClearField(
+        self, field_name: typing.Literal["op", b"op", "operand", b"operand"]
+    ) -> None: ...
+
+Global___UnaryOp: typing_extensions.TypeAlias = UnaryOp
+
+@typing.final
+class List(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    ELTS_FIELD_NUMBER: builtins.int
+    @property
+    def elts(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[Global___Expr]: ...
+    def __init__(
+        self,
+        *,
+        elts: collections.abc.Iterable[Global___Expr] | None = ...,
+    ) -> None: ...
+    def ClearField(self, field_name: typing.Literal["elts", b"elts"]) -> None: ...
+
+Global___List: typing_extensions.TypeAlias = List
+
+@typing.final
+class Tuple(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    ELTS_FIELD_NUMBER: builtins.int
+    @property
+    def elts(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[Global___Expr]: ...
+    def __init__(
+        self,
+        *,
+        elts: collections.abc.Iterable[Global___Expr] | None = ...,
+    ) -> None: ...
+    def ClearField(self, field_name: typing.Literal["elts", b"elts"]) -> None: ...
+
+Global___Tuple: typing_extensions.TypeAlias = Tuple
+
+@typing.final
+class Dict(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    KEYS_FIELD_NUMBER: builtins.int
+    VALUES_FIELD_NUMBER: builtins.int
+    @property
+    def keys(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[Global___Expr]: ...
+    @property
+    def values(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[Global___Expr]: ...
+    def __init__(
+        self,
+        *,
+        keys: collections.abc.Iterable[Global___Expr] | None = ...,
+        values: collections.abc.Iterable[Global___Expr] | None = ...,
+    ) -> None: ...
+    def ClearField(
+        self, field_name: typing.Literal["keys", b"keys", "values", b"values"]
+    ) -> None: ...
+
+Global___Dict: typing_extensions.TypeAlias = Dict
 
 @typing.final
 class WorkflowRegistration(google.protobuf.message.Message):
@@ -871,6 +1858,7 @@ class WorkflowNodeDispatch(google.protobuf.message.Message):
     NODE_FIELD_NUMBER: builtins.int
     WORKFLOW_INPUT_FIELD_NUMBER: builtins.int
     CONTEXT_FIELD_NUMBER: builtins.int
+    RESOLVED_KWARGS_FIELD_NUMBER: builtins.int
     @property
     def node(self) -> Global___WorkflowDagNode: ...
     @property
@@ -881,20 +1869,38 @@ class WorkflowNodeDispatch(google.protobuf.message.Message):
     ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[
         Global___WorkflowNodeContext
     ]: ...
+    @property
+    def resolved_kwargs(self) -> Global___WorkflowArguments: ...
     def __init__(
         self,
         *,
         node: Global___WorkflowDagNode | None = ...,
         workflow_input: Global___WorkflowArguments | None = ...,
         context: collections.abc.Iterable[Global___WorkflowNodeContext] | None = ...,
+        resolved_kwargs: Global___WorkflowArguments | None = ...,
     ) -> None: ...
     def HasField(
-        self, field_name: typing.Literal["node", b"node", "workflow_input", b"workflow_input"]
+        self,
+        field_name: typing.Literal[
+            "node",
+            b"node",
+            "resolved_kwargs",
+            b"resolved_kwargs",
+            "workflow_input",
+            b"workflow_input",
+        ],
     ) -> builtins.bool: ...
     def ClearField(
         self,
         field_name: typing.Literal[
-            "context", b"context", "node", b"node", "workflow_input", b"workflow_input"
+            "context",
+            b"context",
+            "node",
+            b"node",
+            "resolved_kwargs",
+            b"resolved_kwargs",
+            "workflow_input",
+            b"workflow_input",
         ],
     ) -> None: ...
 

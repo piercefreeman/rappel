@@ -1,18 +1,14 @@
 import asyncio
-from typing import List
 
 from proto import messages_pb2 as pb2
 from rappel import registry as action_registry
 from rappel.actions import action, serialize_error_payload, serialize_result_payload
-from rappel.workflow_runtime import WorkflowNodeResult, execute_node
-
-_guard_calls: List[str] = []
+from rappel.workflow_runtime import NodeExecutionResult, execute_node
 
 
 @action
-async def guarded_noop() -> str:
-    _guard_calls.append("ran")
-    return "ok"
+async def multiply(value: int) -> int:
+    return value * 2
 
 
 @action
@@ -20,26 +16,22 @@ async def exception_handler() -> str:
     return "handled"
 
 
-def _build_dispatch(flag: bool) -> pb2.WorkflowNodeDispatch:
-    if action_registry.get("guarded_noop") is None:
-        action_registry.register("guarded_noop", guarded_noop)
+def _build_resolved_dispatch() -> pb2.WorkflowNodeDispatch:
+    if action_registry.get("multiply") is None:
+        action_registry.register("multiply", multiply)
     node = pb2.WorkflowDagNode(
-        id="node_guard",
-        action="guarded_noop",
+        id="node_multiply",
+        action="multiply",
         module=__name__,
-        guard="flag",
     )
-    node.produces.append("result")
+    node.produces.append("value")
     dispatch = pb2.WorkflowNodeDispatch(node=node)
-    workflow_input = pb2.WorkflowArguments()
-    entry = workflow_input.arguments.add()
-    entry.key = "flag"
-    entry.value.primitive.bool_value = flag
-    dispatch.workflow_input.CopyFrom(workflow_input)
-    payload = serialize_result_payload(flag)
-    entry = dispatch.context.add()
-    entry.variable = "flag"
-    entry.payload.CopyFrom(payload)
+    resolved = pb2.WorkflowArguments()
+    entry = resolved.arguments.add()
+    entry.key = "value"
+    entry.value.primitive.int_value = 10
+    dispatch.resolved_kwargs.CopyFrom(resolved)
+    dispatch.workflow_input.CopyFrom(pb2.WorkflowArguments())
     return dispatch
 
 
@@ -69,33 +61,15 @@ def _build_exception_dispatch(include_error: bool) -> pb2.WorkflowNodeDispatch:
     return dispatch
 
 
-def test_execute_node_skips_guarded_action() -> None:
-    _guard_calls.clear()
-    payload = _build_dispatch(flag=False)
+def test_execute_node_uses_resolved_kwargs() -> None:
+    payload = _build_resolved_dispatch()
     result = asyncio.run(execute_node(payload))
-    assert isinstance(result, WorkflowNodeResult)
-    assert result.variables == {}
-    assert _guard_calls == []
-
-
-def test_execute_node_runs_guarded_action_when_true() -> None:
-    _guard_calls.clear()
-    payload = _build_dispatch(flag=True)
-    result = asyncio.run(execute_node(payload))
-    assert isinstance(result, WorkflowNodeResult)
-    assert result.variables == {"result": "ok"}
-    assert _guard_calls == ["ran"]
+    assert isinstance(result, NodeExecutionResult)
+    assert result.result == 20
 
 
 def test_execute_node_handles_exception_when_edge_matches() -> None:
     payload = _build_exception_dispatch(include_error=True)
     result = asyncio.run(execute_node(payload))
-    assert isinstance(result, WorkflowNodeResult)
-    assert result.variables == {"value": "handled"}
-
-
-def test_execute_node_skips_exception_handler_without_error() -> None:
-    payload = _build_exception_dispatch(include_error=False)
-    result = asyncio.run(execute_node(payload))
-    assert isinstance(result, WorkflowNodeResult)
-    assert result.variables == {}
+    assert isinstance(result, NodeExecutionResult)
+    assert result.result == "handled"

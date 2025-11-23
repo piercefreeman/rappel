@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import inspect
 import os
@@ -15,7 +16,7 @@ from .actions import deserialize_result_payload
 from .formatter import Formatter, supports_color
 from .logger import configure as configure_logger
 from .serialization import build_arguments_from_kwargs
-from .workflow_dag import DagNode, WorkflowDag, build_workflow_dag
+from .workflow_dag import DagNode, LoopSpec, WorkflowDag, build_workflow_dag
 from .workflow_runtime import WorkflowNodeResult
 
 logger = configure_logger("rappel.workflow")
@@ -102,8 +103,18 @@ class Workflow:
                 produces=list(node.produces),
             )
             proto_node.kwargs.update(node.kwargs)
+            if node.loop:
+                proto_node.loop.iterable_expr = node.loop.iterable_expr
+                proto_node.loop.loop_var = node.loop.loop_var
+                proto_node.loop.accumulator = node.loop.accumulator
+                proto_node.loop.preamble = node.loop.preamble or ""
+                proto_node.loop.body_action = node.loop.body_action
+                if node.loop.body_module:
+                    proto_node.loop.body_module = node.loop.body_module
+                proto_node.loop.body_kwargs.update(node.loop.body_kwargs)
             if node.guard:
                 proto_node.guard = node.guard
+            _populate_node_ast(proto_node, node)
             if node.timeout_seconds is not None:
                 proto_node.timeout_seconds = node.timeout_seconds
             if node.max_retries is not None:
@@ -427,6 +438,293 @@ def workflow(cls: type[TWorkflow]) -> type[TWorkflow]:
     cls.run = run_public  # type: ignore[assignment]
     workflow_registry.register(cls.short_name(), cls)
     return cls
+
+
+def _populate_node_ast(proto_node: pb2.WorkflowDagNode, node: DagNode) -> None:
+    # Python block kwargs contain full statements; skip AST emission for those nodes.
+    if node.action == "python_block":
+        return
+    ast_payload = pb2.WorkflowNodeAst()
+    for key, expr_text in node.kwargs.items():
+        expr_proto = _parse_expr(expr_text)
+        if expr_proto is None:
+            continue
+        ast_payload.kwargs[key].CopyFrom(expr_proto)
+    if node.guard:
+        guard_expr = _parse_expr(node.guard)
+        if guard_expr is not None:
+            ast_payload.guard.CopyFrom(guard_expr)
+    if node.loop:
+        loop_ast = pb2.LoopAst(
+            loop_var=node.loop.loop_var,
+            accumulator=node.loop.accumulator,
+        )
+        iterable_expr = _parse_expr(node.loop.iterable_expr)
+        if iterable_expr is not None:
+            loop_ast.iterable.CopyFrom(iterable_expr)
+        if node.loop.preamble:
+            for stmt in _parse_preamble(node.loop.preamble):
+                loop_ast.preamble.append(stmt)
+        action_ast = _build_action_ast(node.loop)
+        if action_ast is not None:
+            loop_ast.body_action.CopyFrom(action_ast)
+        ast_payload.loop.CopyFrom(loop_ast)
+    if ast_payload.kwargs or ast_payload.HasField("guard") or ast_payload.HasField("loop"):
+        proto_node.ast.CopyFrom(ast_payload)
+
+
+def _build_action_ast(loop_spec: "LoopSpec") -> Optional[pb2.ActionAst]:
+    action_name = loop_spec.body_action
+    module_name = loop_spec.body_module or ""
+    if not action_name:
+        return None
+    action_ast = pb2.ActionAst(action_name=action_name, module_name=module_name)
+    for key, expr_text in loop_spec.body_kwargs.items():
+        expr_proto = _parse_expr(expr_text)
+        if expr_proto is None:
+            continue
+        keyword = action_ast.keywords.add()
+        keyword.arg = key
+        keyword.value.CopyFrom(expr_proto)
+    return action_ast
+
+
+def _parse_preamble(snippet: str) -> list[pb2.Stmt]:
+    try:
+        tree = ast.parse(snippet)
+    except SyntaxError:
+        return []
+    statements: list[pb2.Stmt] = []
+    for stmt in tree.body:
+        stmt_proto = _stmt_to_proto(stmt)
+        if stmt_proto is not None:
+            statements.append(stmt_proto)
+    return statements
+
+
+def _parse_expr(expr_text: str) -> Optional[pb2.Expr]:
+    text = expr_text.strip()
+    if not text:
+        return None
+    try:
+        parsed = ast.parse(text, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(f"unsupported expression syntax: {expr_text!r}") from exc
+    expr_proto = _expr_to_proto(parsed.body)
+    if expr_proto is None:
+        raise ValueError(f"unsupported expression structure: {expr_text!r}")
+    return expr_proto
+
+
+def _stmt_to_proto(stmt: ast.stmt) -> Optional[pb2.Stmt]:
+    if isinstance(stmt, ast.Assign):
+        assign = pb2.Assign()
+        for target in stmt.targets:
+            target_expr = _expr_to_proto(target)
+            if target_expr is None:
+                continue
+            assign.targets.append(target_expr)
+        value_expr = _expr_to_proto(stmt.value)
+        if value_expr is None:
+            return None
+        assign.value.CopyFrom(value_expr)
+        wrapper = pb2.Stmt()
+        wrapper.assign.CopyFrom(assign)
+        return wrapper
+    if isinstance(stmt, ast.Expr):
+        expr_proto = _expr_to_proto(stmt.value)
+        if expr_proto is None:
+            return None
+        wrapper = pb2.Stmt()
+        wrapper.expr.CopyFrom(expr_proto)
+        return wrapper
+    return None
+
+
+def _expr_to_proto(expr: ast.AST) -> Optional[pb2.Expr]:
+    if isinstance(expr, ast.JoinedStr):
+        parts: list[pb2.Expr] = []
+        for value in expr.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                part = pb2.Expr(constant=pb2.Constant(string_value=value.value))
+            elif isinstance(value, ast.FormattedValue):
+                inner = _expr_to_proto(value.value)
+                if inner is None:
+                    return None
+                part = pb2.Expr(
+                    call=pb2.Call(
+                        func=pb2.Expr(name=pb2.Name(id="str")),
+                        args=[inner],
+                        keywords=[],
+                    )
+                )
+            else:
+                return None
+            parts.append(part)
+        if not parts:
+            return None
+        expr_proto = parts[0]
+        for part in parts[1:]:
+            expr_proto = pb2.Expr(
+                bin_op=pb2.BinOp(
+                    left=expr_proto,
+                    op=pb2.BinOpKind.BIN_OP_KIND_ADD,
+                    right=part,
+                )
+            )
+        return expr_proto
+    if isinstance(expr, ast.Name):
+        return pb2.Expr(name=pb2.Name(id=expr.id))
+    if isinstance(expr, ast.Constant):
+        const = pb2.Constant()
+        if expr.value is None:
+            const.is_none = True
+        elif isinstance(expr.value, bool):
+            const.bool_value = expr.value
+        elif isinstance(expr.value, int):
+            const.int_value = expr.value
+        elif isinstance(expr.value, float):
+            const.float_value = expr.value
+        elif isinstance(expr.value, str):
+            const.string_value = expr.value
+        else:
+            return None
+        return pb2.Expr(constant=const)
+    if isinstance(expr, ast.Attribute):
+        value = _expr_to_proto(expr.value)
+        if value is None:
+            return None
+        return pb2.Expr(attribute=pb2.Attribute(value=value, attr=expr.attr))
+    if isinstance(expr, ast.Subscript):
+        value = _expr_to_proto(expr.value)
+        if value is None:
+            return None
+        slice_expr = _expr_to_proto(expr.slice) if isinstance(expr.slice, ast.AST) else None
+        if slice_expr is None:
+            return None
+        return pb2.Expr(subscript=pb2.Subscript(value=value, slice=slice_expr))
+    if isinstance(expr, ast.BinOp):
+        left = _expr_to_proto(expr.left)
+        right = _expr_to_proto(expr.right)
+        if left is None or right is None:
+            return None
+        op = _BIN_OP_KIND.get(type(expr.op))
+        if op is None:
+            return None
+        return pb2.Expr(bin_op=pb2.BinOp(left=left, op=op, right=right))
+    if isinstance(expr, ast.BoolOp):
+        values = [_expr_to_proto(v) for v in expr.values]
+        if any(v is None for v in values):
+            return None
+        op = _BOOL_OP_KIND.get(type(expr.op))
+        if op is None:
+            return None
+        return pb2.Expr(bool_op=pb2.BoolOp(op=op, values=[v for v in values if v is not None]))
+    if isinstance(expr, ast.Compare):
+        left = _expr_to_proto(expr.left)
+        comps = [_expr_to_proto(c) for c in expr.comparators]
+        if left is None or any(c is None for c in comps):
+            return None
+        ops: list[pb2.CmpOpKind] = []
+        for op in expr.ops:
+            mapped = _CMP_OP_KIND.get(type(op))
+            if mapped is None:
+                return None
+            ops.append(mapped)
+        return pb2.Expr(
+            compare=pb2.Compare(
+                left=left,
+                ops=ops,
+                comparators=[c for c in comps if c is not None],
+            )
+        )
+    if isinstance(expr, ast.Call):
+        func_expr = _expr_to_proto(expr.func)
+        if func_expr is None:
+            return None
+        args: list[pb2.Expr] = []
+        for arg in expr.args:
+            proto_arg = _expr_to_proto(arg)
+            if proto_arg is None:
+                return None
+            args.append(proto_arg)
+        keywords: list[pb2.Keyword] = []
+        for kw in expr.keywords:
+            if kw.arg is None:
+                return None
+            kw_expr = _expr_to_proto(kw.value)
+            if kw_expr is None:
+                return None
+            keyword = pb2.Keyword(arg=kw.arg, value=kw_expr)
+            keywords.append(keyword)
+        return pb2.Expr(call=pb2.Call(func=func_expr, args=args, keywords=keywords))
+    if isinstance(expr, ast.List):
+        elts = [_expr_to_proto(e) for e in expr.elts]
+        if any(e is None for e in elts):
+            return None
+        return pb2.Expr(list=pb2.List(elts=[e for e in elts if e is not None]))
+    if isinstance(expr, ast.Tuple):
+        elts = [_expr_to_proto(e) for e in expr.elts]
+        if any(e is None for e in elts):
+            return None
+        return pb2.Expr(tuple=pb2.Tuple(elts=[e for e in elts if e is not None]))
+    if isinstance(expr, ast.Dict):
+        keys: list[pb2.Expr] = []
+        values: list[pb2.Expr] = []
+        for key, value in zip(expr.keys, expr.values, strict=False):
+            if key is None:
+                return None
+            key_expr = _expr_to_proto(key)
+            value_expr = _expr_to_proto(value)
+            if key_expr is None or value_expr is None:
+                return None
+            keys.append(key_expr)
+            values.append(value_expr)
+        return pb2.Expr(dict=pb2.Dict(keys=keys, values=values))
+    if isinstance(expr, ast.UnaryOp):
+        operand = _expr_to_proto(expr.operand)
+        if operand is None:
+            return None
+        op = _UNARY_OP_KIND.get(type(expr.op))
+        if op is None:
+            return None
+        return pb2.Expr(unary_op=pb2.UnaryOp(op=op, operand=operand))
+    return None
+
+
+_BIN_OP_KIND: dict[type[ast.AST], pb2.BinOpKind] = {
+    ast.Add: pb2.BinOpKind.BIN_OP_KIND_ADD,
+    ast.Sub: pb2.BinOpKind.BIN_OP_KIND_SUB,
+    ast.Mult: pb2.BinOpKind.BIN_OP_KIND_MULT,
+    ast.Div: pb2.BinOpKind.BIN_OP_KIND_DIV,
+    ast.Mod: pb2.BinOpKind.BIN_OP_KIND_MOD,
+    ast.FloorDiv: pb2.BinOpKind.BIN_OP_KIND_FLOORDIV,
+    ast.Pow: pb2.BinOpKind.BIN_OP_KIND_POW,
+}
+
+_BOOL_OP_KIND: dict[type[ast.AST], pb2.BoolOpKind] = {
+    ast.And: pb2.BoolOpKind.BOOL_OP_KIND_AND,
+    ast.Or: pb2.BoolOpKind.BOOL_OP_KIND_OR,
+}
+
+_CMP_OP_KIND: dict[type[ast.AST], pb2.CmpOpKind] = {
+    ast.Eq: pb2.CmpOpKind.CMP_OP_KIND_EQ,
+    ast.NotEq: pb2.CmpOpKind.CMP_OP_KIND_NOT_EQ,
+    ast.Lt: pb2.CmpOpKind.CMP_OP_KIND_LT,
+    ast.LtE: pb2.CmpOpKind.CMP_OP_KIND_LT_E,
+    ast.Gt: pb2.CmpOpKind.CMP_OP_KIND_GT,
+    ast.GtE: pb2.CmpOpKind.CMP_OP_KIND_GT_E,
+    ast.In: pb2.CmpOpKind.CMP_OP_KIND_IN,
+    ast.NotIn: pb2.CmpOpKind.CMP_OP_KIND_NOT_IN,
+    ast.Is: pb2.CmpOpKind.CMP_OP_KIND_IS,
+    ast.IsNot: pb2.CmpOpKind.CMP_OP_KIND_IS_NOT,
+}
+
+_UNARY_OP_KIND: dict[type[ast.AST], pb2.UnaryOpKind] = {
+    ast.USub: pb2.UnaryOpKind.UNARY_OP_KIND_USUB,
+    ast.UAdd: pb2.UnaryOpKind.UNARY_OP_KIND_UADD,
+    ast.Not: pb2.UnaryOpKind.UNARY_OP_KIND_NOT,
+}
 
 
 def _running_under_pytest() -> bool:

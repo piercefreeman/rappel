@@ -222,6 +222,7 @@ impl DispatcherTask {
                     delivery_id: metrics.delivery_id,
                     result_payload: metrics.response_payload,
                     dispatch_token: metrics.dispatch_token,
+                    control: metrics.control,
                 };
                 if let Err(err) = completion_tx.send(record).await {
                     warn!(?err, "completion channel closed, dropping record");

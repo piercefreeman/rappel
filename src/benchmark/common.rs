@@ -101,9 +101,7 @@ pub fn spawn_completion_worker(
                         Some(record) => {
                             buffer.push(record);
                             if buffer.len() >= BATCH_SIZE {
-                                if let Err(err) = database.mark_actions_batch(&buffer).await {
-                                    warn!(?err, "failed to flush completion batch");
-                                }
+                                flush_batch(&database, &mut buffer).await;
                                 buffer.clear();
                             }
                         }
@@ -117,18 +115,22 @@ pub fn spawn_completion_worker(
                         }
                         continue;
                     }
-                    if let Err(err) = database.mark_actions_batch(&buffer).await {
-                        warn!(?err, "failed to flush completion batch");
-                    }
+                    flush_batch(&database, &mut buffer).await;
                     buffer.clear();
                 }
             }
         }
-        if !buffer.is_empty()
-            && let Err(err) = database.mark_actions_batch(&buffer).await
-        {
-            warn!(?err, "failed to flush completion batch");
+        if !buffer.is_empty() {
+            flush_batch(&database, &mut buffer).await;
         }
     });
     (tx, handle)
+}
+
+async fn flush_batch(database: &Database, buffer: &mut Vec<CompletionRecord>) {
+    let mut pending = Vec::new();
+    std::mem::swap(buffer, &mut pending);
+    if let Err(err) = database.mark_actions_batch(&pending).await {
+        warn!(?err, "failed to flush completion batch");
+    }
 }

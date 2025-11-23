@@ -255,6 +255,43 @@ def test_list_comprehension_of_actions_expands_nodes_per_item() -> None:
     assert summarize_node.depends_on == [doubled_collection.id]
 
 
+class ForLoopActionWorkflow(Workflow):
+    async def run(self) -> None:
+        numbers = await asyncio.gather(fetch_number(idx=1), fetch_number(idx=2))
+        results = []
+        for number in numbers:
+            expanded = number + 1
+            doubled = await double_number(value=expanded)
+            results.append(doubled)
+        await summarize(values=results)
+
+
+def test_for_loop_builds_loop_controller_node() -> None:
+    dag = build_workflow_dag(ForLoopActionWorkflow)
+    actions = [node.action for node in dag.nodes]
+    assert actions == [
+        "fetch_number",
+        "fetch_number",
+        "python_block",
+        "python_block",
+        "loop",
+        "summarize",
+        "python_block",
+    ]
+    controller = next(node for node in dag.nodes if node.action == "loop")
+    assert controller.produces == ["results"]
+    assert controller.loop is not None
+    assert controller.loop.iterable_expr == "numbers"
+    assert controller.loop.loop_var == "number"
+    assert controller.loop.body_kwargs == {"value": "expanded"}
+    assert controller.loop.accumulator == "results"
+    assert "expanded = number + 1" in (controller.loop.preamble or "")
+    numbers_node = next(node for node in dag.nodes if node.produces == ["numbers"])
+    assert controller.depends_on == [numbers_node.id]
+    summarize_node = next(node for node in dag.nodes if node.action == "summarize")
+    assert summarize_node.depends_on == [controller.id]
+
+
 class PositionalArgsWorkflow(Workflow):
     async def run(self) -> None:
         await positional_action("greeting", 3)

@@ -49,7 +49,11 @@ dependencies = [
     run_shell(env_dir.path(), "uv sync", &[], None).await?;
 
     let mut run_envs = env_vars.to_vec();
-    let mut python_paths = vec![repo_python.join("src"), repo_python.clone()];
+    let mut python_paths = vec![
+        repo_python.join("src"),
+        repo_python.join("proto"),
+        repo_python.clone(),
+    ];
     if let Some(existing) = env::var_os("PYTHONPATH") {
         python_paths.extend(env::split_paths(&existing));
     }
