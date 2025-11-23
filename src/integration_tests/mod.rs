@@ -24,6 +24,9 @@ const INTEGRATION_MODULE_SOURCE: &str = include_str!("fixtures/integration_modul
 const INTEGRATION_COMPLEX_MODULE: &str = include_str!("fixtures/integration_complex.py");
 const INTEGRATION_LOOP_MODULE: &str = "integration_loop";
 const INTEGRATION_LOOP_MODULE_SOURCE: &str = include_str!("fixtures/integration_loop.py");
+const INTEGRATION_LOOP_ACCUM_MODULE: &str = "integration_loop_accum";
+const INTEGRATION_LOOP_ACCUM_MODULE_SOURCE: &str =
+    include_str!("fixtures/integration_loop_accum.py");
 const INTEGRATION_EXCEPTION_MODULE: &str = include_str!("fixtures/integration_exception.py");
 
 const REGISTER_SCRIPT: &str = r#"
@@ -54,6 +57,17 @@ from integration_loop import LoopWorkflow
 
 async def main():
     wf = LoopWorkflow()
+    await wf.run()
+
+asyncio.run(main())
+"#;
+
+const REGISTER_LOOP_ACCUM_SCRIPT: &str = r#"
+import asyncio
+from integration_loop_accum import LoopAccumWorkflow
+
+async def main():
+    wf = LoopAccumWorkflow()
     await wf.run()
 
 asyncio.run(main())
@@ -429,6 +443,52 @@ async fn workflow_executes_looped_actions() -> Result<()> {
     let parsed_result =
         parse_result(&stored_payload)?.context("expected primitive workflow result")?;
     assert_eq!(parsed_result, "alpha-local-decorated,beta-local-decorated");
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn workflow_accumulates_loop_outputs() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+    let Some(harness) = WorkflowHarness::new(WorkflowHarnessConfig {
+        files: &[
+            (
+                "integration_loop_accum.py",
+                INTEGRATION_LOOP_ACCUM_MODULE_SOURCE,
+            ),
+            ("register_loop_accum.py", REGISTER_LOOP_ACCUM_SCRIPT),
+        ],
+        entrypoint: "register_loop_accum.py",
+        workflow_name: "loopaccumworkflow",
+        user_module: INTEGRATION_LOOP_ACCUM_MODULE,
+        inputs: &[("input", "unused")],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let completed = harness.dispatch_all().await?;
+    assert!(
+        completed.len() >= harness.expected_actions(),
+        "expected at least {} completions, saw {}",
+        harness.expected_actions(),
+        completed.len()
+    );
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .context("missing workflow result payload")?;
+    let parsed_result =
+        parse_result(&stored_payload)?.context("expected primitive workflow result")?;
+    assert_eq!(
+        parsed_result,
+        "alpha-local-0-decorated,beta-local-1-decorated"
+    );
 
     harness.shutdown().await?;
     Ok(())
