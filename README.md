@@ -248,6 +248,17 @@ $ cargo run --bin bench -- \
   --workers 4 \
   --log-interval 15 \
   uv run python/tools/parse_bench_logs.py
+
+The `bench` binary seeds raw actions to measure dequeue/execute/ack throughput. Use `bench_instances` for an end-to-end workflow run (queueing and executing full workflow instances via the scheduler) without installing a separate `rappel-worker` binary—the harness shells out to `uv run python -m rappel.worker` automatically:
+
+```bash
+$ cargo run --bin bench_instances -- \
+  --instances 200 \
+  --batch-size 4 \
+  --payload-size 1024 \
+  --concurrency 64 \
+  --workers 4
+```
 ```
 
 Add `--json` to the parser if you prefer JSON output.

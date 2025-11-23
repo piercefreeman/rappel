@@ -30,6 +30,7 @@ use uuid::Uuid;
 #[derive(Clone, Debug)]
 pub struct PythonWorkerConfig {
     pub script_path: PathBuf,
+    pub script_args: Vec<String>,
     pub user_module: String,
     pub extra_python_paths: Vec<PathBuf>,
 }
@@ -37,8 +38,14 @@ pub struct PythonWorkerConfig {
 impl Default for PythonWorkerConfig {
     fn default() -> Self {
         Self {
-            script_path: PathBuf::from("rappel-worker"),
-            user_module: "fixtures.benchmark_actions".to_string(),
+            script_path: PathBuf::from("uv"),
+            script_args: vec![
+                "run".to_string(),
+                "python".to_string(),
+                "-m".to_string(),
+                "rappel.worker".to_string(),
+            ],
+            user_module: "benchmark.fixtures.benchmark_actions".to_string(),
             extra_python_paths: vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")],
         }
     }
@@ -122,6 +129,7 @@ impl PythonWorker {
         info!(python_path = %python_path, "configured python path for worker");
 
         let mut command = Command::new(&config.script_path);
+        command.args(&config.script_args);
         command
             .arg("--bridge")
             .arg(bridge.addr().to_string())
@@ -130,7 +138,8 @@ impl PythonWorker {
             .arg("--user-module")
             .arg(&config.user_module)
             .stderr(Stdio::inherit())
-            .env("PYTHONPATH", python_path);
+            .env("PYTHONPATH", python_path)
+            .current_dir(&package_root);
 
         let mut child = match command.spawn().context("failed to launch python worker") {
             Ok(child) => child,

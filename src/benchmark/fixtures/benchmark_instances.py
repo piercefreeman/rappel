@@ -41,7 +41,8 @@ class BenchmarkInstancesWorkflow(Workflow):
     async def run(self, batch_size: int = 4, payload_size: int = 1024) -> InstanceRunStats:
         requests = await prepare_requests(batch_size=batch_size, payload_size=payload_size)
         summary = await summarize_requests(requests=requests)
-        return await persist_results(results=summary)
+        persisted = await persist_results(results=summary)
+        return persisted
 
 
 @dataclass
@@ -93,4 +94,3 @@ def run_benchmark_instances(
         elapsed=elapsed,
         responses=responses,
     )
-
