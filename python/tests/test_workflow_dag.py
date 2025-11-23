@@ -255,6 +255,25 @@ def test_list_comprehension_of_actions_expands_nodes_per_item() -> None:
     assert summarize_node.depends_on == [doubled_collection.id]
 
 
+class ReturnGatherWorkflow(Workflow):
+    async def run(self) -> tuple[int, int]:
+        return await asyncio.gather(fetch_number(idx=1), fetch_number(idx=2))
+
+
+def test_return_statement_can_await_gather_actions() -> None:
+    dag = build_workflow_dag(ReturnGatherWorkflow)
+    assert dag.return_variable == RETURN_VARIABLE
+    actions = [node.action for node in dag.nodes]
+    assert actions == ["fetch_number", "fetch_number", "python_block"]
+    collection = dag.nodes[-1]
+    assert collection.produces == [RETURN_VARIABLE]
+    assert (
+        collection.kwargs["code"]
+        == f"{RETURN_VARIABLE} = [{RETURN_VARIABLE}__item0, {RETURN_VARIABLE}__item1]"
+    )
+    assert collection.depends_on == [dag.nodes[0].id, dag.nodes[1].id]
+
+
 class ForLoopActionWorkflow(Workflow):
     async def run(self) -> None:
         numbers = await asyncio.gather(fetch_number(idx=1), fetch_number(idx=2))
@@ -316,6 +335,32 @@ def test_return_variable_tracks_existing_assignment() -> None:
     assert dag.nodes[-1].action == "summarize"
 
 
+class ReturnAwaitActionWorkflow(Workflow):
+    async def run(self) -> float:
+        return await summarize(values=[1.0])
+
+
+def test_return_statement_can_await_action() -> None:
+    dag = build_workflow_dag(ReturnAwaitActionWorkflow)
+    assert dag.return_variable == RETURN_VARIABLE
+    last = dag.nodes[-1]
+    assert last.action == "summarize"
+    assert last.produces == [RETURN_VARIABLE]
+
+
+class NoReturnWorkflow(Workflow):
+    async def run(self) -> None:
+        await fetch_number(idx=1)
+
+
+def test_missing_return_defaults_to_none() -> None:
+    dag = build_workflow_dag(NoReturnWorkflow)
+    assert dag.return_variable == RETURN_VARIABLE
+    assert dag.nodes[-1].action == "python_block"
+    assert dag.nodes[-1].produces == [RETURN_VARIABLE]
+    assert dag.nodes[-1].kwargs["code"] == f"{RETURN_VARIABLE} = None"
+
+
 class TryExceptWorkflow(Workflow):
     async def run(self) -> None:
         try:
@@ -338,12 +383,12 @@ def test_try_except_builds_exception_edges() -> None:
 
 
 class InvalidReturnWorkflow(Workflow):
-    async def run(self) -> float:
-        return await summarize(values=[1.0])
+    async def run(self) -> None:
+        return await asyncio.sleep(0)
 
 
 def test_return_statement_cannot_await() -> None:
-    with pytest.raises(ValueError, match="cannot directly await"):
+    with pytest.raises(ValueError, match="only supported for action calls"):
         build_workflow_dag(InvalidReturnWorkflow)
 
 
