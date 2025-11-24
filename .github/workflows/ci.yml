@@ -163,9 +163,13 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Update project version
+      - name: Update project version (tag)
         if: startsWith(github.ref, 'refs/tags/v')
         run: uv run scripts/update_version.py ${{ github.ref_name }}
+
+      - name: Update project version (full-build)
+        if: github.event_name == 'pull_request' && contains(toJson(github.event.pull_request.labels), 'full-build')
+        run: uv run scripts/update_version.py 0.1.0
 
       - name: Build wheel artifact
         run: uv run scripts/build_wheel.py --out-dir target/wheels
@@ -180,6 +184,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-wheel
     timeout-minutes: 20
+    environment: pypi
     if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(toJson(github.event.pull_request.labels), 'full-build'))
     permissions:
       contents: read
@@ -221,21 +226,17 @@ jobs:
         with:
           name: rappel-wheels
           path: target/release-wheels
+      
+      - name: Flatten wheels for publish
+        run: |
+          set -x
+          mkdir -p target/release-wheels/publish
+          find target/release-wheels -type f -name '*.whl' -exec cp {} target/release-wheels/publish \;
+          ls -lsa target/release-wheels
+          ls -lsa target/release-wheels/publish
 
-      - name: Publish Linux wheel to PyPI
+      - name: Publish wheels to PyPI
         if: startsWith(github.ref, 'refs/tags/v')
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: target/release-wheels/linux
-
-      - name: Publish macOS wheel to PyPI
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: target/release-wheels/macos
-
-      - name: Publish Windows wheel to PyPI
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: target/release-wheels/windows
+          packages-dir: target/release-wheels/publish
