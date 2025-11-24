@@ -90,9 +90,21 @@ def _platform_tag() -> str:
         raise RuntimeError("unable to determine platform tag from sys_tags()") from None
 
 
+def _rewrite_wheel(wheel: Path, replacements: dict[str, bytes]) -> None:
+    temp_path = wheel.with_suffix(".whl.tmp")
+    with zipfile.ZipFile(wheel, mode="r") as src:
+        with zipfile.ZipFile(temp_path, mode="w", compression=zipfile.ZIP_DEFLATED) as dst:
+            for item in src.infolist():
+                if item.filename in replacements:
+                    dst.writestr(item, replacements[item.filename])
+                else:
+                    dst.writestr(item, src.read(item.filename))
+    temp_path.replace(wheel)
+
+
 def _set_wheel_tag(wheel: Path) -> Path:
     platform = _platform_tag()
-    with zipfile.ZipFile(wheel, mode="a") as archive:
+    with zipfile.ZipFile(wheel, mode="r") as archive:
         prefix = _dist_info_prefix(archive)
         wheel_info_path = f"{prefix}.dist-info/WHEEL"
         record_path = f"{prefix}.dist-info/RECORD"
@@ -112,7 +124,6 @@ def _set_wheel_tag(wheel: Path) -> Path:
         tag_value = f"py3-none-{platform}"
         lines.append(f"Tag: {tag_value}")
         new_wheel_body = "\n".join(lines) + "\n"
-        archive.writestr(wheel_info_path, new_wheel_body.encode("utf-8"))
 
         record_data = archive.read(record_path).decode("utf-8").splitlines()
         record_lines: list[str] = []
@@ -127,7 +138,15 @@ def _set_wheel_tag(wheel: Path) -> Path:
                 continue
             record_lines.append(entry)
         record_lines.append(f"{wheel_info_path},sha256={digest},{size}")
-        archive.writestr(record_path, "\n".join(record_lines) + "\n")
+        new_record_body = "\n".join(record_lines) + "\n"
+
+    _rewrite_wheel(
+        wheel,
+        {
+            wheel_info_path: new_wheel_body.encode("utf-8"),
+            record_path: new_record_body.encode("utf-8"),
+        },
+    )
 
     new_name = f"{prefix}-{tag_value}.whl"
     new_path = wheel.with_name(new_name)
@@ -140,12 +159,12 @@ def install_scripts_in_wheel(out_dir: Path, stage_dir: Path) -> None:
     wheels = _wheel_files(out_dir)
     suffix = ".exe" if sys.platform == "win32" else ""
     for wheel in wheels:
-        with zipfile.ZipFile(wheel, mode="a") as archive:
+        new_entries: list[tuple[str, bytes]] = []
+        with zipfile.ZipFile(wheel, mode="r") as archive:
             prefix = _dist_info_prefix(archive)
             scripts_dir = f"{prefix}.data/scripts"
             record_path = f"{prefix}.dist-info/RECORD"
             existing = set(archive.namelist())
-            new_entries: list[tuple[str, bytes]] = []
             for binary in stage_dir.iterdir():
                 if not binary.is_file():
                     continue
@@ -162,13 +181,29 @@ def install_scripts_in_wheel(out_dir: Path, stage_dir: Path) -> None:
                     target_name = f"{scripts_dir}/{script_name}"
                     if target_name in existing:
                         continue
-                    info = zipfile.ZipInfo(target_name)
-                    info.external_attr = 0o755 << 16
-                    archive.writestr(info, data)
                     existing.add(target_name)
                     new_entries.append((target_name, data))
-            if new_entries:
-                record_data = archive.read(record_path).decode("utf-8")
+
+        if not new_entries:
+            continue
+
+        temp_path = wheel.with_suffix(".whl.tmp")
+        with zipfile.ZipFile(wheel, mode="r") as src:
+            with zipfile.ZipFile(temp_path, mode="w", compression=zipfile.ZIP_DEFLATED) as dst:
+                prefix = _dist_info_prefix(src)
+                record_path = f"{prefix}.dist-info/RECORD"
+
+                for item in src.infolist():
+                    if item.filename == record_path:
+                        continue
+                    dst.writestr(item, src.read(item.filename))
+
+                for target_name, data in new_entries:
+                    info = zipfile.ZipInfo(target_name)
+                    info.external_attr = 0o755 << 16
+                    dst.writestr(info, data)
+
+                record_data = src.read(record_path).decode("utf-8")
                 record_lines = [line for line in record_data.splitlines() if line]
                 for filename, payload in new_entries:
                     digest = (
@@ -177,7 +212,9 @@ def install_scripts_in_wheel(out_dir: Path, stage_dir: Path) -> None:
                         .rstrip("=")
                     )
                     record_lines.append(f"{filename},sha256={digest},{len(payload)}")
-                archive.writestr(record_path, "\n".join(record_lines) + "\n")
+                dst.writestr(record_path, "\n".join(record_lines) + "\n")
+
+        temp_path.replace(wheel)
 
 
 def assert_entrypoints_in_wheel(out_dir: Path) -> None:
