@@ -82,16 +82,16 @@ def _dist_info_prefix(archive: zipfile.ZipFile) -> str:
     raise RuntimeError("unable to locate .dist-info directory in wheel")
 
 
-def _platform_tag() -> tags.Tag:
+def _platform_tag() -> str:
     tag_iter = tags.sys_tags()
     try:
-        return next(tag_iter)
+        return next(tag_iter).platform
     except StopIteration:
         raise RuntimeError("unable to determine platform tag from sys_tags()") from None
 
 
 def _set_wheel_tag(wheel: Path) -> Path:
-    tag = _platform_tag()
+    platform = _platform_tag()
     with zipfile.ZipFile(wheel, mode="a") as archive:
         prefix = _dist_info_prefix(archive)
         wheel_info_path = f"{prefix}.dist-info/WHEEL"
@@ -109,7 +109,7 @@ def _set_wheel_tag(wheel: Path) -> Path:
             lines.append(line)
         if not has_root:
             lines.append("Root-Is-Purelib: false")
-        tag_value = f"{tag.interpreter}-{tag.abi}-{tag.platform}"
+        tag_value = f"py3-none-{platform}"
         lines.append(f"Tag: {tag_value}")
         new_wheel_body = "\n".join(lines) + "\n"
         archive.writestr(wheel_info_path, new_wheel_body.encode("utf-8"))
