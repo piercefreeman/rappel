@@ -170,6 +170,17 @@ jobs:
       - name: Build wheel artifact
         run: uv run scripts/build_wheel.py --out-dir target/wheels
 
+      - name: Build sdist artifact (Linux only)
+        if: runner.os == 'Linux'
+        run: uv build --project python --sdist --out-dir target/sdist
+
+      - name: Upload sdist artifact (Linux only)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rappel-sdist
+          path: target/sdist/*.tar.gz
+
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
@@ -209,10 +220,17 @@ jobs:
           name: rappel-wheel-Windows
           path: artifacts/windows
 
+      - name: Download sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: rappel-sdist
+          path: artifacts/sdist
+
       - name: Assemble wheels
         run: |
           uv run scripts/assemble_wheels.py \
             --output target/release-wheels \
+            --sdist artifacts/sdist \
             linux=artifacts/linux \
             macos=artifacts/macos \
             windows=artifacts/windows
@@ -222,17 +240,9 @@ jobs:
         with:
           name: rappel-wheels
           path: target/release-wheels
-      
-      - name: Flatten wheels for publish
-        run: |
-          set -x
-          mkdir -p target/release-wheels/publish
-          find target/release-wheels -type f -name '*.whl' -exec cp {} target/release-wheels/publish \;
-          ls -lsa target/release-wheels
-          ls -lsa target/release-wheels/publish
 
       - name: Publish wheels to PyPI
         if: startsWith(github.ref, 'refs/tags/v')
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: target/release-wheels/publish
+          packages-dir: target/release-wheels
