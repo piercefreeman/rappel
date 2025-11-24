@@ -37,14 +37,10 @@ pub struct PythonWorkerConfig {
 
 impl Default for PythonWorkerConfig {
     fn default() -> Self {
+        let (script_path, script_args) = default_runner();
         Self {
-            script_path: PathBuf::from("uv"),
-            script_args: vec![
-                "run".to_string(),
-                "python".to_string(),
-                "-m".to_string(),
-                "rappel.worker".to_string(),
-            ],
+            script_path,
+            script_args,
             user_module: "benchmark.fixtures.benchmark_actions".to_string(),
             extra_python_paths: vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")],
         }
@@ -78,6 +74,39 @@ impl SharedState {
             pending_responses: HashMap::new(),
         }
     }
+}
+
+fn default_runner() -> (PathBuf, Vec<String>) {
+    if let Some(path) = find_executable("rappel-worker") {
+        return (path, Vec::new());
+    }
+    (
+        PathBuf::from("uv"),
+        vec![
+            "run".to_string(),
+            "python".to_string(),
+            "-m".to_string(),
+            "rappel.worker".to_string(),
+        ],
+    )
+}
+
+fn find_executable(bin: &str) -> Option<PathBuf> {
+    let path_var = env::var_os("PATH")?;
+    for dir in env::split_paths(&path_var) {
+        let candidate = dir.join(bin);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            let exe_candidate = dir.join(format!("{bin}.exe"));
+            if exe_candidate.is_file() {
+                return Some(exe_candidate);
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone)]

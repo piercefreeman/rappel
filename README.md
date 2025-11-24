@@ -9,10 +9,11 @@ rappel is a library to let you build durable background tasks that withstand dev
 An example is worth a thousand words. Here's how you define your workflow:
 
 ```python
-from rappel import Workflow, action
+from rappel import Workflow, action, workflow
 from myapp.models import User, GreetingSummary
 from myapp.db import my_db
 
+@workflow
 class GreetingWorkflow(Workflow):
     async def run(self, user_id: str):
         user = await fetch_user(user_id)      # first action
