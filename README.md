@@ -31,7 +31,7 @@ async def fetch_user(user_id: str) -> User:
 
 @action
 async def build_greetings(user: User) -> GreetingSummary:
-    messages: List[str] = []
+    messages: list[str] = []
     for topic in user.interests:
         messages.append(f"Hi {user.name}, let's talk about {topic}!")
     return GreetingSummary(user=user, messages=messages)
