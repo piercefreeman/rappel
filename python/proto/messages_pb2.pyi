@@ -815,6 +815,7 @@ class WorkflowNodeAst(google.protobuf.message.Message):
     KWARGS_FIELD_NUMBER: builtins.int
     GUARD_FIELD_NUMBER: builtins.int
     LOOP_FIELD_NUMBER: builtins.int
+    SLEEP_DURATION_FIELD_NUMBER: builtins.int
     @property
     def kwargs(
         self,
@@ -823,17 +824,33 @@ class WorkflowNodeAst(google.protobuf.message.Message):
     def guard(self) -> Global___Expr: ...
     @property
     def loop(self) -> Global___LoopAst: ...
+    @property
+    def sleep_duration(self) -> Global___Expr:
+        """Sleep duration expression in seconds"""
+
     def __init__(
         self,
         *,
         kwargs: collections.abc.Mapping[builtins.str, Global___Expr] | None = ...,
         guard: Global___Expr | None = ...,
         loop: Global___LoopAst | None = ...,
+        sleep_duration: Global___Expr | None = ...,
     ) -> None: ...
     def HasField(
         self,
         field_name: typing.Literal[
-            "_guard", b"_guard", "_loop", b"_loop", "guard", b"guard", "loop", b"loop"
+            "_guard",
+            b"_guard",
+            "_loop",
+            b"_loop",
+            "_sleep_duration",
+            b"_sleep_duration",
+            "guard",
+            b"guard",
+            "loop",
+            b"loop",
+            "sleep_duration",
+            b"sleep_duration",
         ],
     ) -> builtins.bool: ...
     def ClearField(
@@ -843,12 +860,16 @@ class WorkflowNodeAst(google.protobuf.message.Message):
             b"_guard",
             "_loop",
             b"_loop",
+            "_sleep_duration",
+            b"_sleep_duration",
             "guard",
             b"guard",
             "kwargs",
             b"kwargs",
             "loop",
             b"loop",
+            "sleep_duration",
+            b"sleep_duration",
         ],
     ) -> None: ...
     @typing.overload
@@ -859,6 +880,10 @@ class WorkflowNodeAst(google.protobuf.message.Message):
     def WhichOneof(
         self, oneof_group: typing.Literal["_loop", b"_loop"]
     ) -> typing.Literal["loop"] | None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_sleep_duration", b"_sleep_duration"]
+    ) -> typing.Literal["sleep_duration"] | None: ...
 
 Global___WorkflowNodeAst: typing_extensions.TypeAlias = WorkflowNodeAst
 

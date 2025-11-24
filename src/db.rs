@@ -47,6 +47,9 @@ struct SchedulingContext {
     eval_ctx: EvalContext,
     payloads: HashMap<String, Vec<NodeContextEntry>>,
     exceptions: HashMap<String, Value>,
+    /// Maps node IDs to their "wake at" times (for sleep nodes, this is when they complete).
+    /// Regular nodes have wake_at = NOW() (completion time).
+    wake_times: HashMap<String, DateTime<Utc>>,
 }
 
 fn encode_value_result(value: &Value) -> Result<WorkflowArguments> {
@@ -141,6 +144,27 @@ fn guard_allows(node: &WorkflowDagNode, ctx: &EvalContext) -> Result<bool> {
     Ok(is_truthy_value(&value))
 }
 
+/// Evaluate the sleep duration expression and return the number of seconds.
+fn evaluate_sleep_duration(node: &WorkflowDagNode, ctx: &EvalContext) -> Result<Option<f64>> {
+    let Some(ast) = node.ast.as_ref() else {
+        return Ok(None);
+    };
+    let Some(sleep_expr) = ast.sleep_duration.as_ref() else {
+        return Ok(None);
+    };
+    let value = eval_expr(sleep_expr, ctx)?;
+    match value {
+        Value::Number(n) => {
+            let secs = n.as_f64().context("sleep duration must be a number")?;
+            if secs < 0.0 {
+                anyhow::bail!("sleep duration must be non-negative, got {}", secs);
+            }
+            Ok(Some(secs))
+        }
+        _ => anyhow::bail!("sleep duration must be a number, got {:?}", value),
+    }
+}
+
 fn exception_matches(edge: &proto::WorkflowExceptionEdge, error: &Value) -> bool {
     let Value::Object(map) = error else {
         return false;
@@ -199,6 +223,23 @@ fn evaluate_kwargs(node: &WorkflowDagNode, ctx: &EvalContext) -> Result<HashMap<
         evaluated.insert(key.clone(), value);
     }
     Ok(evaluated)
+}
+
+/// Compute the earliest time a node can be scheduled based on its dependencies' wake times.
+fn compute_scheduled_at(
+    node: &WorkflowDagNode,
+    wake_times: &HashMap<String, DateTime<Utc>>,
+) -> DateTime<Utc> {
+    let now = Utc::now();
+    let mut earliest = now;
+    for dep in node.depends_on.iter().chain(node.wait_for_sync.iter()) {
+        if let Some(wake_at) = wake_times.get(dep)
+            && *wake_at > earliest
+        {
+            earliest = *wake_at;
+        }
+    }
+    earliest
 }
 
 fn build_dependency_contexts(
@@ -301,6 +342,7 @@ async fn build_scheduling_context(
         eval_ctx,
         payloads,
         exceptions,
+        wake_times: HashMap::new(),
     })
 }
 
@@ -2055,6 +2097,45 @@ impl Database {
                     next_sequence += 1;
                     continue;
                 }
+                // Handle sleep nodes: complete immediately but set a future wake time for dependents
+                if node.action == "sleep" {
+                    let sleep_secs = evaluate_sleep_duration(&node, &scheduling_ctx.eval_ctx)?;
+                    if let Some(sleep_secs) = sleep_secs {
+                        let wake_at = Utc::now()
+                            + chrono::Duration::milliseconds((sleep_secs * 1000.0) as i64);
+                        scheduling_ctx.wake_times.insert(node_id.clone(), wake_at);
+                        let payload = build_null_payload(&node)?;
+                        insert_synthetic_completion_tx(
+                            tx,
+                            &instance,
+                            &node,
+                            &workflow_input,
+                            next_sequence,
+                            payload.clone(),
+                            true,
+                        )
+                        .await?;
+                        if let Some(payload) = payload {
+                            update_scheduling_context(
+                                &node,
+                                Some(payload),
+                                true,
+                                &mut scheduling_ctx,
+                            )?;
+                        }
+                        dag_state.record_completion(node_id.clone());
+                        completed_count += 1;
+                        progressed = true;
+                        next_sequence += 1;
+                        tracing::debug!(
+                            node_id = %node_id,
+                            sleep_seconds = sleep_secs,
+                            wake_at = %wake_at,
+                            "sleep node completed, dependents will be scheduled at wake time"
+                        );
+                        continue;
+                    }
+                }
                 if let Some(loop_ast) = loop_ast {
                     let loop_eval = evaluate_loop_iteration(&node, &scheduling_ctx.eval_ctx)?;
                     if let Some(loop_eval) = loop_eval {
@@ -2091,6 +2172,7 @@ impl Database {
                             loop_eval.kwargs,
                         )?;
                         let dispatch_bytes = queued.dispatch.encode_to_vec();
+                        let scheduled_at = compute_scheduled_at(&node, &scheduling_ctx.wake_times);
                         sqlx::query_scalar::<_, LedgerActionId>(
                             r#"
                             INSERT INTO daemon_action_ledger (
@@ -2121,7 +2203,7 @@ impl Database {
                                 $9,
                                 $10,
                                 0,
-                                NOW(),
+                                $11,
                                 'failure'
                             )
                             RETURNING id
@@ -2137,6 +2219,7 @@ impl Database {
                         .bind(queued.timeout_seconds)
                         .bind(queued.max_retries)
                         .bind(queued.timeout_retry_limit)
+                        .bind(scheduled_at)
                         .fetch_one(tx.as_mut())
                         .await?;
                         dag_state.record_known(node_id.clone());
@@ -2173,6 +2256,7 @@ impl Database {
                 let queued =
                     build_action_dispatch(node.clone(), &workflow_input, contexts, kwargs)?;
                 let dispatch_bytes = queued.dispatch.encode_to_vec();
+                let scheduled_at = compute_scheduled_at(&node, &scheduling_ctx.wake_times);
                 sqlx::query_scalar::<_, LedgerActionId>(
                     r#"
                     INSERT INTO daemon_action_ledger (
@@ -2203,7 +2287,7 @@ impl Database {
                         $9,
                         $10,
                         0,
-                        NOW(),
+                        $11,
                         'failure'
                     )
                     RETURNING id
@@ -2219,6 +2303,7 @@ impl Database {
                 .bind(queued.timeout_seconds)
                 .bind(queued.max_retries)
                 .bind(queued.timeout_retry_limit)
+                .bind(scheduled_at)
                 .fetch_one(tx.as_mut())
                 .await?;
                 dag_state.record_known(node_id);

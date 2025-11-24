@@ -109,6 +109,7 @@ message WorkflowNodeAst {
   map<string, Expr> kwargs = 1;
   optional Expr guard = 2;
   optional LoopAst loop = 3;
+  optional Expr sleep_duration = 4;  // Sleep duration expression in seconds
 }
 
 message LoopAst {

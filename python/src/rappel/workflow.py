@@ -469,7 +469,17 @@ def _populate_node_ast(proto_node: pb2.WorkflowDagNode, node: DagNode) -> None:
         if action_ast is not None:
             loop_ast.body_action.CopyFrom(action_ast)
         ast_payload.loop.CopyFrom(loop_ast)
-    if ast_payload.kwargs or ast_payload.HasField("guard") or ast_payload.HasField("loop"):
+    if node.sleep_duration_expr:
+        sleep_expr = _parse_expr(node.sleep_duration_expr)
+        if sleep_expr is not None:
+            ast_payload.sleep_duration.CopyFrom(sleep_expr)
+    has_ast_content = (
+        ast_payload.kwargs
+        or ast_payload.HasField("guard")
+        or ast_payload.HasField("loop")
+        or ast_payload.HasField("sleep_duration")
+    )
+    if has_ast_content:
         proto_node.ast.CopyFrom(ast_payload)
 
 

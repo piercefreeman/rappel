@@ -24,6 +24,7 @@ class DagNode:
     max_retries: Optional[int] = None
     timeout_retry_limit: Optional[int] = None
     loop: Optional["LoopSpec"] = None
+    sleep_duration_expr: Optional[str] = None  # Expression evaluated at scheduling time
 
 
 RETURN_VARIABLE = "__workflow_return"
@@ -280,6 +281,10 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         gather = self._match_gather_call(node.value)
         if gather is not None:
             self._handle_gather([], gather)
+            return
+        sleep_seconds = self._match_sleep_call(node.value)
+        if sleep_seconds is not None:
+            self._append_sleep_node(sleep_seconds)
             return
         if self._is_complex_block(node.value):
             self._capture_block(node.value)
@@ -695,6 +700,63 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         elif isinstance(func, ast.Name):
             is_gather = func.id == "gather"
         return call if is_gather else None
+
+    def _match_sleep_call(self, expr: ast.AST) -> Optional[str]:
+        """Match `await asyncio.sleep(duration)` and return the duration expression as a string."""
+        if not isinstance(expr, ast.Await):
+            return None
+        call = expr.value
+        if not isinstance(call, ast.Call):
+            return None
+        func = call.func
+        is_sleep = False
+        if isinstance(func, ast.Attribute):
+            is_sleep = (
+                isinstance(func.value, ast.Name)
+                and func.value.id == "asyncio"
+                and func.attr == "sleep"
+            )
+        elif isinstance(func, ast.Name):
+            is_sleep = func.id == "sleep"
+        if not is_sleep:
+            return None
+        if not call.args:
+            line = getattr(call, "lineno", "?")
+            raise ValueError(f"asyncio.sleep() requires a duration argument (line {line})")
+        duration_expr = call.args[0]
+        self._validate_sleep_duration(duration_expr)
+        return ast.unparse(duration_expr)
+
+    def _validate_sleep_duration(self, expr: ast.AST) -> None:
+        """Validate that the sleep duration expression is valid.
+
+        We allow any expression that can be evaluated at runtime (variables, literals,
+        arithmetic expressions, etc.). We reject negative literals at compile time.
+        """
+        # Check for negative literal: -10 is UnaryOp(USub, Constant(10))
+        if isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.USub):
+            if isinstance(expr.operand, ast.Constant) and isinstance(
+                expr.operand.value, (int, float)
+            ):
+                raise ValueError("sleep duration must be non-negative")
+        # Check for negative constant
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, (int, float)):
+            if expr.value < 0:
+                raise ValueError("sleep duration must be non-negative")
+
+    def _append_sleep_node(self, sleep_duration_expr: str) -> None:
+        """Append a sleep node to the DAG."""
+        node_id = self._new_node_id()
+        sleep_node = DagNode(
+            id=node_id,
+            action="sleep",
+            kwargs={},
+            module="rappel.workflow_runtime",
+            depends_on=[],
+            produces=[],
+            sleep_duration_expr=sleep_duration_expr,
+        )
+        self._append_node(sleep_node)
 
     def _handle_gather(self, targets: List[ast.expr], call: ast.Call) -> None:
         flat_targets = self._flatten_targets(targets)

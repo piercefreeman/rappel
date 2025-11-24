@@ -467,3 +467,119 @@ def test_python_block_captures_imports() -> None:
     block = next(node for node in dag.nodes if node.action == "python_block")
     assert "import math" in block.kwargs["imports"]
     assert "math.sqrt(4)" in block.kwargs["code"]
+
+
+# Sleep tests
+
+
+class SleepWorkflow(Workflow):
+    async def run(self) -> None:
+        await fetch_records()
+        await asyncio.sleep(60)
+        await persist_summary(total=1.0)
+
+
+def test_sleep_creates_sleep_node() -> None:
+    dag = build_workflow_dag(SleepWorkflow)
+    actions = [node.action for node in dag.nodes]
+    # python_block at end is for implicit return
+    assert actions == ["fetch_records", "sleep", "persist_summary", "python_block"]
+    sleep_node = next(n for n in dag.nodes if n.action == "sleep")
+    assert sleep_node.sleep_duration_expr == "60"
+    # Sleep node should depend on previous node
+    assert sleep_node.wait_for_sync == [dag.nodes[0].id]
+    # Next action should depend on sleep node
+    persist_node = next(n for n in dag.nodes if n.action == "persist_summary")
+    assert persist_node.wait_for_sync == [sleep_node.id]
+
+
+class SleepWithMethodCallWorkflow(Workflow):
+    async def run(self) -> None:
+        await asyncio.sleep(timedelta(hours=1, minutes=30).total_seconds())
+
+
+def test_sleep_with_method_call() -> None:
+    # Method calls are stored as expressions and evaluated at runtime
+    # (will fail at runtime if the expression can't be evaluated)
+    dag = build_workflow_dag(SleepWithMethodCallWorkflow)
+    sleep_node = next(n for n in dag.nodes if n.action == "sleep")
+    assert sleep_node.sleep_duration_expr == "timedelta(hours=1, minutes=30).total_seconds()"
+
+
+class SleepWithLocalVariableWorkflow(Workflow):
+    async def run(self) -> None:
+        delay = 60
+        await asyncio.sleep(delay)
+
+
+def test_sleep_with_local_variable() -> None:
+    """Local variables are captured as expressions to be evaluated at runtime."""
+    dag = build_workflow_dag(SleepWithLocalVariableWorkflow)
+    sleep_node = next(n for n in dag.nodes if n.action == "sleep")
+    assert sleep_node.sleep_duration_expr == "delay"
+
+
+class SleepWithNegativeWorkflow(Workflow):
+    async def run(self) -> None:
+        await asyncio.sleep(-10)
+
+
+def test_sleep_with_negative_rejected() -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        build_workflow_dag(SleepWithNegativeWorkflow)
+
+
+class SleepWithFloatWorkflow(Workflow):
+    async def run(self) -> None:
+        await asyncio.sleep(0.5)
+
+
+def test_sleep_with_float() -> None:
+    dag = build_workflow_dag(SleepWithFloatWorkflow)
+    sleep_node = next(n for n in dag.nodes if n.action == "sleep")
+    assert sleep_node.sleep_duration_expr == "0.5"
+
+
+class MultipleSleepsWorkflow(Workflow):
+    async def run(self) -> None:
+        await fetch_records()
+        await asyncio.sleep(10)
+        await asyncio.sleep(20)
+        await persist_summary(total=1.0)
+
+
+def test_multiple_sleeps() -> None:
+    dag = build_workflow_dag(MultipleSleepsWorkflow)
+    actions = [node.action for node in dag.nodes]
+    # python_block at end is for implicit return
+    assert actions == ["fetch_records", "sleep", "sleep", "persist_summary", "python_block"]
+    sleep_nodes = [n for n in dag.nodes if n.action == "sleep"]
+    assert sleep_nodes[0].sleep_duration_expr == "10"
+    assert sleep_nodes[1].sleep_duration_expr == "20"
+
+
+class SleepWithVariableExprWorkflow(Workflow):
+    async def run(self, delay: int) -> None:
+        await asyncio.sleep(delay)
+        await persist_summary(total=1.0)
+
+
+def test_sleep_with_variable_expression() -> None:
+    """Variables should be resolved at scheduling time."""
+    dag = build_workflow_dag(SleepWithVariableExprWorkflow)
+    sleep_node = next(n for n in dag.nodes if n.action == "sleep")
+    # The expression is stored as-is, will be evaluated at runtime
+    assert sleep_node.sleep_duration_expr == "delay"
+
+
+class SleepWithArithmeticWorkflow(Workflow):
+    async def run(self, hours: int) -> None:
+        await asyncio.sleep(hours * 60 * 60)
+        await persist_summary(total=1.0)
+
+
+def test_sleep_with_arithmetic_expression() -> None:
+    """Arithmetic expressions should be stored and evaluated at runtime."""
+    dag = build_workflow_dag(SleepWithArithmeticWorkflow)
+    sleep_node = next(n for n in dag.nodes if n.action == "sleep")
+    assert sleep_node.sleep_duration_expr == "hours * 60 * 60"
