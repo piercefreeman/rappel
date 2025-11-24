@@ -1,7 +1,8 @@
 [project]
 name = "rappel"
 version = "0.1.0"
-description = "Python worker transport harness for benchmarking"
+description = "Distributed & durable background events in Python"
+readme = "../README.md"
 requires-python = ">=3.12"
 dependencies = [
     "googleapis-common-protos>=1.72.0",
