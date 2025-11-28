@@ -618,6 +618,84 @@ async fn insert_synthetic_completion_tx(
     Ok(())
 }
 
+/// Insert a sleep action that will be auto-completed when scheduled_at is reached.
+/// Unlike regular actions, sleep nodes are not dispatched to workers.
+async fn insert_sleep_action_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    instance: &WorkflowInstanceRow,
+    node: &WorkflowDagNode,
+    workflow_input: &WorkflowArguments,
+    action_seq: i32,
+    scheduled_at: DateTime<Utc>,
+) -> Result<()> {
+    let dispatch = WorkflowNodeDispatch {
+        node: Some(node.clone()),
+        workflow_input: Some(workflow_input.clone()),
+        context: Vec::new(),
+        resolved_kwargs: None,
+    };
+    let dispatch_bytes = dispatch.encode_to_vec();
+    let backoff = BackoffConfig::from_proto(node.backoff.as_ref());
+    sqlx::query(
+        r#"
+        INSERT INTO daemon_action_ledger (
+            instance_id,
+            partition_id,
+            action_seq,
+            status,
+            module,
+            function_name,
+            dispatch_payload,
+            workflow_node_id,
+            timeout_seconds,
+            max_retries,
+            timeout_retry_limit,
+            attempt_number,
+            scheduled_at,
+            retry_kind,
+            backoff_kind,
+            backoff_base_delay_ms,
+            backoff_multiplier
+        ) VALUES (
+            $1, $2, $3,
+            'sleeping',
+            $4, $5, $6, $7,
+            $8, $9, $10,
+            0,
+            $11,
+            'failure',
+            $12, $13, $14
+        )
+        "#,
+    )
+    .bind(instance.id)
+    .bind(instance.partition_id)
+    .bind(action_seq)
+    .bind("rappel.workflow_runtime")
+    .bind("sleep")
+    .bind(&dispatch_bytes)
+    .bind(&node.id)
+    .bind(
+        node.timeout_seconds
+            .unwrap_or(DEFAULT_ACTION_TIMEOUT_SECS as u32) as i32,
+    )
+    .bind(
+        node.max_retries
+            .unwrap_or(DEFAULT_ACTION_MAX_RETRIES as u32) as i32,
+    )
+    .bind(
+        node.timeout_retry_limit
+            .unwrap_or(DEFAULT_TIMEOUT_RETRY_LIMIT as u32) as i32,
+    )
+    .bind(scheduled_at)
+    .bind(backoff.kind_str())
+    .bind(backoff.base_delay_ms())
+    .bind(backoff.multiplier())
+    .execute(tx.as_mut())
+    .await?;
+    Ok(())
+}
+
 fn build_null_payload(node: &WorkflowDagNode) -> Result<Option<WorkflowArguments>> {
     if node.produces.is_empty() {
         return Ok(None);
@@ -1819,6 +1897,68 @@ impl Database {
         Ok(timed_out_ids.len())
     }
 
+    /// Complete sleeping actions whose scheduled_at time has passed.
+    /// Returns the number of actions completed.
+    pub async fn complete_sleeping_actions(&self, limit: i64) -> Result<usize> {
+        let mut tx = self.pool.begin().await?;
+        // Find sleeping actions that are ready to complete
+        let ready_actions: Vec<(LedgerActionId, WorkflowInstanceId, Option<String>)> =
+            sqlx::query_as(
+                r#"
+            WITH ready AS (
+                SELECT id
+                FROM daemon_action_ledger
+                WHERE status = 'sleeping'
+                  AND scheduled_at <= NOW()
+                ORDER BY scheduled_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT $1
+            )
+            UPDATE daemon_action_ledger AS dal
+            SET status = 'completed',
+                success = true,
+                completed_at = NOW(),
+                acked_at = NOW()
+            FROM ready
+            WHERE dal.id = ready.id
+            RETURNING dal.id, dal.instance_id, dal.workflow_node_id
+            "#,
+            )
+            .bind(limit.max(1))
+            .fetch_all(&mut *tx)
+            .await?;
+
+        if ready_actions.is_empty() {
+            tx.commit().await?;
+            return Ok(0);
+        }
+
+        // Collect unique workflow instances that need rescheduling
+        let mut workflow_instances: HashSet<WorkflowInstanceId> = HashSet::new();
+        for (_, instance_id, node_id) in &ready_actions {
+            if node_id.is_some() {
+                workflow_instances.insert(*instance_id);
+            }
+        }
+
+        // Schedule dependent actions for each affected workflow instance
+        for instance_id in workflow_instances {
+            let inserted = self
+                .schedule_workflow_instance_tx(&mut tx, instance_id)
+                .await?;
+            if inserted > 0 {
+                tracing::debug!(
+                    instance_id = %instance_id,
+                    inserted,
+                    "workflow actions unlocked after sleep completion"
+                );
+            }
+        }
+
+        tx.commit().await?;
+        Ok(ready_actions.len())
+    }
+
     pub async fn mark_actions_batch(&self, records: &[CompletionRecord]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
@@ -2281,6 +2421,25 @@ impl Database {
                         next_sequence += 1;
                         continue;
                     }
+                }
+                // Sleep nodes are handled specially - they insert a synthetic completion
+                // with a future scheduled_at time. The action is not dispatched to a worker.
+                if node.action == "sleep" {
+                    let scheduled_at = compute_scheduled_at(&node, &scheduling_ctx.eval_ctx)?;
+                    insert_sleep_action_tx(
+                        tx,
+                        &instance,
+                        &node,
+                        &workflow_input,
+                        next_sequence,
+                        scheduled_at,
+                    )
+                    .await?;
+                    dag_state.record_known(node_id.clone());
+                    inserted += 1;
+                    next_sequence += 1;
+                    progressed = true;
+                    continue;
                 }
                 let kwargs = evaluate_kwargs(&node, &scheduling_ctx.eval_ctx)?;
                 let contexts = build_dependency_contexts(&node, &scheduling_ctx.payloads);

@@ -121,6 +121,11 @@ impl DispatcherTask {
                         metrics::counter!("rappel_dispatch_errors_total").increment(1);
                         warn!(?err, "timeout check failed");
                     }
+                    // Complete any sleeping actions whose scheduled_at has passed
+                    if let Err(err) = self.complete_sleeping_actions().await {
+                        metrics::counter!("rappel_dispatch_errors_total").increment(1);
+                        warn!(?err, "sleep completion check failed");
+                    }
                 }
                 changed = self.shutdown_rx.changed() => {
                     if changed.is_ok() && *self.shutdown_rx.borrow() {
@@ -295,6 +300,15 @@ impl DispatcherTask {
         let count = self.database.mark_timed_out_actions(limit).await?;
         if count > 0 {
             info!(count, "marked timed out actions");
+        }
+        Ok(())
+    }
+
+    async fn complete_sleeping_actions(&self) -> Result<()> {
+        let limit = self.config.batch_size.max(1);
+        let count = self.database.complete_sleeping_actions(limit).await?;
+        if count > 0 {
+            debug!(count, "completed sleeping actions");
         }
         Ok(())
     }
