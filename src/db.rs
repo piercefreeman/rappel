@@ -618,7 +618,6 @@ async fn insert_synthetic_completion_tx(
     Ok(())
 }
 
-
 fn build_null_payload(node: &WorkflowDagNode) -> Result<Option<WorkflowArguments>> {
     if node.produces.is_empty() {
         return Ok(None);
@@ -663,12 +662,11 @@ fn eval_context_from_dispatch(dispatch: &WorkflowNodeDispatch) -> Result<EvalCon
             // Don't overwrite existing non-null values with null - this handles convergent
             // branches (try/except, if/else) where skipped nodes produce null values that
             // shouldn't replace real values from the branch that actually executed.
-            if final_value.is_null() {
-                if let Some(existing) = ctx.get(&entry.variable) {
-                    if !existing.is_null() {
-                        continue;
-                    }
-                }
+            if final_value.is_null()
+                && let Some(existing) = ctx.get(&entry.variable)
+                && !existing.is_null()
+            {
+                continue;
             }
             ctx.insert(entry.variable.clone(), final_value);
         }

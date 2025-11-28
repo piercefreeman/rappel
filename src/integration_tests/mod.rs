@@ -858,7 +858,7 @@ async fn workflow_success_path_skips_exception_handler() -> Result<()> {
         entrypoint: "register_exception_with_success.py",
         workflow_name: "exceptionwithsuccessworkflow",
         user_module: "integration_exception_with_success",
-        inputs: &[("should_fail", TestInputValue::Bool(false))],  // Success path!
+        inputs: &[("should_fail", TestInputValue::Bool(false))], // Success path!
     })
     .await?
     else {
@@ -903,10 +903,7 @@ async fn workflow_success_path_skips_exception_handler() -> Result<()> {
         "success_action did not succeed - it should run in success path"
     );
     let success_payload = success_result.context("success result payload missing")?;
-    assert!(
-        !success_payload.is_empty(),
-        "success payload missing bytes"
-    );
+    assert!(!success_payload.is_empty(), "success payload missing bytes");
 
     // Verify final workflow result
     let stored_payload = harness

@@ -584,7 +584,6 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         Returns None if the branch doesn't have exactly one action call.
         """
         preamble: List[ast.stmt] = []
-        action_stmt: Optional[ast.stmt] = None
         action_call: Optional[ParsedActionCall] = None
         action_target: Optional[str] = None
         postamble: List[ast.stmt] = []
@@ -597,7 +596,6 @@ class WorkflowDagBuilder(ast.NodeVisitor):
                     # Multiple actions in one branch - not supported
                     return None
                 found_action = True
-                action_stmt = stmt
                 action_call, action_target = stmt_action
             elif found_action:
                 postamble.append(stmt)

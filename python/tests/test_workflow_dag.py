@@ -792,13 +792,13 @@ class ElifChainWorkflow(Workflow):
         value = await fetch_number(idx=1)
         if value >= 100:
             result = await summarize(values=[float(value)])
-            tier = "high"
+            _tier = "high"  # noqa: F841
         elif value >= 50:
             result = await summarize(values=[float(value) / 2])
-            tier = "medium"
+            _tier = "medium"  # noqa: F841
         else:
             result = await summarize(values=[float(value) / 4])
-            tier = "low"
+            _tier = "low"  # noqa: F841
         return result
 
 
@@ -811,8 +811,8 @@ def test_elif_chain_creates_multiple_guarded_branches() -> None:
     assert actions.count("summarize") == 3
     summarize_nodes = [n for n in dag.nodes if n.action == "summarize"]
     # Each should have a guard
-    guards = [n.guard for n in summarize_nodes]
-    assert all(g is not None for g in guards)
+    guards: list[str] = [n.guard for n in summarize_nodes if n.guard is not None]
+    assert len(guards) == 3
     # The guards should be mutually exclusive
     assert any("value >= 100" in g for g in guards)
     assert any("value >= 50" in g for g in guards)
