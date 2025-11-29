@@ -1,7 +1,7 @@
 PROTO_FILES := proto/messages.proto
 PY_PROTO_OUT := python/proto
 
-.PHONY: all build-proto clean lint lint-verify python-lint python-lint-verify rust-lint rust-lint-verify
+.PHONY: all build-proto clean lint lint-verify python-lint python-lint-verify rust-lint rust-lint-verify coverage python-coverage rust-coverage
 
 all: build-proto
 
@@ -48,3 +48,13 @@ rust-lint:
 rust-lint-verify:
 	cargo fmt -- --check
 	cargo clippy --all-targets --all-features -- -D warnings
+
+# Coverage targets
+coverage: python-coverage rust-coverage
+
+python-coverage:
+	cd python && uv run pytest tests --cov=rappel --cov-report=term-missing --cov-report=xml:coverage.xml --cov-report=html:htmlcov
+
+rust-coverage:
+	cargo llvm-cov --html --output-dir target/llvm-cov-html
+	cargo llvm-cov --lcov --output-path target/lcov.info

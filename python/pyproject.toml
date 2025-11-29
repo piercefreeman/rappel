@@ -21,6 +21,7 @@ rappel-worker = "rappel.worker:main"
 dev = [
     "grpcio-tools>=1.66,<2",
     "pytest>=8",
+    "pytest-cov>=6",
     "ty>=0.0.1a26",
     "ruff>=0.6",
     "mypy-protobuf>=3.7.0",
@@ -55,3 +56,22 @@ packages = ["src/rappel", "proto"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src", "proto", "README.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=rappel --cov-report=term-missing --cov-report=xml:coverage.xml --cov-report=html:htmlcov"
+
+[tool.coverage.run]
+source = ["src/rappel"]
+branch = true
+omit = ["*/tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+show_missing = true

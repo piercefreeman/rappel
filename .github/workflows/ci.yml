@@ -35,9 +35,15 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      - name: Python tests
+      - name: Python tests with coverage
         working-directory: python
-        run: uv run pytest tests
+        run: uv run pytest tests --cov=rappel --cov-report=term-missing --cov-report=xml:coverage.xml
+
+      - name: Upload Python coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-coverage
+          path: python/coverage.xml
 
   rust-lint:
     runs-on: ubuntu-latest
@@ -70,10 +76,19 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy, rustfmt, llvm-tools-preview
 
-      - name: Cargo test
-        run: cargo test
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Run tests with coverage
+        run: cargo llvm-cov --lcov --output-path lcov.info
+
+      - name: Upload Rust coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage
+          path: lcov.info
 
   integration:
     runs-on: ubuntu-latest

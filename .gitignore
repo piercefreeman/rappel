@@ -50,6 +50,8 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 cover/
+lcov.info
+target/llvm-cov-html/
 
 # Translations
 *.mo
