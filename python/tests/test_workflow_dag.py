@@ -930,7 +930,7 @@ class MultiActionLoopWithPreambleWorkflow(Workflow):
     async def run(self, orders: list) -> list:
         results = []
         for order in orders:
-            order_id = order["id"]
+            _order_id = order["id"]  # noqa: F841 - testing preamble capture
             validated = await validate_order(order=order)
             payment = await process_payment(validated=validated)
             results.append(payment)

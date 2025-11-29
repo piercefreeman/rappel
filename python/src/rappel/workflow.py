@@ -18,8 +18,6 @@ from .logger import configure as configure_logger
 from .serialization import build_arguments_from_kwargs
 from .workflow_dag import (
     DagNode,
-    LoopBodyGraph,
-    LoopBodyNode,
     LoopSpec,
     MultiActionLoopSpec,
     WorkflowDag,

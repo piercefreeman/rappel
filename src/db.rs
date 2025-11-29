@@ -485,7 +485,10 @@ fn find_next_ready_phase(
     }
 
     let mut local_ctx = ctx.clone();
-    local_ctx.insert(loop_ast.loop_var.clone(), items[state.current_index].clone());
+    local_ctx.insert(
+        loop_ast.loop_var.clone(),
+        items[state.current_index].clone(),
+    );
     local_ctx.insert(
         loop_ast.accumulator.clone(),
         Value::Array(state.accumulator.clone()),
@@ -545,10 +548,7 @@ fn find_next_ready_phase(
 }
 
 /// Check if all phases in the body graph are completed
-fn is_iteration_complete(
-    node: &WorkflowDagNode,
-    state: &MultiActionLoopState,
-) -> bool {
+fn is_iteration_complete(node: &WorkflowDagNode, state: &MultiActionLoopState) -> bool {
     let Some(ast) = node.ast.as_ref() else {
         return true;
     };
@@ -566,15 +566,15 @@ fn is_iteration_complete(
 }
 
 /// Extract the result variable from the completed iteration
-fn extract_iteration_result(
-    node: &WorkflowDagNode,
-    state: &MultiActionLoopState,
-) -> Option<Value> {
+fn extract_iteration_result(node: &WorkflowDagNode, state: &MultiActionLoopState) -> Option<Value> {
     let ast = node.ast.as_ref()?;
     let loop_ast = ast.r#loop.as_ref()?;
     let body_graph = loop_ast.body_graph.as_ref()?;
 
-    state.phase_results.get(&body_graph.result_variable).cloned()
+    state
+        .phase_results
+        .get(&body_graph.result_variable)
+        .cloned()
 }
 
 /// Check if this node has a multi-action loop body graph
@@ -610,11 +610,7 @@ fn extract_multi_action_loop_state(
     let phase_results = ctx
         .get(LOOP_PHASE_RESULTS_VAR)
         .and_then(|v| match v {
-            Value::Object(obj) => Some(
-                obj.iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            ),
+            Value::Object(obj) => Some(obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
             _ => None,
         })
         .unwrap_or_default();
@@ -1215,7 +1211,9 @@ impl Database {
         // Handle multi-action loop completion
         if has_multi_action_body_graph(&node) {
             return self
-                .process_multi_action_loop_completion_tx(tx, record, &node, &loop_ast, &dispatch, &row)
+                .process_multi_action_loop_completion_tx(
+                    tx, record, &node, &loop_ast, &dispatch, &row,
+                )
                 .await;
         }
 
@@ -1438,7 +1436,9 @@ impl Database {
         let iteration_args = decode_arguments(&record.result_payload, "phase result")?;
         let decoded = decode_payload(&iteration_args)?;
         if let Some(result_value) = decoded.result {
-            state.phase_results.insert(current_output_var.clone(), result_value);
+            state
+                .phase_results
+                .insert(current_output_var.clone(), result_value);
         }
         state.completed_phases.insert(current_phase_id.clone());
 
@@ -1451,17 +1451,27 @@ impl Database {
 
             // Update phase tracking in context
             let phases_value = Value::Array(
-                state.completed_phases.iter().map(|s| Value::String(s.clone())).collect()
+                state
+                    .completed_phases
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
             );
             let phases_payload = encode_value_result(&phases_value)?;
 
             let results_value = Value::Object(
-                state.phase_results.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                state
+                    .phase_results
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
             );
             let results_payload = encode_value_result(&results_value)?;
 
-            let phase_id_payload = encode_value_result(&Value::String(next_phase.phase_id.clone()))?;
-            let output_var_payload = encode_value_result(&Value::String(next_phase.output_var.clone()))?;
+            let phase_id_payload =
+                encode_value_result(&Value::String(next_phase.phase_id.clone()))?;
+            let output_var_payload =
+                encode_value_result(&Value::String(next_phase.output_var.clone()))?;
 
             // Remove old phase context entries
             new_dispatch.context.retain(|ctx| {
@@ -1546,7 +1556,10 @@ impl Database {
         // No more phases - iteration is complete
         // Extract result and add to accumulator
         let body_graph = loop_ast.body_graph.as_ref().context("missing body graph")?;
-        let result_value = state.phase_results.get(&body_graph.result_variable).cloned();
+        let result_value = state
+            .phase_results
+            .get(&body_graph.result_variable)
+            .cloned();
         if let Some(val) = result_value {
             state.accumulator.push(val);
         }
@@ -1586,12 +1599,17 @@ impl Database {
                 let mut new_dispatch = dispatch.clone();
 
                 // Update all context entries for new iteration
-                let accumulator_payload = encode_value_result(&Value::Array(state.accumulator.clone()))?;
-                let index_payload = encode_value_result(&Value::Number(serde_json::Number::from(next_index as u64)))?;
+                let accumulator_payload =
+                    encode_value_result(&Value::Array(state.accumulator.clone()))?;
+                let index_payload = encode_value_result(&Value::Number(serde_json::Number::from(
+                    next_index as u64,
+                )))?;
                 let phases_payload = encode_value_result(&Value::Array(vec![]))?;
                 let results_payload = encode_value_result(&Value::Object(serde_json::Map::new()))?;
-                let phase_id_payload = encode_value_result(&Value::String(next_phase.phase_id.clone()))?;
-                let output_var_payload = encode_value_result(&Value::String(next_phase.output_var.clone()))?;
+                let phase_id_payload =
+                    encode_value_result(&Value::String(next_phase.phase_id.clone()))?;
+                let output_var_payload =
+                    encode_value_result(&Value::String(next_phase.output_var.clone()))?;
 
                 new_dispatch.context.retain(|ctx| {
                     ctx.variable != loop_ast.accumulator
@@ -2649,11 +2667,13 @@ impl Database {
                             &scheduling_ctx.eval_ctx,
                             &loop_ast.accumulator,
                         );
-                        let phase_eval = find_next_ready_phase(&node, &scheduling_ctx.eval_ctx, &state)?;
+                        let phase_eval =
+                            find_next_ready_phase(&node, &scheduling_ctx.eval_ctx, &state)?;
 
                         if let Some(phase_eval) = phase_eval {
                             // Dispatch the next ready phase
-                            let mut contexts = build_dependency_contexts(&node, &scheduling_ctx.payloads);
+                            let mut contexts =
+                                build_dependency_contexts(&node, &scheduling_ctx.payloads);
 
                             // Add accumulator to context
                             let accumulator_value = Value::Array(state.accumulator.clone());
@@ -2665,7 +2685,8 @@ impl Database {
                             });
 
                             // Add loop index to context
-                            let index_value = Value::Number(serde_json::Number::from(state.current_index as u64));
+                            let index_value =
+                                Value::Number(serde_json::Number::from(state.current_index as u64));
                             let index_payload = encode_value_result(&index_value)?;
                             contexts.push(WorkflowNodeContext {
                                 variable: LOOP_INDEX_VAR.to_string(),
@@ -2675,7 +2696,11 @@ impl Database {
 
                             // Add completed phases to context
                             let phases_value = Value::Array(
-                                state.completed_phases.iter().map(|s| Value::String(s.clone())).collect()
+                                state
+                                    .completed_phases
+                                    .iter()
+                                    .map(|s| Value::String(s.clone()))
+                                    .collect(),
                             );
                             let phases_payload = encode_value_result(&phases_value)?;
                             contexts.push(WorkflowNodeContext {
@@ -2686,7 +2711,11 @@ impl Database {
 
                             // Add phase results to context
                             let results_value = Value::Object(
-                                state.phase_results.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                                state
+                                    .phase_results
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect(),
                             );
                             let results_payload = encode_value_result(&results_value)?;
                             contexts.push(WorkflowNodeContext {
@@ -2696,13 +2725,15 @@ impl Database {
                             });
 
                             // Add current phase info
-                            let phase_id_payload = encode_value_result(&Value::String(phase_eval.phase_id.clone()))?;
+                            let phase_id_payload =
+                                encode_value_result(&Value::String(phase_eval.phase_id.clone()))?;
                             contexts.push(WorkflowNodeContext {
                                 variable: "__current_phase_id".to_string(),
                                 payload: Some(phase_id_payload),
                                 workflow_node_id: node_id.clone(),
                             });
-                            let output_var_payload = encode_value_result(&Value::String(phase_eval.output_var.clone()))?;
+                            let output_var_payload =
+                                encode_value_result(&Value::String(phase_eval.output_var.clone()))?;
                             contexts.push(WorkflowNodeContext {
                                 variable: "__current_phase_output_var".to_string(),
                                 payload: Some(output_var_payload),
@@ -2723,7 +2754,8 @@ impl Database {
                                 phase_eval.kwargs,
                             )?;
                             let dispatch_bytes = queued.dispatch.encode_to_vec();
-                            let scheduled_at = compute_scheduled_at(&node, &scheduling_ctx.eval_ctx)?;
+                            let scheduled_at =
+                                compute_scheduled_at(&node, &scheduling_ctx.eval_ctx)?;
                             sqlx::query_scalar::<_, LedgerActionId>(
                                 r#"
                                 INSERT INTO daemon_action_ledger (
@@ -2782,7 +2814,8 @@ impl Database {
                                 }
 
                                 // Check if there are more iterations
-                                let iterable = loop_ast.iterable.as_ref().context("missing iterable")?;
+                                let iterable =
+                                    loop_ast.iterable.as_ref().context("missing iterable")?;
                                 let iterable_value = eval_expr(iterable, &scheduling_ctx.eval_ctx)?;
                                 let items_len = match iterable_value {
                                     Value::Array(arr) => arr.len(),
@@ -2797,7 +2830,9 @@ impl Database {
                                     );
                                     scheduling_ctx.eval_ctx.insert(
                                         LOOP_INDEX_VAR.to_string(),
-                                        Value::Number(serde_json::Number::from((state.current_index + 1) as u64)),
+                                        Value::Number(serde_json::Number::from(
+                                            (state.current_index + 1) as u64,
+                                        )),
                                     );
                                     // Clear phase tracking for new iteration
                                     scheduling_ctx.eval_ctx.remove(LOOP_PHASE_VAR);
@@ -2807,7 +2842,8 @@ impl Database {
                                     continue;
                                 } else {
                                     // All iterations done - mark node complete
-                                    let payload = encode_value_result(&Value::Array(new_accumulator))?;
+                                    let payload =
+                                        encode_value_result(&Value::Array(new_accumulator))?;
                                     insert_synthetic_completion_tx(
                                         tx,
                                         &instance,
@@ -2818,7 +2854,12 @@ impl Database {
                                         true,
                                     )
                                     .await?;
-                                    update_scheduling_context(&node, Some(payload), true, &mut scheduling_ctx)?;
+                                    update_scheduling_context(
+                                        &node,
+                                        Some(payload),
+                                        true,
+                                        &mut scheduling_ctx,
+                                    )?;
                                     dag_state.record_completion(node_id.clone());
                                     completed_count += 1;
                                     progressed = true;
