@@ -1285,9 +1285,11 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         flat_targets = self._flatten_targets(targets)
 
         # Handle starred list comprehension pattern: asyncio.gather(*[action(x) for x in items])
-        if (len(call.args) == 1
+        if (
+            len(call.args) == 1
             and isinstance(call.args[0], ast.Starred)
-            and isinstance(call.args[0].value, ast.ListComp)):
+            and isinstance(call.args[0].value, ast.ListComp)
+        ):
             listcomp = call.args[0].value
             if len(flat_targets) == 1 and flat_targets[0]:
                 target_name = flat_targets[0]

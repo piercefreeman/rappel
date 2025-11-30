@@ -597,7 +597,10 @@ fn find_next_ready_phase(
                 tracing::debug!("preamble: processed_list is not array: {:?}", pl);
             }
         } else {
-            tracing::debug!("preamble: processed_list NOT in context. Keys: {:?}", pre_preamble_keys);
+            tracing::debug!(
+                "preamble: processed_list NOT in context. Keys: {:?}",
+                pre_preamble_keys
+            );
         }
         for stmt in &loop_ast.preamble {
             eval_stmt(stmt, &mut local_ctx)?;
@@ -1803,16 +1806,17 @@ impl Database {
                 });
 
                 // Get preamble results from the new iteration's first phase
-                let preamble_results_value = if let Some(preamble_vars) = &next_phase.preamble_results {
-                    Value::Object(
-                        preamble_vars
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                    )
-                } else {
-                    Value::Object(serde_json::Map::new())
-                };
+                let preamble_results_value =
+                    if let Some(preamble_vars) = &next_phase.preamble_results {
+                        Value::Object(
+                            preamble_vars
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect(),
+                        )
+                    } else {
+                        Value::Object(serde_json::Map::new())
+                    };
                 let preamble_results_payload = encode_value_result(&preamble_results_value)?;
 
                 new_dispatch.context.push(WorkflowNodeContext {
@@ -2485,8 +2489,7 @@ impl Database {
             Ok(records) => {
                 let count = records.len();
                 if count > 0 {
-                    metrics::counter!("rappel_actions_dispatched_total")
-                        .increment(count as u64);
+                    metrics::counter!("rappel_actions_dispatched_total").increment(count as u64);
                 }
                 // JSON timing output for analysis
                 debug!(
@@ -3053,23 +3056,25 @@ impl Database {
                             });
 
                             // Add preamble results to context (from first phase evaluation)
-                            let preamble_results_value = if let Some(preamble_vars) = &phase_eval.preamble_results {
-                                Value::Object(
-                                    preamble_vars
-                                        .iter()
-                                        .map(|(k, v)| (k.clone(), v.clone()))
-                                        .collect(),
-                                )
-                            } else {
-                                Value::Object(
-                                    state
-                                        .preamble_results
-                                        .iter()
-                                        .map(|(k, v)| (k.clone(), v.clone()))
-                                        .collect(),
-                                )
-                            };
-                            let preamble_results_payload = encode_value_result(&preamble_results_value)?;
+                            let preamble_results_value =
+                                if let Some(preamble_vars) = &phase_eval.preamble_results {
+                                    Value::Object(
+                                        preamble_vars
+                                            .iter()
+                                            .map(|(k, v)| (k.clone(), v.clone()))
+                                            .collect(),
+                                    )
+                                } else {
+                                    Value::Object(
+                                        state
+                                            .preamble_results
+                                            .iter()
+                                            .map(|(k, v)| (k.clone(), v.clone()))
+                                            .collect(),
+                                    )
+                                };
+                            let preamble_results_payload =
+                                encode_value_result(&preamble_results_value)?;
                             contexts.push(WorkflowNodeContext {
                                 variable: LOOP_PREAMBLE_RESULTS_VAR.to_string(),
                                 payload: Some(preamble_results_payload),

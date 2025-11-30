@@ -355,7 +355,11 @@ print(base64.b64encode(payload.SerializeToString()).decode(), end='')
     Ok(bytes)
 }
 
-fn build_workflow_input(fan_out_factor: usize, work_intensity: usize, payload_size: usize) -> Vec<u8> {
+fn build_workflow_input(
+    fan_out_factor: usize,
+    work_intensity: usize,
+    payload_size: usize,
+) -> Vec<u8> {
     let mut arguments = proto::WorkflowArguments {
         arguments: Vec::new(),
     };
@@ -382,7 +386,9 @@ fn build_workflow_input(fan_out_factor: usize, work_intensity: usize, payload_si
     arguments.encode_to_vec()
 }
 
-fn primitive_argument(kind: proto::primitive_workflow_argument::Kind) -> proto::WorkflowArgumentValue {
+fn primitive_argument(
+    kind: proto::primitive_workflow_argument::Kind,
+) -> proto::WorkflowArgumentValue {
     proto::WorkflowArgumentValue {
         kind: Some(proto::workflow_argument_value::Kind::Primitive(
             proto::PrimitiveWorkflowArgument { kind: Some(kind) },

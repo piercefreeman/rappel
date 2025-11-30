@@ -32,8 +32,7 @@ async fn main() -> Result<()> {
         batch_size: worker_settings.batch_size,
         max_concurrent: worker_settings.max_concurrent,
     };
-    let dispatcher =
-        Dispatcher::start(dispatcher_config, Arc::clone(&database), Arc::clone(&pool));
+    let dispatcher = Dispatcher::start(dispatcher_config, Arc::clone(&database), Arc::clone(&pool));
     info!(
         worker_count,
         max_concurrent = worker_settings.max_concurrent,

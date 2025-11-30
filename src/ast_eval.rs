@@ -112,10 +112,7 @@ pub fn eval_stmt(stmt: &proto::Stmt, ctx: &mut EvalContext) -> Result<()> {
             Ok(())
         }
         proto::stmt::Kind::ForStmt(for_stmt) => {
-            let iter_value = eval_expr(
-                for_stmt.iter.as_ref().context("for missing iter")?,
-                ctx,
-            )?;
+            let iter_value = eval_expr(for_stmt.iter.as_ref().context("for missing iter")?, ctx)?;
             let Value::Array(items) = iter_value else {
                 return Err(anyhow!("for loop requires iterable"));
             };
@@ -546,10 +543,8 @@ fn eval_call(call: &proto::Call, ctx: &EvalContext) -> Result<Value> {
                     Value::Array(a) => Ok(Value::Array(a.clone())),
                     Value::String(s) => {
                         // Convert string to list of characters
-                        let chars: Vec<Value> = s
-                            .chars()
-                            .map(|c| Value::String(c.to_string()))
-                            .collect();
+                        let chars: Vec<Value> =
+                            s.chars().map(|c| Value::String(c.to_string())).collect();
                         Ok(Value::Array(chars))
                     }
                     _ => Err(anyhow!("list requires an iterable")),
@@ -562,7 +557,13 @@ fn eval_call(call: &proto::Call, ctx: &EvalContext) -> Result<Value> {
                 let val = match &args[0] {
                     Value::Number(n) => n.as_i64().unwrap_or(0),
                     Value::String(s) => s.parse::<i64>().unwrap_or(0),
-                    Value::Bool(b) => if *b { 1 } else { 0 },
+                    Value::Bool(b) => {
+                        if *b {
+                            1
+                        } else {
+                            0
+                        }
+                    }
                     _ => return Err(anyhow!("int unsupported type")),
                 };
                 Ok(Value::Number(Number::from(val)))
@@ -574,10 +575,18 @@ fn eval_call(call: &proto::Call, ctx: &EvalContext) -> Result<Value> {
                 let val = match &args[0] {
                     Value::Number(n) => n.as_f64().unwrap_or(0.0),
                     Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
-                    Value::Bool(b) => if *b { 1.0 } else { 0.0 },
+                    Value::Bool(b) => {
+                        if *b {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
                     _ => return Err(anyhow!("float unsupported type")),
                 };
-                Ok(Value::Number(Number::from_f64(val).unwrap_or(Number::from(0))))
+                Ok(Value::Number(
+                    Number::from_f64(val).unwrap_or(Number::from(0)),
+                ))
             }
             "bool" => {
                 if args.len() != 1 {
@@ -654,7 +663,9 @@ fn eval_call(call: &proto::Call, ctx: &EvalContext) -> Result<Value> {
                 if total.fract() == 0.0 && total.abs() < i64::MAX as f64 {
                     Ok(Value::Number(Number::from(total as i64)))
                 } else {
-                    Ok(Value::Number(Number::from_f64(total).unwrap_or(Number::from(0))))
+                    Ok(Value::Number(
+                        Number::from_f64(total).unwrap_or(Number::from(0)),
+                    ))
                 }
             }
             "abs" => {
@@ -665,7 +676,9 @@ fn eval_call(call: &proto::Call, ctx: &EvalContext) -> Result<Value> {
                 if val.fract() == 0.0 {
                     Ok(Value::Number(Number::from(val.abs() as i64)))
                 } else {
-                    Ok(Value::Number(Number::from_f64(val.abs()).unwrap_or(Number::from(0))))
+                    Ok(Value::Number(
+                        Number::from_f64(val.abs()).unwrap_or(Number::from(0)),
+                    ))
                 }
             }
             other => Err(anyhow!("unsupported call '{}'", other)),
@@ -882,9 +895,18 @@ mod tests {
         assert_eq!(
             result,
             Value::Array(vec![
-                Value::Array(vec![Value::Number(Number::from(0)), Value::Number(Number::from(10))]),
-                Value::Array(vec![Value::Number(Number::from(1)), Value::Number(Number::from(20))]),
-                Value::Array(vec![Value::Number(Number::from(2)), Value::Number(Number::from(30))]),
+                Value::Array(vec![
+                    Value::Number(Number::from(0)),
+                    Value::Number(Number::from(10))
+                ]),
+                Value::Array(vec![
+                    Value::Number(Number::from(1)),
+                    Value::Number(Number::from(20))
+                ]),
+                Value::Array(vec![
+                    Value::Number(Number::from(2)),
+                    Value::Number(Number::from(30))
+                ]),
             ])
         );
     }
@@ -902,8 +924,14 @@ mod tests {
         assert_eq!(
             result,
             Value::Array(vec![
-                Value::Array(vec![Value::Number(Number::from(5)), Value::Number(Number::from(10))]),
-                Value::Array(vec![Value::Number(Number::from(6)), Value::Number(Number::from(20))]),
+                Value::Array(vec![
+                    Value::Number(Number::from(5)),
+                    Value::Number(Number::from(10))
+                ]),
+                Value::Array(vec![
+                    Value::Number(Number::from(6)),
+                    Value::Number(Number::from(20))
+                ]),
             ])
         );
     }
@@ -937,7 +965,10 @@ mod tests {
     #[test]
     fn supports_list_append() {
         let mut ctx = EvalContext::new();
-        ctx.insert("items".to_string(), Value::Array(vec![Value::Number(Number::from(1))]));
+        ctx.insert(
+            "items".to_string(),
+            Value::Array(vec![Value::Number(Number::from(1))]),
+        );
 
         // Create: items.append(2)
         let append_call = proto::Expr {

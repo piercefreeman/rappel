@@ -256,10 +256,7 @@ async fn run_actions_benchmark(
 ) -> Result<()> {
     info!(
         messages,
-        payload,
-        concurrency,
-        workers,
-        "starting actions benchmark"
+        payload, concurrency, workers, "starting actions benchmark"
     );
 
     let worker_config = PythonWorkerConfig {
@@ -315,11 +312,7 @@ async fn run_instances_benchmark(
 ) -> Result<()> {
     info!(
         instances,
-        batch_size,
-        payload_size,
-        concurrency,
-        workers,
-        "starting instances benchmark"
+        batch_size, payload_size, concurrency, workers, "starting instances benchmark"
     );
 
     let worker_config = PythonWorkerConfig::default();
