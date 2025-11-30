@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -8,6 +9,7 @@ use sqlx::{
     FromRow, PgPool, Postgres, Row, Transaction,
     postgres::{PgPoolOptions, PgRow},
 };
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{
@@ -35,9 +37,49 @@ const LOOP_PHASE_VAR: &str = "__loop_phase";
 const LOOP_PHASE_RESULTS_VAR: &str = "__loop_phase_results";
 const LOOP_PREAMBLE_RESULTS_VAR: &str = "__loop_preamble_results";
 
+/// Cached workflow version data - avoids repeated DB lookups for the same version
+#[derive(Debug, Clone)]
+struct CachedWorkflowVersion {
+    concurrent: bool,
+    dag: WorkflowDagDefinition,
+    node_map: HashMap<String, WorkflowDagNode>,
+}
+
+/// LRU-style cache for workflow versions. Uses a simple HashMap with a max size.
+/// When full, clears the entire cache (simple but effective for workflow orchestration
+/// where versions are relatively stable during a run).
+#[derive(Debug, Default)]
+struct WorkflowVersionCache {
+    entries: HashMap<WorkflowVersionId, CachedWorkflowVersion>,
+    max_size: usize,
+}
+
+impl WorkflowVersionCache {
+    fn new(max_size: usize) -> Self {
+        Self {
+            entries: HashMap::with_capacity(max_size),
+            max_size,
+        }
+    }
+
+    fn get(&self, version_id: &WorkflowVersionId) -> Option<&CachedWorkflowVersion> {
+        self.entries.get(version_id)
+    }
+
+    fn insert(&mut self, version_id: WorkflowVersionId, version: CachedWorkflowVersion) {
+        // Simple eviction: if at capacity, clear everything
+        // This is fine because in practice we have very few workflow versions active at once
+        if self.entries.len() >= self.max_size && !self.entries.contains_key(&version_id) {
+            self.entries.clear();
+        }
+        self.entries.insert(version_id, version);
+    }
+}
+
 #[derive(Clone)]
 pub struct Database {
     pool: PgPool,
+    version_cache: Arc<RwLock<WorkflowVersionCache>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1809,11 +1851,64 @@ impl Database {
             .run(&pool)
             .await
             .with_context(|| "failed to run migrations")?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            version_cache: Arc::new(RwLock::new(WorkflowVersionCache::new(64))),
+        })
     }
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Get a cached workflow version, or fetch from DB and cache it.
+    /// This avoids repeated DB lookups for the same workflow version during scheduling.
+    async fn get_cached_version(
+        &self,
+        version_id: WorkflowVersionId,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<CachedWorkflowVersion> {
+        // Try to get from cache first (read lock)
+        {
+            let cache = self.version_cache.read().await;
+            if let Some(cached) = cache.get(&version_id) {
+                return Ok(cached.clone());
+            }
+        }
+
+        // Not in cache, fetch from DB
+        let version = sqlx::query_as::<_, WorkflowVersionRow>(
+            r#"
+            SELECT concurrent, dag_proto
+            FROM workflow_versions
+            WHERE id = $1
+            "#,
+        )
+        .bind(version_id)
+        .fetch_one(tx.as_mut())
+        .await?;
+
+        let dag = WorkflowDagDefinition::decode(version.dag_proto.as_slice())
+            .context("failed to decode workflow dag for scheduling")?;
+
+        let mut node_map = HashMap::new();
+        for node in &dag.nodes {
+            node_map.insert(node.id.clone(), node.clone());
+        }
+
+        let cached = CachedWorkflowVersion {
+            concurrent: version.concurrent,
+            dag,
+            node_map,
+        };
+
+        // Store in cache (write lock)
+        {
+            let mut cache = self.version_cache.write().await;
+            cache.insert(version_id, cached.clone());
+        }
+
+        Ok(cached)
     }
 
     pub async fn list_workflow_versions(&self) -> Result<Vec<WorkflowVersionSummary>> {
@@ -2667,29 +2762,15 @@ impl Database {
             );
             return Ok(0);
         };
-        let version = sqlx::query_as::<_, WorkflowVersionRow>(
-            r#"
-            SELECT concurrent, dag_proto
-            FROM workflow_versions
-            WHERE id = $1
-            "#,
-        )
-        .bind(version_id)
-        .fetch_one(tx.as_mut())
-        .await?;
-        let dag = WorkflowDagDefinition::decode(version.dag_proto.as_slice())
-            .context("failed to decode workflow dag for scheduling")?;
-        let mut node_map = HashMap::new();
-        for node in &dag.nodes {
-            node_map.insert(node.id.clone(), node.clone());
-        }
+        // Use cached workflow version to avoid repeated DB lookups
+        let cached_version = self.get_cached_version(version_id, tx).await?;
         let (known_nodes, completed_nodes) = load_instance_node_state(tx, instance.id).await?;
         let mut dag_state = InstanceDagState::new(known_nodes, completed_nodes);
-        let dag_machine = DagStateMachine::new(&dag, version.concurrent);
+        let dag_machine = DagStateMachine::new(&cached_version.dag, cached_version.concurrent);
         let workflow_input_bytes = instance.input_payload.clone().unwrap_or_default();
         let workflow_input = decode_arguments(&workflow_input_bytes, "workflow input")?;
         let mut scheduling_ctx =
-            build_scheduling_context(tx, instance.id, &node_map, &workflow_input).await?;
+            build_scheduling_context(tx, instance.id, &cached_version.node_map, &workflow_input).await?;
         let mut completed_count = dag_state.completed().len();
         let mut next_sequence = instance.next_action_seq;
         let mut inserted = 0usize;
@@ -3193,7 +3274,7 @@ impl Database {
         store_instance_result_if_complete(
             tx,
             &instance,
-            &dag,
+            &cached_version.dag,
             &scheduling_ctx.payloads,
             completed_count,
         )
