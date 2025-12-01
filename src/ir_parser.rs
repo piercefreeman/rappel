@@ -190,34 +190,46 @@ mod tests {
 
     #[test]
     fn test_loop() {
+        // Loop body now contains statements in sequence
         let loop_ = Loop {
             iterator_expr: "items".to_string(),
             loop_var: "item".to_string(),
-            accumulators: vec!["results".to_string()],
-            preamble: vec![PythonBlock {
-                code: "x = item * 2".to_string(),
-                imports: vec![],
-                definitions: vec![],
-                inputs: vec!["item".to_string()],
-                outputs: vec!["x".to_string()],
-                location: None,
-            }],
-            body: vec![make_action_call("process", Some("processed"))],
-            yields: vec![YieldExpr {
-                source_expr: "processed".to_string(),
-                accumulator: "results".to_string(),
-            }],
+            accumulator: "results".to_string(),
+            body: vec![
+                // Preamble as a PythonBlock statement
+                Statement {
+                    kind: Some(statement::Kind::PythonBlock(PythonBlock {
+                        code: "x = item * 2".to_string(),
+                        imports: vec![],
+                        definitions: vec![],
+                        inputs: vec!["item".to_string()],
+                        outputs: vec!["x".to_string()],
+                        location: None,
+                    })),
+                },
+                // Action as a statement
+                Statement {
+                    kind: Some(statement::Kind::ActionCall(make_action_call("process", Some("processed")))),
+                },
+                // Append as a PythonBlock statement
+                Statement {
+                    kind: Some(statement::Kind::PythonBlock(PythonBlock {
+                        code: "results.append(processed)".to_string(),
+                        imports: vec![],
+                        definitions: vec![],
+                        inputs: vec!["processed".to_string(), "results".to_string()],
+                        outputs: vec![],
+                        location: None,
+                    })),
+                },
+            ],
             location: Some(make_location(1, 0)),
         };
 
         assert_eq!(loop_.iterator_expr, "items");
         assert_eq!(loop_.loop_var, "item");
-        assert_eq!(loop_.accumulators, vec!["results"]);
-        assert_eq!(loop_.preamble.len(), 1);
-        assert_eq!(loop_.body.len(), 1);
-        assert_eq!(loop_.yields.len(), 1);
-        assert_eq!(loop_.yields[0].source_expr, "processed");
-        assert_eq!(loop_.yields[0].accumulator, "results");
+        assert_eq!(loop_.accumulator, "results");
+        assert_eq!(loop_.body.len(), 3);  // preamble + action + append
     }
 
     #[test]

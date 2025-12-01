@@ -13,6 +13,7 @@ import google.protobuf.internal.containers
 import google.protobuf.internal.enum_type_wrapper
 import google.protobuf.message
 import google.protobuf.struct_pb2
+import ir_pb2
 
 if sys.version_info >= (3, 10):
     import typing as typing_extensions
@@ -2292,12 +2293,22 @@ class WorkflowRegistration(google.protobuf.message.Message):
     DAG_FIELD_NUMBER: builtins.int
     DAG_HASH_FIELD_NUMBER: builtins.int
     INITIAL_CONTEXT_FIELD_NUMBER: builtins.int
+    IR_FIELD_NUMBER: builtins.int
+    CONCURRENT_FIELD_NUMBER: builtins.int
     workflow_name: builtins.str
     dag_hash: builtins.str
+    concurrent: builtins.bool
+    """Concurrent execution mode"""
     @property
-    def dag(self) -> Global___WorkflowDagDefinition: ...
+    def dag(self) -> Global___WorkflowDagDefinition:
+        """DEPRECATED: Use ir field instead. DAG is now computed on Rust side from IR."""
+
     @property
     def initial_context(self) -> Global___WorkflowArguments: ...
+    @property
+    def ir(self) -> ir_pb2.Workflow:
+        """The workflow IR - this is parsed by Rust into a DAG"""
+
     def __init__(
         self,
         *,
@@ -2305,19 +2316,28 @@ class WorkflowRegistration(google.protobuf.message.Message):
         dag: Global___WorkflowDagDefinition | None = ...,
         dag_hash: builtins.str = ...,
         initial_context: Global___WorkflowArguments | None = ...,
+        ir: ir_pb2.Workflow | None = ...,
+        concurrent: builtins.bool = ...,
     ) -> None: ...
     def HasField(
-        self, field_name: typing.Literal["dag", b"dag", "initial_context", b"initial_context"]
+        self,
+        field_name: typing.Literal[
+            "dag", b"dag", "initial_context", b"initial_context", "ir", b"ir"
+        ],
     ) -> builtins.bool: ...
     def ClearField(
         self,
         field_name: typing.Literal[
+            "concurrent",
+            b"concurrent",
             "dag",
             b"dag",
             "dag_hash",
             b"dag_hash",
             "initial_context",
             b"initial_context",
+            "ir",
+            b"ir",
             "workflow_name",
             b"workflow_name",
         ],

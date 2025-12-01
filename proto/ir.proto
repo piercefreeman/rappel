@@ -93,20 +93,15 @@ message PythonBlock {
   optional SourceLocation location = 6;
 }
 
-// A for loop with action(s) in the body
+// A for loop with a sub-graph body
+// The body receives the loop variable bound to the current item each iteration.
+// The last statement's output (if it produces the accumulator variable) is collected.
 message Loop {
   string iterator_expr = 1;        // Expression producing the iterable
   string loop_var = 2;             // Loop variable name
-  repeated string accumulators = 3; // Variables initialized as [] before loop
-  repeated PythonBlock preamble = 4; // Pure Python before first action
-  repeated ActionCall body = 5;    // Action calls in sequence
-  repeated YieldExpr yields = 6;   // What gets collected each iteration
-  optional SourceLocation location = 7;
-}
-
-message YieldExpr {
-  string source_expr = 1;          // Expression to evaluate
-  string accumulator = 2;          // Accumulator to append to
+  string accumulator = 3;          // Variable to collect results into (initialized as [])
+  repeated Statement body = 4;     // Sub-graph of statements executed each iteration
+  optional SourceLocation location = 5;
 }
 
 // One branch of a conditional
@@ -128,8 +123,10 @@ message Conditional {
 // An except handler
 message ExceptHandler {
   repeated ExceptionType exception_types = 1;
-  repeated ActionCall body = 2;
-  optional SourceLocation location = 3;
+  repeated PythonBlock preamble = 2;    // Statements before first action
+  repeated ActionCall body = 3;          // One or more actions
+  repeated PythonBlock postamble = 4;    // Statements after last action
+  optional SourceLocation location = 5;
 }
 
 message ExceptionType {
@@ -139,9 +136,11 @@ message ExceptionType {
 
 // Try/except block with actions
 message TryExcept {
-  repeated ActionCall try_body = 1;
-  repeated ExceptHandler handlers = 2;
-  optional SourceLocation location = 3;
+  repeated PythonBlock try_preamble = 1;   // Statements before first action in try
+  repeated ActionCall try_body = 2;         // One or more actions in try
+  repeated PythonBlock try_postamble = 3;   // Statements after last action in try
+  repeated ExceptHandler handlers = 4;
+  optional SourceLocation location = 5;
 }
 
 // Durable sleep

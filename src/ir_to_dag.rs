@@ -324,15 +324,12 @@ fn convert_loop(state: &mut ConversionState, loop_: &ir::Loop) -> Result<(), Con
         ..Default::default()
     };
 
-    // Add loop metadata
-    let mut accumulators = Vec::new();
-    for acc in &loop_.accumulators {
-        accumulators.push(msg::AccumulatorSpec {
-            var: acc.clone(),
-            source_node: None,
-            source_expr: None,
-        });
-    }
+    // Single accumulator (new simplified structure)
+    let accumulators = vec![msg::AccumulatorSpec {
+        var: loop_.accumulator.clone(),
+        source_node: None,
+        source_expr: None,
+    }];
 
     // Find the node ID that produces the iterator variable
     let iterator_source_node = state.variable_producers.get(&loop_.iterator_expr).cloned()
@@ -364,129 +361,57 @@ fn convert_loop(state: &mut ConversionState, loop_: &ir::Loop) -> Result<(), Con
 
     state.nodes.push(loop_head);
 
-    // Track all body nodes (preamble blocks + actions)
+    // Track all body nodes
     let mut body_node_ids: Vec<String> = Vec::new();
 
-    // Create python_block nodes for each preamble statement
-    // These execute after loop_head sets the loop variable, before the action
-    for (i, preamble_block) in loop_.preamble.iter().enumerate() {
-        let preamble_node_id = format!("{}_preamble_{}", loop_id, i);
+    // Process loop body as a sub-graph of statements
+    // The body contains statements (PythonBlock, ActionCall, etc.) in sequence
+    state.last_node_id = Some(loop_head_id.clone());
 
-        let mut preamble_node = WorkflowDagNode {
-            id: preamble_node_id.clone(),
-            action: "python_block".to_string(),
-            loop_id: Some(loop_id.clone()),
-            ..Default::default()
+    for stmt in &loop_.body {
+        let stmt_kind = stmt.kind.as_ref().ok_or_else(|| ConversionError {
+            message: "Loop body statement has no kind".to_string(),
+            location: loop_.location.clone(),
+        })?;
+
+        let node_id = match stmt_kind {
+            ir::statement::Kind::ActionCall(action) => {
+                let id = convert_action_call(state, action)?;
+                // Mark this node as part of the loop
+                if let Some(node) = state.nodes.iter_mut().find(|n| n.id == id) {
+                    node.loop_id = Some(loop_id.clone());
+                }
+                id
+            }
+            ir::statement::Kind::PythonBlock(block) => {
+                convert_python_block(state, block)?;
+                let id = state.last_node_id.clone().unwrap();
+                // Mark this node as part of the loop
+                if let Some(node) = state.nodes.iter_mut().find(|n| n.id == id) {
+                    node.loop_id = Some(loop_id.clone());
+                }
+                id
+            }
+            _ => {
+                return Err(ConversionError {
+                    message: format!("Unsupported statement type in loop body"),
+                    location: loop_.location.clone(),
+                });
+            }
         };
 
-        // Store the Python code to execute
-        preamble_node.kwargs.insert("code".to_string(), preamble_block.code.clone());
-
-        // Track inputs and outputs for the python block
-        for input in &preamble_block.inputs {
-            preamble_node.kwargs.insert(format!("__input_{}", input), input.clone());
-        }
-        for output in &preamble_block.outputs {
-            preamble_node.produces.push(output.clone());
-            // Track that this preamble produces the output variable
-            state.variable_producers.insert(output.clone(), preamble_node_id.clone());
-        }
-
-        // Preamble depends on loop_head (which sets the loop variable)
-        if body_node_ids.is_empty() {
-            preamble_node.depends_on.push(loop_head_id.clone());
-        } else {
-            // Chain preambles together
-            preamble_node.depends_on.push(body_node_ids.last().unwrap().clone());
-        }
-
-        state.nodes.push(preamble_node);
-        body_node_ids.push(preamble_node_id);
-    }
-
-    // Process loop body actions
-    // Track the last node before processing actions so actions chain properly
-    let preamble_last = body_node_ids.last().cloned();
-    state.last_node_id = preamble_last.clone().or(Some(loop_head_id.clone()));
-
-    // Track action node IDs separately - we need to make yields depend on all actions
-    let mut action_node_ids: Vec<String> = Vec::new();
-
-    for action in &loop_.body {
-        let node_id = convert_action_call(state, action)?;
-        // Mark this node as part of the loop
-        if let Some(node) = state.nodes.iter_mut().find(|n| n.id == node_id) {
-            node.loop_id = Some(loop_id.clone());
-            // If there were preambles, action depends on last preamble, not loop_head
-            if let Some(preamble_last) = &preamble_last {
-                // Remove loop_head from depends_on if present, add preamble instead
-                node.depends_on.retain(|d| d != &loop_head_id);
-                if !node.depends_on.contains(preamble_last) {
-                    node.depends_on.push(preamble_last.clone());
-                }
-            }
-        }
-        action_node_ids.push(node_id.clone());
         body_node_ids.push(node_id);
     }
 
-    // Process yield expressions - these extract values from action results for accumulators
-    // Each yield becomes a python_block that evaluates the expression
-    for (i, yield_expr) in loop_.yields.iter().enumerate() {
-        let yield_node_id = format!("{}_yield_{}", loop_id, i);
-
-        let mut yield_node = WorkflowDagNode {
-            id: yield_node_id.clone(),
-            action: "python_block".to_string(),
-            loop_id: Some(loop_id.clone()),
-            ..Default::default()
-        };
-
-        // Generate code to evaluate the yield expression and store it
-        // The expression might be something like `processed["result"]`
-        // We create a special variable __yield_result_{accumulator} to hold the value
-        let yield_var = format!("__yield_{}", yield_expr.accumulator);
-        let code = format!("{} = {}", yield_var, yield_expr.source_expr);
-        yield_node.kwargs.insert("code".to_string(), code);
-
-        // The yield node produces a variable that will be accumulated
-        yield_node.produces.push(yield_var.clone());
-
-        // Yield nodes depend on:
-        // 1. All action nodes (to get their output variables)
-        // 2. Previous yield nodes (to maintain ordering)
-        for action_id in &action_node_ids {
-            if !yield_node.depends_on.contains(action_id) {
-                yield_node.depends_on.push(action_id.clone());
-            }
-        }
-        // Also chain to previous yield if any
-        if let Some(prev_yield) = body_node_ids.last() {
-            if !action_node_ids.contains(prev_yield) && !yield_node.depends_on.contains(prev_yield) {
-                yield_node.depends_on.push(prev_yield.clone());
-            }
-        }
-
-        state.nodes.push(yield_node);
-        body_node_ids.push(yield_node_id.clone());
-
-        // Update the accumulator to use this yield's output
-        // We'll update the source_expr to reference our yield variable
-    }
-
-    // Determine the first body entry (could be preamble or action)
-    let first_body_entry = if !loop_.preamble.is_empty() {
-        format!("{}_preamble_0", loop_id)
-    } else if let Some(first) = body_node_ids.first() {
+    // Determine the first body entry
+    let first_body_entry = if let Some(first) = body_node_ids.first() {
         first.clone()
     } else {
-        loop_head_id.clone() // No body - shouldn't happen
+        return Err(ConversionError {
+            message: "Loop body is empty".to_string(),
+            location: loop_.location.clone(),
+        });
     };
-
-    // Build a map of accumulator -> yield variable
-    let yield_vars: std::collections::HashMap<String, String> = loop_.yields.iter()
-        .map(|y| (y.accumulator.clone(), format!("__yield_{}", y.accumulator)))
-        .collect();
 
     // Update loop head meta with body info
     if let Some(head) = state.nodes.iter_mut().find(|n| n.id == loop_head_id) {
@@ -497,13 +422,8 @@ fn convert_loop(state: &mut ConversionState, loop_: &ir::Loop) -> Result<(), Con
             }
             meta.body_nodes = body_node_ids.clone();
 
-            // Update accumulator sources based on yields
-            for acc in &mut meta.accumulators {
-                if let Some(yield_var) = yield_vars.get(&acc.var) {
-                    // Accumulator gets its value from the yield variable
-                    acc.source_expr = Some(yield_var.clone());
-                }
-                // Also set source_node to the last body node for context propagation
+            // Set accumulator source to the last body node
+            if let Some(acc) = meta.accumulators.first_mut() {
                 if let Some(last_node) = body_node_ids.last() {
                     acc.source_node = Some(last_node.clone());
                 }
@@ -511,7 +431,7 @@ fn convert_loop(state: &mut ConversionState, loop_: &ir::Loop) -> Result<(), Con
         }
     }
 
-    // Add Continue edge from loop_head to first body node (preamble or action)
+    // Add Continue edge from loop_head to first body node
     state.edges.push(msg::DagEdge {
         from_node: loop_head_id.clone(),
         to_node: first_body_entry,
@@ -529,10 +449,8 @@ fn convert_loop(state: &mut ConversionState, loop_: &ir::Loop) -> Result<(), Con
         });
     }
 
-    // Track accumulators as produced by the loop
-    for acc in &loop_.accumulators {
-        state.variable_producers.insert(acc.clone(), loop_head_id.clone());
-    }
+    // Track accumulator as produced by the loop
+    state.variable_producers.insert(loop_.accumulator.clone(), loop_head_id.clone());
 
     // Reset last_node_id to loop_head so subsequent nodes depend on loop completion
     state.last_node_id = Some(loop_head_id);
@@ -609,12 +527,30 @@ fn convert_conditional(state: &mut ConversionState, cond: &ir::Conditional) -> R
 fn convert_try_except(state: &mut ConversionState, te: &ir::TryExcept) -> Result<(), ConversionError> {
     let try_start = state.last_node_id.clone();
 
-    // Convert try body actions
-    let mut try_node_ids = Vec::new();
-    for action in &te.try_body {
-        let node_id = convert_action_call(state, action)?;
-        try_node_ids.push(node_id);
+    // Track all try block nodes (preamble, body, postamble) for exception edges
+    let try_block_start_idx = state.nodes.len();
+
+    // Convert try preamble
+    for preamble in &te.try_preamble {
+        convert_python_block(state, preamble)?;
     }
+
+    // Convert try body actions
+    for action in &te.try_body {
+        convert_action_call(state, action)?;
+    }
+
+    // Convert try postamble
+    for postamble in &te.try_postamble {
+        convert_python_block(state, postamble)?;
+    }
+
+    // Collect all try block node IDs for exception edges
+    // All nodes in the try block can potentially fail (either directly or via propagation)
+    let try_node_ids: Vec<String> = state.nodes[try_block_start_idx..]
+        .iter()
+        .map(|n| n.id.clone())
+        .collect();
 
     // Track the last node of the try block for convergence after handlers
     let try_end = state.last_node_id.clone();
@@ -625,32 +561,64 @@ fn convert_try_except(state: &mut ConversionState, te: &ir::TryExcept) -> Result
         // Reset to branch from try start - handlers don't depend on try body success
         state.last_node_id = try_start.clone();
 
-        for action in &handler.body {
-            let handler_node_id = convert_action_call(state, action)?;
+        // Track all nodes in this handler so we can add exception edges to all of them
+        let handler_start_idx = state.nodes.len();
 
-            // Add exception edges TO the handler node FROM try nodes
-            // The handler depends on exceptions from try nodes
-            if let Some(handler_node) = state.nodes.iter_mut().find(|n| n.id == handler_node_id) {
-                for try_id in &try_node_ids {
-                    for exc_type in &handler.exception_types {
-                        let edge = msg::WorkflowExceptionEdge {
-                            source_node_id: try_id.clone(),
-                            exception_type: exc_type.name.clone().unwrap_or_default(),
-                            exception_module: exc_type.module.clone().unwrap_or_default(),
-                        };
-                        handler_node.exception_edges.push(edge);
-                    }
-                }
+        // Convert handler preamble
+        for preamble in &handler.preamble {
+            convert_python_block(state, preamble)?;
+        }
+
+        // Convert handler actions
+        for action in &handler.body {
+            convert_action_call(state, action)?;
+        }
+
+        // Convert handler postamble
+        for postamble in &handler.postamble {
+            convert_python_block(state, postamble)?;
+        }
+
+        // Add exception edges TO ALL handler nodes FROM ALL try nodes
+        // Use empty exception type to match any error - the type matching is done
+        // at the workflow definition level, not at the DAG edge level.
+        // This is necessary because exceptions propagate through the try block,
+        // and propagated exceptions have type "RuntimeError" not the original type.
+        for node in state.nodes.iter_mut().skip(handler_start_idx) {
+            for try_id in &try_node_ids {
+                let edge = msg::WorkflowExceptionEdge {
+                    source_node_id: try_id.clone(),
+                    exception_type: String::new(), // Match any exception type
+                    exception_module: String::new(),
+                };
+                node.exception_edges.push(edge);
             }
         }
 
-        handler_end_ids.push(state.last_node_id.clone());
+        if let Some(last_id) = &state.last_node_id {
+            handler_end_ids.push(last_id.clone());
+        }
     }
 
-    // After try/except, code should continue from whichever path completed
-    // For now, set last_node_id to try_end (success path) - handlers set variables
-    // that downstream code can use
-    state.last_node_id = try_end;
+    // Add convergence join node after try/except - downstream code should run after
+    // EITHER the try block completes successfully OR any handler completes
+    let mut all_branch_ends = Vec::new();
+    if let Some(try_end_id) = &try_end {
+        all_branch_ends.push(try_end_id.clone());
+    }
+    all_branch_ends.extend(handler_end_ids);
+
+    if !all_branch_ends.is_empty() {
+        let join_id = state.next_node_id("try_except_join");
+        let join_node = WorkflowDagNode {
+            id: join_id.clone(),
+            action: "__conditional_join".to_string(),
+            depends_on: all_branch_ends,
+            ..Default::default()
+        };
+        state.nodes.push(join_node);
+        state.last_node_id = Some(join_id);
+    }
 
     Ok(())
 }
@@ -943,36 +911,121 @@ mod tests {
 
     #[test]
     fn test_loop_with_preamble() {
+        // Loop body now contains statements in sequence:
+        // 1. PythonBlock (preamble)
+        // 2. ActionCall
+        // 3. PythonBlock (append)
         let workflow = ir::Workflow {
             name: "test".to_string(),
             params: vec![],
             body: vec![
                 // First action produces items
                 make_statement(ir::statement::Kind::ActionCall(make_action("fetch_items", Some("items")))),
-                // Loop with preamble
+                // Loop with body as sequence of statements
                 make_statement(ir::statement::Kind::Loop(ir::Loop {
                     loop_var: "item".to_string(),
                     iterator_expr: "items".to_string(),
-                    accumulators: vec!["outputs".to_string()],
-                    preamble: vec![ir::PythonBlock {
-                        code: "processed = f'{item}-processed'".to_string(),
-                        inputs: vec!["item".to_string()],
-                        outputs: vec!["processed".to_string()],
-                        imports: vec![],
-                        definitions: vec![],
-                        location: None,
-                    }],
-                    yields: vec![],
-                    body: vec![ir::ActionCall {
-                        action: "process_item".to_string(),
-                        module: Some("test".to_string()),
-                        kwargs: {
-                            let mut m = HashMap::new();
-                            m.insert("data".to_string(), "processed".to_string());
-                            m
+                    accumulator: "outputs".to_string(),
+                    body: vec![
+                        // Preamble as a PythonBlock statement
+                        ir::Statement {
+                            kind: Some(ir::statement::Kind::PythonBlock(ir::PythonBlock {
+                                code: "processed = f'{item}-processed'".to_string(),
+                                inputs: vec!["item".to_string()],
+                                outputs: vec!["processed".to_string()],
+                                imports: vec![],
+                                definitions: vec![],
+                                location: None,
+                            })),
                         },
-                        target: Some("result".to_string()),
-                        config: None,
+                        // Action as a statement
+                        ir::Statement {
+                            kind: Some(ir::statement::Kind::ActionCall(ir::ActionCall {
+                                action: "process_item".to_string(),
+                                module: Some("test".to_string()),
+                                kwargs: {
+                                    let mut m = HashMap::new();
+                                    m.insert("data".to_string(), "processed".to_string());
+                                    m
+                                },
+                                target: Some("result".to_string()),
+                                config: None,
+                                location: None,
+                            })),
+                        },
+                        // Append as a PythonBlock statement
+                        ir::Statement {
+                            kind: Some(ir::statement::Kind::PythonBlock(ir::PythonBlock {
+                                code: "outputs.append(result)".to_string(),
+                                inputs: vec!["result".to_string(), "outputs".to_string()],
+                                outputs: vec![],
+                                imports: vec![],
+                                definitions: vec![],
+                                location: None,
+                            })),
+                        },
+                    ],
+                    location: None,
+                })),
+            ],
+            return_type: None,
+        };
+
+        let dag = convert_workflow(&workflow, false).unwrap();
+
+        // Should have: fetch_items, loop_head, preamble (python_block), action, append (python_block)
+        assert_eq!(dag.nodes.len(), 5, "Expected 5 nodes: fetch_items, loop_head, preamble, action, append");
+
+        // Check node types
+        let loop_head = dag.nodes.iter().find(|n| n.action == "__loop_head").unwrap();
+        let python_blocks: Vec<_> = dag.nodes.iter().filter(|n| n.action == "python_block").collect();
+        let action_node = dag.nodes.iter().find(|n| n.action == "process_item").unwrap();
+
+        assert_eq!(python_blocks.len(), 2, "Should have 2 python_block nodes (preamble and append)");
+
+        // First python_block is preamble
+        let preamble = &python_blocks[0];
+        assert_eq!(preamble.kwargs.get("code"), Some(&"processed = f'{item}-processed'".to_string()));
+        assert!(preamble.produces.contains(&"processed".to_string()));
+        assert_eq!(preamble.loop_id, Some("loop_1".to_string()));
+
+        // Action should depend on preamble
+        assert!(action_node.depends_on.contains(&preamble.id), "Action should depend on preamble");
+
+        // Check edges: should have Continue edge from loop_head to preamble
+        let continue_edge = dag.edges.iter().find(|e| e.from_node == loop_head.id && e.edge_type == msg::EdgeType::Continue as i32);
+        assert!(continue_edge.is_some(), "Should have Continue edge from loop_head");
+        assert_eq!(continue_edge.unwrap().to_node, preamble.id, "Continue edge should go to preamble");
+
+        // Check edges: should have Back edge from last body node (append) to loop_head
+        let append = &python_blocks[1];
+        let back_edge = dag.edges.iter().find(|e| e.to_node == loop_head.id && e.edge_type == msg::EdgeType::Back as i32);
+        assert!(back_edge.is_some(), "Should have Back edge to loop_head");
+        assert_eq!(back_edge.unwrap().from_node, append.id, "Back edge should come from append");
+    }
+
+    #[test]
+    fn test_try_except() {
+        // Create a try/except with two actions in try and one in handler
+        let workflow = ir::Workflow {
+            name: "test".to_string(),
+            params: vec![],
+            body: vec![
+                make_statement(ir::statement::Kind::TryExcept(ir::TryExcept {
+                    try_preamble: vec![],
+                    try_body: vec![
+                        make_action("provide_value", Some("number")),
+                        make_action("explode", None),
+                    ],
+                    try_postamble: vec![],
+                    handlers: vec![ir::ExceptHandler {
+                        exception_types: vec![ir::ExceptionType {
+                            name: Some("ValueError".to_string()),
+                            module: None,
+                        }],
+                        preamble: vec![],
+                        body: vec![make_action("cleanup", Some("result"))],
+                        postamble: vec![],
                         location: None,
                     }],
                     location: None,
@@ -983,33 +1036,25 @@ mod tests {
 
         let dag = convert_workflow(&workflow, false).unwrap();
 
-        // Should have: fetch_items, loop_head, preamble (python_block), process_item
-        assert_eq!(dag.nodes.len(), 4, "Expected 4 nodes: fetch_items, loop_head, preamble, process_item");
+        // Should have: provide_value, explode, cleanup, __conditional_join
+        println!("DAG nodes:");
+        for node in &dag.nodes {
+            println!("  {} (action={})", node.id, node.action);
+        }
+        assert_eq!(dag.nodes.len(), 4, "Expected 4 nodes: 2 try actions + 1 handler action + 1 join");
 
-        // Check node types
-        let loop_head = dag.nodes.iter().find(|n| n.action == "__loop_head").unwrap();
-        let preamble = dag.nodes.iter().find(|n| n.action == "python_block").unwrap();
-        let action_node = dag.nodes.iter().find(|n| n.action == "process_item").unwrap();
+        // Find nodes
+        let provide_value = dag.nodes.iter().find(|n| n.action == "provide_value").unwrap();
+        let explode = dag.nodes.iter().find(|n| n.action == "explode").unwrap();
+        let cleanup = dag.nodes.iter().find(|n| n.action == "cleanup").unwrap();
+        let join = dag.nodes.iter().find(|n| n.action == "__conditional_join").unwrap();
 
-        // Preamble should have the code
-        assert_eq!(preamble.kwargs.get("code"), Some(&"processed = f'{item}-processed'".to_string()));
-        // Preamble should produce 'processed'
-        assert!(preamble.produces.contains(&"processed".to_string()));
-        // Preamble should be part of the loop
-        assert_eq!(preamble.loop_id, Some("loop_1".to_string()));
+        // Verify handler has exception edges from both try actions
+        assert!(cleanup.exception_edges.iter().any(|e| e.source_node_id == provide_value.id));
+        assert!(cleanup.exception_edges.iter().any(|e| e.source_node_id == explode.id));
 
-        // Action should depend on preamble, not loop_head
-        assert!(action_node.depends_on.contains(&preamble.id), "Action should depend on preamble");
-        assert!(!action_node.depends_on.contains(&loop_head.id), "Action should not directly depend on loop_head");
-
-        // Check edges: should have Continue edge from loop_head to preamble
-        let continue_edge = dag.edges.iter().find(|e| e.from_node == loop_head.id && e.edge_type == msg::EdgeType::Continue as i32);
-        assert!(continue_edge.is_some(), "Should have Continue edge from loop_head");
-        assert_eq!(continue_edge.unwrap().to_node, preamble.id, "Continue edge should go to preamble");
-
-        // Check edges: should have Back edge from action to loop_head
-        let back_edge = dag.edges.iter().find(|e| e.to_node == loop_head.id && e.edge_type == msg::EdgeType::Back as i32);
-        assert!(back_edge.is_some(), "Should have Back edge to loop_head");
-        assert_eq!(back_edge.unwrap().from_node, action_node.id, "Back edge should come from action");
+        // Verify join depends on both try_end (explode) and handler_end (cleanup)
+        assert!(join.depends_on.contains(&explode.id), "Join should depend on try end (explode)");
+        assert!(join.depends_on.contains(&cleanup.id), "Join should depend on handler end (cleanup)");
     }
 }

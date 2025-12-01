@@ -259,15 +259,15 @@ class SingleActionLoopWorkflow(Workflow):
         assert loop is not None
         assert loop.loop_var == "number"
         assert loop.iterator_expr == "numbers"
-        assert "results" in loop.accumulators
+        assert loop.accumulator == "results"
 
-        assert len(loop.body) == 1
-        assert loop.body[0].action == "double"
-        assert loop.body[0].target == "doubled"
-
-        assert len(loop.yields) == 1
-        assert loop.yields[0].source_expr == "doubled"
-        assert loop.yields[0].accumulator == "results"
+        # Body contains: action, append (as python_block)
+        assert len(loop.body) == 2
+        assert loop.body[0].WhichOneof("kind") == "action_call"
+        assert loop.body[0].action_call.action == "double"
+        assert loop.body[0].action_call.target == "doubled"
+        assert loop.body[1].WhichOneof("kind") == "python_block"
+        assert "results.append(doubled)" in loop.body[1].python_block.code
 
     def test_multi_action_loop(self, action_defs: dict[str, ActionDefinition]):
         """Test loop with multiple sequential actions."""
@@ -291,10 +291,12 @@ class MultiActionLoopWorkflow(Workflow):
                 break
 
         assert loop is not None
-        assert len(loop.body) == 3
-        assert loop.body[0].action == "validate_order"
-        assert loop.body[1].action == "process_payment"
-        assert loop.body[2].action == "send_confirmation"
+        # Body contains: 3 actions + append (as python_block)
+        assert len(loop.body) == 4
+        assert loop.body[0].action_call.action == "validate_order"
+        assert loop.body[1].action_call.action == "process_payment"
+        assert loop.body[2].action_call.action == "send_confirmation"
+        assert loop.body[3].WhichOneof("kind") == "python_block"
 
     def test_loop_with_preamble(self, action_defs: dict[str, ActionDefinition]):
         """Test loop with Python code before the first action."""
@@ -317,13 +319,23 @@ class LoopWithPreambleWorkflow(Workflow):
                 break
 
         assert loop is not None
-        assert len(loop.preamble) == 1
-        assert "adjusted = item * 2" in loop.preamble[0].code
-        assert "item" in loop.preamble[0].inputs
-        assert "adjusted" in loop.preamble[0].outputs
+        # Body contains: preamble (python_block), action, append (python_block)
+        assert len(loop.body) == 3
+        # First statement is the preamble
+        assert loop.body[0].WhichOneof("kind") == "python_block"
+        assert "adjusted = item * 2" in loop.body[0].python_block.code
+        assert "item" in loop.body[0].python_block.inputs
+        assert "adjusted" in loop.body[0].python_block.outputs
+        # Second is the action
+        assert loop.body[1].WhichOneof("kind") == "action_call"
+        # Third is the append
+        assert loop.body[2].WhichOneof("kind") == "python_block"
 
-    def test_multi_accumulator_loop(self, action_defs: dict[str, ActionDefinition]):
-        """Test loop with multiple accumulators."""
+    def test_multi_accumulator_loop_raises_error(self, action_defs: dict[str, ActionDefinition]):
+        """Test that loops with multiple accumulators raise an error."""
+        import pytest
+        from rappel.ir import IRParseError
+
         code = """
 class MultiAccumulatorWorkflow(Workflow):
     async def run(self, items: list) -> tuple:
@@ -335,18 +347,8 @@ class MultiAccumulatorWorkflow(Workflow):
             metrics.append(processed * 2)
         return (results, metrics)
 """
-        workflow = parse_workflow_class(code, action_defs)
-
-        loop = None
-        for stmt in workflow.body:
-            if stmt.WhichOneof("kind") == "loop":
-                loop = stmt.loop
-                break
-
-        assert loop is not None
-        assert "results" in loop.accumulators
-        assert "metrics" in loop.accumulators
-        assert len(loop.yields) == 2
+        with pytest.raises(IRParseError, match="Loop can only append to one accumulator"):
+            parse_workflow_class(code, action_defs)
 
 
 class TestConditionals:
@@ -855,8 +857,9 @@ class LoopWorkflow(Workflow):
         serializer = IRSerializer()
         text = serializer.serialize(workflow)
 
-        assert "loop item in items" in text
-        assert "yield doubled -> results" in text
+        assert "loop item in items -> results:" in text
+        assert "@example_module.double(" in text
+        assert "results.append(doubled)" in text
 
     def test_serialize_conditional(self, action_defs: dict[str, ActionDefinition]):
         """Test serialization of conditional."""
@@ -1342,8 +1345,9 @@ class LoopPreambleWorkflow(Workflow):
         serializer = IRSerializer()
         text = serializer.serialize(workflow)
 
-        assert "loop item in items" in text
-        assert "# preamble" in text
+        assert "loop item in items -> results:" in text
+        # Preamble is now just a python block in the body
+        assert "adjusted = item * 2" in text
 
     def test_serialize_conditional_with_preamble_postamble(
         self, action_defs: dict[str, ActionDefinition]

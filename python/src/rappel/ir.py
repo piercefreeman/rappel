@@ -340,7 +340,7 @@ class IRParser:
         elif kind == "python_block":
             self._known_vars.update(stmt.python_block.outputs)
         elif kind == "loop":
-            self._known_vars.update(stmt.loop.accumulators)
+            self._known_vars.add(stmt.loop.accumulator)
         elif kind == "conditional" and stmt.conditional.HasField("target"):
             self._known_vars.add(stmt.conditional.target)
         elif kind == "spread" and stmt.spread.HasField("target"):
@@ -457,7 +457,11 @@ class IRParser:
         return ir_pb2.Statement(python_block=self._make_python_block([stmt], location))
 
     def _parse_for_loop(self, stmt: ast.For, location: ir_pb2.SourceLocation) -> ir_pb2.Loop:
-        """Parse a for loop."""
+        """Parse a for loop.
+
+        The loop body is parsed as a sub-graph of statements. The accumulator is
+        detected from append() calls in the body - these become PythonBlock statements.
+        """
         if stmt.orelse:
             raise IRParseError("for/else is not supported", stmt, location)
 
@@ -467,25 +471,42 @@ class IRParser:
         loop_var = stmt.target.id
         iterator_expr = ast.unparse(stmt.iter)
 
-        preamble: list[ir_pb2.PythonBlock] = []
-        actions: list[ir_pb2.ActionCall] = []
-        yields: list[ir_pb2.YieldExpr] = []
-        accumulators: list[str] = []
-
+        # Track variables available in loop body (includes loop var)
         loop_known_vars = self._known_vars | {loop_var}
-        found_first_action = False
+
+        # Detect accumulator from append statements
+        accumulator: str | None = None
+        for body_stmt in stmt.body:
+            append_info = self._extract_append(body_stmt)
+            if append_info is not None:
+                acc_name, _ = append_info
+                if accumulator is None:
+                    accumulator = acc_name
+                elif accumulator != acc_name:
+                    raise IRParseError(
+                        f"Loop can only append to one accumulator, found both '{accumulator}' and '{acc_name}'",
+                        body_stmt,
+                        _source_location_from_node(body_stmt),
+                    )
+
+        if accumulator is None:
+            raise IRParseError("for loop must append to an accumulator", stmt, location)
+
+        # Parse body statements as a sub-graph
+        body_statements: list[ir_pb2.Statement] = []
+        has_action = False
 
         for body_stmt in stmt.body:
             body_location = _source_location_from_node(body_stmt)
 
+            # Check for append - becomes a PythonBlock
             append_info = self._extract_append(body_stmt)
             if append_info is not None:
-                acc_name, source_expr = append_info
-                yields.append(ir_pb2.YieldExpr(source_expr=source_expr, accumulator=acc_name))
-                if acc_name not in accumulators:
-                    accumulators.append(acc_name)
+                block = self._make_python_block([body_stmt], body_location, loop_known_vars)
+                body_statements.append(ir_pb2.Statement(python_block=block))
                 continue
 
+            # Check for action call with assignment
             if isinstance(body_stmt, ast.Assign) and len(body_stmt.targets) == 1:
                 target = body_stmt.targets[0]
                 if isinstance(target, ast.Name):
@@ -493,44 +514,34 @@ class IRParser:
                     if action_call is not None:
                         action_call.target = target.id
                         action_call.location.CopyFrom(body_location)
-                        actions.append(action_call)
+                        body_statements.append(ir_pb2.Statement(action_call=action_call))
                         loop_known_vars.add(target.id)
-                        found_first_action = True
+                        has_action = True
                         continue
 
+            # Check for action call as expression
             if isinstance(body_stmt, ast.Expr):
                 action_call = self._extract_action_call(body_stmt.value)
                 if action_call is not None:
                     action_call.location.CopyFrom(body_location)
-                    actions.append(action_call)
-                    found_first_action = True
+                    body_statements.append(ir_pb2.Statement(action_call=action_call))
+                    has_action = True
                     continue
 
-            if found_first_action:
-                raise IRParseError(
-                    "Non-action statements after first action in loop body not supported",
-                    body_stmt,
-                    body_location,
-                )
-            else:
-                block = self._make_python_block([body_stmt], body_location, loop_known_vars)
-                preamble.append(block)
-                loop_known_vars.update(block.outputs)
+            # Everything else becomes a PythonBlock
+            block = self._make_python_block([body_stmt], body_location, loop_known_vars)
+            body_statements.append(ir_pb2.Statement(python_block=block))
+            loop_known_vars.update(block.outputs)
 
-        if not actions:
+        if not has_action:
             raise IRParseError("for loop must contain at least one action call", stmt, location)
-
-        if not yields:
-            raise IRParseError("for loop must append to an accumulator", stmt, location)
 
         loop = ir_pb2.Loop(
             iterator_expr=iterator_expr,
             loop_var=loop_var,
+            accumulator=accumulator,
         )
-        loop.accumulators.extend(accumulators)
-        loop.preamble.extend(preamble)
-        loop.body.extend(actions)
-        loop.yields.extend(yields)
+        loop.body.extend(body_statements)
         loop.location.CopyFrom(location)
 
         return loop
@@ -671,24 +682,21 @@ class IRParser:
         if not stmt.handlers:
             raise IRParseError("try must have except handlers", stmt, location)
 
-        try_actions: list[ir_pb2.ActionCall] = []
-        try_known_vars = set(self._known_vars)
-
-        for body_stmt in stmt.body:
-            stmt_location = _source_location_from_node(body_stmt)
-            action = self._extract_statement_action(body_stmt)
-            if action:
-                action.location.CopyFrom(stmt_location)
-                try_actions.append(action)
-                if action.HasField("target"):
-                    try_known_vars.add(action.target)
-            else:
-                raise IRParseError(
-                    "try block must contain only action calls", body_stmt, stmt_location
-                )
+        # Parse try body with preamble/postamble support
+        try_preamble, try_actions, try_postamble = self._parse_try_or_handler_body(
+            stmt.body, set(self._known_vars), "try block"
+        )
 
         if not try_actions:
             raise IRParseError("try block must contain at least one action", stmt, location)
+
+        # Track variables from try block for handler parsing
+        try_known_vars = set(self._known_vars)
+        for action in try_actions:
+            if action.HasField("target"):
+                try_known_vars.add(action.target)
+        for block in try_postamble:
+            try_known_vars.update(block.outputs)
 
         handlers: list[ir_pb2.ExceptHandler] = []
         for handler in stmt.handlers:
@@ -703,32 +711,70 @@ class IRParser:
 
             exc_types = self._extract_exception_types(handler.type)
 
-            handler_actions: list[ir_pb2.ActionCall] = []
-            for handler_stmt in handler.body:
-                stmt_location = _source_location_from_node(handler_stmt)
-                action = self._extract_statement_action(handler_stmt)
-                if action:
-                    action.location.CopyFrom(stmt_location)
-                    handler_actions.append(action)
-                else:
-                    raise IRParseError(
-                        "except block must contain only action calls",
-                        handler_stmt,
-                        stmt_location,
-                    )
+            # Parse handler body with preamble/postamble support
+            handler_preamble, handler_actions, handler_postamble = self._parse_try_or_handler_body(
+                handler.body, try_known_vars, "except block"
+            )
 
             exc_handler = ir_pb2.ExceptHandler()
             exc_handler.exception_types.extend(exc_types)
+            exc_handler.preamble.extend(handler_preamble)
             exc_handler.body.extend(handler_actions)
+            exc_handler.postamble.extend(handler_postamble)
             exc_handler.location.CopyFrom(handler_location)
             handlers.append(exc_handler)
 
         try_except = ir_pb2.TryExcept()
+        try_except.try_preamble.extend(try_preamble)
         try_except.try_body.extend(try_actions)
+        try_except.try_postamble.extend(try_postamble)
         try_except.handlers.extend(handlers)
         try_except.location.CopyFrom(location)
 
         return try_except
+
+    def _parse_try_or_handler_body(
+        self, body: list[ast.stmt], known_vars: set[str], block_name: str
+    ) -> tuple[list[ir_pb2.PythonBlock], list[ir_pb2.ActionCall], list[ir_pb2.PythonBlock]]:
+        """Parse a try or except handler body into preamble, actions, postamble.
+
+        Similar to _parse_branch_body but for try/except blocks.
+        """
+        preamble: list[ir_pb2.PythonBlock] = []
+        actions: list[ir_pb2.ActionCall] = []
+        postamble: list[ir_pb2.PythonBlock] = []
+
+        block_known_vars = set(known_vars)
+        found_first_action = False
+        in_postamble = False
+
+        for stmt in body:
+            stmt_location = _source_location_from_node(stmt)
+            stmt_action = self._extract_statement_action(stmt)
+
+            if stmt_action is not None:
+                if in_postamble:
+                    raise IRParseError(
+                        f"Actions cannot appear after non-action statements in {block_name}",
+                        stmt,
+                        stmt_location,
+                    )
+                stmt_action.location.CopyFrom(stmt_location)
+                actions.append(stmt_action)
+                if stmt_action.HasField("target"):
+                    block_known_vars.add(stmt_action.target)
+                found_first_action = True
+            elif not found_first_action:
+                block = self._make_python_block([stmt], stmt_location, block_known_vars)
+                preamble.append(block)
+                block_known_vars.update(block.outputs)
+            else:
+                in_postamble = True
+                block = self._make_python_block([stmt], stmt_location, block_known_vars)
+                postamble.append(block)
+                block_known_vars.update(block.outputs)
+
+        return preamble, actions, postamble
 
     def _extract_exception_types(self, node: ast.expr | None) -> list[ir_pb2.ExceptionType]:
         """Extract exception types from except clause."""
@@ -1384,29 +1430,13 @@ class IRSerializer:
     def _serialize_loop(self, loop: ir_pb2.Loop) -> list[str]:
         lines = []
 
-        acc_str = ", ".join(loop.accumulators)
         loc = self._loc_comment(loop.location if loop.HasField("location") else None)
-        lines.append(f"loop {loop.loop_var} in {loop.iterator_expr} -> [{acc_str}]:{loc}")
+        lines.append(f"loop {loop.loop_var} in {loop.iterator_expr} -> {loop.accumulator}:{loc}")
 
-        if loop.preamble:
-            for pre in loop.preamble:
-                io_parts = []
-                if pre.inputs:
-                    io_parts.append(f"reads: {', '.join(pre.inputs)}")
-                if pre.outputs:
-                    io_parts.append(f"writes: {', '.join(pre.outputs)}")
-                io_str = f" ({'; '.join(io_parts)})" if io_parts else ""
-                lines.append(f"    # preamble{io_str}")
-                for line in pre.code.split("\n"):
-                    lines.append("    " + line)
-
-        for action in loop.body:
-            action_lines = self._serialize_action(action)
-            for line in action_lines:
+        for stmt in loop.body:
+            stmt_lines = self._serialize_statement(stmt)
+            for line in stmt_lines:
                 lines.append("    " + line)
-
-        for y in loop.yields:
-            lines.append(f"    yield {y.source_expr} -> {y.accumulator}")
 
         return lines
 
@@ -1455,10 +1485,38 @@ class IRSerializer:
     def _serialize_try_except(self, te: ir_pb2.TryExcept) -> list[str]:
         loc = self._loc_comment(te.location if te.HasField("location") else None)
         lines = [f"try:{loc}"]
+
+        # Serialize try preamble
+        if te.try_preamble:
+            for pre in te.try_preamble:
+                io_parts = []
+                if pre.inputs:
+                    io_parts.append(f"reads: {', '.join(pre.inputs)}")
+                if pre.outputs:
+                    io_parts.append(f"writes: {', '.join(pre.outputs)}")
+                io_str = f" ({'; '.join(io_parts)})" if io_parts else ""
+                lines.append(f"    # preamble{io_str}")
+                for line in pre.code.split("\n"):
+                    lines.append("    " + line)
+
+        # Serialize try body actions
         for action in te.try_body:
             action_lines = self._serialize_action(action)
             for line in action_lines:
                 lines.append("    " + line)
+
+        # Serialize try postamble
+        if te.try_postamble:
+            for post in te.try_postamble:
+                io_parts = []
+                if post.inputs:
+                    io_parts.append(f"reads: {', '.join(post.inputs)}")
+                if post.outputs:
+                    io_parts.append(f"writes: {', '.join(post.outputs)}")
+                io_str = f" ({'; '.join(io_parts)})" if io_parts else ""
+                lines.append(f"    # postamble{io_str}")
+                for line in post.code.split("\n"):
+                    lines.append("    " + line)
 
         for handler in te.handlers:
             hloc = self._loc_comment(handler.location if handler.HasField("location") else None)
@@ -1479,10 +1537,37 @@ class IRSerializer:
                 else:
                     lines.append(f"except ({', '.join(types)}):{hloc}")
 
+            # Serialize handler preamble
+            if handler.preamble:
+                for pre in handler.preamble:
+                    io_parts = []
+                    if pre.inputs:
+                        io_parts.append(f"reads: {', '.join(pre.inputs)}")
+                    if pre.outputs:
+                        io_parts.append(f"writes: {', '.join(pre.outputs)}")
+                    io_str = f" ({'; '.join(io_parts)})" if io_parts else ""
+                    lines.append(f"    # preamble{io_str}")
+                    for line in pre.code.split("\n"):
+                        lines.append("    " + line)
+
+            # Serialize handler body actions
             for action in handler.body:
                 action_lines = self._serialize_action(action)
                 for line in action_lines:
                     lines.append("    " + line)
+
+            # Serialize handler postamble
+            if handler.postamble:
+                for post in handler.postamble:
+                    io_parts = []
+                    if post.inputs:
+                        io_parts.append(f"reads: {', '.join(post.inputs)}")
+                    if post.outputs:
+                        io_parts.append(f"writes: {', '.join(post.outputs)}")
+                    io_str = f" ({'; '.join(io_parts)})" if io_parts else ""
+                    lines.append(f"    # postamble{io_str}")
+                    for line in post.code.split("\n"):
+                        lines.append("    " + line)
 
         return lines
 
