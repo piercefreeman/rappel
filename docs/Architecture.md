@@ -50,11 +50,12 @@ Tuning notes:
 - `poll_interval_ms` balances latency and database load. The 100ms default
   yields at most 10 queries per second per worker process while keeping queued
   actions responsive.
-- `batch_size` controls how many dequeued actions get fanned out per poll. 100
-  gives ~1000 actions/second at the default interval without overwhelming the
-  worker pool.
-- `max_concurrent` dispatches default to `workers * 2`, providing enough
-  in-flight buffering to keep workers busy without unbounded task spawning.
+- `batch_size` controls how many dequeued actions get fanned out per poll. Defaults
+  to `worker_count * action_concurrency` (total concurrency capacity) so one poll
+  can saturate all workers.
+- `action_concurrency` controls how many asyncio tasks run concurrently per
+  worker. The default is `workers * 2`, providing enough in-flight buffering to
+  keep workers busy without unbounded task spawning.
 
 The dispatcher automatically handles completion batching and graceful
 shutdowns so a single host can service the entire queue with one outbound

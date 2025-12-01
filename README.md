@@ -140,16 +140,16 @@ If you have a particular workflow that you think should be working but isn't yet
 
 The main rappel configuration is done through env vars, which is what you'll typically use in production when using a docker deployment pipeline. If we can't find an environment parameter we will fallback to looking for an .env that specifies it within your local filesystem.
 
-| Environment Variable | Description | Default | Example |
-|---------------------|-------------|---------|---------|
-| `DATABASE_URL` | PostgreSQL connection string for the rappel server | (required) | `postgresql://user:pass@localhost:5433/rappel` |
-| `CARABINER_HTTP_ADDR` | HTTP bind address for `rappel-server` | `127.0.0.1:24117` | `0.0.0.0:24117` |
-| `CARABINER_GRPC_ADDR` | gRPC bind address for `rappel-server` | HTTP port + 1 | `0.0.0.0:24118` |
-| `CARABINER_WORKER_COUNT` | Number of Python worker processes | `num_cpus` | `8` |
-| `CARABINER_MAX_CONCURRENT` | Max concurrent actions across all workers | `32` | `64` |
-| `CARABINER_USER_MODULE` | Python module preloaded into each worker | none | `my_app.actions` |
-| `CARABINER_POLL_INTERVAL_MS` | Poll interval for the dispatch loop (ms) | `100` | `50` |
-| `CARABINER_BATCH_SIZE` | Max actions fetched per poll | `100` | `200` |
+| Environment Variable | Description | Default |
+|---------------------|-------------|---------|
+| `DATABASE_URL` | PostgreSQL connection string for the rappel server | (required) |
+| `CARABINER_HTTP_ADDR` | HTTP bind address for `rappel-server` | `127.0.0.1:24117` |
+| `CARABINER_GRPC_ADDR` | gRPC bind address for `rappel-server` | HTTP port + 1 |
+| `CARABINER_WORKER_COUNT` | Number of Python worker processes | `num_cpus` |
+| `CARABINER_ACTION_CONCURRENCY` | Max concurrent asyncio tasks per worker (total concurrency = WORKER_COUNT × ACTION_CONCURRENCY) | `32` |
+| `CARABINER_USER_MODULE` | Python module preloaded into each worker | none |
+| `CARABINER_POLL_INTERVAL_MS` | Poll interval for the dispatch loop (ms) | `100` |
+| `CARABINER_BATCH_SIZE` | Max actions fetched per poll | `WORKER_COUNT × ACTION_CONCURRENCY` |
 
 ## Philosophy
 
@@ -175,7 +175,7 @@ Nothing on the market provides this balance - `rappel` aims to try. We don't exp
 - You want background job code to plug and play with your existing unit test & static analysis stack
 - You are focused on getting to product market fit versus scale
 
-Performance is a top priority of rappel. That's why it's written with a Rust core, is lightweight on your database connection by minimizing connections to ~1 per machine host, and runs continuous benchmarks on CI. But it's not the _only_ priority. After all there's only so much we can do with Postgres as an ACID backing store. Once you start to tax Postgres' capabilities you're probably at the scale where you should switch to a more complicated architecture.
+Performance is a top priority of rappel. That's why it's written with a Rust core, is lightweight on your database connection by minimizing connections to one pool per machine host, and runs continuous benchmarks on CI. But it's not the _only_ priority. After all there's only so much we can do with Postgres as an ACID backing store. Once you start to tax Postgres' capabilities you're probably at the scale where you should switch to a more complicated architecture.
 
 **When shouldn't you?**
 

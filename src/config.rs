@@ -13,7 +13,7 @@ const DOTENV_FILENAME: &str = ".env";
 const HTTP_ADDR_ENV: &str = "CARABINER_HTTP_ADDR";
 const GRPC_ADDR_ENV: &str = "CARABINER_GRPC_ADDR";
 const WORKER_COUNT_ENV: &str = "CARABINER_WORKER_COUNT";
-const WORKER_MAX_CONCURRENT_ENV: &str = "CARABINER_MAX_CONCURRENT";
+const ACTION_CONCURRENCY_ENV: &str = "CARABINER_ACTION_CONCURRENCY";
 const WORKER_USER_MODULE_ENV: &str = "CARABINER_USER_MODULE";
 const WORKER_POLL_INTERVAL_ENV: &str = "CARABINER_POLL_INTERVAL_MS";
 const WORKER_BATCH_SIZE_ENV: &str = "CARABINER_BATCH_SIZE";
@@ -29,7 +29,7 @@ pub struct AppConfig {
 #[derive(Debug, Clone)]
 pub struct WorkerRuntimeConfig {
     pub worker_count: usize,
-    pub max_concurrent: usize,
+    pub action_concurrency: usize,
     pub user_module: Option<String>,
     pub poll_interval: Duration,
     pub batch_size: i64,
@@ -111,14 +111,14 @@ impl WorkerRuntimeConfig {
             }
             Err(_) => num_cpus::get().max(1),
         };
-        let max_concurrent = match env::var(WORKER_MAX_CONCURRENT_ENV) {
+        let action_concurrency = match env::var(ACTION_CONCURRENCY_ENV) {
             Ok(raw) => {
                 let parsed = raw.parse::<usize>().with_context(|| {
-                    format!("{WORKER_MAX_CONCURRENT_ENV} must be a positive integer")
+                    format!("{ACTION_CONCURRENCY_ENV} must be a positive integer")
                 })?;
                 if parsed == 0 {
                     return Err(anyhow!(
-                        "{WORKER_MAX_CONCURRENT_ENV} must be greater than zero when provided"
+                        "{ACTION_CONCURRENCY_ENV} must be greater than zero when provided"
                     ));
                 }
                 parsed
@@ -151,11 +151,12 @@ impl WorkerRuntimeConfig {
                 }
                 parsed
             }
-            Err(_) => 100,
+            // Default to total concurrency capacity (worker_count * action_concurrency)
+            Err(_) => (worker_count * action_concurrency) as i64,
         };
         Ok(Self {
             worker_count,
-            max_concurrent,
+            action_concurrency,
             user_module: env::var(WORKER_USER_MODULE_ENV).ok(),
             poll_interval: Duration::from_millis(poll_interval_ms),
             batch_size,
