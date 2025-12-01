@@ -30,12 +30,12 @@ async fn main() -> Result<()> {
     let dispatcher_config = DispatcherConfig {
         poll_interval: worker_settings.poll_interval,
         batch_size: worker_settings.batch_size,
-        max_concurrent: worker_settings.max_concurrent,
+        action_concurrency: worker_settings.action_concurrency,
     };
     let dispatcher = Dispatcher::start(dispatcher_config, Arc::clone(&database), Arc::clone(&pool));
     info!(
         worker_count,
-        max_concurrent = worker_settings.max_concurrent,
+        action_concurrency = worker_settings.action_concurrency,
         poll_interval_ms = worker_settings.poll_interval.as_millis(),
         batch_size = worker_settings.batch_size,
         "python worker pool started - waiting for shutdown signal"

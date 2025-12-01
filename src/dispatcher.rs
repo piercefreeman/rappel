@@ -21,15 +21,18 @@ const COMPLETION_FLUSH_INTERVAL_MS: u64 = 2;
 pub struct DispatcherConfig {
     pub poll_interval: Duration,
     pub batch_size: i64,
-    pub max_concurrent: usize,
+    pub action_concurrency: usize,
 }
 
 impl Default for DispatcherConfig {
     fn default() -> Self {
+        // Mirror WorkerRuntimeConfig defaults: worker_count = num_cpus, action_concurrency = 32
+        let worker_count = num_cpus::get().max(1);
+        let action_concurrency = 32;
         Self {
             poll_interval: Duration::from_millis(100),
-            batch_size: 100,
-            max_concurrent: num_cpus::get().max(1) * 2,
+            batch_size: (worker_count * action_concurrency) as i64,
+            action_concurrency,
         }
     }
 }
@@ -91,7 +94,7 @@ impl DispatcherTask {
         info!(
             poll_interval_ms = self.config.poll_interval.as_millis(),
             batch_size = self.config.batch_size,
-            max_concurrent = self.config.max_concurrent,
+            action_concurrency = self.config.action_concurrency,
             "starting dispatcher",
         );
 
@@ -101,7 +104,7 @@ impl DispatcherTask {
         let mut timeout_ticker = interval(Duration::from_secs(5));
         timeout_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        let semaphore = Arc::new(Semaphore::new(self.config.max_concurrent.max(1)));
+        let semaphore = Arc::new(Semaphore::new(self.config.action_concurrency.max(1)));
         let (completion_tx, completion_rx) = self.completion_channel();
         let db = Arc::clone(&self.database);
         let completion_handle = tokio::spawn(async move {
@@ -318,7 +321,7 @@ impl DispatcherTask {
     }
 
     async fn wait_for_inflight(&mut self, semaphore: &Arc<Semaphore>) {
-        let expected = self.config.max_concurrent.max(1);
+        let expected = self.config.action_concurrency.max(1);
         loop {
             if semaphore.available_permits() == expected {
                 break;
@@ -344,8 +347,13 @@ mod tests {
     #[test]
     fn default_config_values() {
         let config = DispatcherConfig::default();
+        let expected_worker_count = num_cpus::get().max(1);
+        let expected_action_concurrency = 32;
         assert_eq!(config.poll_interval, std::time::Duration::from_millis(100));
-        assert_eq!(config.batch_size, 100);
-        assert_eq!(config.max_concurrent, num_cpus::get().max(1) * 2);
+        assert_eq!(
+            config.batch_size,
+            (expected_worker_count * expected_action_concurrency) as i64
+        );
+        assert_eq!(config.action_concurrency, expected_action_concurrency);
     }
 }
