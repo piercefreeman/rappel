@@ -2316,3 +2316,93 @@ class SerializeSubgraphWorkflow(Workflow):
         assert "parallel(" in text
         assert "@example_module.fetch_left()" in text
         assert "self.my_subgraph(x=10)" in text
+
+    def test_subgraph_uses_action_output(
+        self, action_defs: dict[str, ActionDefinition], module_index: ModuleIndex
+    ):
+        """Test subgraph can use output from a previous action."""
+        code = """
+class SubgraphUsesActionOutputWorkflow(Workflow):
+    async def run(self) -> tuple:
+        # First get some data
+        data = await fetch_left()
+
+        # Then use that data in parallel subgraph calls
+        results = await asyncio.gather(
+            self.process_data(value=data),
+            self.process_data(value=data * 2)
+        )
+        return results
+
+    async def process_data(self, value: int) -> int:
+        return await double(value=value)
+"""
+        workflow = parse_workflow_class(code, action_defs, module_index)
+
+        # First statement should be action call that sets 'data'
+        assert workflow.body[0].WhichOneof("kind") == "action_call"
+        assert workflow.body[0].action_call.target == "data"
+
+        # Second statement should be gather with subgraphs using 'data'
+        gather = workflow.body[1].gather
+        assert len(gather.calls) == 2
+
+        call1 = gather.calls[0].subgraph
+        assert call1.method_name == "process_data"
+        assert call1.kwargs["value"] == "data"
+
+        call2 = gather.calls[1].subgraph
+        assert call2.method_name == "process_data"
+        assert call2.kwargs["value"] == "data * 2"
+
+    def test_subgraph_uses_workflow_params(
+        self, action_defs: dict[str, ActionDefinition], module_index: ModuleIndex
+    ):
+        """Test subgraph can use workflow input parameters."""
+        code = """
+class SubgraphUsesParamsWorkflow(Workflow):
+    async def run(self, x: int, y: int) -> tuple:
+        results = await asyncio.gather(
+            self.compute(input_val=x),
+            self.compute(input_val=y)
+        )
+        return results
+
+    async def compute(self, input_val: int) -> int:
+        return await double(value=input_val)
+"""
+        workflow = parse_workflow_class(code, action_defs, module_index)
+
+        gather = workflow.body[0].gather
+        assert gather.calls[0].subgraph.kwargs["input_val"] == "x"
+        assert gather.calls[1].subgraph.kwargs["input_val"] == "y"
+
+    def test_subgraph_with_complex_expressions(
+        self, action_defs: dict[str, ActionDefinition], module_index: ModuleIndex
+    ):
+        """Test subgraph arguments can be complex expressions."""
+        code = """
+class SubgraphComplexExprWorkflow(Workflow):
+    async def run(self, items: list) -> tuple:
+        count = await fetch_left()
+
+        results = await asyncio.gather(
+            self.process(data=items[0], multiplier=count + 1),
+            self.process(data=items[-1], multiplier=len(items))
+        )
+        return results
+
+    async def process(self, data: int, multiplier: int) -> int:
+        return await double(value=data * multiplier)
+"""
+        workflow = parse_workflow_class(code, action_defs, module_index)
+
+        gather = workflow.body[1].gather
+
+        call1 = gather.calls[0].subgraph
+        assert call1.kwargs["data"] == "items[0]"
+        assert call1.kwargs["multiplier"] == "count + 1"
+
+        call2 = gather.calls[1].subgraph
+        assert call2.kwargs["data"] == "items[-1]"
+        assert call2.kwargs["multiplier"] == "len(items)"

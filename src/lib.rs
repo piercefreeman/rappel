@@ -6,6 +6,7 @@ pub mod dag_state;
 pub mod db;
 pub mod dispatcher;
 pub mod instances;
+pub mod ir_parser;
 pub mod messages;
 pub mod retry;
 pub mod server_client;
