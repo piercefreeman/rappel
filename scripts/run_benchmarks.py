@@ -62,6 +62,25 @@ def reset_database():
         print(f"Warning: Database reset failed: {result.stderr}", file=sys.stderr)
 
 
+def check_benchmark_available() -> bool:
+    """Check if the benchmark binary exists and has the expected subcommands."""
+    binary_path = Path("./target/release/benchmark")
+    if not binary_path.exists():
+        return False
+
+    # Check if it has the expected subcommands
+    try:
+        result = subprocess.run(
+            ["./target/release/benchmark", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return "actions" in result.stdout and "instances" in result.stdout
+    except Exception:
+        return False
+
+
 def run_benchmark(benchmark_type: str, args: list[str], timeout: int = 300) -> dict:
     """Run a benchmark and parse the results."""
     cmd = ["./target/release/benchmark", benchmark_type] + args
@@ -70,6 +89,9 @@ def run_benchmark(benchmark_type: str, args: list[str], timeout: int = 300) -> d
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        print("Benchmark binary not found", file=sys.stderr)
+        return {"error": "binary_not_found"}
     except subprocess.TimeoutExpired:
         print(f"Benchmark {benchmark_type} timed out after {timeout}s", file=sys.stderr)
         return {"error": "timeout"}
@@ -122,6 +144,19 @@ def run_benchmark(benchmark_type: str, args: list[str], timeout: int = 300) -> d
 def main(output: str, skip_actions: bool, skip_instances: bool):
     """Run all benchmarks and output results as JSON."""
     results = {}
+
+    # Check if benchmark binary is available
+    if not check_benchmark_available():
+        print("Benchmark binary not available or missing subcommands", file=sys.stderr)
+        results["_meta"] = {
+            "benchmark_available": False,
+            "reason": "Benchmark binary not found or missing required subcommands (actions, instances)",
+        }
+        Path(output).write_text(json.dumps(results, indent=2))
+        print(json.dumps(results, indent=2))
+        return
+
+    results["_meta"] = {"benchmark_available": True}
 
     # Actions benchmark - raw action throughput
     if not skip_actions:

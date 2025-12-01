@@ -489,7 +489,7 @@ jobs:
     needs: build-wheel
     timeout-minutes: 20
     environment: pypi
-    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(toJson(github.event.pull_request.labels), 'full-build'))
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
     permissions:
       contents: read
       id-token: write

@@ -52,6 +52,35 @@ def generate_markdown_report(
         "",
     ]
 
+    # Check metadata for benchmark availability
+    pr_meta = pr_results.pop("_meta", {})
+    main_meta = main_results.pop("_meta", {})
+
+    pr_available = pr_meta.get("benchmark_available", True)
+    main_available = main_meta.get("benchmark_available", True)
+
+    # Handle case where main doesn't have benchmarks
+    if not main_available:
+        lines.extend(
+            [
+                "> :information_source: **Benchmarks are new in this PR** - main branch does not have the benchmark infrastructure.",
+                "",
+                f"> Reason: {main_meta.get('reason', 'Unknown')}",
+                "",
+            ]
+        )
+
+    if not pr_available:
+        lines.extend(
+            [
+                "> :x: **Benchmarks failed on PR branch**",
+                "",
+                f"> Reason: {pr_meta.get('reason', 'Unknown')}",
+                "",
+            ]
+        )
+        return "\n".join(lines)
+
     # Check if benchmark code changed
     if benchmark_diff.strip():
         lines.extend(
@@ -68,34 +97,74 @@ def generate_markdown_report(
             ]
         )
 
-    # Results table
-    lines.extend(
-        [
-            "### Results",
-            "",
-            "| Benchmark | Metric | PR | Main | Change |",
-            "|-----------|--------|---:|-----:|-------:|",
-        ]
-    )
+    # Get benchmark names (excluding _meta)
+    pr_benchmarks = {k for k in pr_results.keys() if not k.startswith("_")}
+    main_benchmarks = {k for k in main_results.keys() if not k.startswith("_")}
+    all_benchmarks = sorted(pr_benchmarks | main_benchmarks)
 
-    for bench_name in sorted(set(pr_results.keys()) | set(main_results.keys())):
+    if not all_benchmarks:
+        lines.append("No benchmark results available.")
+        return "\n".join(lines)
+
+    # Results table
+    if main_available and main_benchmarks:
+        lines.extend(
+            [
+                "### Results",
+                "",
+                "| Benchmark | Metric | PR | Main | Change |",
+                "|-----------|--------|---:|-----:|-------:|",
+            ]
+        )
+    else:
+        # No comparison available, just show PR results
+        lines.extend(
+            [
+                "### PR Benchmark Results",
+                "",
+                "| Benchmark | Metric | Value |",
+                "|-----------|--------|------:|",
+            ]
+        )
+
+    for bench_name in all_benchmarks:
         pr_bench = pr_results.get(bench_name, {})
         main_bench = main_results.get(bench_name, {})
 
-        # Throughput row
-        pr_tp = pr_bench.get("throughput", 0)
-        main_tp = main_bench.get("throughput", 0)
-        change_tp = format_change(pr_tp, main_tp, higher_is_better=True) if main_tp else "N/A"
-        lines.append(
-            f"| **{bench_name}** | Throughput (msg/s) | {pr_tp:.0f} | {main_tp:.0f} | {change_tp} |"
-        )
+        # Skip if error
+        if pr_bench.get("error"):
+            lines.append(f"| **{bench_name}** | Error | {pr_bench.get('error')} | - | - |")
+            continue
 
-        # P95 latency row
+        pr_tp = pr_bench.get("throughput", 0)
         pr_p95 = pr_bench.get("p95_ms", 0)
-        main_p95 = main_bench.get("p95_ms", 0)
-        if pr_p95 and main_p95:
-            change_p95 = format_change(pr_p95, main_p95, higher_is_better=False)
-            lines.append(f"| | P95 Latency (ms) | {pr_p95:.1f} | {main_p95:.1f} | {change_p95} |")
+
+        if main_available and main_benchmarks:
+            main_tp = main_bench.get("throughput", 0)
+            main_p95 = main_bench.get("p95_ms", 0)
+
+            # Throughput row
+            change_tp = (
+                format_change(pr_tp, main_tp, higher_is_better=True) if main_tp else "N/A (new)"
+            )
+            lines.append(
+                f"| **{bench_name}** | Throughput (msg/s) | {pr_tp:.0f} | {main_tp:.0f} | {change_tp} |"
+            )
+
+            # P95 latency row
+            if pr_p95:
+                if main_p95:
+                    change_p95 = format_change(pr_p95, main_p95, higher_is_better=False)
+                    lines.append(
+                        f"| | P95 Latency (ms) | {pr_p95:.1f} | {main_p95:.1f} | {change_p95} |"
+                    )
+                else:
+                    lines.append(f"| | P95 Latency (ms) | {pr_p95:.1f} | - | N/A (new) |")
+        else:
+            # Just show PR results
+            lines.append(f"| **{bench_name}** | Throughput (msg/s) | {pr_tp:.0f} |")
+            if pr_p95:
+                lines.append(f"| | P95 Latency (ms) | {pr_p95:.1f} |")
 
     lines.extend(
         [
