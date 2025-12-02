@@ -4,6 +4,7 @@
 //! The DAG is produced by converting IR and is NOT exposed via protobuf.
 //! Only the IR representation crosses the Python<->Rust boundary.
 
+use crate::ir_parser::Expression;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -75,8 +76,9 @@ pub struct LoopHeadMeta {
 /// Metadata for branch nodes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchMeta {
-    /// Guard expression to evaluate
-    pub guard_expr: String,
+    /// Guard expression to evaluate (None = unconditional/else branch)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub guard: Option<Expression>,
     /// Entry node for true branch (if any)
     pub true_entry: Option<String>,
     /// Entry node for false branch (if any)

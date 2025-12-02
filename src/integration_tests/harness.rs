@@ -1,6 +1,19 @@
 //! Integration test harness using the new Store API.
 
-use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration, sync::Once};
+
+static INIT_TRACING: Once = Once::new();
+
+fn init_tracing() {
+    INIT_TRACING.call_once(|| {
+        if std::env::var("RUST_LOG").is_ok() {
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_test_writer()
+                .init();
+        }
+    });
+}
 
 use anyhow::{Context, Result, anyhow};
 use prost::Message;
@@ -42,6 +55,8 @@ pub struct WorkflowHarness {
 
 impl WorkflowHarness {
     pub async fn new(config: WorkflowHarnessConfig<'_>) -> Result<Option<Self>> {
+        init_tracing();
+
         let database_url = match env::var("DATABASE_URL") {
             Ok(url) => url,
             Err(_) => {

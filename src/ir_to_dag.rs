@@ -346,108 +346,154 @@ fn convert_loop(state: &mut ConversionState, loop_: &ir::Loop) -> Result<(), Con
 
 fn convert_conditional(state: &mut ConversionState, cond: &ir::Conditional) -> Result<(), ConversionError> {
     let prev_last = state.last_node_id.clone();
-    let mut branch_end_nodes = Vec::new();
 
-    // Create branch node
-    let branch_id = state.next_node_id("branch");
-    let mut true_nodes: HashSet<String> = HashSet::new();
-    let mut false_nodes: HashSet<String> = HashSet::new();
-    let mut true_entry: Option<String> = None;
-    let mut false_entry: Option<String> = None;
+    // For if/elif/else, we create a chain of branch nodes.
+    // Each branch node evaluates one guard:
+    //   - If true: execute that branch's body, then go to merge
+    //   - If false: proceed to next branch node (or else branch if last)
+    //
+    // Structure for 3 branches (if/elif/else):
+    //   Branch_0 --guard_0_true--> Body_0 --> Merge
+    //            --guard_0_false--> Branch_1 --guard_1_true--> Body_1 --> Merge
+    //                                        --guard_1_false--> Body_2 --> Merge
 
-    for (i, branch) in cond.branches.iter().enumerate() {
-        // Capture nodes before processing this branch
+    struct BranchInfo {
+        guard: Option<ir::Expression>,
+        entry: Option<String>,
+        end_node: Option<String>,
+        nodes: HashSet<String>,
+    }
+
+    let mut branch_infos: Vec<BranchInfo> = Vec::new();
+
+    // First pass: create all body nodes for each branch
+    for branch in &cond.branches {
         let nodes_before: HashSet<String> = state.dag.nodes.keys().cloned().collect();
         state.last_node_id = None;
+
+        // Track the first node added in this branch
+        let mut first_node_in_branch: Option<String> = None;
 
         // Process preamble
         for pre in &branch.preamble {
             convert_python_block(state, pre)?;
+            if first_node_in_branch.is_none() {
+                first_node_in_branch = state.last_node_id.clone();
+            }
         }
 
         // Process actions
         for action in &branch.actions {
             convert_action_call(state, action)?;
+            if first_node_in_branch.is_none() {
+                first_node_in_branch = state.last_node_id.clone();
+            }
         }
 
         // Process postamble
         for post in &branch.postamble {
             convert_python_block(state, post)?;
+            if first_node_in_branch.is_none() {
+                first_node_in_branch = state.last_node_id.clone();
+            }
         }
 
-        // Collect nodes for this branch - those not in nodes_before
+        // Collect nodes for this branch
         let branch_nodes: HashSet<String> = state.dag.nodes.keys()
             .filter(|k| !nodes_before.contains(*k))
             .cloned()
             .collect();
 
-        // Find entry node - first node added
-        let entry = state.dag.nodes.keys()
-            .find(|k| !nodes_before.contains(*k))
-            .cloned();
-
-        // First branch is "true", rest are "false" (elif/else)
-        if i == 0 {
-            true_nodes = branch_nodes;
-            true_entry = entry;
-        } else {
-            false_nodes.extend(branch_nodes);
-            if false_entry.is_none() {
-                false_entry = entry;
-            }
-        }
-
-        if let Some(last) = &state.last_node_id {
-            branch_end_nodes.push(last.clone());
-        }
+        branch_infos.push(BranchInfo {
+            guard: branch.guard.clone(),
+            entry: first_node_in_branch,
+            end_node: state.last_node_id.clone(),
+            nodes: branch_nodes,
+        });
     }
 
-    // Create merge node if needed
-    let merge_id = if let Some(target) = &cond.target {
-        let merge_id = state.next_node_id("cond_merge");
-        let mut merge_node = Node::gather_join(&merge_id);
+    // Create merge node if there's a target, or just to join branches
+    let merge_id = state.next_node_id("cond_merge");
+    let mut merge_node = Node::gather_join(&merge_id);
+    if let Some(target) = &cond.target {
         merge_node.produces.push(target.clone());
+    }
 
-        // Add edges from branch ends to merge
-        for end_id in &branch_end_nodes {
+    // Add edges from branch ends to merge
+    for info in &branch_infos {
+        if let Some(end_id) = &info.end_node {
             if let Some(end_node) = state.dag.get_node_mut(end_id) {
                 end_node.add_edge(merge_id.clone(), EdgeKind::Data);
             }
         }
+    }
 
-        state.dag.add_node(merge_node);
-        Some(merge_id.clone())
-    } else {
-        None
-    };
+    state.dag.add_node(merge_node);
 
-    // Convert guard expression to string for the first branch
-    let guard_expr = cond.branches.first()
-        .and_then(|b| b.guard.as_ref())
-        .map(expression_to_code)
-        .unwrap_or_default();
+    // Create branch nodes in reverse order (last to first)
+    // so that each branch's false_entry points to the next branch node
+    let mut next_branch_id: Option<String> = None;
+    let mut branch_node_ids: Vec<String> = Vec::new();
+    // Track branch node IDs that should be skipped when earlier branches are taken
+    let mut later_branch_node_ids: HashSet<String> = HashSet::new();
 
-    // Create branch metadata
-    let branch_meta = BranchMeta {
-        guard_expr,
-        true_entry,
-        false_entry,
-        true_nodes,
-        false_nodes,
-        merge_node: merge_id.clone(),
-    };
+    for i in (0..branch_infos.len()).rev() {
+        let info = &branch_infos[i];
+        let branch_id = state.next_node_id("branch");
+        branch_node_ids.push(branch_id.clone());
 
-    let branch_node = Node::branch(&branch_id, branch_meta);
+        // For the last branch (else), there's no guard - it's always taken
+        let is_else_branch = info.guard.is_none() && i == branch_infos.len() - 1;
 
-    // Connect previous node to branch
+        // Collect all nodes that belong to branches AFTER this one (to mark as skipped when true)
+        // This includes both body nodes AND the branch nodes themselves
+        let mut later_branch_nodes: HashSet<String> = HashSet::new();
+        for j in (i + 1)..branch_infos.len() {
+            later_branch_nodes.extend(branch_infos[j].nodes.clone());
+        }
+        // Also include the later branch node IDs (they need to be skipped too)
+        later_branch_nodes.extend(later_branch_node_ids.clone());
+
+        let branch_meta = BranchMeta {
+            guard: info.guard.clone(),
+            true_entry: info.entry.clone(),
+            false_entry: if is_else_branch { None } else { next_branch_id.clone().or(info.entry.clone()) },
+            true_nodes: info.nodes.clone(),
+            false_nodes: later_branch_nodes,
+            merge_node: Some(merge_id.clone()),
+        };
+
+        let mut branch_node = Node::branch(&branch_id, branch_meta);
+
+        // Add edge from this branch to its body entry (for dependency tracking)
+        if let Some(entry) = &info.entry {
+            branch_node.add_edge(entry.clone(), EdgeKind::Data);
+        }
+
+        // Add edge from this branch to the next branch (for chaining elif/else)
+        if let Some(next_id) = &next_branch_id {
+            branch_node.add_edge(next_id.clone(), EdgeKind::Data);
+        }
+
+        state.dag.add_node(branch_node);
+        next_branch_id = Some(branch_id.clone());
+        // Add this branch's ID to the set that will be skipped by earlier branches
+        later_branch_node_ids.insert(branch_id);
+    }
+
+    // The first branch node is the entry to the conditional chain
+    let first_branch_id = branch_node_ids.last().cloned();
+
+    // Connect previous node to first branch
     if let Some(prev_id) = &prev_last {
-        if let Some(prev_node) = state.dag.get_node_mut(prev_id) {
-            prev_node.add_edge(branch_id.clone(), EdgeKind::Data);
+        if let Some(first_branch) = &first_branch_id {
+            if let Some(prev_node) = state.dag.get_node_mut(prev_id) {
+                prev_node.add_edge(first_branch.clone(), EdgeKind::Data);
+            }
         }
     }
 
-    state.dag.add_node(branch_node);
-    state.last_node_id = merge_id.or_else(|| branch_end_nodes.last().cloned());
+    state.last_node_id = Some(merge_id);
 
     Ok(())
 }

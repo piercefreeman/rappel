@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Pool, Postgres, Row};
 use std::collections::HashMap;
+use tracing::debug;
 use uuid::Uuid;
 
 /// Workflow version stored in database
@@ -360,6 +361,15 @@ impl Store {
 
     /// Complete an action and process the result
     pub async fn complete_action(&self, completion: ActionCompletion) -> Result<()> {
+        debug!(
+            action_id = %completion.action_id,
+            instance_id = %completion.instance_id,
+            node_id = %completion.node_id,
+            success = completion.success,
+            has_result = completion.result.is_some(),
+            "Completing action"
+        );
+
         // Mark action as completed
         sqlx::query(
             r#"
@@ -378,6 +388,12 @@ impl Store {
         let (state, dag, _workflow_input) = self.load_instance(completion.instance_id).await?;
         let mut state = state;
 
+        debug!(
+            instance_id = %completion.instance_id,
+            eval_context_vars = %state.context_summary(),
+            "Loaded instance state before handle_completion"
+        );
+
         // Process completion through scheduler
         let scheduler = Scheduler::new(&dag);
         let action = scheduler.handle_completion(
@@ -387,18 +403,40 @@ impl Store {
             completion.success,
         )?;
 
+        debug!(
+            instance_id = %completion.instance_id,
+            eval_context_vars = %state.context_summary(),
+            scheduler_action = ?format!("{:?}", &action).chars().take(100).collect::<String>(),
+            "State after handle_completion, saving"
+        );
+
         // Save updated state
         self.save_instance_state(completion.instance_id, &state).await?;
 
         // Handle scheduler action
         match action {
             SchedulerAction::NodesReady { node_ids } => {
+                debug!(
+                    instance_id = %completion.instance_id,
+                    ready_nodes = ?node_ids,
+                    "Processing ready nodes"
+                );
                 self.process_ready_nodes(completion.instance_id, node_ids).await?;
             }
             SchedulerAction::WorkflowComplete { result } => {
+                debug!(
+                    instance_id = %completion.instance_id,
+                    has_result = result.is_some(),
+                    "Workflow complete"
+                );
                 self.complete_instance(completion.instance_id, result).await?;
             }
             SchedulerAction::Dispatch { node_id, dispatch } => {
+                debug!(
+                    instance_id = %completion.instance_id,
+                    dispatch_node = %node_id,
+                    "Direct dispatch from completion"
+                );
                 if let Some(node) = dag.get_node(&node_id) {
                     self.enqueue_action(completion.instance_id, &node_id, &dispatch, node).await?;
                 }

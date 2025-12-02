@@ -13,6 +13,7 @@
 //! - Push-based: completing a node immediately unlocks dependents
 
 use crate::dag::{Dag, EdgeKind, Node, NodeKind};
+use crate::ir_parser::{self as ir, Expression};
 use crate::messages::proto::{
     NodeContext, NodeDispatch, NodeInfo, WorkflowArguments,
 };
@@ -20,6 +21,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use tracing::debug;
 
 /// Node execution state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,7 +109,48 @@ impl InstanceState {
 
     /// Set a variable in eval_context
     pub fn set_var(&mut self, name: impl Into<String>, value: Value) {
-        self.eval_context.insert(name.into(), value);
+        let name = name.into();
+        debug!(
+            variable = %name,
+            value_type = ?value_type_name(&value),
+            value_preview = %value_preview(&value),
+            "Setting variable in eval_context"
+        );
+        self.eval_context.insert(name, value);
+    }
+
+    /// Get a summary of the current eval_context for debugging
+    pub fn context_summary(&self) -> String {
+        let vars: Vec<String> = self.eval_context
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, value_preview(v)))
+            .collect();
+        vars.join(", ")
+    }
+}
+
+/// Get a short type name for a Value
+fn value_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Get a short preview of a Value for logging
+fn value_preview(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) if s.len() <= 50 => format!("\"{}\"", s),
+        Value::String(s) => format!("\"{}...\"", &s[..47]),
+        Value::Array(arr) => format!("[{} items]", arr.len()),
+        Value::Object(obj) => format!("{{{} keys}}", obj.len()),
     }
 }
 
@@ -171,36 +214,59 @@ impl<'a> Scheduler<'a> {
         let node = self.dag.get_node(node_id)
             .ok_or_else(|| anyhow!("Node {} not found", node_id))?;
 
+        debug!(
+            node_id = %node_id,
+            node_kind = ?node.kind,
+            action = ?node.action,
+            produces = ?node.produces,
+            eval_context = %state.context_summary(),
+            "Processing ready node"
+        );
+
         match node.kind {
             NodeKind::LoopHead => {
-                // Evaluate loop head locally (not dispatched to worker)
+                debug!(node_id = %node_id, "Evaluating loop head locally");
                 self.evaluate_loop_head(state, node)
             }
             NodeKind::Branch => {
-                // Evaluate branch condition locally
+                debug!(node_id = %node_id, "Evaluating branch condition locally");
                 self.evaluate_branch(state, node)
             }
             NodeKind::GatherJoin => {
-                // Gather results from parallel branches
+                debug!(node_id = %node_id, "Evaluating gather join locally");
                 self.evaluate_gather_join(state, node)
             }
             NodeKind::Action | NodeKind::Computed | NodeKind::Sleep => {
-                // Dispatch to worker
+                debug!(
+                    node_id = %node_id,
+                    kwargs = ?node.kwargs,
+                    "Building dispatch for worker"
+                );
                 let dispatch = self.build_dispatch(state, node, workflow_input)?;
                 state.mark_running(node_id);
+                debug!(
+                    node_id = %node_id,
+                    context_vars = dispatch.context.len(),
+                    "Dispatching to worker"
+                );
                 Ok(SchedulerAction::Dispatch {
                     node_id: node_id.to_string(),
                     dispatch,
                 })
             }
             NodeKind::TryHead => {
-                // Try head just passes through to try body
+                debug!(node_id = %node_id, "Try head - passing through");
                 self.mark_complete_and_unlock(state, node, None)
             }
             NodeKind::Return => {
-                // Return node - workflow complete
                 let result = self.dag.return_variable.as_ref()
                     .and_then(|var| state.get_var(var).cloned());
+                debug!(
+                    node_id = %node_id,
+                    return_var = ?self.dag.return_variable,
+                    has_result = result.is_some(),
+                    "Workflow complete"
+                );
                 Ok(SchedulerAction::WorkflowComplete { result })
             }
         }
@@ -217,8 +283,17 @@ impl<'a> Scheduler<'a> {
         let node = self.dag.get_node(node_id)
             .ok_or_else(|| anyhow!("Node {} not found", node_id))?;
 
+        debug!(
+            node_id = %node_id,
+            success = success,
+            has_result = result.is_some(),
+            result_preview = %result.as_ref().map(value_preview).unwrap_or_else(|| "none".to_string()),
+            produces = ?node.produces,
+            "Handling node completion"
+        );
+
         if !success {
-            // Handle failure - check for exception handlers
+            debug!(node_id = %node_id, "Node failed - checking exception handlers");
             return self.handle_failure(state, node, result);
         }
 
@@ -227,6 +302,11 @@ impl<'a> Scheduler<'a> {
             // Check if this is a WorkflowNodeResult with variables dict
             // (returned by python_block nodes)
             if let Some(variables) = value.get("variables").and_then(|v| v.as_object()) {
+                debug!(
+                    node_id = %node_id,
+                    variables_count = variables.len(),
+                    "Storing WorkflowNodeResult variables"
+                );
                 for var in &node.produces {
                     if let Some(var_value) = variables.get(var) {
                         state.set_var(var.clone(), var_value.clone());
@@ -234,14 +314,26 @@ impl<'a> Scheduler<'a> {
                 }
             } else {
                 // Simple result - assign to all produces (typically just one)
+                debug!(
+                    node_id = %node_id,
+                    produces = ?node.produces,
+                    "Storing simple result to produces"
+                );
                 for var in &node.produces {
                     state.set_var(var.clone(), value.clone());
                 }
             }
         }
 
+        debug!(
+            node_id = %node_id,
+            eval_context_after = %state.context_summary(),
+            "State after storing result"
+        );
+
         // Check for back edge (loop iteration complete)
         if let Some(loop_head_id) = self.get_back_edge_target(node) {
+            debug!(node_id = %node_id, loop_head = %loop_head_id, "Found back edge to loop head");
             return self.handle_back_edge(state, node, &loop_head_id);
         }
 
@@ -362,8 +454,32 @@ impl<'a> Scheduler<'a> {
         let meta = node.branch_meta.as_ref()
             .ok_or_else(|| anyhow!("Branch {} missing metadata", node.id))?;
 
+        debug!(
+            node_id = %node.id,
+            guard_expr = ?meta.guard,
+            true_entry = ?meta.true_entry,
+            false_entry = ?meta.false_entry,
+            true_nodes_count = meta.true_nodes.len(),
+            false_nodes_count = meta.false_nodes.len(),
+            eval_context = %state.context_summary(),
+            "Evaluating branch condition"
+        );
+
         // Evaluate guard expression
-        let guard_result = self.evaluate_guard(&meta.guard_expr, state)?;
+        let guard_result = match &meta.guard {
+            Some(expr) => {
+                let result = eval_expression(expr, &state.eval_context)?;
+                value_to_bool(&result)
+            }
+            None => true, // No guard = unconditional (else branch)
+        };
+
+        debug!(
+            node_id = %node.id,
+            guard_expr = ?meta.guard,
+            guard_result = guard_result,
+            "Guard evaluation result"
+        );
 
         state.node_states.insert(node.id.clone(), NodeState::Completed);
 
@@ -372,26 +488,76 @@ impl<'a> Scheduler<'a> {
         if guard_result {
             // Unlock true branch, skip false branch
             if let Some(true_entry) = &meta.true_entry {
+                debug!(
+                    node_id = %node.id,
+                    unlocking = %true_entry,
+                    "Taking true branch"
+                );
                 if self.try_unlock_node(state, true_entry) {
                     newly_ready.push(true_entry.clone());
                 }
             }
-            // Mark false branch nodes as skipped
-            for node_id in &meta.false_nodes {
-                state.node_states.insert(node_id.clone(), NodeState::Skipped);
+            // First mark ALL false branch nodes as skipped
+            for skipped_id in &meta.false_nodes {
+                state.node_states.insert(skipped_id.clone(), NodeState::Skipped);
             }
+            // Then unlock downstream nodes of skipped nodes (but only if target is NOT also skipped)
+            for skipped_id in &meta.false_nodes {
+                if let Some(skipped_node) = self.dag.get_node(skipped_id) {
+                    for edge in &skipped_node.edges {
+                        if edge.kind == EdgeKind::Data && !meta.false_nodes.contains(&edge.target) {
+                            if self.try_unlock_node(state, &edge.target) {
+                                newly_ready.push(edge.target.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            debug!(
+                node_id = %node.id,
+                skipped_count = meta.false_nodes.len(),
+                "Skipped false branch nodes"
+            );
         } else {
             // Unlock false branch, skip true branch
             if let Some(false_entry) = &meta.false_entry {
+                debug!(
+                    node_id = %node.id,
+                    unlocking = %false_entry,
+                    "Taking false branch"
+                );
                 if self.try_unlock_node(state, false_entry) {
                     newly_ready.push(false_entry.clone());
                 }
             }
-            // Mark true branch nodes as skipped
-            for node_id in &meta.true_nodes {
-                state.node_states.insert(node_id.clone(), NodeState::Skipped);
+            // First mark ALL true branch nodes as skipped
+            for skipped_id in &meta.true_nodes {
+                state.node_states.insert(skipped_id.clone(), NodeState::Skipped);
             }
+            // Then unlock downstream nodes of skipped nodes (but only if target is NOT also skipped)
+            for skipped_id in &meta.true_nodes {
+                if let Some(skipped_node) = self.dag.get_node(skipped_id) {
+                    for edge in &skipped_node.edges {
+                        if edge.kind == EdgeKind::Data && !meta.true_nodes.contains(&edge.target) {
+                            if self.try_unlock_node(state, &edge.target) {
+                                newly_ready.push(edge.target.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            debug!(
+                node_id = %node.id,
+                skipped_count = meta.true_nodes.len(),
+                "Skipped true branch nodes"
+            );
         }
+
+        debug!(
+            node_id = %node.id,
+            newly_ready = ?newly_ready,
+            "Branch evaluation complete"
+        );
 
         Ok(SchedulerAction::NodesReady { node_ids: newly_ready })
     }
@@ -473,11 +639,11 @@ impl<'a> Scheduler<'a> {
         Ok(SchedulerAction::NodesReady { node_ids: newly_ready })
     }
 
-    /// Check if all nodes in the workflow are completed
+    /// Check if all nodes in the workflow are completed (or skipped)
     fn is_workflow_complete(&self, state: &InstanceState) -> bool {
-        // All nodes must be in Completed state
+        // All nodes must be in Completed or Skipped state
         self.dag.nodes.keys().all(|node_id| {
-            matches!(state.node_states.get(node_id), Some(NodeState::Completed))
+            matches!(state.node_states.get(node_id), Some(NodeState::Completed) | Some(NodeState::Skipped))
         })
     }
 
@@ -505,28 +671,6 @@ impl<'a> Scheduler<'a> {
         node.edges.iter()
             .find(|e| e.kind == EdgeKind::Back)
             .map(|e| e.target.clone())
-    }
-
-    /// Evaluate a guard expression against eval_context
-    fn evaluate_guard(&self, expr: &str, state: &InstanceState) -> Result<bool> {
-        // Simple evaluation for common patterns
-        // TODO: Use ast_eval for full expression support
-
-        if expr.is_empty() || expr == "True" {
-            return Ok(true);
-        }
-        if expr == "False" {
-            return Ok(false);
-        }
-
-        // Check for simple variable reference
-        if let Some(value) = state.get_var(expr) {
-            return Ok(value_to_bool(value));
-        }
-
-        // For now, default to true for complex expressions
-        // TODO: Full expression evaluation
-        Ok(true)
     }
 
     /// Build dispatch payload for a node
@@ -560,10 +704,10 @@ impl<'a> Scheduler<'a> {
 }
 
 /// Build context entries for a node from eval_context
-fn build_context_for_node(state: &InstanceState, _node: &Node) -> Vec<NodeContext> {
+fn build_context_for_node(state: &InstanceState, node: &Node) -> Vec<NodeContext> {
     // For now, include all variables in context
     // TODO: Optimize to only include variables referenced in kwargs
-    state.eval_context.iter()
+    let context: Vec<NodeContext> = state.eval_context.iter()
         .map(|(var, value)| {
             NodeContext {
                 variable: var.clone(),
@@ -571,7 +715,17 @@ fn build_context_for_node(state: &InstanceState, _node: &Node) -> Vec<NodeContex
                 source_node_id: String::new(),
             }
         })
-        .collect()
+        .collect();
+
+    let var_names: Vec<&str> = context.iter().map(|c| c.variable.as_str()).collect();
+    debug!(
+        node_id = %node.id,
+        context_vars = ?var_names,
+        context_count = context.len(),
+        "Built context for node dispatch"
+    );
+
+    context
 }
 
 /// Convert a Value to WorkflowArguments with "result" key (matches Python's serialize_result_payload)
@@ -651,6 +805,257 @@ fn value_to_bool(value: &Value) -> bool {
         Value::String(s) => !s.is_empty(),
         Value::Array(a) => !a.is_empty(),
         Value::Object(o) => !o.is_empty(),
+    }
+}
+
+/// Evaluate a proto Expression against a context
+fn eval_expression(expr: &Expression, context: &HashMap<String, Value>) -> Result<Value> {
+    use ir::expression::Kind;
+    use ir::binary_op::Op as BinaryOp;
+    use ir::unary_op::Op as UnaryOp;
+    use ir::literal::Value as LiteralValue;
+
+    match &expr.kind {
+        None => Err(anyhow!("Expression has no kind")),
+
+        Some(Kind::Literal(lit)) => {
+            match &lit.value {
+                None => Ok(Value::Null),
+                Some(LiteralValue::NullValue(_)) => Ok(Value::Null),
+                Some(LiteralValue::BoolValue(b)) => Ok(Value::Bool(*b)),
+                Some(LiteralValue::IntValue(i)) => Ok(Value::Number((*i).into())),
+                Some(LiteralValue::FloatValue(d)) => {
+                    serde_json::Number::from_f64(*d)
+                        .map(Value::Number)
+                        .ok_or_else(|| anyhow!("Invalid float: {}", d))
+                }
+                Some(LiteralValue::StringValue(s)) => Ok(Value::String(s.clone())),
+            }
+        }
+
+        Some(Kind::Variable(var_name)) => {
+            context.get(var_name)
+                .cloned()
+                .ok_or_else(|| anyhow!("Variable '{}' not found in context", var_name))
+        }
+
+        Some(Kind::Subscript(sub)) => {
+            let base = sub.base.as_ref()
+                .ok_or_else(|| anyhow!("Subscript missing base"))?;
+            let key = sub.key.as_ref()
+                .ok_or_else(|| anyhow!("Subscript missing key"))?;
+
+            let base_val = eval_expression(base, context)?;
+            let key_val = eval_expression(key, context)?;
+
+            match (&base_val, &key_val) {
+                (Value::Array(arr), Value::Number(n)) => {
+                    let idx = n.as_i64().ok_or_else(|| anyhow!("Array index must be integer"))? as usize;
+                    arr.get(idx).cloned().ok_or_else(|| anyhow!("Array index {} out of bounds", idx))
+                }
+                (Value::Object(obj), Value::String(k)) => {
+                    obj.get(k).cloned().ok_or_else(|| anyhow!("Key '{}' not found in object", k))
+                }
+                _ => Err(anyhow!("Invalid subscript: {:?}[{:?}]", base_val, key_val))
+            }
+        }
+
+        Some(Kind::Array(arr)) => {
+            let items: Result<Vec<Value>> = arr.elements.iter()
+                .map(|e| eval_expression(e, context))
+                .collect();
+            Ok(Value::Array(items?))
+        }
+
+        Some(Kind::Dict(dict)) => {
+            let mut map = serde_json::Map::new();
+            for entry in &dict.entries {
+                // Dict keys are strings directly in the proto
+                let key_str = entry.key.clone();
+                let val = entry.value.as_ref()
+                    .ok_or_else(|| anyhow!("Dict entry missing value"))?;
+
+                map.insert(key_str, eval_expression(val, context)?);
+            }
+            Ok(Value::Object(map))
+        }
+
+        Some(Kind::BinaryOp(binop)) => {
+            let left = binop.left.as_ref()
+                .ok_or_else(|| anyhow!("BinaryOp missing left operand"))?;
+            let right = binop.right.as_ref()
+                .ok_or_else(|| anyhow!("BinaryOp missing right operand"))?;
+
+            let left_val = eval_expression(left, context)?;
+
+            // Short-circuit for and/or
+            match BinaryOp::try_from(binop.op) {
+                Ok(BinaryOp::And) => {
+                    if !value_to_bool(&left_val) {
+                        return Ok(Value::Bool(false));
+                    }
+                    let right_val = eval_expression(right, context)?;
+                    return Ok(Value::Bool(value_to_bool(&right_val)));
+                }
+                Ok(BinaryOp::Or) => {
+                    if value_to_bool(&left_val) {
+                        return Ok(Value::Bool(true));
+                    }
+                    let right_val = eval_expression(right, context)?;
+                    return Ok(Value::Bool(value_to_bool(&right_val)));
+                }
+                _ => {}
+            }
+
+            let right_val = eval_expression(right, context)?;
+
+            match BinaryOp::try_from(binop.op) {
+                Ok(BinaryOp::Add) => numeric_binop(&left_val, &right_val, |a, b| a + b),
+                Ok(BinaryOp::Sub) => numeric_binop(&left_val, &right_val, |a, b| a - b),
+                Ok(BinaryOp::Mul) => numeric_binop(&left_val, &right_val, |a, b| a * b),
+                Ok(BinaryOp::Div) => numeric_binop(&left_val, &right_val, |a, b| a / b),
+                Ok(BinaryOp::Mod) => numeric_binop(&left_val, &right_val, |a, b| a % b),
+                Ok(BinaryOp::Eq) => Ok(Value::Bool(left_val == right_val)),
+                Ok(BinaryOp::Ne) => Ok(Value::Bool(left_val != right_val)),
+                Ok(BinaryOp::Lt) => Ok(Value::Bool(compare_numeric(&left_val, &right_val, |a, b| a < b))),
+                Ok(BinaryOp::Le) => Ok(Value::Bool(compare_numeric(&left_val, &right_val, |a, b| a <= b))),
+                Ok(BinaryOp::Gt) => Ok(Value::Bool(compare_numeric(&left_val, &right_val, |a, b| a > b))),
+                Ok(BinaryOp::Ge) => Ok(Value::Bool(compare_numeric(&left_val, &right_val, |a, b| a >= b))),
+                Ok(BinaryOp::And) | Ok(BinaryOp::Or) => unreachable!(), // handled above
+                Ok(BinaryOp::In) => {
+                    // Check if left is in right (array/object)
+                    match &right_val {
+                        Value::Array(arr) => Ok(Value::Bool(arr.contains(&left_val))),
+                        Value::Object(obj) => {
+                            match &left_val {
+                                Value::String(s) => Ok(Value::Bool(obj.contains_key(s))),
+                                _ => Ok(Value::Bool(false)),
+                            }
+                        }
+                        _ => Err(anyhow!("'in' operator requires array or object on right side"))
+                    }
+                }
+                Ok(BinaryOp::NotIn) => {
+                    // Check if left is NOT in right
+                    match &right_val {
+                        Value::Array(arr) => Ok(Value::Bool(!arr.contains(&left_val))),
+                        Value::Object(obj) => {
+                            match &left_val {
+                                Value::String(s) => Ok(Value::Bool(!obj.contains_key(s))),
+                                _ => Ok(Value::Bool(true)),
+                            }
+                        }
+                        _ => Err(anyhow!("'not in' operator requires array or object on right side"))
+                    }
+                }
+                Ok(BinaryOp::Unspecified) | Err(_) => Err(anyhow!("Unknown binary operator: {}", binop.op))
+            }
+        }
+
+        Some(Kind::UnaryOp(unop)) => {
+            let operand = unop.operand.as_ref()
+                .ok_or_else(|| anyhow!("UnaryOp missing operand"))?;
+            let val = eval_expression(operand, context)?;
+
+            match UnaryOp::try_from(unop.op) {
+                Ok(UnaryOp::Not) => Ok(Value::Bool(!value_to_bool(&val))),
+                Ok(UnaryOp::Neg) => {
+                    match val.as_f64() {
+                        Some(n) => serde_json::Number::from_f64(-n)
+                            .map(Value::Number)
+                            .ok_or_else(|| anyhow!("Invalid negation result")),
+                        None => Err(anyhow!("Cannot negate non-number: {:?}", val))
+                    }
+                }
+                Ok(UnaryOp::Unspecified) | Err(_) => Err(anyhow!("Unknown unary operator: {}", unop.op))
+            }
+        }
+
+        Some(Kind::Call(call)) => {
+            // Handle built-in functions
+            let args: Result<Vec<Value>> = call.args.iter()
+                .map(|e| eval_expression(e, context))
+                .collect();
+            let args = args?;
+
+            match call.function.as_str() {
+                "len" => {
+                    if args.len() != 1 {
+                        return Err(anyhow!("len() takes 1 argument, got {}", args.len()));
+                    }
+                    match &args[0] {
+                        Value::Array(a) => Ok(Value::Number((a.len() as i64).into())),
+                        Value::String(s) => Ok(Value::Number((s.len() as i64).into())),
+                        Value::Object(o) => Ok(Value::Number((o.len() as i64).into())),
+                        _ => Err(anyhow!("len() not supported for {:?}", args[0]))
+                    }
+                }
+                "str" => {
+                    if args.len() != 1 {
+                        return Err(anyhow!("str() takes 1 argument, got {}", args.len()));
+                    }
+                    Ok(Value::String(format!("{}", args[0])))
+                }
+                "int" => {
+                    if args.len() != 1 {
+                        return Err(anyhow!("int() takes 1 argument, got {}", args.len()));
+                    }
+                    match &args[0] {
+                        Value::Number(n) => Ok(Value::Number((n.as_i64().unwrap_or(0)).into())),
+                        Value::String(s) => s.parse::<i64>()
+                            .map(|n| Value::Number(n.into()))
+                            .map_err(|_| anyhow!("Cannot convert '{}' to int", s)),
+                        _ => Err(anyhow!("int() not supported for {:?}", args[0]))
+                    }
+                }
+                _ => Err(anyhow!("Unknown function: {}", call.function))
+            }
+        }
+
+        Some(Kind::Attribute(attr)) => {
+            let base = attr.base.as_ref()
+                .ok_or_else(|| anyhow!("Attribute access missing base"))?;
+            let base_val = eval_expression(base, context)?;
+
+            match base_val {
+                Value::Object(obj) => {
+                    obj.get(&attr.attribute)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("Attribute '{}' not found", attr.attribute))
+                }
+                _ => Err(anyhow!("Cannot access attribute on {:?}", base_val))
+            }
+        }
+    }
+}
+
+fn numeric_binop<F>(left: &Value, right: &Value, op: F) -> Result<Value>
+where
+    F: Fn(f64, f64) -> f64,
+{
+    match (left.as_f64(), right.as_f64()) {
+        (Some(l), Some(r)) => {
+            let result = op(l, r);
+            // Try to preserve integer type if both inputs were integers
+            if left.as_i64().is_some() && right.as_i64().is_some() && result.fract() == 0.0 {
+                Ok(Value::Number((result as i64).into()))
+            } else {
+                serde_json::Number::from_f64(result)
+                    .map(Value::Number)
+                    .ok_or_else(|| anyhow!("Invalid arithmetic result"))
+            }
+        }
+        _ => Err(anyhow!("Cannot perform arithmetic on non-numbers: {:?} and {:?}", left, right))
+    }
+}
+
+fn compare_numeric<F>(left: &Value, right: &Value, cmp: F) -> bool
+where
+    F: Fn(f64, f64) -> bool,
+{
+    match (left.as_f64(), right.as_f64()) {
+        (Some(l), Some(r)) => cmp(l, r),
+        _ => false,
     }
 }
 
