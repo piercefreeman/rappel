@@ -3501,15 +3501,6 @@ impl Database {
                 && let Some(loop_head_node) = dag.nodes.iter().find(|n| n.id == loop_head_id)
                 && let Some(loop_meta) = loop_head_node.loop_head_meta.as_ref()
             {
-                // Update loop state: increment index, append to accumulators
-                // First, get the result from which to extract accumulator values
-                let body_result = completion
-                    .payload
-                    .as_ref()
-                    .and_then(|p| decode_payload(p).ok())
-                    .and_then(|d| d.result)
-                    .unwrap_or(Value::Null);
-
                 // Get current loop state
                 let loop_state: Option<(i32, Option<Vec<u8>>)> = sqlx::query_as(
                     r#"
@@ -3525,82 +3516,129 @@ impl Database {
 
                 let (current_index, accumulators_bytes) = loop_state.unwrap_or((0, None));
 
-                // Parse accumulators map: { "var_name" -> [values...] }
-                let mut accumulators: HashMap<String, Vec<Value>> = accumulators_bytes
-                    .as_ref()
-                    .and_then(|b| serde_json::from_slice(b).ok())
-                    .unwrap_or_default();
+                // Check if accumulators are managed by python_block or by db.rs
+                // New model (IR-based loops): source_node is None, accumulator is managed by
+                //   python_block in the body via append() - we read from eval_context
+                // Old model (Spread loops): source_node is Some, db.rs collects action result
+                let uses_python_block_accumulator = loop_meta.accumulators.iter()
+                    .all(|acc| acc.source_node.is_none());
 
-                // Create a context with the body result for evaluating source expressions
-                let mut eval_ctx = EvalContext::new();
-                // The body action produces output in a variable - for multi-action loops,
-                // we store intermediate phase results in phase_results. The last phase's
-                // result is available under the variable name it produces.
-                // For single-action multi-accumulator loops, the result is from the single action.
+                if uses_python_block_accumulator {
+                    // New model: The python_block for append() already updated the accumulator
+                    // in eval_context. We need to read it back and store in loop_iteration_state.
 
-                // Get current eval context to have access to phase results
-                let ctx_value: Option<Value> = sqlx::query_scalar(
-                    "SELECT context_json FROM instance_eval_context WHERE instance_id = $1",
-                )
-                .bind(instance_id)
-                .fetch_optional(tx.as_mut())
-                .await?;
+                    // Get the updated accumulator from eval_context
+                    let ctx_value: Option<Value> = sqlx::query_scalar(
+                        "SELECT context_json FROM instance_eval_context WHERE instance_id = $1",
+                    )
+                    .bind(instance_id)
+                    .fetch_optional(tx.as_mut())
+                    .await?;
 
-                if let Some(Value::Object(map)) = ctx_value {
-                    for (k, v) in map {
-                        eval_ctx.insert(k, v);
+                    // Extract updated accumulators from eval_context
+                    let mut updated_accumulators: HashMap<String, Vec<Value>> = HashMap::new();
+                    if let Some(Value::Object(map)) = ctx_value {
+                        for acc in &loop_meta.accumulators {
+                            if let Some(Value::Array(arr)) = map.get(&acc.var) {
+                                updated_accumulators.insert(acc.var.clone(), arr.clone());
+                            }
+                        }
                     }
-                }
 
-                // For each accumulator, evaluate its source expression to get the value
-                for acc in &loop_meta.accumulators {
-                    let value = if let Some(source_expr) = &acc.source_expr {
-                        // Evaluate expression like "processed['result']" or just "result"
-                        // Handle patterns:
-                        //   "var_name" -> look up var_name in context
-                        //   "var_name['key']" -> look up var_name in context, then subscript
-                        evaluate_source_expr(source_expr, &eval_ctx).unwrap_or(body_result.clone())
-                    } else {
-                        // No source expression - use body result directly
-                        body_result.clone()
-                    };
+                    // Update loop_iteration_state with new index AND updated accumulators
+                    sqlx::query(
+                        r#"
+                        UPDATE loop_iteration_state
+                        SET current_index = $3, accumulators = $4
+                        WHERE instance_id = $1 AND node_id = $2
+                        "#,
+                    )
+                    .bind(instance_id)
+                    .bind(loop_head_id)
+                    .bind(current_index + 1)
+                    .bind(serde_json::to_vec(&updated_accumulators)?)
+                    .execute(tx.as_mut())
+                    .await?;
+                } else {
+                    // Old model: db.rs manages accumulator tracking
+                    // Get the result from which to extract accumulator values
+                    let body_result = completion
+                        .payload
+                        .as_ref()
+                        .and_then(|p| decode_payload(p).ok())
+                        .and_then(|d| d.result)
+                        .unwrap_or(Value::Null);
 
-                    // Get or create the accumulator array and append
-                    let acc_vec = accumulators.entry(acc.var.clone()).or_default();
-                    acc_vec.push(value);
-                }
+                    // Parse accumulators map: { "var_name" -> [values...] }
+                    let mut accumulators: HashMap<String, Vec<Value>> = accumulators_bytes
+                        .as_ref()
+                        .and_then(|b| serde_json::from_slice(b).ok())
+                        .unwrap_or_default();
 
-                // Update loop state with incremented index and updated accumulators
-                sqlx::query(
-                    r#"
-                    UPDATE loop_iteration_state
-                    SET current_index = $3, accumulators = $4
-                    WHERE instance_id = $1 AND node_id = $2
-                    "#,
-                )
-                .bind(instance_id)
-                .bind(loop_head_id)
-                .bind(current_index + 1)
-                .bind(serde_json::to_vec(&accumulators)?)
-                .execute(tx.as_mut())
-                .await?;
+                    // Create a context with the body result for evaluating source expressions
+                    let mut eval_ctx = EvalContext::new();
 
-                // Update each accumulator in eval_context so loop_head can see them
-                for acc in &loop_meta.accumulators {
-                    if let Some(acc_values) = accumulators.get(&acc.var) {
-                        let acc_json =
-                            serde_json::json!({ &acc.var: Value::Array(acc_values.clone()) });
-                        sqlx::query(
-                            r#"
-                            UPDATE instance_eval_context
-                            SET context_json = context_json || $2
-                            WHERE instance_id = $1
-                            "#,
-                        )
-                        .bind(instance_id)
-                        .bind(acc_json)
-                        .execute(tx.as_mut())
-                        .await?;
+                    // Get current eval context to have access to phase results
+                    let ctx_value: Option<Value> = sqlx::query_scalar(
+                        "SELECT context_json FROM instance_eval_context WHERE instance_id = $1",
+                    )
+                    .bind(instance_id)
+                    .fetch_optional(tx.as_mut())
+                    .await?;
+
+                    if let Some(Value::Object(map)) = ctx_value {
+                        for (k, v) in map {
+                            eval_ctx.insert(k, v);
+                        }
+                    }
+
+                    // For each accumulator, evaluate its source expression to get the value
+                    for acc in &loop_meta.accumulators {
+                        let value = if let Some(source_expr) = &acc.source_expr {
+                            // Evaluate expression like "processed['result']" or just "result"
+                            evaluate_source_expr(source_expr, &eval_ctx).unwrap_or(body_result.clone())
+                        } else {
+                            // No source expression - use body result directly
+                            body_result.clone()
+                        };
+
+                        // Get or create the accumulator array and append
+                        let acc_vec = accumulators.entry(acc.var.clone()).or_default();
+                        acc_vec.push(value);
+                    }
+
+                    // Update loop state with incremented index and updated accumulators
+                    sqlx::query(
+                        r#"
+                        UPDATE loop_iteration_state
+                        SET current_index = $3, accumulators = $4
+                        WHERE instance_id = $1 AND node_id = $2
+                        "#,
+                    )
+                    .bind(instance_id)
+                    .bind(loop_head_id)
+                    .bind(current_index + 1)
+                    .bind(serde_json::to_vec(&accumulators)?)
+                    .execute(tx.as_mut())
+                    .await?;
+
+                    // Update each accumulator in eval_context so loop_head can see them
+                    for acc in &loop_meta.accumulators {
+                        if let Some(acc_values) = accumulators.get(&acc.var) {
+                            let acc_json =
+                                serde_json::json!({ &acc.var: Value::Array(acc_values.clone()) });
+                            sqlx::query(
+                                r#"
+                                UPDATE instance_eval_context
+                                SET context_json = context_json || $2
+                                WHERE instance_id = $1
+                                "#,
+                            )
+                            .bind(instance_id)
+                            .bind(acc_json)
+                            .execute(tx.as_mut())
+                            .await?;
+                        }
                     }
                 }
 
@@ -3885,6 +3923,24 @@ impl Database {
                                     .bind(serde_json::to_vec(&init_accumulators)?)
                                     .execute(tx.as_mut())
                                     .await?;
+
+                                // Also initialize accumulators in eval_context for python_block access
+                                let acc_init_json: serde_json::Map<String, Value> = loop_meta
+                                    .accumulators
+                                    .iter()
+                                    .map(|acc| (acc.var.clone(), Value::Array(Vec::new())))
+                                    .collect();
+                                sqlx::query(
+                                    r#"
+                                    UPDATE instance_eval_context
+                                    SET context_json = context_json || $2
+                                    WHERE instance_id = $1
+                                    "#,
+                                )
+                                .bind(instance_id)
+                                .bind(Value::Object(acc_init_json))
+                                .execute(tx.as_mut())
+                                .await?;
                             }
 
                             // Get the current item from the iterator

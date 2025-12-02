@@ -422,12 +422,10 @@ fn convert_loop(state: &mut ConversionState, loop_: &ir::Loop) -> Result<(), Con
             }
             meta.body_nodes = body_node_ids.clone();
 
-            // Set accumulator source to the last body node
-            if let Some(acc) = meta.accumulators.first_mut() {
-                if let Some(last_node) = body_node_ids.last() {
-                    acc.source_node = Some(last_node.clone());
-                }
-            }
+            // NOTE: For IR-based loops (new model), we intentionally leave source_node = None.
+            // This tells db.rs that the accumulator is managed by a python_block in the body
+            // (via append() calls) rather than being collected from action results.
+            // Spread loops set source_node to the action node to collect its result.
         }
     }
 

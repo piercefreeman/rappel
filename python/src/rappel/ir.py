@@ -193,6 +193,28 @@ class VariableAnalyzer(ast.NodeVisitor):
             # Handle for-else constructs
             self.visit(stmt)
 
+    def visit_Expr(self, node: ast.Expr) -> None:
+        """Detect mutating method calls like list.append().
+
+        When we see a call like `outputs.append(value)`, the list `outputs` is mutated.
+        We mark it as both a read (to access the list) and a write (since it's modified).
+        """
+        if isinstance(node.value, ast.Call):
+            call = node.value
+            # Check for method calls like var.append(), var.extend(), var.clear(), etc.
+            if isinstance(call.func, ast.Attribute):
+                attr = call.func
+                # List/dict mutating methods
+                mutating_methods = {
+                    "append", "extend", "insert", "remove", "pop", "clear",
+                    "reverse", "sort", "update", "setdefault"
+                }
+                if attr.attr in mutating_methods and isinstance(attr.value, ast.Name):
+                    var_name = attr.value.id
+                    self.reads.add(var_name)
+                    self.writes.add(var_name)
+        self.generic_visit(node)
+
     def visit_comprehension(self, node: ast.comprehension) -> None:
         self.visit(node.iter)
         if isinstance(node.target, ast.Name):
