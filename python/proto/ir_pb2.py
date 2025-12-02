@@ -9,7 +9,6 @@ from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import runtime_version as _runtime_version
 from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
-
 _runtime_version.ValidateProtobufRuntimeVersion(
     _runtime_version.Domain.PUBLIC,
     5,
@@ -25,17 +24,13 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x08ir.proto\x12\trappel.ir\"\x8c\x01\n\x0eSourceLocation\x12\x0e\n\x06lineno\x18\x01 \x01(\r\x12\x12\n\ncol_offset\x18\x02 \x01(\r\x12\x17\n\nend_lineno\x18\x03 \x01(\rH\x00\x88\x01\x01\x12\x1b\n\x0e\x65nd_col_offset\x18\x04 \x01(\rH\x01\x88\x01\x01\x42\r\n\x0b_end_linenoB\x11\n\x0f_end_col_offset\"\xc0\x01\n\rBackoffConfig\x12+\n\x04kind\x18\x01 \x01(\x0e\x32\x1d.rappel.ir.BackoffConfig.Kind\x12\x15\n\rbase_delay_ms\x18\x02 \x01(\r\x12\x17\n\nmultiplier\x18\x03 \x01(\x01H\x00\x88\x01\x01\"C\n\x04Kind\x12\x14\n\x10KIND_UNSPECIFIED\x10\x00\x12\x0f\n\x0bKIND_LINEAR\x10\x01\x12\x14\n\x10KIND_EXPONENTIAL\x10\x02\x42\r\n\x0b_multiplier\"\xa9\x01\n\x0fRunActionConfig\x12\x1c\n\x0ftimeout_seconds\x18\x01 \x01(\rH\x00\x88\x01\x01\x12\x18\n\x0bmax_retries\x18\x02 \x01(\rH\x01\x88\x01\x01\x12.\n\x07\x62\x61\x63koff\x18\x03 \x01(\x0b\x32\x18.rappel.ir.BackoffConfigH\x02\x88\x01\x01\x42\x12\n\x10_timeout_secondsB\x0e\n\x0c_max_retriesB\n\n\x08_backoff\"\xb9\x02\n\nActionCall\x12\x0e\n\x06\x61\x63tion\x18\x01 \x01(\t\x12\x13\n\x06module\x18\x02 \x01(\tH\x00\x88\x01\x01\x12\x31\n\x06kwargs\x18\x03 \x03(\x0b\x32!.rappel.ir.ActionCall.KwargsEntry\x12\x13\n\x06target\x18\x04 \x01(\tH\x01\x88\x01\x01\x12/\n\x06\x63onfig\x18\x05 \x01(\x0b\x32\x1a.rappel.ir.RunActionConfigH\x02\x88\x01\x01\x12\x30\n\x08location\x18\x06 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x03\x88\x01\x01\x1a-\n\x0bKwargsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x42\t\n\x07_moduleB\t\n\x07_targetB\t\n\x07_configB\x0b\n\t_location\"\xe6\x01\n\x0cSubgraphCall\x12\x13\n\x0bmethod_name\x18\x01 \x01(\t\x12\x33\n\x06kwargs\x18\x02 \x03(\x0b\x32#.rappel.ir.SubgraphCall.KwargsEntry\x12\x13\n\x06target\x18\x03 \x01(\tH\x00\x88\x01\x01\x12\x30\n\x08location\x18\x04 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x01\x88\x01\x01\x1a-\n\x0bKwargsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x42\t\n\x07_targetB\x0b\n\t_location\"j\n\nGatherCall\x12\'\n\x06\x61\x63tion\x18\x01 \x01(\x0b\x32\x15.rappel.ir.ActionCallH\x00\x12+\n\x08subgraph\x18\x02 \x01(\x0b\x32\x17.rappel.ir.SubgraphCallH\x00\x42\x06\n\x04kind\"\x8d\x01\n\x06Gather\x12$\n\x05\x63\x61lls\x18\x01 \x03(\x0b\x32\x15.rappel.ir.GatherCall\x12\x13\n\x06target\x18\x02 \x01(\tH\x00\x88\x01\x01\x12\x30\n\x08location\x18\x03 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x01\x88\x01\x01\x42\t\n\x07_targetB\x0b\n\t_location\"\xa1\x01\n\x0bPythonBlock\x12\x0c\n\x04\x63ode\x18\x01 \x01(\t\x12\x0f\n\x07imports\x18\x02 \x03(\t\x12\x13\n\x0b\x64\x65\x66initions\x18\x03 \x03(\t\x12\x0e\n\x06inputs\x18\x04 \x03(\t\x12\x0f\n\x07outputs\x18\x05 \x03(\t\x12\x30\n\x08location\x18\x06 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x00\x88\x01\x01\x42\x0b\n\t_location\"\xa7\x01\n\x04Loop\x12\x15\n\riterator_expr\x18\x01 \x01(\t\x12\x10\n\x08loop_var\x18\x02 \x01(\t\x12\x13\n\x0b\x61\x63\x63umulator\x18\x03 \x01(\t\x12\"\n\x04\x62ody\x18\x04 \x03(\x0b\x32\x14.rappel.ir.Statement\x12\x30\n\x08location\x18\x05 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x00\x88\x01\x01\x42\x0b\n\t_location\"\xd3\x01\n\x06\x42ranch\x12\r\n\x05guard\x18\x01 \x01(\t\x12(\n\x08preamble\x18\x02 \x03(\x0b\x32\x16.rappel.ir.PythonBlock\x12&\n\x07\x61\x63tions\x18\x03 \x03(\x0b\x32\x15.rappel.ir.ActionCall\x12)\n\tpostamble\x18\x04 \x03(\x0b\x32\x16.rappel.ir.PythonBlock\x12\x30\n\x08location\x18\x05 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x00\x88\x01\x01\x42\x0b\n\t_location\"\x91\x01\n\x0b\x43onditional\x12#\n\x08\x62ranches\x18\x01 \x03(\x0b\x32\x11.rappel.ir.Branch\x12\x13\n\x06target\x18\x02 \x01(\tH\x00\x88\x01\x01\x12\x30\n\x08location\x18\x03 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x01\x88\x01\x01\x42\t\n\x07_targetB\x0b\n\t_location\"\xfb\x01\n\rExceptHandler\x12\x31\n\x0f\x65xception_types\x18\x01 \x03(\x0b\x32\x18.rappel.ir.ExceptionType\x12(\n\x08preamble\x18\x02 \x03(\x0b\x32\x16.rappel.ir.PythonBlock\x12#\n\x04\x62ody\x18\x03 \x03(\x0b\x32\x15.rappel.ir.ActionCall\x12)\n\tpostamble\x18\x04 \x03(\x0b\x32\x16.rappel.ir.PythonBlock\x12\x30\n\x08location\x18\x05 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x00\x88\x01\x01\x42\x0b\n\t_location\"K\n\rExceptionType\x12\x13\n\x06module\x18\x01 \x01(\tH\x00\x88\x01\x01\x12\x11\n\x04name\x18\x02 \x01(\tH\x01\x88\x01\x01\x42\t\n\x07_moduleB\x07\n\x05_name\"\xfc\x01\n\tTryExcept\x12,\n\x0ctry_preamble\x18\x01 \x03(\x0b\x32\x16.rappel.ir.PythonBlock\x12\'\n\x08try_body\x18\x02 \x03(\x0b\x32\x15.rappel.ir.ActionCall\x12-\n\rtry_postamble\x18\x03 \x03(\x0b\x32\x16.rappel.ir.PythonBlock\x12*\n\x08handlers\x18\x04 \x03(\x0b\x32\x18.rappel.ir.ExceptHandler\x12\x30\n\x08location\x18\x05 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x00\x88\x01\x01\x42\x0b\n\t_location\"]\n\x05Sleep\x12\x15\n\rduration_expr\x18\x01 \x01(\t\x12\x30\n\x08location\x18\x02 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x00\x88\x01\x01\x42\x0b\n\t_location\"\xae\x01\n\x06Return\x12\x0e\n\x04\x65xpr\x18\x01 \x01(\tH\x00\x12\'\n\x06\x61\x63tion\x18\x02 \x01(\x0b\x32\x15.rappel.ir.ActionCallH\x00\x12#\n\x06gather\x18\x03 \x01(\x0b\x32\x11.rappel.ir.GatherH\x00\x12\x30\n\x08location\x18\x04 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x01\x88\x01\x01\x42\x07\n\x05valueB\x0b\n\t_location\"\xb2\x01\n\x06Spread\x12%\n\x06\x61\x63tion\x18\x01 \x01(\x0b\x32\x15.rappel.ir.ActionCall\x12\x10\n\x08loop_var\x18\x02 \x01(\t\x12\x10\n\x08iterable\x18\x03 \x01(\t\x12\x13\n\x06target\x18\x04 \x01(\tH\x00\x88\x01\x01\x12\x30\n\x08location\x18\x05 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x01\x88\x01\x01\x42\t\n\x07_targetB\x0b\n\t_location\"\x84\x03\n\tStatement\x12,\n\x0b\x61\x63tion_call\x18\x01 \x01(\x0b\x32\x15.rappel.ir.ActionCallH\x00\x12#\n\x06gather\x18\x02 \x01(\x0b\x32\x11.rappel.ir.GatherH\x00\x12.\n\x0cpython_block\x18\x03 \x01(\x0b\x32\x16.rappel.ir.PythonBlockH\x00\x12\x1f\n\x04loop\x18\x04 \x01(\x0b\x32\x0f.rappel.ir.LoopH\x00\x12-\n\x0b\x63onditional\x18\x05 \x01(\x0b\x32\x16.rappel.ir.ConditionalH\x00\x12*\n\ntry_except\x18\x06 \x01(\x0b\x32\x14.rappel.ir.TryExceptH\x00\x12!\n\x05sleep\x18\x07 \x01(\x0b\x32\x10.rappel.ir.SleepH\x00\x12(\n\x0breturn_stmt\x18\x08 \x01(\x0b\x32\x11.rappel.ir.ReturnH\x00\x12#\n\x06spread\x18\t \x01(\x0b\x32\x11.rappel.ir.SpreadH\x00\x42\x06\n\x04kind\"O\n\rWorkflowParam\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x1c\n\x0ftype_annotation\x18\x02 \x01(\tH\x00\x88\x01\x01\x42\x12\n\x10_type_annotation\"\x90\x01\n\x08Workflow\x12\x0c\n\x04name\x18\x01 \x01(\t\x12(\n\x06params\x18\x02 \x03(\x0b\x32\x18.rappel.ir.WorkflowParam\x12\"\n\x04\x62ody\x18\x03 \x03(\x0b\x32\x14.rappel.ir.Statement\x12\x18\n\x0breturn_type\x18\x04 \x01(\tH\x00\x88\x01\x01\x42\x0e\n\x0c_return_type\"U\n\x10\x41\x63tionDefinition\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x13\n\x06module\x18\x02 \x01(\tH\x00\x88\x01\x01\x12\x13\n\x0bparam_names\x18\x03 \x03(\tB\t\n\x07_module\"\\\n\nParseError\x12\x0f\n\x07message\x18\x01 \x01(\t\x12\x30\n\x08location\x18\x02 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x00\x88\x01\x01\x42\x0b\n\t_locationb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x08ir.proto\x12\trappel.ir\"\x8c\x01\n\x0eSourceLocation\x12\x0e\n\x06lineno\x18\x01 \x01(\r\x12\x12\n\ncol_offset\x18\x02 \x01(\r\x12\x17\n\nend_lineno\x18\x03 \x01(\rH\x00\x88\x01\x01\x12\x1b\n\x0e\x65nd_col_offset\x18\x04 \x01(\rH\x01\x88\x01\x01\x42\r\n\x0b_end_linenoB\x11\n\x0f_end_col_offset\"\xc0\x01\n\rBackoffConfig\x12+\n\x04kind\x18\x01 \x01(\x0e\x32\x1d.rappel.ir.BackoffConfig.Kind\x12\x15\n\rbase_delay_ms\x18\x02 \x01(\r\x12\x17\n\nmultiplier\x18\x03 \x01(\x01H\x00\x88\x01\x01\"C\n\x04Kind\x12\x14\n\x10KIND_UNSPECIFIED\x10\x00\x12\x0f\n\x0bKIND_LINEAR\x10\x01\x12\x14\n\x10KIND_EXPONENTIAL\x10\x02\x42\r\n\x0b_multiplier\"\xa9\x01\n\x0fRunActionConfig\x12\x1c\n\x0ftimeout_seconds\x18\x01 \x01(\rH\x00\x88\x01\x01\x12\x18\n\x0bmax_retries\x18\x02 \x01(\rH\x01\x88\x01\x01\x12.\n\x07\x62\x61\x63koff\x18\x03 \x01(\x0b\x32\x18.rappel.ir.BackoffConfigH\x02\x88\x01\x01\x42\x12\n\x10_timeout_secondsB\x0e\n\x0c_max_retriesB\n\n\x08_backoff\"\x82\x01\n\x07Literal\x12\x14\n\nnull_value\x18\x01 \x01(\x08H\x00\x12\x14\n\nbool_value\x18\x02 \x01(\x08H\x00\x12\x13\n\tint_value\x18\x03 \x01(\x03H\x00\x12\x15\n\x0b\x66loat_value\x18\x04 \x01(\x01H\x00\x12\x16\n\x0cstring_value\x18\x05 \x01(\tH\x00\x42\x07\n\x05value\"\xee\x02\n\nExpression\x12%\n\x07literal\x18\x01 \x01(\x0b\x32\x12.rappel.ir.LiteralH\x00\x12\x12\n\x08variable\x18\x02 \x01(\tH\x00\x12)\n\tsubscript\x18\x03 \x01(\x0b\x32\x14.rappel.ir.SubscriptH\x00\x12%\n\x05\x61rray\x18\x04 \x01(\x0b\x32\x14.rappel.ir.ArrayExprH\x00\x12#\n\x04\x64ict\x18\x05 \x01(\x0b\x32\x13.rappel.ir.DictExprH\x00\x12(\n\tbinary_op\x18\x06 \x01(\x0b\x32\x13.rappel.ir.BinaryOpH\x00\x12&\n\x08unary_op\x18\x07 \x01(\x0b\x32\x12.rappel.ir.UnaryOpH\x00\x12#\n\x04\x63\x61ll\x18\x08 \x01(\x0b\x32\x13.rappel.ir.CallExprH\x00\x12/\n\tattribute\x18\t \x01(\x0b\x32\x1a.rappel.ir.AttributeAccessH\x00\x42\x06\n\x04kind\"T\n\tSubscript\x12#\n\x04\x62\x61se\x18\x01 \x01(\x0b\x32\x15.rappel.ir.Expression\x12\"\n\x03key\x18\x02 \x01(\x0b\x32\x15.rappel.ir.Expression\"I\n\x0f\x41ttributeAccess\x12#\n\x04\x62\x61se\x18\x01 \x01(\x0b\x32\x15.rappel.ir.Expression\x12\x11\n\tattribute\x18\x02 \x01(\t\"4\n\tArrayExpr\x12\'\n\x08\x65lements\x18\x01 \x03(\x0b\x32\x15.rappel.ir.Expression\"1\n\x08\x44ictExpr\x12%\n\x07\x65ntries\x18\x01 \x03(\x0b\x32\x14.rappel.ir.DictEntry\">\n\tDictEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12$\n\x05value\x18\x02 \x01(\x0b\x32\x15.rappel.ir.Expression\"\xc3\x02\n\x08\x42inaryOp\x12\"\n\x02op\x18\x01 \x01(\x0e\x32\x16.rappel.ir.BinaryOp.Op\x12#\n\x04left\x18\x02 \x01(\x0b\x32\x15.rappel.ir.Expression\x12$\n\x05right\x18\x03 \x01(\x0b\x32\x15.rappel.ir.Expression\"\xc7\x01\n\x02Op\x12\x12\n\x0eOP_UNSPECIFIED\x10\x00\x12\n\n\x06OP_ADD\x10\x01\x12\n\n\x06OP_SUB\x10\x02\x12\n\n\x06OP_MUL\x10\x03\x12\n\n\x06OP_DIV\x10\x04\x12\n\n\x06OP_MOD\x10\x05\x12\t\n\x05OP_EQ\x10\n\x12\t\n\x05OP_NE\x10\x0b\x12\t\n\x05OP_LT\x10\x0c\x12\t\n\x05OP_LE\x10\r\x12\t\n\x05OP_GT\x10\x0e\x12\t\n\x05OP_GE\x10\x0f\x12\n\n\x06OP_AND\x10\x14\x12\t\n\x05OP_OR\x10\x15\x12\t\n\x05OP_IN\x10\x1e\x12\r\n\tOP_NOT_IN\x10\x1f\"\x86\x01\n\x07UnaryOp\x12!\n\x02op\x18\x01 \x01(\x0e\x32\x15.rappel.ir.UnaryOp.Op\x12&\n\x07operand\x18\x02 \x01(\x0b\x32\x15.rappel.ir.Expression\"0\n\x02Op\x12\x12\n\x0eOP_UNSPECIFIED\x10\x00\x12\n\n\x06OP_NOT\x10\x01\x12\n\n\x06OP_NEG\x10\x02\"A\n\x08\x43\x61llExpr\x12\x10\n\x08\x66unction\x18\x01 \x01(\t\x12#\n\x04\x61rgs\x18\x02 \x03(\x0b\x32\x15.rappel.ir.Expression\";\n\x05KwArg\x12\x0c\n\x04name\x18\x01 \x01(\t\x12$\n\x05value\x18\x02 \x01(\x0b\x32\x15.rappel.ir.Expression\"\xf7\x01\n\nActionCall\x12\x0e\n\x06\x61\x63tion\x18\x01 \x01(\t\x12\x13\n\x06module\x18\x02 \x01(\tH\x00\x88\x01\x01\x12\x1e\n\x04\x61rgs\x18\x03 \x03(\x0b\x32\x10.rappel.ir.KwArg\x12\x13\n\x06target\x18\x04 \x01(\tH\x01\x88\x01\x01\x12/\n\x06\x63onfig\x18\x05 \x01(\x0b\x32\x1a.rappel.ir.RunActionConfigH\x02\x88\x01\x01\x12\x30\n\x08location\x18\x06 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x03\x88\x01\x01\x42\t\n\x07_moduleB\t\n\x07_targetB\t\n\x07_configB\x0b\n\t_location\"\xa2\x01\n\x0cSubgraphCall\x12\x13\n\x0bmethod_name\x18\x01 \x01(\t\x12\x1e\n\x04\x61rgs\x18\x02 \x03(\x0b\x32\x10.rappel.ir.KwArg\x12\x13\n\x06target\x18\x03 \x01(\tH\x00\x88\x01\x01\x12\x30\n\x08location\x18\x04 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x01\x88\x01\x01\x42\t\n\x07_targetB\x0b\n\t_location\"j\n\nGatherCall\x12\'\n\x06\x61\x63tion\x18\x01 \x01(\x0b\x32\x15.rappel.ir.ActionCallH\x00\x12+\n\x08subgraph\x18\x02 \x01(\x0b\x32\x17.rappel.ir.SubgraphCallH\x00\x42\x06\n\x04kind\"\x8d\x01\n\x06Gather\x12$\n\x05\x63\x61lls\x18\x01 \x03(\x0b\x32\x15.rappel.ir.GatherCall\x12\x13\n\x06target\x18\x02 \x01(\tH\x00\x88\x01\x01\x12\x30\n\x08location\x18\x03 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x01\x88\x01\x01\x42\t\n\x07_targetB\x0b\n\t_location\"\xa1\x01\n\x0bPythonBlock\x12\x0c\n\x04\x63ode\x18\x01 \x01(\t\x12\x0f\n\x07imports\x18\x02 \x03(\t\x12\x13\n\x0b\x64\x65\x66initions\x18\x03 \x03(\t\x12\x0e\n\x06inputs\x18\x04 \x03(\t\x12\x0f\n\x07outputs\x18\x05 \x03(\t\x12\x30\n\x08location\x18\x06 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x00\x88\x01\x01\x42\x0b\n\t_location\"\xb9\x01\n\x04Loop\x12\'\n\x08iterator\x18\x01 \x01(\x0b\x32\x15.rappel.ir.Expression\x12\x10\n\x08loop_var\x18\x02 \x01(\t\x12\x13\n\x0b\x61\x63\x63umulator\x18\x03 \x01(\t\x12\"\n\x04\x62ody\x18\x04 \x03(\x0b\x32\x14.rappel.ir.Statement\x12\x30\n\x08location\x18\x05 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x00\x88\x01\x01\x42\x0b\n\t_location\"\xea\x01\n\x06\x42ranch\x12$\n\x05guard\x18\x01 \x01(\x0b\x32\x15.rappel.ir.Expression\x12(\n\x08preamble\x18\x02 \x03(\x0b\x32\x16.rappel.ir.PythonBlock\x12&\n\x07\x61\x63tions\x18\x03 \x03(\x0b\x32\x15.rappel.ir.ActionCall\x12)\n\tpostamble\x18\x04 \x03(\x0b\x32\x16.rappel.ir.PythonBlock\x12\x30\n\x08location\x18\x05 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x00\x88\x01\x01\x42\x0b\n\t_location\"\x91\x01\n\x0b\x43onditional\x12#\n\x08\x62ranches\x18\x01 \x03(\x0b\x32\x11.rappel.ir.Branch\x12\x13\n\x06target\x18\x02 \x01(\tH\x00\x88\x01\x01\x12\x30\n\x08location\x18\x03 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x01\x88\x01\x01\x42\t\n\x07_targetB\x0b\n\t_location\"\xfb\x01\n\rExceptHandler\x12\x31\n\x0f\x65xception_types\x18\x01 \x03(\x0b\x32\x18.rappel.ir.ExceptionType\x12(\n\x08preamble\x18\x02 \x03(\x0b\x32\x16.rappel.ir.PythonBlock\x12#\n\x04\x62ody\x18\x03 \x03(\x0b\x32\x15.rappel.ir.ActionCall\x12)\n\tpostamble\x18\x04 \x03(\x0b\x32\x16.rappel.ir.PythonBlock\x12\x30\n\x08location\x18\x05 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x00\x88\x01\x01\x42\x0b\n\t_location\"K\n\rExceptionType\x12\x13\n\x06module\x18\x01 \x01(\tH\x00\x88\x01\x01\x12\x11\n\x04name\x18\x02 \x01(\tH\x01\x88\x01\x01\x42\t\n\x07_moduleB\x07\n\x05_name\"\xfc\x01\n\tTryExcept\x12,\n\x0ctry_preamble\x18\x01 \x03(\x0b\x32\x16.rappel.ir.PythonBlock\x12\'\n\x08try_body\x18\x02 \x03(\x0b\x32\x15.rappel.ir.ActionCall\x12-\n\rtry_postamble\x18\x03 \x03(\x0b\x32\x16.rappel.ir.PythonBlock\x12*\n\x08handlers\x18\x04 \x03(\x0b\x32\x18.rappel.ir.ExceptHandler\x12\x30\n\x08location\x18\x05 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x00\x88\x01\x01\x42\x0b\n\t_location\"o\n\x05Sleep\x12\'\n\x08\x64uration\x18\x01 \x01(\x0b\x32\x15.rappel.ir.Expression\x12\x30\n\x08location\x18\x02 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x00\x88\x01\x01\x42\x0b\n\t_location\"\xcb\x01\n\x06Return\x12+\n\nexpression\x18\x01 \x01(\x0b\x32\x15.rappel.ir.ExpressionH\x00\x12\'\n\x06\x61\x63tion\x18\x02 \x01(\x0b\x32\x15.rappel.ir.ActionCallH\x00\x12#\n\x06gather\x18\x03 \x01(\x0b\x32\x11.rappel.ir.GatherH\x00\x12\x30\n\x08location\x18\x04 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x01\x88\x01\x01\x42\x07\n\x05valueB\x0b\n\t_location\"\xc9\x01\n\x06Spread\x12%\n\x06\x61\x63tion\x18\x01 \x01(\x0b\x32\x15.rappel.ir.ActionCall\x12\x10\n\x08loop_var\x18\x02 \x01(\t\x12\'\n\x08iterable\x18\x03 \x01(\x0b\x32\x15.rappel.ir.Expression\x12\x13\n\x06target\x18\x04 \x01(\tH\x00\x88\x01\x01\x12\x30\n\x08location\x18\x05 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x01\x88\x01\x01\x42\t\n\x07_targetB\x0b\n\t_location\"\x84\x03\n\tStatement\x12,\n\x0b\x61\x63tion_call\x18\x01 \x01(\x0b\x32\x15.rappel.ir.ActionCallH\x00\x12#\n\x06gather\x18\x02 \x01(\x0b\x32\x11.rappel.ir.GatherH\x00\x12.\n\x0cpython_block\x18\x03 \x01(\x0b\x32\x16.rappel.ir.PythonBlockH\x00\x12\x1f\n\x04loop\x18\x04 \x01(\x0b\x32\x0f.rappel.ir.LoopH\x00\x12-\n\x0b\x63onditional\x18\x05 \x01(\x0b\x32\x16.rappel.ir.ConditionalH\x00\x12*\n\ntry_except\x18\x06 \x01(\x0b\x32\x14.rappel.ir.TryExceptH\x00\x12!\n\x05sleep\x18\x07 \x01(\x0b\x32\x10.rappel.ir.SleepH\x00\x12(\n\x0breturn_stmt\x18\x08 \x01(\x0b\x32\x11.rappel.ir.ReturnH\x00\x12#\n\x06spread\x18\t \x01(\x0b\x32\x11.rappel.ir.SpreadH\x00\x42\x06\n\x04kind\"O\n\rWorkflowParam\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x1c\n\x0ftype_annotation\x18\x02 \x01(\tH\x00\x88\x01\x01\x42\x12\n\x10_type_annotation\"\x90\x01\n\x08Workflow\x12\x0c\n\x04name\x18\x01 \x01(\t\x12(\n\x06params\x18\x02 \x03(\x0b\x32\x18.rappel.ir.WorkflowParam\x12\"\n\x04\x62ody\x18\x03 \x03(\x0b\x32\x14.rappel.ir.Statement\x12\x18\n\x0breturn_type\x18\x04 \x01(\tH\x00\x88\x01\x01\x42\x0e\n\x0c_return_type\"U\n\x10\x41\x63tionDefinition\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x13\n\x06module\x18\x02 \x01(\tH\x00\x88\x01\x01\x12\x13\n\x0bparam_names\x18\x03 \x03(\tB\t\n\x07_module\"\\\n\nParseError\x12\x0f\n\x07message\x18\x01 \x01(\t\x12\x30\n\x08location\x18\x02 \x01(\x0b\x32\x19.rappel.ir.SourceLocationH\x00\x88\x01\x01\x42\x0b\n\t_locationb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'ir_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_ACTIONCALL_KWARGSENTRY']._loaded_options = None
-  _globals['_ACTIONCALL_KWARGSENTRY']._serialized_options = b'8\001'
-  _globals['_SUBGRAPHCALL_KWARGSENTRY']._loaded_options = None
-  _globals['_SUBGRAPHCALL_KWARGSENTRY']._serialized_options = b'8\001'
   _globals['_SOURCELOCATION']._serialized_start=24
   _globals['_SOURCELOCATION']._serialized_end=164
   _globals['_BACKOFFCONFIG']._serialized_start=167
@@ -44,46 +39,68 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_BACKOFFCONFIG_KIND']._serialized_end=344
   _globals['_RUNACTIONCONFIG']._serialized_start=362
   _globals['_RUNACTIONCONFIG']._serialized_end=531
-  _globals['_ACTIONCALL']._serialized_start=534
-  _globals['_ACTIONCALL']._serialized_end=847
-  _globals['_ACTIONCALL_KWARGSENTRY']._serialized_start=756
-  _globals['_ACTIONCALL_KWARGSENTRY']._serialized_end=801
-  _globals['_SUBGRAPHCALL']._serialized_start=850
-  _globals['_SUBGRAPHCALL']._serialized_end=1080
-  _globals['_SUBGRAPHCALL_KWARGSENTRY']._serialized_start=756
-  _globals['_SUBGRAPHCALL_KWARGSENTRY']._serialized_end=801
-  _globals['_GATHERCALL']._serialized_start=1082
-  _globals['_GATHERCALL']._serialized_end=1188
-  _globals['_GATHER']._serialized_start=1191
-  _globals['_GATHER']._serialized_end=1332
-  _globals['_PYTHONBLOCK']._serialized_start=1335
-  _globals['_PYTHONBLOCK']._serialized_end=1496
-  _globals['_LOOP']._serialized_start=1499
-  _globals['_LOOP']._serialized_end=1666
-  _globals['_BRANCH']._serialized_start=1669
-  _globals['_BRANCH']._serialized_end=1880
-  _globals['_CONDITIONAL']._serialized_start=1883
-  _globals['_CONDITIONAL']._serialized_end=2028
-  _globals['_EXCEPTHANDLER']._serialized_start=2031
-  _globals['_EXCEPTHANDLER']._serialized_end=2282
-  _globals['_EXCEPTIONTYPE']._serialized_start=2284
-  _globals['_EXCEPTIONTYPE']._serialized_end=2359
-  _globals['_TRYEXCEPT']._serialized_start=2362
-  _globals['_TRYEXCEPT']._serialized_end=2614
-  _globals['_SLEEP']._serialized_start=2616
-  _globals['_SLEEP']._serialized_end=2709
-  _globals['_RETURN']._serialized_start=2712
-  _globals['_RETURN']._serialized_end=2886
-  _globals['_SPREAD']._serialized_start=2889
-  _globals['_SPREAD']._serialized_end=3067
-  _globals['_STATEMENT']._serialized_start=3070
-  _globals['_STATEMENT']._serialized_end=3458
-  _globals['_WORKFLOWPARAM']._serialized_start=3460
-  _globals['_WORKFLOWPARAM']._serialized_end=3539
-  _globals['_WORKFLOW']._serialized_start=3542
-  _globals['_WORKFLOW']._serialized_end=3686
-  _globals['_ACTIONDEFINITION']._serialized_start=3688
-  _globals['_ACTIONDEFINITION']._serialized_end=3773
-  _globals['_PARSEERROR']._serialized_start=3775
-  _globals['_PARSEERROR']._serialized_end=3867
+  _globals['_LITERAL']._serialized_start=534
+  _globals['_LITERAL']._serialized_end=664
+  _globals['_EXPRESSION']._serialized_start=667
+  _globals['_EXPRESSION']._serialized_end=1033
+  _globals['_SUBSCRIPT']._serialized_start=1035
+  _globals['_SUBSCRIPT']._serialized_end=1119
+  _globals['_ATTRIBUTEACCESS']._serialized_start=1121
+  _globals['_ATTRIBUTEACCESS']._serialized_end=1194
+  _globals['_ARRAYEXPR']._serialized_start=1196
+  _globals['_ARRAYEXPR']._serialized_end=1248
+  _globals['_DICTEXPR']._serialized_start=1250
+  _globals['_DICTEXPR']._serialized_end=1299
+  _globals['_DICTENTRY']._serialized_start=1301
+  _globals['_DICTENTRY']._serialized_end=1363
+  _globals['_BINARYOP']._serialized_start=1366
+  _globals['_BINARYOP']._serialized_end=1689
+  _globals['_BINARYOP_OP']._serialized_start=1490
+  _globals['_BINARYOP_OP']._serialized_end=1689
+  _globals['_UNARYOP']._serialized_start=1692
+  _globals['_UNARYOP']._serialized_end=1826
+  _globals['_UNARYOP_OP']._serialized_start=1778
+  _globals['_UNARYOP_OP']._serialized_end=1826
+  _globals['_CALLEXPR']._serialized_start=1828
+  _globals['_CALLEXPR']._serialized_end=1893
+  _globals['_KWARG']._serialized_start=1895
+  _globals['_KWARG']._serialized_end=1954
+  _globals['_ACTIONCALL']._serialized_start=1957
+  _globals['_ACTIONCALL']._serialized_end=2204
+  _globals['_SUBGRAPHCALL']._serialized_start=2207
+  _globals['_SUBGRAPHCALL']._serialized_end=2369
+  _globals['_GATHERCALL']._serialized_start=2371
+  _globals['_GATHERCALL']._serialized_end=2477
+  _globals['_GATHER']._serialized_start=2480
+  _globals['_GATHER']._serialized_end=2621
+  _globals['_PYTHONBLOCK']._serialized_start=2624
+  _globals['_PYTHONBLOCK']._serialized_end=2785
+  _globals['_LOOP']._serialized_start=2788
+  _globals['_LOOP']._serialized_end=2973
+  _globals['_BRANCH']._serialized_start=2976
+  _globals['_BRANCH']._serialized_end=3210
+  _globals['_CONDITIONAL']._serialized_start=3213
+  _globals['_CONDITIONAL']._serialized_end=3358
+  _globals['_EXCEPTHANDLER']._serialized_start=3361
+  _globals['_EXCEPTHANDLER']._serialized_end=3612
+  _globals['_EXCEPTIONTYPE']._serialized_start=3614
+  _globals['_EXCEPTIONTYPE']._serialized_end=3689
+  _globals['_TRYEXCEPT']._serialized_start=3692
+  _globals['_TRYEXCEPT']._serialized_end=3944
+  _globals['_SLEEP']._serialized_start=3946
+  _globals['_SLEEP']._serialized_end=4057
+  _globals['_RETURN']._serialized_start=4060
+  _globals['_RETURN']._serialized_end=4263
+  _globals['_SPREAD']._serialized_start=4266
+  _globals['_SPREAD']._serialized_end=4467
+  _globals['_STATEMENT']._serialized_start=4470
+  _globals['_STATEMENT']._serialized_end=4858
+  _globals['_WORKFLOWPARAM']._serialized_start=4860
+  _globals['_WORKFLOWPARAM']._serialized_end=4939
+  _globals['_WORKFLOW']._serialized_start=4942
+  _globals['_WORKFLOW']._serialized_end=5086
+  _globals['_ACTIONDEFINITION']._serialized_start=5088
+  _globals['_ACTIONDEFINITION']._serialized_end=5173
+  _globals['_PARSEERROR']._serialized_start=5175
+  _globals['_PARSEERROR']._serialized_end=5267
 # @@protoc_insertion_point(module_scope)

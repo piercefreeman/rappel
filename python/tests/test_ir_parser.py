@@ -11,7 +11,16 @@ import textwrap
 import pytest
 
 from proto import ir_pb2
-from rappel.ir import ActionDefinition, IRParser, IRSerializer, ModuleIndex
+from rappel.ir import ActionDefinition, IRParser, IRSerializer, ModuleIndex, _expression_to_string
+
+
+def get_arg_value(action_or_subgraph, name: str) -> str:
+    """Get an argument value by name from an ActionCall or SubgraphCall, returning as string."""
+    for arg in action_or_subgraph.args:
+        if arg.name == name:
+            return _expression_to_string(arg.value)
+    raise KeyError(f"Argument '{name}' not found")
+
 
 # =============================================================================
 # Test Fixtures - Example Workflows
@@ -160,7 +169,7 @@ class SimpleSequentialWorkflow(Workflow):
 
         # Return
         assert workflow.body[3].WhichOneof("kind") == "return_stmt"
-        assert workflow.body[3].return_stmt.expr == "total"
+        assert _expression_to_string(workflow.body[3].return_stmt.expression) == "total"
 
     def test_return_action(self, action_defs: dict[str, ActionDefinition]):
         """Test returning the result of an action directly."""
@@ -228,9 +237,9 @@ class GatherWithParamsWorkflow(Workflow):
 
         gather = workflow.body[0].gather
         assert len(gather.calls) == 3
-        assert gather.calls[0].action.kwargs["idx"] == "1"
-        assert gather.calls[1].action.kwargs["idx"] == "2"
-        assert gather.calls[2].action.kwargs["idx"] == "3"
+        assert get_arg_value(gather.calls[0].action, "idx") == "1"
+        assert get_arg_value(gather.calls[1].action, "idx") == "2"
+        assert get_arg_value(gather.calls[2].action, "idx") == "3"
 
 
 class TestLoops:
@@ -258,7 +267,7 @@ class SingleActionLoopWorkflow(Workflow):
 
         assert loop is not None
         assert loop.loop_var == "number"
-        assert loop.iterator_expr == "numbers"
+        assert _expression_to_string(loop.iterator) == "numbers"
         assert loop.accumulator == "results"
 
         # Body contains: action, append (as python_block)
@@ -378,8 +387,8 @@ class SimpleConditionalWorkflow(Workflow):
         assert len(cond.branches) == 2
         assert cond.target == "result"
 
-        assert "(value > 50)" in cond.branches[0].guard
-        assert "not " in cond.branches[1].guard
+        assert "value > 50" in _expression_to_string(cond.branches[0].guard)
+        assert "not" in _expression_to_string(cond.branches[1].guard)
 
     def test_if_elif_else(self, action_defs: dict[str, ActionDefinition]):
         """Test if/elif/else chain."""
@@ -576,7 +585,7 @@ class SleepWorkflow(Workflow):
                 break
 
         assert sleep is not None
-        assert sleep.duration_expr == "60"
+        assert _expression_to_string(sleep.duration) == "60"
 
     def test_sleep_with_expression(self, action_defs: dict[str, ActionDefinition]):
         """Test sleep with expression for duration."""
@@ -596,7 +605,7 @@ class SleepExprWorkflow(Workflow):
                 break
 
         assert sleep is not None
-        assert sleep.duration_expr == "wait_time * 2"
+        assert _expression_to_string(sleep.duration) == "wait_time * 2"
 
 
 class TestSpread:
@@ -627,7 +636,7 @@ class SpreadWorkflow(Workflow):
 
         assert loop is not None
         assert loop.accumulator == "doubled"
-        assert loop.iterator_expr == "numbers"
+        assert _expression_to_string(loop.iterator) == "numbers"
         assert loop.loop_var == "n"
 
         # Loop body should have action call and append
@@ -722,9 +731,9 @@ class PositionalArgsWorkflow(Workflow):
 
         action = workflow.body[0].action_call
         assert action.action == "positional_action"
-        assert action.kwargs["prefix"] == "'hello'"
-        assert action.kwargs["count"] == "42"
-        assert action.kwargs["suffix"] == "'!'"
+        assert get_arg_value(action, "prefix") == "'hello'"
+        assert get_arg_value(action, "count") == "42"
+        assert get_arg_value(action, "suffix") == "'!'"
 
 
 class TestPythonBlocks:
@@ -1432,10 +1441,10 @@ class ExtraArgsWorkflow(Workflow):
 
         action = workflow.body[0].action_call
         # First arg mapped to param name
-        assert action.kwargs["a"] == "'first'"
+        assert get_arg_value(action, "a") == "'first'"
         # Extra args get __argN names
-        assert action.kwargs["__arg1"] == "'second'"
-        assert action.kwargs["__arg2"] == "'third'"
+        assert get_arg_value(action, "__arg1") == "'second'"
+        assert get_arg_value(action, "__arg2") == "'third'"
 
     def test_positional_args_no_signature(self):
         """Test positional args when action has no param_names."""
@@ -1479,8 +1488,8 @@ class NoSigWorkflow(Workflow):
 
         action = workflow.body[0].action_call
         # All args get __argN names when no signature
-        assert action.kwargs["__arg0"] == "'first'"
-        assert action.kwargs["__arg1"] == "'second'"
+        assert get_arg_value(action, "__arg0") == "'first'"
+        assert get_arg_value(action, "__arg1") == "'second'"
 
 
 class TestComplexWorkflows:
@@ -1883,7 +1892,7 @@ class SleepWorkflow(Workflow):
 
         # First statement should be sleep
         sleep = workflow.body[0].sleep
-        assert sleep.duration_expr == "10"
+        assert _expression_to_string(sleep.duration) == "10"
 
 
 class TestSpreadEdgeCases:
@@ -1902,7 +1911,7 @@ class SpreadWorkflow(Workflow):
         # Async list comprehensions now become Loop IR
         loop = workflow.body[0].loop
         assert loop.loop_var == "v"
-        assert loop.iterator_expr == "items"
+        assert _expression_to_string(loop.iterator) == "items"
         assert loop.accumulator == "results"
 
         # Loop body should have action call and append
@@ -2282,13 +2291,13 @@ class SubgraphKwargsWorkflow(Workflow):
 
         call1 = gather.calls[0].subgraph
         assert call1.method_name == "process_value"
-        assert call1.kwargs["value"] == "x"
-        assert call1.kwargs["multiplier"] == "2"
+        assert get_arg_value(call1, "value") == "x"
+        assert get_arg_value(call1, "multiplier") == "2"
 
         call2 = gather.calls[1].subgraph
         assert call2.method_name == "process_value"
-        assert call2.kwargs["value"] == "y"
-        assert call2.kwargs["multiplier"] == "3"
+        assert get_arg_value(call2, "value") == "y"
+        assert get_arg_value(call2, "multiplier") == "3"
 
     def test_subgraph_with_positional_args(
         self, action_defs: dict[str, ActionDefinition], module_index: ModuleIndex
@@ -2311,8 +2320,8 @@ class SubgraphPositionalWorkflow(Workflow):
         gather = workflow.body[0].gather
         call1 = gather.calls[0].subgraph
         assert call1.method_name == "helper"
-        assert call1.kwargs["__arg0"] == "1"
-        assert call1.kwargs["__arg1"] == "2"
+        assert get_arg_value(call1, "__arg0") == "1"
+        assert get_arg_value(call1, "__arg1") == "2"
 
     def test_serialize_subgraph_in_gather(
         self, action_defs: dict[str, ActionDefinition], module_index: ModuleIndex
@@ -2372,11 +2381,11 @@ class SubgraphUsesActionOutputWorkflow(Workflow):
 
         call1 = gather.calls[0].subgraph
         assert call1.method_name == "process_data"
-        assert call1.kwargs["value"] == "data"
+        assert get_arg_value(call1, "value") == "data"
 
         call2 = gather.calls[1].subgraph
         assert call2.method_name == "process_data"
-        assert call2.kwargs["value"] == "data * 2"
+        assert get_arg_value(call2, "value") == "data * 2"
 
     def test_subgraph_uses_workflow_params(
         self, action_defs: dict[str, ActionDefinition], module_index: ModuleIndex
@@ -2397,8 +2406,8 @@ class SubgraphUsesParamsWorkflow(Workflow):
         workflow = parse_workflow_class(code, action_defs, module_index)
 
         gather = workflow.body[0].gather
-        assert gather.calls[0].subgraph.kwargs["input_val"] == "x"
-        assert gather.calls[1].subgraph.kwargs["input_val"] == "y"
+        assert get_arg_value(gather.calls[0].subgraph, "input_val") == "x"
+        assert get_arg_value(gather.calls[1].subgraph, "input_val") == "y"
 
     def test_subgraph_with_complex_expressions(
         self, action_defs: dict[str, ActionDefinition], module_index: ModuleIndex
@@ -2423,9 +2432,9 @@ class SubgraphComplexExprWorkflow(Workflow):
         gather = workflow.body[1].gather
 
         call1 = gather.calls[0].subgraph
-        assert call1.kwargs["data"] == "items[0]"
-        assert call1.kwargs["multiplier"] == "count + 1"
+        assert get_arg_value(call1, "data") == "items[0]"
+        assert get_arg_value(call1, "multiplier") == "count + 1"
 
         call2 = gather.calls[1].subgraph
-        assert call2.kwargs["data"] == "items[-1]"
-        assert call2.kwargs["multiplier"] == "len(items)"
+        assert get_arg_value(call2, "data") == "items[-1]"
+        assert get_arg_value(call2, "multiplier") == "len(items)"

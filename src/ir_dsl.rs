@@ -110,7 +110,7 @@ impl<'a> DslFormatter<'a> {
     fn format_action_call(&mut self, action: &ir::ActionCall) {
         self.write_indent();
 
-        // target = @action(kwargs) [policy]
+        // target = @action(args) [policy]
         if let Some(target) = &action.target {
             self.write(target);
             self.write(" = ");
@@ -124,15 +124,16 @@ impl<'a> DslFormatter<'a> {
         self.write(&action.action);
         self.write("(");
 
-        let mut first = true;
-        for (key, value) in &action.kwargs {
-            if !first {
+        // Format structured args
+        for (i, kwarg) in action.args.iter().enumerate() {
+            if i > 0 {
                 self.write(", ");
             }
-            first = false;
-            self.write(key);
+            self.write(&kwarg.name);
             self.write("=");
-            self.write(value);
+            if let Some(value) = &kwarg.value {
+                self.format_expression(value);
+            }
         }
         self.write(")");
 
@@ -216,15 +217,16 @@ impl<'a> DslFormatter<'a> {
         self.write(&subgraph.method_name);
         self.write("(");
 
-        let mut first = true;
-        for (key, value) in &subgraph.kwargs {
-            if !first {
+        // Format structured args
+        for (i, kwarg) in subgraph.args.iter().enumerate() {
+            if i > 0 {
                 self.write(", ");
             }
-            first = false;
-            self.write(key);
+            self.write(&kwarg.name);
             self.write("=");
-            self.write(value);
+            if let Some(value) = &kwarg.value {
+                self.format_expression(value);
+            }
         }
         self.write(")\n");
     }
@@ -267,7 +269,10 @@ impl<'a> DslFormatter<'a> {
         self.write("loop ");
         self.write(&loop_.loop_var);
         self.write(" in ");
-        self.write(&loop_.iterator_expr);
+        // Format iterator expression
+        if let Some(iterator) = &loop_.iterator {
+            self.format_expression(iterator);
+        }
         self.write(" -> [");
         self.write(&loop_.accumulator);
         self.write("]:\n");
@@ -283,16 +288,21 @@ impl<'a> DslFormatter<'a> {
         for (i, branch) in cond.branches.iter().enumerate() {
             self.write_indent();
 
+            // Check if guard is present and not empty
+            let has_guard = branch.guard.as_ref().map_or(false, |g| g.kind.is_some());
+
             if i == 0 {
                 self.write("branch if ");
-            } else if branch.guard.is_empty() {
+            } else if !has_guard {
                 self.write("branch else");
             } else {
                 self.write("branch elif ");
             }
 
-            if !branch.guard.is_empty() {
-                self.write(&branch.guard);
+            if has_guard {
+                if let Some(guard) = &branch.guard {
+                    self.format_expression(guard);
+                }
             }
             self.write(":\n");
 
@@ -394,7 +404,9 @@ impl<'a> DslFormatter<'a> {
     fn format_sleep(&mut self, sleep: &ir::Sleep) {
         self.write_indent();
         self.write("@sleep(");
-        self.write(&sleep.duration_expr);
+        if let Some(duration) = &sleep.duration {
+            self.format_expression(duration);
+        }
         self.write(")\n");
     }
 
@@ -405,8 +417,8 @@ impl<'a> DslFormatter<'a> {
         if let Some(value) = &ret.value {
             self.write(" ");
             match value {
-                ir::r#return::Value::Expr(expr) => {
-                    self.write(expr);
+                ir::r#return::Value::Expression(expr) => {
+                    self.format_expression(expr);
                 }
                 ir::r#return::Value::Action(action) => {
                     // Inline action without newline
@@ -417,15 +429,15 @@ impl<'a> DslFormatter<'a> {
                     }
                     self.write(&action.action);
                     self.write("(");
-                    let mut first = true;
-                    for (key, value) in &action.kwargs {
-                        if !first {
+                    for (i, kwarg) in action.args.iter().enumerate() {
+                        if i > 0 {
                             self.write(", ");
                         }
-                        first = false;
-                        self.write(key);
+                        self.write(&kwarg.name);
                         self.write("=");
-                        self.write(value);
+                        if let Some(val) = &kwarg.value {
+                            self.format_expression(val);
+                        }
                     }
                     self.write(")");
                 }
@@ -435,6 +447,140 @@ impl<'a> DslFormatter<'a> {
             }
         }
         self.write("\n");
+    }
+
+    fn format_expression(&mut self, expr: &ir::Expression) {
+        let kind = match &expr.kind {
+            Some(k) => k,
+            None => return,
+        };
+
+        match kind {
+            ir::expression::Kind::Literal(lit) => {
+                self.format_literal(lit);
+            }
+            ir::expression::Kind::Variable(name) => {
+                self.write(name);
+            }
+            ir::expression::Kind::Subscript(sub) => {
+                if let Some(base) = &sub.base {
+                    self.format_expression(base);
+                }
+                self.write("[");
+                if let Some(key) = &sub.key {
+                    self.format_expression(key);
+                }
+                self.write("]");
+            }
+            ir::expression::Kind::Array(arr) => {
+                self.write("[");
+                for (i, elem) in arr.elements.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.format_expression(elem);
+                }
+                self.write("]");
+            }
+            ir::expression::Kind::Dict(dict) => {
+                self.write("{");
+                for (i, entry) in dict.entries.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.write("\"");
+                    self.write(&entry.key);
+                    self.write("\": ");
+                    if let Some(val) = &entry.value {
+                        self.format_expression(val);
+                    }
+                }
+                self.write("}");
+            }
+            ir::expression::Kind::BinaryOp(binop) => {
+                if let Some(left) = &binop.left {
+                    self.format_expression(left);
+                }
+                let op_str = match ir::binary_op::Op::try_from(binop.op) {
+                    Ok(ir::binary_op::Op::Add) => " + ",
+                    Ok(ir::binary_op::Op::Sub) => " - ",
+                    Ok(ir::binary_op::Op::Mul) => " * ",
+                    Ok(ir::binary_op::Op::Div) => " / ",
+                    Ok(ir::binary_op::Op::Mod) => " % ",
+                    Ok(ir::binary_op::Op::Eq) => " == ",
+                    Ok(ir::binary_op::Op::Ne) => " != ",
+                    Ok(ir::binary_op::Op::Lt) => " < ",
+                    Ok(ir::binary_op::Op::Le) => " <= ",
+                    Ok(ir::binary_op::Op::Gt) => " > ",
+                    Ok(ir::binary_op::Op::Ge) => " >= ",
+                    Ok(ir::binary_op::Op::And) => " and ",
+                    Ok(ir::binary_op::Op::Or) => " or ",
+                    Ok(ir::binary_op::Op::In) => " in ",
+                    Ok(ir::binary_op::Op::NotIn) => " not in ",
+                    _ => " ?? ",
+                };
+                self.write(op_str);
+                if let Some(right) = &binop.right {
+                    self.format_expression(right);
+                }
+            }
+            ir::expression::Kind::UnaryOp(unop) => {
+                let op_str = match ir::unary_op::Op::try_from(unop.op) {
+                    Ok(ir::unary_op::Op::Not) => "not ",
+                    Ok(ir::unary_op::Op::Neg) => "-",
+                    _ => "",
+                };
+                self.write(op_str);
+                if let Some(operand) = &unop.operand {
+                    self.format_expression(operand);
+                }
+            }
+            ir::expression::Kind::Call(call) => {
+                self.write(&call.function);
+                self.write("(");
+                for (i, arg) in call.args.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.format_expression(arg);
+                }
+                self.write(")");
+            }
+            ir::expression::Kind::Attribute(attr) => {
+                if let Some(base) = &attr.base {
+                    self.format_expression(base);
+                }
+                self.write(".");
+                self.write(&attr.attribute);
+            }
+        }
+    }
+
+    fn format_literal(&mut self, lit: &ir::Literal) {
+        let value = match &lit.value {
+            Some(v) => v,
+            None => return,
+        };
+
+        match value {
+            ir::literal::Value::NullValue(_) => {
+                self.write("null");
+            }
+            ir::literal::Value::BoolValue(b) => {
+                self.write(if *b { "true" } else { "false" });
+            }
+            ir::literal::Value::IntValue(i) => {
+                self.write(&i.to_string());
+            }
+            ir::literal::Value::FloatValue(f) => {
+                self.write(&f.to_string());
+            }
+            ir::literal::Value::StringValue(s) => {
+                self.write("\"");
+                self.write(s);
+                self.write("\"");
+            }
+        }
     }
 
     fn format_spread(&mut self, spread: &ir::Spread) {
@@ -453,21 +599,23 @@ impl<'a> DslFormatter<'a> {
             }
             self.write(&action.action);
             self.write("(");
-            let mut first = true;
-            for (key, value) in &action.kwargs {
-                if !first {
+            for (i, kwarg) in action.args.iter().enumerate() {
+                if i > 0 {
                     self.write(", ");
                 }
-                first = false;
-                self.write(key);
+                self.write(&kwarg.name);
                 self.write("=");
-                self.write(value);
+                if let Some(val) = &kwarg.value {
+                    self.format_expression(val);
+                }
             }
             self.write(")");
         }
 
         self.write(" over ");
-        self.write(&spread.iterable);
+        if let Some(iterable) = &spread.iterable {
+            self.format_expression(iterable);
+        }
         self.write(" as ");
         self.write(&spread.loop_var);
         self.write("\n");
@@ -477,13 +625,19 @@ impl<'a> DslFormatter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+
+    /// Helper function to create a variable expression for tests
+    fn make_var_expr(name: &str) -> ir::Expression {
+        ir::Expression {
+            kind: Some(ir::expression::Kind::Variable(name.to_string())),
+        }
+    }
 
     fn make_action(name: &str, target: Option<&str>) -> ir::ActionCall {
         ir::ActionCall {
             action: name.to_string(),
             module: Some("test_module".to_string()),
-            kwargs: HashMap::new(),
+            args: vec![],
             target: target.map(|s| s.to_string()),
             config: None,
             location: None,
@@ -506,7 +660,7 @@ mod tests {
                 },
                 ir::Statement {
                     kind: Some(ir::statement::Kind::ReturnStmt(ir::Return {
-                        value: Some(ir::r#return::Value::Expr("data".to_string())),
+                        value: Some(ir::r#return::Value::Expression(make_var_expr("data"))),
                         location: None,
                     })),
                 },
@@ -558,7 +712,7 @@ mod tests {
             body: vec![
                 ir::Statement {
                     kind: Some(ir::statement::Kind::Loop(ir::Loop {
-                        iterator_expr: "items".to_string(),
+                        iterator: Some(make_var_expr("items")),
                         loop_var: "item".to_string(),
                         accumulator: "results".to_string(),
                         body: vec![

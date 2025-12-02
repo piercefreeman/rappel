@@ -43,6 +43,314 @@ class IRParseError(Exception):
         super().__init__(f"{message}{loc_str}")
 
 
+# AST operator to IR BinaryOp mapping
+_BINOP_MAP: dict[type, ir_pb2.BinaryOp.Op] = {
+    ast.Add: ir_pb2.BinaryOp.OP_ADD,
+    ast.Sub: ir_pb2.BinaryOp.OP_SUB,
+    ast.Mult: ir_pb2.BinaryOp.OP_MUL,
+    ast.Div: ir_pb2.BinaryOp.OP_DIV,
+    ast.Mod: ir_pb2.BinaryOp.OP_MOD,
+}
+
+_CMPOP_MAP: dict[type, ir_pb2.BinaryOp.Op] = {
+    ast.Eq: ir_pb2.BinaryOp.OP_EQ,
+    ast.NotEq: ir_pb2.BinaryOp.OP_NE,
+    ast.Lt: ir_pb2.BinaryOp.OP_LT,
+    ast.LtE: ir_pb2.BinaryOp.OP_LE,
+    ast.Gt: ir_pb2.BinaryOp.OP_GT,
+    ast.GtE: ir_pb2.BinaryOp.OP_GE,
+    ast.In: ir_pb2.BinaryOp.OP_IN,
+    ast.NotIn: ir_pb2.BinaryOp.OP_NOT_IN,
+}
+
+_BOOLOP_MAP: dict[type, ir_pb2.BinaryOp.Op] = {
+    ast.And: ir_pb2.BinaryOp.OP_AND,
+    ast.Or: ir_pb2.BinaryOp.OP_OR,
+}
+
+_UNARYOP_MAP: dict[type, ir_pb2.UnaryOp.Op] = {
+    ast.Not: ir_pb2.UnaryOp.OP_NOT,
+    ast.USub: ir_pb2.UnaryOp.OP_NEG,
+}
+
+
+def _ast_to_expression(node: ast.expr) -> ir_pb2.Expression:
+    """Convert a Python AST expression to an IR Expression protobuf."""
+    if isinstance(node, ast.Constant):
+        return _constant_to_expression(node)
+
+    if isinstance(node, ast.Name):
+        return ir_pb2.Expression(variable=node.id)
+
+    if isinstance(node, ast.Subscript):
+        return ir_pb2.Expression(
+            subscript=ir_pb2.Subscript(
+                base=_ast_to_expression(node.value),
+                key=_ast_to_expression(node.slice),
+            )
+        )
+
+    if isinstance(node, ast.Attribute):
+        return ir_pb2.Expression(
+            attribute=ir_pb2.AttributeAccess(
+                base=_ast_to_expression(node.value),
+                attribute=node.attr,
+            )
+        )
+
+    if isinstance(node, ast.List):
+        return ir_pb2.Expression(
+            array=ir_pb2.ArrayExpr(
+                elements=[_ast_to_expression(e) for e in node.elts]
+            )
+        )
+
+    if isinstance(node, ast.Dict):
+        entries = []
+        for k, v in zip(node.keys, node.values):
+            if k is None:
+                # dict unpacking (**d) - not supported in IR
+                raise IRParseError(
+                    "Dict unpacking (**) is not supported in expressions",
+                    node,
+                    _source_location_from_node(node),
+                )
+            # For now, only support string literal keys
+            if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                entries.append(ir_pb2.DictEntry(key=k.value, value=_ast_to_expression(v)))
+            else:
+                raise IRParseError(
+                    f"Dict keys must be string literals, got {ast.unparse(k)}",
+                    k,
+                    _source_location_from_node(k),
+                )
+        return ir_pb2.Expression(dict=ir_pb2.DictExpr(entries=entries))
+
+    if isinstance(node, ast.BinOp):
+        op = _BINOP_MAP.get(type(node.op))
+        if op is None:
+            raise IRParseError(
+                f"Unsupported binary operator: {type(node.op).__name__}",
+                node,
+                _source_location_from_node(node),
+            )
+        return ir_pb2.Expression(
+            binary_op=ir_pb2.BinaryOp(
+                op=op,
+                left=_ast_to_expression(node.left),
+                right=_ast_to_expression(node.right),
+            )
+        )
+
+    if isinstance(node, ast.Compare):
+        # Handle comparison chains like a < b < c
+        if len(node.ops) == 1 and len(node.comparators) == 1:
+            op = _CMPOP_MAP.get(type(node.ops[0]))
+            if op is None:
+                raise IRParseError(
+                    f"Unsupported comparison operator: {type(node.ops[0]).__name__}",
+                    node,
+                    _source_location_from_node(node),
+                )
+            return ir_pb2.Expression(
+                binary_op=ir_pb2.BinaryOp(
+                    op=op,
+                    left=_ast_to_expression(node.left),
+                    right=_ast_to_expression(node.comparators[0]),
+                )
+            )
+        else:
+            # Chain comparison like a < b < c becomes (a < b) and (b < c)
+            exprs = []
+            left = node.left
+            for op_node, right in zip(node.ops, node.comparators):
+                op = _CMPOP_MAP.get(type(op_node))
+                if op is None:
+                    raise IRParseError(
+                        f"Unsupported comparison operator: {type(op_node).__name__}",
+                        node,
+                        _source_location_from_node(node),
+                    )
+                exprs.append(
+                    ir_pb2.Expression(
+                        binary_op=ir_pb2.BinaryOp(
+                            op=op,
+                            left=_ast_to_expression(left),
+                            right=_ast_to_expression(right),
+                        )
+                    )
+                )
+                left = right
+            # Combine with AND
+            result = exprs[0]
+            for expr in exprs[1:]:
+                result = ir_pb2.Expression(
+                    binary_op=ir_pb2.BinaryOp(
+                        op=ir_pb2.BinaryOp.OP_AND,
+                        left=result,
+                        right=expr,
+                    )
+                )
+            return result
+
+    if isinstance(node, ast.BoolOp):
+        op = _BOOLOP_MAP.get(type(node.op))
+        if op is None:
+            raise IRParseError(
+                f"Unsupported boolean operator: {type(node.op).__name__}",
+                node,
+                _source_location_from_node(node),
+            )
+        # BoolOp has multiple values, chain them left to right
+        result = _ast_to_expression(node.values[0])
+        for value in node.values[1:]:
+            result = ir_pb2.Expression(
+                binary_op=ir_pb2.BinaryOp(
+                    op=op,
+                    left=result,
+                    right=_ast_to_expression(value),
+                )
+            )
+        return result
+
+    if isinstance(node, ast.UnaryOp):
+        op = _UNARYOP_MAP.get(type(node.op))
+        if op is None:
+            raise IRParseError(
+                f"Unsupported unary operator: {type(node.op).__name__}",
+                node,
+                _source_location_from_node(node),
+            )
+        return ir_pb2.Expression(
+            unary_op=ir_pb2.UnaryOp(
+                op=op,
+                operand=_ast_to_expression(node.operand),
+            )
+        )
+
+    if isinstance(node, ast.Call):
+        # Only support simple function calls like len(x)
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+            args = [_ast_to_expression(arg) for arg in node.args]
+            return ir_pb2.Expression(
+                call=ir_pb2.CallExpr(function=func_name, args=args)
+            )
+        raise IRParseError(
+            f"Complex function call not supported in expressions: {ast.unparse(node)}",
+            node,
+            _source_location_from_node(node),
+        )
+
+    if isinstance(node, ast.IfExp):
+        # Ternary: a if cond else b
+        # Not directly supported in IR - we'd need to add it or raise
+        raise IRParseError(
+            f"Ternary expressions not supported in IR: {ast.unparse(node)}",
+            node,
+            _source_location_from_node(node),
+        )
+
+    if isinstance(node, ast.JoinedStr):
+        # F-strings - store the unparsed representation as a variable/code expression
+        # This allows the runtime to evaluate it with the proper context
+        return ir_pb2.Expression(variable=ast.unparse(node))
+
+    raise IRParseError(
+        f"Unsupported expression type: {type(node).__name__}: {ast.unparse(node)}",
+        node,
+        _source_location_from_node(node),
+    )
+
+
+def _constant_to_expression(node: ast.Constant) -> ir_pb2.Expression:
+    """Convert a Python constant to an IR Expression."""
+    value = node.value
+    if value is None:
+        return ir_pb2.Expression(literal=ir_pb2.Literal(null_value=True))
+    if isinstance(value, bool):
+        return ir_pb2.Expression(literal=ir_pb2.Literal(bool_value=value))
+    if isinstance(value, int):
+        return ir_pb2.Expression(literal=ir_pb2.Literal(int_value=value))
+    if isinstance(value, float):
+        return ir_pb2.Expression(literal=ir_pb2.Literal(float_value=value))
+    if isinstance(value, str):
+        return ir_pb2.Expression(literal=ir_pb2.Literal(string_value=value))
+    raise IRParseError(
+        f"Unsupported constant type: {type(value).__name__}",
+        node,
+        _source_location_from_node(node),
+    )
+
+
+def _expression_to_string(expr: ir_pb2.Expression) -> str:
+    """Convert an IR Expression back to a Python code string for display."""
+    kind = expr.WhichOneof("kind")
+    if kind == "literal":
+        lit = expr.literal
+        lit_kind = lit.WhichOneof("value")
+        if lit_kind == "null_value":
+            return "None"
+        if lit_kind == "bool_value":
+            return "True" if lit.bool_value else "False"
+        if lit_kind == "int_value":
+            return str(lit.int_value)
+        if lit_kind == "float_value":
+            return str(lit.float_value)
+        if lit_kind == "string_value":
+            return repr(lit.string_value)
+        return "None"
+    if kind == "variable":
+        return expr.variable
+    if kind == "subscript":
+        base = _expression_to_string(expr.subscript.base)
+        key = _expression_to_string(expr.subscript.key)
+        return f"{base}[{key}]"
+    if kind == "attribute":
+        base = _expression_to_string(expr.attribute.base)
+        return f"{base}.{expr.attribute.attribute}"
+    if kind == "array":
+        elements = [_expression_to_string(e) for e in expr.array.elements]
+        return f"[{', '.join(elements)}]"
+    if kind == "dict":
+        entries = [f"{repr(e.key)}: {_expression_to_string(e.value)}" for e in expr.dict.entries]
+        return f"{{{', '.join(entries)}}}"
+    if kind == "binary_op":
+        left = _expression_to_string(expr.binary_op.left)
+        right = _expression_to_string(expr.binary_op.right)
+        op_map = {
+            ir_pb2.BinaryOp.OP_ADD: "+",
+            ir_pb2.BinaryOp.OP_SUB: "-",
+            ir_pb2.BinaryOp.OP_MUL: "*",
+            ir_pb2.BinaryOp.OP_DIV: "/",
+            ir_pb2.BinaryOp.OP_MOD: "%",
+            ir_pb2.BinaryOp.OP_EQ: "==",
+            ir_pb2.BinaryOp.OP_NE: "!=",
+            ir_pb2.BinaryOp.OP_LT: "<",
+            ir_pb2.BinaryOp.OP_LE: "<=",
+            ir_pb2.BinaryOp.OP_GT: ">",
+            ir_pb2.BinaryOp.OP_GE: ">=",
+            ir_pb2.BinaryOp.OP_AND: "and",
+            ir_pb2.BinaryOp.OP_OR: "or",
+            ir_pb2.BinaryOp.OP_IN: "in",
+            ir_pb2.BinaryOp.OP_NOT_IN: "not in",
+        }
+        op_str = op_map.get(expr.binary_op.op, "?")
+        return f"{left} {op_str} {right}"
+    if kind == "unary_op":
+        operand = _expression_to_string(expr.unary_op.operand)
+        op_map = {
+            ir_pb2.UnaryOp.OP_NOT: "not ",
+            ir_pb2.UnaryOp.OP_NEG: "-",
+        }
+        op_str = op_map.get(expr.unary_op.op, "?")
+        return f"{op_str}{operand}"
+    if kind == "call":
+        args = [_expression_to_string(a) for a in expr.call.args]
+        return f"{expr.call.function}({', '.join(args)})"
+    return "?"
+
+
 def _source_location_from_node(node: ast.AST) -> ir_pb2.SourceLocation:
     """Create a SourceLocation from an AST node."""
     loc = ir_pb2.SourceLocation(
@@ -420,7 +728,7 @@ class IRParser:
             ret.gather.CopyFrom(gather)
             return ret
 
-        ret.expr = ast.unparse(stmt.value)
+        ret.expression.CopyFrom(_ast_to_expression(stmt.value))
         return ret
 
     def _parse_expr_statement(
@@ -505,7 +813,6 @@ class IRParser:
             raise IRParseError("for loop target must be a simple variable", stmt, location)
 
         loop_var = stmt.target.id
-        iterator_expr = ast.unparse(stmt.iter)
 
         # Track variables available in loop body (includes loop var)
         loop_known_vars = self._known_vars | {loop_var}
@@ -573,10 +880,10 @@ class IRParser:
             raise IRParseError("for loop must contain at least one action call", stmt, location)
 
         loop = ir_pb2.Loop(
-            iterator_expr=iterator_expr,
             loop_var=loop_var,
             accumulator=accumulator,
         )
+        loop.iterator.CopyFrom(_ast_to_expression(stmt.iter))
         loop.body.extend(body_statements)
         loop.location.CopyFrom(location)
 
@@ -593,7 +900,9 @@ class IRParser:
         branches = self._extract_conditional_branches(stmt, parent_guard=None)
 
         for branch in branches:
-            errors = self._guard_validator.validate(branch.guard, branch.location)
+            # Convert Expression back to string for validation
+            guard_str = _expression_to_string(branch.guard)
+            errors = self._guard_validator.validate(guard_str, branch.location)
             if errors:
                 raise IRParseError(
                     f"Invalid guard expression: {'; '.join(errors)}",
@@ -614,38 +923,40 @@ class IRParser:
         return ir_pb2.Statement(conditional=cond)
 
     def _extract_conditional_branches(
-        self, stmt: ast.If, parent_guard: str | None
+        self, stmt: ast.If, parent_guard: ast.expr | None
     ) -> list[ir_pb2.Branch]:
         """Extract all branches from an if/elif/else chain."""
         branches: list[ir_pb2.Branch] = []
         location = _source_location_from_node(stmt)
 
-        condition = f"({ast.unparse(stmt.test)})"
-        if parent_guard:
-            true_guard = f"({parent_guard}) and {condition}"
+        # Build guard expression (combining with parent if present)
+        if parent_guard is not None:
+            true_guard = ast.BoolOp(op=ast.And(), values=[parent_guard, stmt.test])
         else:
-            true_guard = condition
+            true_guard = stmt.test
 
         true_branch = self._parse_branch_body(stmt.body, true_guard, location)
         branches.append(true_branch)
 
         if len(stmt.orelse) == 1 and isinstance(stmt.orelse[0], ast.If):
-            negated = (
-                f"not {condition}" if not parent_guard else f"({parent_guard}) and not {condition}"
-            )
+            # Negated guard for elif chain
+            negated = ast.UnaryOp(op=ast.Not(), operand=stmt.test)
+            if parent_guard is not None:
+                negated = ast.BoolOp(op=ast.And(), values=[parent_guard, negated])
             branches.extend(self._extract_conditional_branches(stmt.orelse[0], negated))
         elif stmt.orelse:
-            false_guard = (
-                f"not {condition}" if not parent_guard else f"({parent_guard}) and not {condition}"
-            )
+            # Else branch - negate the condition
+            negated = ast.UnaryOp(op=ast.Not(), operand=stmt.test)
+            if parent_guard is not None:
+                negated = ast.BoolOp(op=ast.And(), values=[parent_guard, negated])
             else_location = _source_location_from_node(stmt.orelse[0])
-            false_branch = self._parse_branch_body(stmt.orelse, false_guard, else_location)
+            false_branch = self._parse_branch_body(stmt.orelse, negated, else_location)
             branches.append(false_branch)
 
         return branches
 
     def _parse_branch_body(
-        self, body: list[ast.stmt], guard: str, location: ir_pb2.SourceLocation
+        self, body: list[ast.stmt], guard: ast.expr, location: ir_pb2.SourceLocation
     ) -> ir_pb2.Branch:
         """Parse a branch body into preamble, actions, postamble."""
         preamble: list[ir_pb2.PythonBlock] = []
@@ -683,12 +994,14 @@ class IRParser:
                 branch_known_vars.update(block.outputs)
 
         if not actions:
+            guard_str = ast.unparse(guard)
             raise IRParseError(
-                f"Conditional branch with guard '{guard}' must have at least one action",
+                f"Conditional branch with guard '{guard_str}' must have at least one action",
                 location=location,
             )
 
-        branch = ir_pb2.Branch(guard=guard)
+        branch = ir_pb2.Branch()
+        branch.guard.CopyFrom(_ast_to_expression(guard))
         branch.preamble.extend(preamble)
         branch.actions.extend(actions)
         branch.postamble.extend(postamble)
@@ -860,44 +1173,60 @@ class IRParser:
         action_def = self.action_defs.get(action_name)
         module = action_def.module if action_def else None
 
-        kwargs = self._extract_kwargs_with_signature(expr, action_def)
+        args = self._extract_args_with_signature(expr, action_def)
 
         action_call = ir_pb2.ActionCall(
             action=action_def.name if action_def else action_name,
         )
         if module:
             action_call.module = module
-        for k, v in kwargs.items():
-            action_call.kwargs[k] = v
+        action_call.args.extend(args)
         action_call.location.CopyFrom(_source_location_from_node(expr))
 
         return action_call
 
-    def _extract_kwargs_with_signature(
+    def _extract_args_with_signature(
         self, call: ast.Call, action_def: ActionDefinition | None
-    ) -> dict[str, str]:
-        """Extract kwargs, mapping positional args using signature."""
-        kwargs: dict[str, str] = {}
+    ) -> list[ir_pb2.KwArg]:
+        """Extract args as KwArg list, mapping positional args using signature."""
+        args: list[ir_pb2.KwArg] = []
+        seen_names: set[str] = set()
 
+        # First process keyword arguments
         for kw in call.keywords:
             if kw.arg is not None:
-                kwargs[kw.arg] = ast.unparse(kw.value)
+                args.append(ir_pb2.KwArg(
+                    name=kw.arg,
+                    value=_ast_to_expression(kw.value),
+                ))
+                seen_names.add(kw.arg)
 
+        # Then process positional arguments
         if call.args:
             if action_def and action_def.param_names:
                 param_names = action_def.param_names
                 for i, arg in enumerate(call.args):
                     if i < len(param_names):
                         param_name = param_names[i]
-                        if param_name not in kwargs:
-                            kwargs[param_name] = ast.unparse(arg)
+                        if param_name not in seen_names:
+                            args.append(ir_pb2.KwArg(
+                                name=param_name,
+                                value=_ast_to_expression(arg),
+                            ))
+                            seen_names.add(param_name)
                     else:
-                        kwargs[f"__arg{i}"] = ast.unparse(arg)
+                        args.append(ir_pb2.KwArg(
+                            name=f"__arg{i}",
+                            value=_ast_to_expression(arg),
+                        ))
             else:
                 for i, arg in enumerate(call.args):
-                    kwargs[f"__arg{i}"] = ast.unparse(arg)
+                    args.append(ir_pb2.KwArg(
+                        name=f"__arg{i}",
+                        value=_ast_to_expression(arg),
+                    ))
 
-        return kwargs
+        return args
 
     def _extract_run_action(self, call: ast.Call) -> ir_pb2.ActionCall | None:
         """Extract action from self.run_action(action(...), ...) pattern."""
@@ -937,7 +1266,7 @@ class IRParser:
             )
 
         action_def = self.action_defs.get(action_name)
-        kwargs = self._extract_kwargs_with_signature(inner, action_def)
+        args = self._extract_args_with_signature(inner, action_def)
         config = self._extract_run_action_config(call.keywords)
 
         action_call = ir_pb2.ActionCall(
@@ -945,8 +1274,7 @@ class IRParser:
         )
         if action_def and action_def.module:
             action_call.module = action_def.module
-        for k, v in kwargs.items():
-            action_call.kwargs[k] = v
+        action_call.args.extend(args)
         if config:
             action_call.config.CopyFrom(config)
         action_call.location.CopyFrom(_source_location_from_node(call))
@@ -1147,19 +1475,24 @@ class IRParser:
         if method_name == "run_action":
             return None
 
-        # Extract kwargs
-        kwargs: dict[str, str] = {}
+        # Extract args as KwArg list
+        args: list[ir_pb2.KwArg] = []
         for kw in expr.keywords:
             if kw.arg is not None:
-                kwargs[kw.arg] = ast.unparse(kw.value)
+                args.append(ir_pb2.KwArg(
+                    name=kw.arg,
+                    value=_ast_to_expression(kw.value),
+                ))
 
         # Handle positional args as __argN
         for i, arg in enumerate(expr.args):
-            kwargs[f"__arg{i}"] = ast.unparse(arg)
+            args.append(ir_pb2.KwArg(
+                name=f"__arg{i}",
+                value=_ast_to_expression(arg),
+            ))
 
         subgraph = ir_pb2.SubgraphCall(method_name=method_name)
-        for k, v in kwargs.items():
-            subgraph.kwargs[k] = v
+        subgraph.args.extend(args)
         subgraph.location.CopyFrom(_source_location_from_node(expr))
 
         return subgraph
@@ -1188,8 +1521,8 @@ class IRParser:
                 _source_location_from_node(expr),
             )
 
-        duration_expr = ast.unparse(expr.args[0])
-        sleep = ir_pb2.Sleep(duration_expr=duration_expr)
+        sleep = ir_pb2.Sleep()
+        sleep.duration.CopyFrom(_ast_to_expression(expr.args[0]))
         sleep.location.CopyFrom(_source_location_from_node(expr))
 
         return sleep
@@ -1230,7 +1563,6 @@ class IRParser:
             return None
 
         loop_var = gen.target.id
-        iterator_expr = ast.unparse(gen.iter)
 
         # Check if the element contains an await action call
         action = self._extract_action_call(expr.elt)
@@ -1263,10 +1595,10 @@ class IRParser:
 
         # Create the Loop IR
         loop = ir_pb2.Loop(
-            iterator_expr=iterator_expr,
             loop_var=loop_var,
             accumulator=target,
         )
+        loop.iterator.CopyFrom(_ast_to_expression(gen.iter))
         loop.body.extend(body_statements)
         loop.location.CopyFrom(location)
 
@@ -1294,15 +1626,13 @@ class IRParser:
             return None
 
         loop_var = gen.target.id
-        iterable = self._get_simple_name(gen.iter)
-        if iterable is None:
-            return None
 
         action = self._extract_action_call(expr.elt)
         if action is None:
             return None
 
-        spread = ir_pb2.Spread(loop_var=loop_var, iterable=iterable, target=target)
+        spread = ir_pb2.Spread(loop_var=loop_var, target=target)
+        spread.iterable.CopyFrom(_ast_to_expression(gen.iter))
         spread.action.CopyFrom(action)
         spread.location.CopyFrom(_source_location_from_node(expr))
 
@@ -1471,9 +1801,11 @@ class IRSerializer:
         return [f"# UNKNOWN: {kind}"]
 
     def _serialize_action(self, action: ir_pb2.ActionCall) -> list[str]:
-        kwargs_str = ", ".join(f"{k}={v}" for k, v in action.kwargs.items())
+        args_str = ", ".join(
+            f"{arg.name}={_expression_to_string(arg.value)}" for arg in action.args
+        )
         module_prefix = f"{action.module}." if action.HasField("module") else ""
-        call_str = f"@{module_prefix}{action.action}({kwargs_str})"
+        call_str = f"@{module_prefix}{action.action}({args_str})"
 
         if action.HasField("config"):
             config_parts = []
@@ -1511,13 +1843,17 @@ class IRSerializer:
         kind = gather_call.WhichOneof("kind")
         if kind == "action":
             call = gather_call.action
-            kwargs_str = ", ".join(f"{k}={v}" for k, v in call.kwargs.items())
+            args_str = ", ".join(
+                f"{arg.name}={_expression_to_string(arg.value)}" for arg in call.args
+            )
             module_prefix = f"{call.module}." if call.HasField("module") else ""
-            return f"@{module_prefix}{call.action}({kwargs_str})"
+            return f"@{module_prefix}{call.action}({args_str})"
         elif kind == "subgraph":
             call = gather_call.subgraph
-            kwargs_str = ", ".join(f"{k}={v}" for k, v in call.kwargs.items())
-            return f"self.{call.method_name}({kwargs_str})"
+            args_str = ", ".join(
+                f"{arg.name}={_expression_to_string(arg.value)}" for arg in call.args
+            )
+            return f"self.{call.method_name}({args_str})"
         else:
             return f"# UNKNOWN gather call: {kind}"
 
@@ -1551,7 +1887,8 @@ class IRSerializer:
         lines = []
 
         loc = self._loc_comment(loop.location if loop.HasField("location") else None)
-        lines.append(f"loop {loop.loop_var} in {loop.iterator_expr} -> {loop.accumulator}:{loc}")
+        iterator_str = _expression_to_string(loop.iterator) if loop.HasField("iterator") else "?"
+        lines.append(f"loop {loop.loop_var} in {iterator_str} -> {loop.accumulator}:{loc}")
 
         for stmt in loop.body:
             stmt_lines = self._serialize_statement(stmt)
@@ -1564,12 +1901,13 @@ class IRSerializer:
         lines = []
         for i, branch in enumerate(cond.branches):
             loc = self._loc_comment(branch.location if branch.HasField("location") else None)
+            guard_str = _expression_to_string(branch.guard) if branch.HasField("guard") else "?"
             if i == 0:
-                lines.append(f"branch if {branch.guard}:{loc}")
-            elif i == len(cond.branches) - 1 and "not " in branch.guard:
+                lines.append(f"branch if {guard_str}:{loc}")
+            elif i == len(cond.branches) - 1 and "not " in guard_str:
                 lines.append(f"branch else:{loc}")
             else:
-                lines.append(f"branch elif {branch.guard}:{loc}")
+                lines.append(f"branch elif {guard_str}:{loc}")
 
             if branch.preamble:
                 for pre in branch.preamble:
@@ -1693,15 +2031,16 @@ class IRSerializer:
 
     def _serialize_sleep(self, sleep: ir_pb2.Sleep) -> list[str]:
         loc = self._loc_comment(sleep.location if sleep.HasField("location") else None)
-        return [f"@sleep({sleep.duration_expr}){loc}"]
+        duration_str = _expression_to_string(sleep.duration) if sleep.HasField("duration") else "?"
+        return [f"@sleep({duration_str}){loc}"]
 
     def _serialize_return(self, ret: ir_pb2.Return) -> list[str]:
         loc = self._loc_comment(ret.location if ret.HasField("location") else None)
         value_kind = ret.WhichOneof("value")
         if value_kind is None:
             return [f"return{loc}"]
-        if value_kind == "expr":
-            return [f"return {ret.expr}{loc}"]
+        if value_kind == "expression":
+            return [f"return {_expression_to_string(ret.expression)}{loc}"]
         if value_kind == "action":
             action_lines = self._serialize_action(ret.action)
             return [f"return {action_lines[0]}"]
@@ -1713,14 +2052,17 @@ class IRSerializer:
 
     def _serialize_spread(self, spread: ir_pb2.Spread) -> list[str]:
         action = spread.action
-        kwargs_str = ", ".join(f"{k}={v}" for k, v in action.kwargs.items())
+        args_str = ", ".join(
+            f"{arg.name}={_expression_to_string(arg.value)}" for arg in action.args
+        )
         module_prefix = f"{action.module}." if action.HasField("module") else ""
-        call_str = f"@{module_prefix}{action.action}({kwargs_str})"
+        call_str = f"@{module_prefix}{action.action}({args_str})"
         loc = self._loc_comment(spread.location if spread.HasField("location") else None)
+        iterable_str = _expression_to_string(spread.iterable) if spread.HasField("iterable") else "?"
         if spread.HasField("target"):
             return [
-                f"{spread.target} = spread {call_str} over {spread.iterable} as {spread.loop_var}{loc}"
+                f"{spread.target} = spread {call_str} over {iterable_str} as {spread.loop_var}{loc}"
             ]
         # Spread without target - parallel action over collection without collecting results.
         # This is a valid pattern when the actions have side effects but results aren't needed.
-        return [f"spread {call_str} over {spread.iterable} as {spread.loop_var}{loc}"]
+        return [f"spread {call_str} over {iterable_str} as {spread.loop_var}{loc}"]

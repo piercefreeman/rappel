@@ -11,6 +11,66 @@ package rappel.ir;
 // - Better error messages with source locations
 // - A debuggable intermediate form
 // - Language-agnostic target for future JS/Go frontends
+//
+// DSL Syntax Reference:
+// ---------------------
+// The IR can be formatted as human-readable DSL text. Below are the patterns:
+//
+// Workflow:
+//   workflow WorkflowName(param1: type, param2: type) -> ReturnType:
+//       <statements>
+//
+// Action Call:
+//   target = @module.action(arg1=value, arg2=value)
+//   @module.action(arg1=value)  // no assignment
+//   target = @module.action(arg=val) [policy: timeout=60s, retry=3, backoff=exp(100ms, 2.0x)]
+//
+// Parallel Execution (Gather):
+//   results = parallel(
+//       @module.action1()
+//       @module.action2()
+//       self.subgraph_method(arg=val)
+//   )
+//
+// Subgraph Call:
+//   result = self.method_name(arg1=value, arg2=value)
+//
+// Loop:
+//   loop item in collection -> [accumulator]:
+//       <statements>
+//
+// Conditional:
+//   branch if condition:
+//       <statements>
+//   branch elif condition:
+//       <statements>
+//   branch else:
+//       <statements>
+//
+// Try/Except:
+//   try:
+//       <statements>
+//   except ExceptionType:
+//       <statements>
+//   except (Type1, Type2):
+//       <statements>
+//
+// Sleep:
+//   @sleep(duration_seconds)
+//
+// Return:
+//   return expression
+//   return @module.action()
+//   return parallel(...)
+//
+// Spread:
+//   target = spread @module.action(arg=loop_var) over collection as loop_var
+//
+// Python Block:
+//   python(reads: var1, var2; writes: var3) {
+//       code here
+//   }
+//
 // =============================================================================
 
 // -----------------------------------------------------------------------------
@@ -28,42 +88,167 @@ message SourceLocation {
 // Execution Policies
 // -----------------------------------------------------------------------------
 
+// DSL: [policy: backoff=linear(100ms)] or [policy: backoff=exp(100ms, 2.0x)]
 message BackoffConfig {
   enum Kind {
     KIND_UNSPECIFIED = 0;
-    KIND_LINEAR = 1;
-    KIND_EXPONENTIAL = 2;
+    KIND_LINEAR = 1;       // DSL: backoff=linear(100ms)
+    KIND_EXPONENTIAL = 2;  // DSL: backoff=exp(100ms, 2.0x)
   }
   Kind kind = 1;
   uint32 base_delay_ms = 2;
   optional double multiplier = 3;  // Only for exponential
 }
 
+// DSL: [policy: timeout=60s, retry=3, backoff=exp(100ms, 2.0x)]
 message RunActionConfig {
-  optional uint32 timeout_seconds = 1;
-  optional uint32 max_retries = 2;
+  optional uint32 timeout_seconds = 1;  // DSL: timeout=60s
+  optional uint32 max_retries = 2;       // DSL: retry=3
   optional BackoffConfig backoff = 3;
+}
+
+// -----------------------------------------------------------------------------
+// Expressions - Structured representation for Rust-side evaluation
+// -----------------------------------------------------------------------------
+
+// JSON-compatible literal values
+// DSL Examples: null, true, false, 42, 3.14, "hello"
+message Literal {
+  oneof value {
+    bool null_value = 1;      // DSL: null
+    bool bool_value = 2;      // DSL: true, false
+    int64 int_value = 3;      // DSL: 42, -1, 0
+    double float_value = 4;   // DSL: 3.14, -0.5
+    string string_value = 5;  // DSL: "hello"
+  }
+}
+
+// A structured expression that can be evaluated in Rust
+// DSL: Any expression like variables, operators, subscripts, etc.
+message Expression {
+  oneof kind {
+    Literal literal = 1;           // DSL: null, true, 42, 3.14, "hello"
+    string variable = 2;           // DSL: result, item, my_var
+    Subscript subscript = 3;       // DSL: expr["key"], expr[0]
+    ArrayExpr array = 4;           // DSL: [1, 2, 3]
+    DictExpr dict = 5;             // DSL: {"a": 1, "b": 2}
+    BinaryOp binary_op = 6;        // DSL: a + b, a > b, x and y
+    UnaryOp unary_op = 7;          // DSL: not x, -x
+    CallExpr call = 8;             // DSL: len(x), str(x)
+    AttributeAccess attribute = 9; // DSL: obj.attr
+  }
+}
+
+// Subscript access
+// DSL: base["key"] or base[0]
+message Subscript {
+  Expression base = 1;             // The expression being subscripted
+  Expression key = 2;              // The key (string for dict, int for list)
+}
+
+// Attribute access
+// DSL: base.attr
+message AttributeAccess {
+  Expression base = 1;             // The expression being accessed
+  string attribute = 2;            // The attribute name
+}
+
+// Array literal expression
+// DSL: [elem1, elem2, elem3]
+message ArrayExpr {
+  repeated Expression elements = 1;
+}
+
+// Dict literal expression
+// DSL: {"key1": value1, "key2": value2}
+message DictExpr {
+  repeated DictEntry entries = 1;
+}
+
+message DictEntry {
+  string key = 1;                  // Dict keys are always strings in JSON
+  Expression value = 2;
+}
+
+// Binary operation
+// DSL: left OP right
+message BinaryOp {
+  enum Op {
+    OP_UNSPECIFIED = 0;
+    // Arithmetic: DSL uses +, -, *, /, %
+    OP_ADD = 1;   // DSL: a + b
+    OP_SUB = 2;   // DSL: a - b
+    OP_MUL = 3;   // DSL: a * b
+    OP_DIV = 4;   // DSL: a / b
+    OP_MOD = 5;   // DSL: a % b
+    // Comparison: DSL uses ==, !=, <, <=, >, >=
+    OP_EQ = 10;   // DSL: a == b
+    OP_NE = 11;   // DSL: a != b
+    OP_LT = 12;   // DSL: a < b
+    OP_LE = 13;   // DSL: a <= b
+    OP_GT = 14;   // DSL: a > b
+    OP_GE = 15;   // DSL: a >= b
+    // Logical: DSL uses 'and', 'or'
+    OP_AND = 20;  // DSL: a and b
+    OP_OR = 21;   // DSL: a or b
+    // Membership: DSL uses 'in', 'not in'
+    OP_IN = 30;      // DSL: a in b
+    OP_NOT_IN = 31;  // DSL: a not in b
+  }
+  Op op = 1;
+  Expression left = 2;
+  Expression right = 3;
+}
+
+// Unary operation
+// DSL: OP operand
+message UnaryOp {
+  enum Op {
+    OP_UNSPECIFIED = 0;
+    OP_NOT = 1;  // DSL: not x
+    OP_NEG = 2;  // DSL: -x
+  }
+  Op op = 1;
+  Expression operand = 2;
+}
+
+// Safe function call (allowlisted functions only)
+// DSL: function(arg1, arg2)
+// Allowed: len, str, int, float, bool, list, dict, tuple, set, sum, min, max, abs, etc.
+message CallExpr {
+  string function = 1;             // Function name
+  repeated Expression args = 2;
 }
 
 // -----------------------------------------------------------------------------
 // Core IR Nodes
 // -----------------------------------------------------------------------------
 
+// Structured keyword argument
+// DSL: name=value (within function calls)
+message KwArg {
+  string name = 1;
+  Expression value = 2;
+}
+
 // A single action invocation - the fundamental unit of durable execution
+// DSL: target = @module.action(arg1=val1, arg2=val2) [policy: timeout=60s]
+// DSL: @module.action(arg=val)  // no target assignment
 message ActionCall {
   string action = 1;              // Action name
   optional string module = 2;     // Module where action is defined
-  map<string, string> kwargs = 3; // Argument expressions as strings
+  repeated KwArg args = 3;        // Structured arguments
   optional string target = 4;     // Variable to assign result to
   optional RunActionConfig config = 5;
   optional SourceLocation location = 6;
 }
 
 // Invocation of a sub-graph (another method on the workflow class)
-// Pattern: self.method_name(arg1=val1, arg2=val2)
+// DSL: target = self.method_name(arg1=val1, arg2=val2)
+// DSL: self.method_name()  // no target assignment
 message SubgraphCall {
   string method_name = 1;         // Name of the method to invoke
-  map<string, string> kwargs = 2; // Argument expressions as strings
+  repeated KwArg args = 2;        // Structured arguments
   optional string target = 3;     // Variable to assign result to
   optional SourceLocation location = 4;
 }
@@ -77,6 +262,12 @@ message GatherCall {
 }
 
 // Parallel execution of multiple actions or subgraphs
+// DSL:
+//   results = parallel(
+//       @module.action1()
+//       @module.action2()
+//       self.subgraph_method(arg=val)
+//   )
 message Gather {
   repeated GatherCall calls = 1;
   optional string target = 2;     // Variable to assign tuple result to
@@ -84,36 +275,56 @@ message Gather {
 }
 
 // Arbitrary Python code that doesn't contain actions (escape hatch)
+// DSL:
+//   python(reads: var1, var2; writes: var3, var4) {
+//       x = var1 + var2
+//       var3 = x * 2
+//   }
 message PythonBlock {
   string code = 1;
   repeated string imports = 2;     // Import statements needed
   repeated string definitions = 3; // Function/class definitions needed
-  repeated string inputs = 4;      // Variables read
-  repeated string outputs = 5;     // Variables written
+  repeated string inputs = 4;      // Variables read (DSL: reads: ...)
+  repeated string outputs = 5;     // Variables written (DSL: writes: ...)
   optional SourceLocation location = 6;
 }
 
 // A for loop with a sub-graph body
+// DSL:
+//   loop item in collection -> [accumulator]:
+//       <statements>
+//
 // The body receives the loop variable bound to the current item each iteration.
-// The last statement's output (if it produces the accumulator variable) is collected.
+// The accumulator variable collects results (initialized as []).
 message Loop {
-  string iterator_expr = 1;        // Expression producing the iterable
-  string loop_var = 2;             // Loop variable name
-  string accumulator = 3;          // Variable to collect results into (initialized as [])
+  Expression iterator = 1;         // DSL: the 'collection' expression
+  string loop_var = 2;             // DSL: the 'item' variable name
+  string accumulator = 3;          // DSL: the '[accumulator]' variable
   repeated Statement body = 4;     // Sub-graph of statements executed each iteration
   optional SourceLocation location = 5;
 }
 
 // One branch of a conditional
+// DSL:
+//   branch if guard_expression:   // First branch
+//   branch elif guard_expression: // Middle branches
+//   branch else:                  // Last branch (no guard)
 message Branch {
-  string guard = 1;                // Guard expression (Python boolean expr)
-  repeated PythonBlock preamble = 2;  // Statements before first action
+  Expression guard = 1;              // DSL: the condition expression (empty for else branch)
+  repeated PythonBlock preamble = 2;  // DSL: # preamble (code before first action)
   repeated ActionCall actions = 3;    // One or more actions (chained in DAG)
-  repeated PythonBlock postamble = 4; // Statements after last action
+  repeated PythonBlock postamble = 4; // DSL: # postamble (code after last action)
   optional SourceLocation location = 5;
 }
 
 // If/elif/else with actions in each branch
+// DSL:
+//   branch if x > 50:
+//       result = @module.high_action()
+//   branch elif x > 25:
+//       result = @module.medium_action()
+//   branch else:
+//       result = @module.low_action()
 message Conditional {
   repeated Branch branches = 1;    // Must cover all cases (else required)
   optional string target = 2;      // Common target variable if branches assign
@@ -121,6 +332,13 @@ message Conditional {
 }
 
 // An except handler
+// DSL:
+//   except ValueError:
+//       <statements>
+//   except (ValueError, TypeError):
+//       <statements>
+//   except module.CustomError:
+//       <statements>
 message ExceptHandler {
   repeated ExceptionType exception_types = 1;
   repeated PythonBlock preamble = 2;    // Statements before first action
@@ -135,6 +353,13 @@ message ExceptionType {
 }
 
 // Try/except block with actions
+// DSL:
+//   try:
+//       result = @module.risky_action()
+//   except ValueError:
+//       result = @module.fallback_action()
+//   except (TypeError, KeyError):
+//       result = @module.other_fallback()
 message TryExcept {
   repeated PythonBlock try_preamble = 1;   // Statements before first action in try
   repeated ActionCall try_body = 2;         // One or more actions in try
@@ -144,28 +369,39 @@ message TryExcept {
 }
 
 // Durable sleep
+// DSL: @sleep(60)
+// DSL: @sleep(duration_var)
+// DSL: @sleep(wait_time * 2)
 message Sleep {
-  string duration_expr = 1;        // Duration in seconds (as expression string)
+  Expression duration = 1;         // Duration in seconds (can be expression)
   optional SourceLocation location = 2;
 }
 
 // Return statement
+// DSL:
+//   return                           // No value
+//   return expression                // Return expression
+//   return @module.action()          // Return action result
+//   return parallel(...)             // Return gather result
 message Return {
   oneof value {
-    string expr = 1;               // Return a variable or expression
-    ActionCall action = 2;         // Return result of action call
-    Gather gather = 3;             // Return result of gather
+    Expression expression = 1;     // DSL: return expr
+    ActionCall action = 2;         // DSL: return @module.action()
+    Gather gather = 3;             // DSL: return parallel(...)
   }
   optional SourceLocation location = 4;
 }
 
 // Compile-time expansion of action over collection
-// Pattern: [await action(x=item) for item in collection]
+// DSL: target = spread @module.action(arg=loop_var) over collection as loop_var
+//
+// This is a compile-time construct that expands to parallel action calls.
+// Unlike Loop, all iterations execute in parallel.
 message Spread {
-  ActionCall action = 1;           // Template action (kwargs reference loop_var)
-  string loop_var = 2;
-  string iterable = 3;             // Variable name of collection
-  optional string target = 4;
+  ActionCall action = 1;           // Template action (args reference loop_var)
+  string loop_var = 2;             // DSL: 'as loop_var'
+  Expression iterable = 3;         // DSL: 'over collection'
+  optional string target = 4;      // DSL: 'target = ...'
   optional SourceLocation location = 5;
 }
 
@@ -175,15 +411,15 @@ message Spread {
 
 message Statement {
   oneof kind {
-    ActionCall action_call = 1;
-    Gather gather = 2;
-    PythonBlock python_block = 3;
-    Loop loop = 4;
-    Conditional conditional = 5;
-    TryExcept try_except = 6;
-    Sleep sleep = 7;
-    Return return_stmt = 8;
-    Spread spread = 9;
+    ActionCall action_call = 1;    // DSL: @module.action()
+    Gather gather = 2;             // DSL: parallel(...)
+    PythonBlock python_block = 3;  // DSL: python { ... }
+    Loop loop = 4;                 // DSL: loop var in expr -> [acc]: ...
+    Conditional conditional = 5;   // DSL: branch if/elif/else
+    TryExcept try_except = 6;      // DSL: try: ... except: ...
+    Sleep sleep = 7;               // DSL: @sleep(duration)
+    Return return_stmt = 8;        // DSL: return ...
+    Spread spread = 9;             // DSL: spread @action() over collection as var
   }
 }
 
@@ -191,11 +427,15 @@ message Statement {
 // Workflow Definition
 // -----------------------------------------------------------------------------
 
+// DSL: workflow WorkflowName(param1: Type1, param2: Type2) -> ReturnType:
 message WorkflowParam {
   string name = 1;
   optional string type_annotation = 2;
 }
 
+// DSL:
+//   workflow MyWorkflow(items: list[int], threshold: float = 0.5) -> dict:
+//       <statements>
 message Workflow {
   string name = 1;
   repeated WorkflowParam params = 2;

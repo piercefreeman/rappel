@@ -20,7 +20,6 @@ pub fn parse_workflow_bytes(bytes: &[u8]) -> Result<Workflow, prost::DecodeError
 mod tests {
     use super::*;
     use prost::Message;
-    use std::collections::HashMap;
 
     fn make_location(line: u32, col: u32) -> SourceLocation {
         SourceLocation {
@@ -31,11 +30,32 @@ mod tests {
         }
     }
 
+    fn make_var_expr(name: &str) -> Expression {
+        Expression {
+            kind: Some(expression::Kind::Variable(name.to_string())),
+        }
+    }
+
+    fn make_string_literal(s: &str) -> Expression {
+        Expression {
+            kind: Some(expression::Kind::Literal(Literal {
+                value: Some(literal::Value::StringValue(s.to_string())),
+            })),
+        }
+    }
+
+    fn make_kwarg(name: &str, value: Expression) -> KwArg {
+        KwArg {
+            name: name.to_string(),
+            value: Some(value),
+        }
+    }
+
     fn make_action_call(name: &str, target: Option<&str>) -> ActionCall {
         ActionCall {
             action: name.to_string(),
             module: Some("test_module".to_string()),
-            kwargs: HashMap::from([("arg1".to_string(), "value1".to_string())]),
+            args: vec![make_kwarg("arg1", make_string_literal("value1"))],
             target: target.map(|s| s.to_string()),
             config: None,
             location: Some(make_location(1, 0)),
@@ -49,7 +69,8 @@ mod tests {
         assert_eq!(action.action, "test_action");
         assert_eq!(action.module, Some("test_module".to_string()));
         assert_eq!(action.target, Some("result".to_string()));
-        assert_eq!(action.kwargs.get("arg1"), Some(&"value1".to_string()));
+        assert_eq!(action.args.len(), 1);
+        assert_eq!(action.args[0].name, "arg1");
         assert!(action.location.is_some());
     }
 
@@ -91,7 +112,7 @@ mod tests {
                 GatherCall {
                     kind: Some(gather_call::Kind::Subgraph(SubgraphCall {
                         method_name: "process_data".to_string(),
-                        kwargs: HashMap::from([("value".to_string(), "x".to_string())]),
+                        args: vec![make_kwarg("value", make_var_expr("x"))],
                         target: None,
                         location: Some(make_location(2, 0)),
                     })),
@@ -110,7 +131,8 @@ mod tests {
         match &gather.calls[1].kind {
             Some(gather_call::Kind::Subgraph(s)) => {
                 assert_eq!(s.method_name, "process_data");
-                assert_eq!(s.kwargs.get("value"), Some(&"x".to_string()));
+                assert_eq!(s.args.len(), 1);
+                assert_eq!(s.args[0].name, "value");
             }
             _ => panic!("Expected Subgraph"),
         }
@@ -133,7 +155,7 @@ mod tests {
                 },
                 Statement {
                     kind: Some(statement::Kind::ReturnStmt(Return {
-                        value: Some(r#return::Value::Expr("data".to_string())),
+                        value: Some(r#return::Value::Expression(make_var_expr("data"))),
                         location: Some(make_location(3, 0)),
                     })),
                 },
@@ -153,7 +175,15 @@ mod tests {
         }
         match &workflow.body[1].kind {
             Some(statement::Kind::ReturnStmt(r)) => {
-                assert_eq!(r.value, Some(r#return::Value::Expr("data".to_string())));
+                match &r.value {
+                    Some(r#return::Value::Expression(e)) => {
+                        match &e.kind {
+                            Some(expression::Kind::Variable(name)) => assert_eq!(name, "data"),
+                            _ => panic!("Expected Variable expression"),
+                        }
+                    }
+                    _ => panic!("Expected Expression return value"),
+                }
             }
             _ => panic!("Expected Return"),
         }
@@ -161,17 +191,35 @@ mod tests {
 
     #[test]
     fn test_conditional() {
+        // Create expressions for guards
+        let gt_zero = Expression {
+            kind: Some(expression::Kind::BinaryOp(Box::new(BinaryOp {
+                left: Some(Box::new(make_var_expr("x"))),
+                op: binary_op::Op::Gt.into(), // Gt = 14
+                right: Some(Box::new(Expression {
+                    kind: Some(expression::Kind::Literal(Literal {
+                        value: Some(literal::Value::IntValue(0)),
+                    })),
+                })),
+            }))),
+        };
+        let true_expr = Expression {
+            kind: Some(expression::Kind::Literal(Literal {
+                value: Some(literal::Value::BoolValue(true)),
+            })),
+        };
+
         let cond = Conditional {
             branches: vec![
                 Branch {
-                    guard: "x > 0".to_string(),
+                    guard: Some(gt_zero),
                     preamble: vec![],
                     actions: vec![make_action_call("positive_action", Some("result"))],
                     postamble: vec![],
                     location: Some(make_location(1, 0)),
                 },
                 Branch {
-                    guard: "True".to_string(),
+                    guard: Some(true_expr),
                     preamble: vec![],
                     actions: vec![make_action_call("negative_action", Some("result"))],
                     postamble: vec![],
@@ -183,8 +231,8 @@ mod tests {
         };
 
         assert_eq!(cond.branches.len(), 2);
-        assert_eq!(cond.branches[0].guard, "x > 0");
-        assert_eq!(cond.branches[1].guard, "True");
+        assert!(cond.branches[0].guard.is_some());
+        assert!(cond.branches[1].guard.is_some());
         assert_eq!(cond.target, Some("result".to_string()));
     }
 
@@ -192,7 +240,7 @@ mod tests {
     fn test_loop() {
         // Loop body now contains statements in sequence
         let loop_ = Loop {
-            iterator_expr: "items".to_string(),
+            iterator: Some(make_var_expr("items")),
             loop_var: "item".to_string(),
             accumulator: "results".to_string(),
             body: vec![
@@ -226,7 +274,7 @@ mod tests {
             location: Some(make_location(1, 0)),
         };
 
-        assert_eq!(loop_.iterator_expr, "items");
+        assert!(loop_.iterator.is_some());
         assert_eq!(loop_.loop_var, "item");
         assert_eq!(loop_.accumulator, "results");
         assert_eq!(loop_.body.len(), 3);  // preamble + action + append

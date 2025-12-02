@@ -3,9 +3,9 @@
 //! This module transforms the hierarchical IR workflow structure into a flat
 //! DAG representation suitable for execution scheduling.
 
-use crate::dag::{BackoffPolicy, BranchMeta, Dag, EdgeKind, HandlerMeta, LoopHeadMeta, Node, NodeKind};
+use crate::dag::{BackoffPolicy, BranchMeta, Dag, EdgeKind, HandlerMeta, LoopHeadMeta, Node};
 use crate::ir_parser::proto as ir;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Error during IR-to-DAG conversion.
 #[derive(Debug, Clone)]
@@ -30,8 +30,6 @@ impl std::error::Error for ConversionError {}
 struct ConversionState {
     dag: Dag,
     node_counter: u32,
-    /// Maps variable names to the node that produces them
-    variable_producers: HashMap<String, String>,
     /// The last completed node ID (for sequencing)
     last_node_id: Option<String>,
 }
@@ -41,7 +39,6 @@ impl ConversionState {
         Self {
             dag: Dag::new(concurrent),
             node_counter: 0,
-            variable_producers: HashMap::new(),
             last_node_id: None,
         }
     }
@@ -53,11 +50,6 @@ impl ConversionState {
     }
 
     fn add_node(&mut self, node: Node) {
-        // Track what this node produces
-        for var in &node.produces {
-            self.variable_producers.insert(var.clone(), node.id.clone());
-        }
-
         // Add data edge from last node if exists
         if let Some(last_id) = &self.last_node_id {
             if let Some(last_node) = self.dag.get_node_mut(last_id) {
@@ -131,9 +123,12 @@ fn convert_action_call(state: &mut ConversionState, action: &ir::ActionCall) -> 
         node.module = Some(module.clone());
     }
 
-    // Copy kwargs
-    for (k, v) in &action.kwargs {
-        node.kwargs.insert(k.clone(), v.clone());
+    // Copy structured args as kwargs (converting Expression to code string)
+    for kwarg in &action.args {
+        if let Some(value) = &kwarg.value {
+            let value_str = expression_to_code(value);
+            node.kwargs.insert(kwarg.name.clone(), value_str);
+        }
     }
 
     // Set produces if target is specified
@@ -224,7 +219,6 @@ fn convert_gather(state: &mut ConversionState, gather: &ir::Gather) -> Result<()
         }
 
         state.dag.add_node(join_node);
-        state.variable_producers.insert(target.clone(), join_id.clone());
         state.last_node_id = Some(join_id);
     } else if !parallel_node_ids.is_empty() {
         state.last_node_id = Some(parallel_node_ids.last().unwrap().clone());
@@ -304,9 +298,14 @@ fn convert_loop(state: &mut ConversionState, loop_: &ir::Loop) -> Result<(), Con
     let body_entry_id = body_entry.unwrap_or_default();
     let body_tail_id = body_tail.unwrap_or_default();
 
+    // Convert iterator expression to string
+    let iterator_var = loop_.iterator.as_ref()
+        .map(expression_to_code)
+        .unwrap_or_default();
+
     // Create loop head node
     let loop_meta = LoopHeadMeta {
-        iterator_var: loop_.iterator_expr.clone(),
+        iterator_var,
         loop_var: loop_.loop_var.clone(),
         body_entry: body_entry_id.clone(),
         body_tail: body_tail_id.clone(),
@@ -317,7 +316,6 @@ fn convert_loop(state: &mut ConversionState, loop_: &ir::Loop) -> Result<(), Con
 
     // The loop produces the accumulator variable
     loop_head.produces.push(loop_.accumulator.clone());
-    state.variable_producers.insert(loop_.accumulator.clone(), loop_head_id.clone());
 
     // Add Continue edge from loop_head to body entry
     if !body_entry_id.is_empty() {
@@ -418,15 +416,20 @@ fn convert_conditional(state: &mut ConversionState, cond: &ir::Conditional) -> R
         }
 
         state.dag.add_node(merge_node);
-        state.variable_producers.insert(target.clone(), merge_id.clone());
         Some(merge_id.clone())
     } else {
         None
     };
 
+    // Convert guard expression to string for the first branch
+    let guard_expr = cond.branches.first()
+        .and_then(|b| b.guard.as_ref())
+        .map(expression_to_code)
+        .unwrap_or_default();
+
     // Create branch metadata
     let branch_meta = BranchMeta {
-        guard_expr: cond.branches.first().map(|b| b.guard.clone()).unwrap_or_default(),
+        guard_expr,
         true_entry,
         false_entry,
         true_nodes,
@@ -474,7 +477,7 @@ fn convert_try_except(state: &mut ConversionState, te: &ir::TryExcept) -> Result
     let try_end = state.last_node_id.clone();
 
     // Process handlers
-    let mut handlers_meta = Vec::new();
+    let mut _handlers_meta = Vec::new();
     let mut handler_end_ids = Vec::new();
 
     for handler in &te.handlers {
@@ -526,7 +529,7 @@ fn convert_try_except(state: &mut ConversionState, te: &ir::TryExcept) -> Result
             }
         }
 
-        handlers_meta.push(HandlerMeta {
+        _handlers_meta.push(HandlerMeta {
             entry: entry.clone(),
             nodes: handler_nodes,
             exception_types: handler.exception_types.iter()
@@ -563,7 +566,10 @@ fn convert_try_except(state: &mut ConversionState, te: &ir::TryExcept) -> Result
 
 fn convert_sleep(state: &mut ConversionState, sleep: &ir::Sleep) -> Result<(), ConversionError> {
     let node_id = state.next_node_id("sleep");
-    let node = Node::sleep(&node_id, &sleep.duration_expr);
+    let duration_str = sleep.duration.as_ref()
+        .map(expression_to_code)
+        .unwrap_or_default();
+    let node = Node::sleep(&node_id, &duration_str);
     state.add_node(node);
     Ok(())
 }
@@ -572,19 +578,19 @@ fn convert_return(state: &mut ConversionState, ret: &ir::Return) -> Result<(), C
     let value = ret.value.as_ref();
 
     match value {
-        Some(ir::r#return::Value::Expr(expr)) => {
-            // Simple variable reference
-            let is_simple_var = expr.chars().all(|c| c.is_alphanumeric() || c == '_')
-                && !expr.is_empty()
-                && !expr.chars().next().unwrap().is_numeric();
+        Some(ir::r#return::Value::Expression(expr)) => {
+            // Convert structured expression to code string for evaluation
+            let expr_str = expression_to_code(expr);
+            let is_simple_var = expr_str.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && !expr_str.is_empty()
+                && !expr_str.chars().next().unwrap().is_numeric();
 
             if is_simple_var {
-                state.dag.return_variable = Some(expr.clone());
+                state.dag.return_variable = Some(expr_str);
             } else {
-                // Complex expression - create python_block
                 let node_id = state.next_node_id("return");
                 let mut node = Node::computed(&node_id);
-                node.kwargs.insert("code".to_string(), format!("__workflow_return = {}", expr));
+                node.kwargs.insert("code".to_string(), format!("__workflow_return = {}", expr_str));
                 node.produces.push("__workflow_return".to_string());
                 state.add_node(node);
                 state.dag.return_variable = Some("__workflow_return".to_string());
@@ -622,8 +628,12 @@ fn convert_spread(state: &mut ConversionState, spread: &ir::Spread) -> Result<()
         if let Some(module) = &action.module {
             node.module = Some(module.clone());
         }
-        for (k, v) in &action.kwargs {
-            node.kwargs.insert(k.clone(), v.clone());
+        // Copy structured args as kwargs
+        for kwarg in &action.args {
+            if let Some(value) = &kwarg.value {
+                let value_str = expression_to_code(value);
+                node.kwargs.insert(kwarg.name.clone(), value_str);
+            }
         }
         node
     } else {
@@ -636,9 +646,14 @@ fn convert_spread(state: &mut ConversionState, spread: &ir::Spread) -> Result<()
     action_node.loop_id = Some(loop_id.clone());
     state.dag.add_node(action_node);
 
+    // Convert iterable expression to string
+    let iterator_var = spread.iterable.as_ref()
+        .map(expression_to_code)
+        .unwrap_or_default();
+
     // Create loop head
     let loop_meta = LoopHeadMeta {
-        iterator_var: spread.iterable.clone(),
+        iterator_var,
         loop_var: spread.loop_var.clone(),
         body_entry: action_node_id.clone(),
         body_tail: action_node_id.clone(),
@@ -663,22 +678,109 @@ fn convert_spread(state: &mut ConversionState, spread: &ir::Spread) -> Result<()
         action_node.add_edge(loop_head_id.clone(), EdgeKind::Back);
     }
 
-    state.variable_producers.insert(target, loop_head_id.clone());
     state.last_node_id = Some(loop_head_id);
 
     Ok(())
 }
 
+/// Convert a structured Expression to Python code string
+fn expression_to_code(expr: &ir::Expression) -> String {
+    let kind = match &expr.kind {
+        Some(k) => k,
+        None => return String::new(),
+    };
+
+    match kind {
+        ir::expression::Kind::Literal(lit) => literal_to_code(lit),
+        ir::expression::Kind::Variable(name) => name.clone(),
+        ir::expression::Kind::Subscript(sub) => {
+            let base = sub.base.as_ref().map(|e| expression_to_code(e)).unwrap_or_default();
+            let key = sub.key.as_ref().map(|e| expression_to_code(e)).unwrap_or_default();
+            format!("{}[{}]", base, key)
+        }
+        ir::expression::Kind::Array(arr) => {
+            let elements: Vec<String> = arr.elements.iter().map(expression_to_code).collect();
+            format!("[{}]", elements.join(", "))
+        }
+        ir::expression::Kind::Dict(dict) => {
+            let entries: Vec<String> = dict.entries.iter()
+                .map(|e| {
+                    let val = e.value.as_ref().map(expression_to_code).unwrap_or_default();
+                    format!("\"{}\": {}", e.key, val)
+                })
+                .collect();
+            format!("{{{}}}", entries.join(", "))
+        }
+        ir::expression::Kind::BinaryOp(binop) => {
+            let left = binop.left.as_ref().map(|e| expression_to_code(e)).unwrap_or_default();
+            let right = binop.right.as_ref().map(|e| expression_to_code(e)).unwrap_or_default();
+            let op = match ir::binary_op::Op::try_from(binop.op) {
+                Ok(ir::binary_op::Op::Add) => "+",
+                Ok(ir::binary_op::Op::Sub) => "-",
+                Ok(ir::binary_op::Op::Mul) => "*",
+                Ok(ir::binary_op::Op::Div) => "/",
+                Ok(ir::binary_op::Op::Mod) => "%",
+                Ok(ir::binary_op::Op::Eq) => "==",
+                Ok(ir::binary_op::Op::Ne) => "!=",
+                Ok(ir::binary_op::Op::Lt) => "<",
+                Ok(ir::binary_op::Op::Le) => "<=",
+                Ok(ir::binary_op::Op::Gt) => ">",
+                Ok(ir::binary_op::Op::Ge) => ">=",
+                Ok(ir::binary_op::Op::And) => "and",
+                Ok(ir::binary_op::Op::Or) => "or",
+                Ok(ir::binary_op::Op::In) => "in",
+                Ok(ir::binary_op::Op::NotIn) => "not in",
+                _ => "??",
+            };
+            format!("({} {} {})", left, op, right)
+        }
+        ir::expression::Kind::UnaryOp(unop) => {
+            let operand = unop.operand.as_ref().map(|e| expression_to_code(e)).unwrap_or_default();
+            match ir::unary_op::Op::try_from(unop.op) {
+                Ok(ir::unary_op::Op::Not) => format!("(not {})", operand),
+                Ok(ir::unary_op::Op::Neg) => format!("(-{})", operand),
+                _ => operand,
+            }
+        }
+        ir::expression::Kind::Call(call) => {
+            let args: Vec<String> = call.args.iter().map(expression_to_code).collect();
+            format!("{}({})", call.function, args.join(", "))
+        }
+        ir::expression::Kind::Attribute(attr) => {
+            let base = attr.base.as_ref().map(|e| expression_to_code(e)).unwrap_or_default();
+            format!("{}.{}", base, attr.attribute)
+        }
+    }
+}
+
+fn literal_to_code(lit: &ir::Literal) -> String {
+    match &lit.value {
+        Some(ir::literal::Value::NullValue(_)) => "None".to_string(),
+        Some(ir::literal::Value::BoolValue(b)) => if *b { "True" } else { "False" }.to_string(),
+        Some(ir::literal::Value::IntValue(i)) => i.to_string(),
+        Some(ir::literal::Value::FloatValue(f)) => f.to_string(),
+        Some(ir::literal::Value::StringValue(s)) => format!("\"{}\"", s),
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use crate::dag::NodeKind;
+
+    /// Helper function to create a variable expression for tests
+    fn make_var_expr(name: &str) -> ir::Expression {
+        ir::Expression {
+            kind: Some(ir::expression::Kind::Variable(name.to_string())),
+        }
+    }
 
     fn make_action(name: &str, target: Option<&str>) -> ir::ActionCall {
         ir::ActionCall {
             action: name.to_string(),
             module: Some("test".to_string()),
-            kwargs: HashMap::new(),
+            args: vec![],
             target: target.map(|s| s.to_string()),
             config: None,
             location: None,
@@ -708,8 +810,7 @@ mod tests {
         let fetch_node = dag.nodes.values().find(|n| n.action.as_deref() == Some("fetch")).unwrap();
         assert_eq!(fetch_node.produces, vec!["data"]);
 
-        let process_node = dag.nodes.values().find(|n| n.action.as_deref() == Some("process")).unwrap();
-        assert!(process_node.kwargs.is_empty() || true); // Just checking it exists
+        let _process_node = dag.nodes.values().find(|n| n.action.as_deref() == Some("process")).unwrap();
     }
 
     #[test]
@@ -751,7 +852,7 @@ mod tests {
             body: vec![
                 make_statement(ir::statement::Kind::ActionCall(make_action("fetch", Some("data")))),
                 make_statement(ir::statement::Kind::ReturnStmt(ir::Return {
-                    value: Some(ir::r#return::Value::Expr("data".to_string())),
+                    value: Some(ir::r#return::Value::Expression(make_var_expr("data"))),
                     location: None,
                 })),
             ],
