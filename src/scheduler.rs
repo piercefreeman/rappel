@@ -421,7 +421,22 @@ impl<'a> Scheduler<'a> {
             }
         }
 
+        // If no more ready nodes, check if workflow is complete
+        if newly_ready.is_empty() && self.is_workflow_complete(state) {
+            let result = self.dag.return_variable.as_ref()
+                .and_then(|var| state.get_var(var).cloned());
+            return Ok(SchedulerAction::WorkflowComplete { result });
+        }
+
         Ok(SchedulerAction::NodesReady { node_ids: newly_ready })
+    }
+
+    /// Check if all nodes in the workflow are completed
+    fn is_workflow_complete(&self, state: &InstanceState) -> bool {
+        // All nodes must be in Completed state
+        self.dag.nodes.keys().all(|node_id| {
+            matches!(state.node_states.get(node_id), Some(NodeState::Completed))
+        })
     }
 
     /// Try to unlock a node (increment deps_satisfied, mark ready if all satisfied)

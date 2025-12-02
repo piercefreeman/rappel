@@ -26,7 +26,11 @@ if _version_not_supported:
 
 
 class WorkflowServiceStub(object):
-    """Missing associated documentation comment in .proto file."""
+    """=============================================================================
+    Services
+    =============================================================================
+
+    """
 
     def __init__(self, channel):
         """Constructor.
@@ -47,7 +51,11 @@ class WorkflowServiceStub(object):
 
 
 class WorkflowServiceServicer(object):
-    """Missing associated documentation comment in .proto file."""
+    """=============================================================================
+    Services
+    =============================================================================
+
+    """
 
     def RegisterWorkflow(self, request, context):
         """Missing associated documentation comment in .proto file."""
@@ -83,7 +91,11 @@ def add_WorkflowServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class WorkflowService(object):
-    """Missing associated documentation comment in .proto file."""
+    """=============================================================================
+    Services
+    =============================================================================
+
+    """
 
     @staticmethod
     def RegisterWorkflow(request,

@@ -82,20 +82,32 @@ impl Store {
         Self { pool }
     }
 
+    /// Get the underlying database pool
+    pub fn pool(&self) -> &Pool<Postgres> {
+        &self.pool
+    }
+
     /// Initialize database schema
     pub async fn init_schema(&self) -> Result<()> {
+        // Create workflows table
         sqlx::query(
             r#"
-            -- Workflow definitions
             CREATE TABLE IF NOT EXISTS workflows (
                 id UUID PRIMARY KEY,
                 name TEXT NOT NULL,
                 dag_json JSONB NOT NULL,
                 concurrent BOOLEAN NOT NULL DEFAULT false,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create workflows table")?;
 
-            -- Workflow instances
+        // Create instances table
+        sqlx::query(
+            r#"
             CREATE TABLE IF NOT EXISTS instances (
                 id UUID PRIMARY KEY,
                 workflow_id UUID NOT NULL REFERENCES workflows(id),
@@ -105,9 +117,16 @@ impl Store {
                 result BYTEA,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 completed_at TIMESTAMPTZ
-            );
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create instances table")?;
 
-            -- Action queue
+        // Create action_queue table
+        sqlx::query(
+            r#"
             CREATE TABLE IF NOT EXISTS action_queue (
                 id UUID PRIMARY KEY,
                 instance_id UUID NOT NULL REFERENCES instances(id),
@@ -120,21 +139,34 @@ impl Store {
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 started_at TIMESTAMPTZ,
                 completed_at TIMESTAMPTZ
-            );
-
-            -- Index for dequeuing
-            CREATE INDEX IF NOT EXISTS idx_action_queue_pending
-                ON action_queue(status, created_at)
-                WHERE status = 'pending';
-
-            -- Index for instance lookup
-            CREATE INDEX IF NOT EXISTS idx_action_queue_instance
-                ON action_queue(instance_id);
+            )
             "#,
         )
         .execute(&self.pool)
         .await
-        .context("Failed to initialize schema")?;
+        .context("Failed to create action_queue table")?;
+
+        // Create indexes
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_action_queue_pending
+                ON action_queue(status, created_at)
+                WHERE status = 'pending'
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create pending index")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_action_queue_instance
+                ON action_queue(instance_id)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create instance index")?;
 
         Ok(())
     }
@@ -157,7 +189,7 @@ impl Store {
         // Create workflow record
         let workflow_id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO workflows (id, name, dag_json, concurrent) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO workflows (id, name, dag_json, concurrent) VALUES ($1, $2, $3::jsonb, $4)",
         )
         .bind(workflow_id)
         .bind(&registration.workflow_name)
@@ -165,7 +197,7 @@ impl Store {
         .bind(registration.concurrent)
         .execute(&self.pool)
         .await
-        .context("Failed to insert workflow")?;
+        .map_err(|e| anyhow!("Failed to insert workflow: {} (name={}, dag_len={})", e, registration.workflow_name, dag_json.len()))?;
 
         // Create initial instance state
         let initial_context = decode_workflow_args(registration.initial_context.as_ref());
@@ -180,7 +212,7 @@ impl Store {
         // Create instance record
         let instance_id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO instances (id, workflow_id, state_json, status, workflow_input) VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO instances (id, workflow_id, state_json, status, workflow_input) VALUES ($1, $2, $3::jsonb, $4, $5)",
         )
         .bind(instance_id)
         .bind(workflow_id)
@@ -271,7 +303,7 @@ impl Store {
         sqlx::query(
             r#"
             INSERT INTO action_queue (id, instance_id, node_id, dispatch_json, timeout_seconds, max_retries)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            VALUES ($1, $2, $3, $4::jsonb, $5, $6)
             "#,
         )
         .bind(action_id)
@@ -300,7 +332,7 @@ impl Store {
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
             )
-            RETURNING id, instance_id, node_id, dispatch_json, timeout_seconds, max_retries, attempt
+            RETURNING id, instance_id, node_id, dispatch_json::text, timeout_seconds, max_retries, attempt
             "#,
         )
         .fetch_optional(&self.pool)
@@ -415,7 +447,7 @@ impl Store {
     async fn load_instance(&self, instance_id: Uuid) -> Result<(InstanceState, Dag, WorkflowArguments)> {
         let row = sqlx::query(
             r#"
-            SELECT i.state_json, w.dag_json, i.workflow_input
+            SELECT i.state_json::text, w.dag_json::text, i.workflow_input
             FROM instances i
             JOIN workflows w ON i.workflow_id = w.id
             WHERE i.id = $1
@@ -447,7 +479,7 @@ impl Store {
         let state_json = serde_json::to_string(state)
             .context("Failed to serialize state")?;
 
-        sqlx::query("UPDATE instances SET state_json = $2 WHERE id = $1")
+        sqlx::query("UPDATE instances SET state_json = $2::jsonb WHERE id = $1")
             .bind(instance_id)
             .bind(&state_json)
             .execute(&self.pool)
@@ -475,6 +507,88 @@ impl Store {
         .context("Failed to complete instance")?;
 
         Ok(())
+    }
+
+    /// Get workflow by name
+    pub async fn get_workflow_by_name(&self, name: &str) -> Result<Option<(Uuid, Dag)>> {
+        let row = sqlx::query(
+            "SELECT id, dag_json::text FROM workflows WHERE name = $1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to get workflow by name")?;
+
+        match row {
+            Some(row) => {
+                let id: Uuid = row.get("id");
+                let dag_json: String = row.get("dag_json");
+                let dag: Dag = serde_json::from_str(&dag_json)
+                    .context("Failed to deserialize DAG")?;
+                Ok(Some((id, dag)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Create an instance with input for an existing workflow
+    pub async fn create_instance_with_input(
+        &self,
+        workflow_id: Uuid,
+        workflow_input: &[u8],
+    ) -> Result<Uuid> {
+        // Load the DAG
+        let row = sqlx::query("SELECT dag_json::text FROM workflows WHERE id = $1")
+            .bind(workflow_id)
+            .fetch_one(&self.pool)
+            .await
+            .context("Workflow not found")?;
+
+        let dag_json: String = row.get("dag_json");
+        let dag: Dag = serde_json::from_str(&dag_json)
+            .context("Failed to deserialize DAG")?;
+
+        // Decode workflow input
+        let workflow_args: WorkflowArguments = prost::Message::decode(workflow_input)
+            .context("Failed to decode workflow input")?;
+        let initial_context = decode_workflow_args(Some(&workflow_args));
+
+        // Create initial instance state
+        let state = InstanceState::new(&dag, initial_context);
+        let state_json = serde_json::to_string(&state)
+            .context("Failed to serialize state")?;
+
+        // Create instance record
+        let instance_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO instances (id, workflow_id, state_json, status, workflow_input) VALUES ($1, $2, $3::jsonb, $4, $5)",
+        )
+        .bind(instance_id)
+        .bind(workflow_id)
+        .bind(&state_json)
+        .bind("running")
+        .bind(workflow_input)
+        .execute(&self.pool)
+        .await
+        .context("Failed to insert instance")?;
+
+        // Schedule initial ready nodes
+        self.schedule_ready_nodes(instance_id, &dag, &state).await?;
+
+        Ok(instance_id)
+    }
+
+    /// Get the latest instance for a workflow
+    pub async fn get_latest_instance_for_workflow(&self, workflow_id: Uuid) -> Result<Option<Uuid>> {
+        let row = sqlx::query(
+            "SELECT id FROM instances WHERE workflow_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(workflow_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to get latest instance")?;
+
+        Ok(row.map(|r| r.get("id")))
     }
 
     /// Get instance status and result

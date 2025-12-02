@@ -27,16 +27,16 @@ async def with_dependency(value: int, suffix: Annotated[str, Depend(provide_suff
     return f"{value}-{suffix}"
 
 
-def _build_resolved_dispatch() -> pb2.WorkflowNodeDispatch:
+def _build_resolved_dispatch() -> pb2.NodeDispatch:
     if action_registry.get("multiply") is None:
         action_registry.register("multiply", multiply)
-    node = pb2.WorkflowDagNode(
+    node = pb2.NodeInfo(
         id="node_multiply",
         action="multiply",
         module=__name__,
     )
     node.produces.append("value")
-    dispatch = pb2.WorkflowNodeDispatch(node=node)
+    dispatch = pb2.NodeDispatch(node=node)
     resolved = pb2.WorkflowArguments()
     entry = resolved.arguments.add()
     entry.key = "value"
@@ -46,20 +46,19 @@ def _build_resolved_dispatch() -> pb2.WorkflowNodeDispatch:
     return dispatch
 
 
-def _build_exception_dispatch(include_error: bool) -> pb2.WorkflowNodeDispatch:
+def _build_exception_dispatch(include_error: bool) -> pb2.NodeDispatch:
     if action_registry.get("exception_handler") is None:
         action_registry.register("exception_handler", exception_handler)
-    node = pb2.WorkflowDagNode(
+    node = pb2.NodeInfo(
         id="node_handler",
         action="exception_handler",
         module=__name__,
     )
     node.produces.append("value")
-    node.guard = "__workflow_exceptions.get('node_source') is not None"
     edge = node.exception_edges.add()
     edge.source_node_id = "node_source"
     edge.exception_type = "RuntimeError"
-    dispatch = pb2.WorkflowNodeDispatch(node=node)
+    dispatch = pb2.NodeDispatch(node=node)
     dispatch.workflow_input.CopyFrom(pb2.WorkflowArguments())
     if include_error:
         payload = serialize_error_payload("source", RuntimeError("boom"))
@@ -67,21 +66,21 @@ def _build_exception_dispatch(include_error: bool) -> pb2.WorkflowNodeDispatch:
         payload = serialize_result_payload("noop")
     entry = dispatch.context.add()
     entry.variable = ""
-    entry.workflow_node_id = "node_source"
+    entry.source_node_id = "node_source"
     entry.payload.CopyFrom(payload)
     return dispatch
 
 
-def _build_dependency_dispatch() -> pb2.WorkflowNodeDispatch:
+def _build_dependency_dispatch() -> pb2.NodeDispatch:
     if action_registry.get("with_dependency") is None:
         action_registry.register("with_dependency", with_dependency)
-    node = pb2.WorkflowDagNode(
+    node = pb2.NodeInfo(
         id="node_dependency",
         action="with_dependency",
         module=__name__,
     )
     node.produces.append("value")
-    dispatch = pb2.WorkflowNodeDispatch(node=node)
+    dispatch = pb2.NodeDispatch(node=node)
     resolved = pb2.WorkflowArguments()
     entry = resolved.arguments.add()
     entry.key = "value"
@@ -132,7 +131,7 @@ else:
 """
 
     # Create a node that simulates the merge python_block
-    node = pb2.WorkflowDagNode(
+    node = pb2.NodeInfo(
         id="node_merge",
         action="python_block",
     )
@@ -167,7 +166,7 @@ def test_build_context_unwraps_workflow_node_result_for_temp_variables() -> None
     from rappel.workflow_runtime import _build_context
 
     # Create a dispatch with context entries from a guarded action node
-    dispatch = pb2.WorkflowNodeDispatch()
+    dispatch = pb2.NodeDispatch()
     dispatch.workflow_input.CopyFrom(pb2.WorkflowArguments())
 
     # Simulate what happens when a guarded action node produces a temp variable
@@ -178,7 +177,7 @@ def test_build_context_unwraps_workflow_node_result_for_temp_variables() -> None
     # The context entry has the temp variable name and the serialized result
     entry = dispatch.context.add()
     entry.variable = temp_var_name
-    entry.workflow_node_id = "node_0"
+    entry.source_node_id = "node_0"
     payload = serialize_result_payload(action_result)
     entry.payload.CopyFrom(payload)
 
@@ -203,7 +202,7 @@ def test_build_context_unwraps_workflow_node_result_variables() -> None:
     """
     from rappel.workflow_runtime import WorkflowNodeResult, _build_context
 
-    dispatch = pb2.WorkflowNodeDispatch()
+    dispatch = pb2.NodeDispatch()
     dispatch.workflow_input.CopyFrom(pb2.WorkflowArguments())
 
     # Simulate a python_block that produces a temp variable
@@ -215,7 +214,7 @@ def test_build_context_unwraps_workflow_node_result_variables() -> None:
 
     entry = dispatch.context.add()
     entry.variable = temp_var_name
-    entry.workflow_node_id = "node_0"
+    entry.source_node_id = "node_0"
     payload = serialize_result_payload(node_result)
     entry.payload.CopyFrom(payload)
 
@@ -243,7 +242,7 @@ def test_build_context_unwraps_dict_result_for_temp_variable() -> None:
     """
     from rappel.workflow_runtime import _build_context
 
-    dispatch = pb2.WorkflowNodeDispatch()
+    dispatch = pb2.NodeDispatch()
     dispatch.workflow_input.CopyFrom(pb2.WorkflowArguments())
 
     temp_var_name = "__branch_message_node_0"
@@ -254,7 +253,7 @@ def test_build_context_unwraps_dict_result_for_temp_variable() -> None:
 
     entry = dispatch.context.add()
     entry.variable = temp_var_name
-    entry.workflow_node_id = "node_0"
+    entry.source_node_id = "node_0"
     payload = serialize_result_payload(dict_result)
     entry.payload.CopyFrom(payload)
 
@@ -298,7 +297,7 @@ else:
     raise RuntimeError("conditional branch produced no value for message")
 """
 
-    node = pb2.WorkflowDagNode(
+    node = pb2.NodeInfo(
         id="node_merge",
         action="python_block",
     )

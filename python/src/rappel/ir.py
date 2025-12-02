@@ -206,8 +206,16 @@ class VariableAnalyzer(ast.NodeVisitor):
                 attr = call.func
                 # List/dict mutating methods
                 mutating_methods = {
-                    "append", "extend", "insert", "remove", "pop", "clear",
-                    "reverse", "sort", "update", "setdefault"
+                    "append",
+                    "extend",
+                    "insert",
+                    "remove",
+                    "pop",
+                    "clear",
+                    "reverse",
+                    "sort",
+                    "update",
+                    "setdefault",
                 }
                 if attr.attr in mutating_methods and isinstance(attr.value, ast.Name):
                     var_name = attr.value.id

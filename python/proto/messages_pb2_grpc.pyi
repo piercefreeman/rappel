@@ -63,6 +63,11 @@ _WorkflowServiceWaitForInstanceType = typing_extensions.TypeVar(
 class WorkflowServiceStub(
     typing.Generic[_WorkflowServiceRegisterWorkflowType, _WorkflowServiceWaitForInstanceType]
 ):
+    """=============================================================================
+    Services
+    =============================================================================
+    """
+
     @typing.overload
     def __init__(
         self: WorkflowServiceStub[
@@ -108,6 +113,11 @@ WorkflowServiceAsyncStub: typing_extensions.TypeAlias = WorkflowServiceStub[
 ]
 
 class WorkflowServiceServicer(metaclass=abc.ABCMeta):
+    """=============================================================================
+    Services
+    =============================================================================
+    """
+
     @abc.abstractmethod
     def RegisterWorkflow(
         self,

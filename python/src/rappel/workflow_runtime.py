@@ -30,7 +30,7 @@ def _decode_workflow_input(payload: pb2.WorkflowArguments | None) -> dict[str, A
 
 
 def _build_context(
-    dispatch: pb2.WorkflowNodeDispatch,
+    dispatch: pb2.NodeDispatch,
 ) -> Tuple[dict[str, Any], dict[str, Dict[str, Any]]]:
     context: dict[str, Any] = {}
     exceptions: dict[str, Dict[str, Any]] = {}
@@ -40,7 +40,7 @@ def _build_context(
         variable = entry.variable
         decoded = deserialize_result_payload(entry.payload)
         if decoded.error is not None:
-            source_id = getattr(entry, "workflow_node_id", "")
+            source_id = getattr(entry, "source_node_id", "")
             if source_id:
                 error_data = dict(decoded.error)
                 exceptions[source_id] = error_data
@@ -91,13 +91,13 @@ def _build_context(
     return context, exceptions
 
 
-def _ensure_action_module(node: pb2.WorkflowDagNode) -> None:
+def _ensure_action_module(node: pb2.NodeInfo) -> None:
     module_name = getattr(node, "module", "")
     if module_name:
         importlib.import_module(module_name)
 
 
-def _evaluate_kwargs(node: pb2.WorkflowDagNode, context: dict[str, Any]) -> Dict[str, Any]:
+def _evaluate_kwargs(node: pb2.NodeInfo, context: dict[str, Any]) -> Dict[str, Any]:
     namespace = {**context}
     evaluated: Dict[str, Any] = {}
     for key, expr in node.kwargs.items():
@@ -106,7 +106,7 @@ def _evaluate_kwargs(node: pb2.WorkflowDagNode, context: dict[str, Any]) -> Dict
 
 
 def _matching_exception_sources(
-    node: pb2.WorkflowDagNode, exceptions: dict[str, Dict[str, Any]]
+    node: pb2.NodeInfo, exceptions: dict[str, Dict[str, Any]]
 ) -> list[str]:
     matches: list[str] = []
     for edge in getattr(node, "exception_edges", []):
@@ -127,7 +127,7 @@ def _matching_exception_sources(
 
 
 def _validate_exception_context(
-    node: pb2.WorkflowDagNode,
+    node: pb2.NodeInfo,
     exceptions: dict[str, Dict[str, Any]],
     matched_sources: list[str],
 ) -> None:
@@ -140,7 +140,7 @@ def _validate_exception_context(
         raise RuntimeError(f"dependency {source} failed")
 
 
-def _import_support_blocks(node: pb2.WorkflowDagNode, namespace: dict[str, Any]) -> None:
+def _import_support_blocks(node: pb2.NodeInfo, namespace: dict[str, Any]) -> None:
     imports = node.kwargs.get("imports")
     definitions = node.kwargs.get("definitions")
     if imports:
@@ -159,7 +159,7 @@ def _import_support_blocks(node: pb2.WorkflowDagNode, namespace: dict[str, Any])
             exec(definition, namespace)  # noqa: S102 - controlled by workflow author
 
 
-def _execute_python_block(node: pb2.WorkflowDagNode, context: dict[str, Any]) -> dict[str, Any]:
+def _execute_python_block(node: pb2.NodeInfo, context: dict[str, Any]) -> dict[str, Any]:
     namespace = dict(context)
     _import_support_blocks(node, namespace)
     code = node.kwargs.get("code")
@@ -173,7 +173,7 @@ def _execute_python_block(node: pb2.WorkflowDagNode, context: dict[str, Any]) ->
     return result
 
 
-async def execute_node(dispatch: pb2.WorkflowNodeDispatch) -> NodeExecutionResult:
+async def execute_node(dispatch: pb2.NodeDispatch) -> NodeExecutionResult:
     context, exceptions = _build_context(dispatch)
     node = dispatch.node
     if node is None:

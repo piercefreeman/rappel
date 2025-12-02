@@ -334,6 +334,7 @@ class LoopWithPreambleWorkflow(Workflow):
     def test_multi_accumulator_loop_raises_error(self, action_defs: dict[str, ActionDefinition]):
         """Test that loops with multiple accumulators raise an error."""
         import pytest
+
         from rappel.ir import IRParseError
 
         code = """
