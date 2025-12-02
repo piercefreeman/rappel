@@ -14,6 +14,7 @@ const INTEGRATION_LOOP: &str = include_str!("fixtures/integration_loop.py");
 const INTEGRATION_LOOP_ACCUM: &str = include_str!("fixtures/integration_loop_accum.py");
 const INTEGRATION_CONDITIONAL: &str = include_str!("fixtures/integration_conditional.py");
 const INTEGRATION_EXCEPTION: &str = include_str!("fixtures/integration_exception.py");
+const INTEGRATION_EXCEPTION_MULTI: &str = include_str!("fixtures/integration_exception_multi.py");
 const INTEGRATION_NESTED_CONDITIONALS: &str = include_str!("fixtures/integration_nested_conditionals.py");
 const INTEGRATION_MULTI_ACTION_LOOP: &str = include_str!("fixtures/integration_multi_action_loop.py");
 const INTEGRATION_SLEEP: &str = include_str!("fixtures/integration_sleep.py");
@@ -348,13 +349,9 @@ if __name__ == "__main__":
 ///     result = cleanup("fallback") -> "handled:fallback"
 /// return result -> "handled:fallback"
 ///
-/// NOTE: This test is currently ignored because exception handling in the
-/// scheduler is not yet implemented. The DAG structure for try/except is
-/// created correctly, but the scheduler's handle_failure() method doesn't
-/// yet route exceptions to handlers.
+/// Test exception handling: try block raises ValueError, caught by except block.
 #[tokio::test]
 #[serial]
-#[ignore = "Exception handling not yet implemented in scheduler"]
 async fn test_integration_exception() {
     let config = WorkflowHarnessConfig {
         files: &[("integration_exception.py", INTEGRATION_EXCEPTION)],
@@ -588,6 +585,154 @@ async fn test_integration_sleep() {
     assert!(
         result_str.starts_with("slept:"),
         "Expected result starting with 'slept:', got {:?}",
+        result_value
+    );
+
+    harness.shutdown().await.expect("shutdown failed");
+}
+
+const INTEGRATION_EXCEPTION_MULTI_VALUE_ERROR_ENTRYPOINT: &str = r#"
+import sys
+import os
+import asyncio
+
+sys.path.insert(0, os.path.dirname(__file__))
+
+from integration_exception_multi import ExceptionMultiValueErrorWorkflow
+
+if __name__ == "__main__":
+    asyncio.run(ExceptionMultiValueErrorWorkflow().run())
+"#;
+
+const INTEGRATION_EXCEPTION_MULTI_TYPE_ERROR_ENTRYPOINT: &str = r#"
+import sys
+import os
+import asyncio
+
+sys.path.insert(0, os.path.dirname(__file__))
+
+from integration_exception_multi import ExceptionMultiTypeErrorWorkflow
+
+if __name__ == "__main__":
+    asyncio.run(ExceptionMultiTypeErrorWorkflow().run())
+"#;
+
+/// Test: Multiple exception handlers - ValueError raised, caught by first handler
+/// try:
+///     raise_value_error() -> raises ValueError
+/// except ValueError:
+///     result = handle_value_error() -> "caught:ValueError"  <-- this one matches
+/// except TypeError:
+///     result = handle_type_error() -> "caught:TypeError"
+/// return result -> "caught:ValueError"
+#[tokio::test]
+#[serial]
+async fn test_integration_exception_multi_value_error() {
+    let config = WorkflowHarnessConfig {
+        files: &[("integration_exception_multi.py", INTEGRATION_EXCEPTION_MULTI)],
+        entrypoint: INTEGRATION_EXCEPTION_MULTI_VALUE_ERROR_ENTRYPOINT,
+        workflow_name: "exceptionmultivalueerrorworkflow",
+        user_module: "integration_exception_multi",
+        inputs: &[],
+    };
+
+    let harness = match WorkflowHarness::new(config).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            eprintln!("Skipping test: database not available");
+            return;
+        }
+        Err(e) => panic!("Failed to create harness: {}", e),
+    };
+
+    // Dispatch all actions
+    let metrics = harness.dispatch_all().await.expect("dispatch_all failed");
+
+    // One action should fail (raise_value_error), handler should succeed
+    let successes: Vec<_> = metrics.iter().filter(|m| m.success).collect();
+    let failures: Vec<_> = metrics.iter().filter(|m| !m.success).collect();
+
+    assert!(
+        successes.len() >= 1,
+        "Expected at least 1 successful action (handle_value_error), got {}",
+        successes.len()
+    );
+    assert!(
+        failures.len() >= 1,
+        "Expected at least 1 failed action (raise_value_error), got {}",
+        failures.len()
+    );
+
+    // Check final result
+    let result = harness.stored_result().await.expect("get result failed");
+    assert!(result.is_some(), "Expected workflow to have result");
+
+    let result_value = result.unwrap();
+    assert_eq!(
+        result_value,
+        serde_json::json!("caught:ValueError"),
+        "Expected 'caught:ValueError', got {:?}",
+        result_value
+    );
+
+    harness.shutdown().await.expect("shutdown failed");
+}
+
+/// Test: Multiple exception handlers - TypeError raised, caught by second handler
+/// try:
+///     raise_type_error() -> raises TypeError
+/// except ValueError:
+///     result = handle_value_error() -> "caught:ValueError"
+/// except TypeError:
+///     result = handle_type_error() -> "caught:TypeError"  <-- this one matches
+/// return result -> "caught:TypeError"
+#[tokio::test]
+#[serial]
+async fn test_integration_exception_multi_type_error() {
+    let config = WorkflowHarnessConfig {
+        files: &[("integration_exception_multi.py", INTEGRATION_EXCEPTION_MULTI)],
+        entrypoint: INTEGRATION_EXCEPTION_MULTI_TYPE_ERROR_ENTRYPOINT,
+        workflow_name: "exceptionmultitypeerrorworkflow",
+        user_module: "integration_exception_multi",
+        inputs: &[],
+    };
+
+    let harness = match WorkflowHarness::new(config).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            eprintln!("Skipping test: database not available");
+            return;
+        }
+        Err(e) => panic!("Failed to create harness: {}", e),
+    };
+
+    // Dispatch all actions
+    let metrics = harness.dispatch_all().await.expect("dispatch_all failed");
+
+    // One action should fail (raise_type_error), handler should succeed
+    let successes: Vec<_> = metrics.iter().filter(|m| m.success).collect();
+    let failures: Vec<_> = metrics.iter().filter(|m| !m.success).collect();
+
+    assert!(
+        successes.len() >= 1,
+        "Expected at least 1 successful action (handle_type_error), got {}",
+        successes.len()
+    );
+    assert!(
+        failures.len() >= 1,
+        "Expected at least 1 failed action (raise_type_error), got {}",
+        failures.len()
+    );
+
+    // Check final result
+    let result = harness.stored_result().await.expect("get result failed");
+    assert!(result.is_some(), "Expected workflow to have result");
+
+    let result_value = result.unwrap();
+    assert_eq!(
+        result_value,
+        serde_json::json!("caught:TypeError"),
+        "Expected 'caught:TypeError', got {:?}",
         result_value
     );
 

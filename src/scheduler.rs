@@ -710,6 +710,30 @@ impl<'a> Scheduler<'a> {
                 }
             }
 
+            // Skip non-matching handler entries and unlock their downstream edges
+            // When we have multiple except blocks, only one handler runs - others should be skipped
+            for edge in &node.edges {
+                if edge.kind == EdgeKind::Exception && edge.target != handler_edge.target {
+                    debug!(
+                        node_id = %node.id,
+                        skipped_handler = %edge.target,
+                        "Skipping non-matching exception handler"
+                    );
+
+                    // Mark the handler entry as skipped
+                    state.node_states.insert(edge.target.clone(), NodeState::Skipped);
+
+                    // Unlock its downstream edges (to the merge node)
+                    if let Some(handler_node) = self.dag.get_node(&edge.target) {
+                        for handler_edge in &handler_node.edges {
+                            if handler_edge.kind == EdgeKind::Data {
+                                self.try_unlock_node(state, &handler_edge.target);
+                            }
+                        }
+                    }
+                }
+            }
+
             // Mark the handler entry as ready
             state.node_states.insert(handler_edge.target.clone(), NodeState::Ready);
 
