@@ -174,17 +174,13 @@ mod tests {
             _ => panic!("Expected ActionCall"),
         }
         match &workflow.body[1].kind {
-            Some(statement::Kind::ReturnStmt(r)) => {
-                match &r.value {
-                    Some(r#return::Value::Expression(e)) => {
-                        match &e.kind {
-                            Some(expression::Kind::Variable(name)) => assert_eq!(name, "data"),
-                            _ => panic!("Expected Variable expression"),
-                        }
-                    }
-                    _ => panic!("Expected Expression return value"),
-                }
-            }
+            Some(statement::Kind::ReturnStmt(r)) => match &r.value {
+                Some(r#return::Value::Expression(e)) => match &e.kind {
+                    Some(expression::Kind::Variable(name)) => assert_eq!(name, "data"),
+                    _ => panic!("Expected Variable expression"),
+                },
+                _ => panic!("Expected Expression return value"),
+            },
             _ => panic!("Expected Return"),
         }
     }
@@ -257,7 +253,10 @@ mod tests {
                 },
                 // Action as a statement
                 Statement {
-                    kind: Some(statement::Kind::ActionCall(make_action_call("process", Some("processed")))),
+                    kind: Some(statement::Kind::ActionCall(make_action_call(
+                        "process",
+                        Some("processed"),
+                    ))),
                 },
                 // Append as a PythonBlock statement
                 Statement {
@@ -277,7 +276,7 @@ mod tests {
         assert!(loop_.iterator.is_some());
         assert_eq!(loop_.loop_var, "item");
         assert_eq!(loop_.accumulator, "results");
-        assert_eq!(loop_.body.len(), 3);  // preamble + action + append
+        assert_eq!(loop_.body.len(), 3); // preamble + action + append
     }
 
     #[test]

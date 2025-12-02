@@ -54,12 +54,31 @@ def _rewrite_messages_pb2() -> None:
     text = target.read_text()
     text = _ensure_struct_import(text)
     text = _ensure_struct_registration(text)
+    # Fix ir_pb2 import
+    ir_needle = "import ir_pb2 as ir__pb2"
+    ir_replacement = "from proto import ir_pb2 as ir__pb2"
+    if ir_needle in text and ir_replacement not in text:
+        text = text.replace(ir_needle, ir_replacement)
+    target.write_text(text)
+
+
+def _rewrite_messages_pb2_pyi() -> None:
+    target = PROTO_DIR / "messages_pb2.pyi"
+    if not target.exists():
+        return
+    text = target.read_text()
+    # Fix ir_pb2 import
+    ir_needle = "import ir_pb2"
+    ir_replacement = "from proto import ir_pb2"
+    if ir_needle in text and ir_replacement not in text:
+        text = text.replace(ir_needle, ir_replacement)
     target.write_text(text)
 
 
 def main() -> None:
     _rewrite_messages_pb2_grpc()
     _rewrite_messages_pb2()
+    _rewrite_messages_pb2_pyi()
 
 
 if __name__ == "__main__":

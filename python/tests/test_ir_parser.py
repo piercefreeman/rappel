@@ -270,13 +270,13 @@ class SingleActionLoopWorkflow(Workflow):
         assert _expression_to_string(loop.iterator) == "numbers"
         assert loop.accumulator == "results"
 
-        # Body contains: action, append (as python_block)
+        # Body contains: action, append (as list_append)
         assert len(loop.body) == 2
         assert loop.body[0].WhichOneof("kind") == "action_call"
         assert loop.body[0].action_call.action == "double"
         assert loop.body[0].action_call.target == "doubled"
-        assert loop.body[1].WhichOneof("kind") == "python_block"
-        assert "results.append(doubled)" in loop.body[1].python_block.code
+        assert loop.body[1].WhichOneof("kind") == "list_append"
+        assert loop.body[1].list_append.target == "results"
 
     def test_multi_action_loop(self, action_defs: dict[str, ActionDefinition]):
         """Test loop with multiple sequential actions."""
@@ -300,12 +300,13 @@ class MultiActionLoopWorkflow(Workflow):
                 break
 
         assert loop is not None
-        # Body contains: 3 actions + append (as python_block)
+        # Body contains: 3 actions + append (as list_append)
         assert len(loop.body) == 4
         assert loop.body[0].action_call.action == "validate_order"
         assert loop.body[1].action_call.action == "process_payment"
         assert loop.body[2].action_call.action == "send_confirmation"
-        assert loop.body[3].WhichOneof("kind") == "python_block"
+        assert loop.body[3].WhichOneof("kind") == "list_append"
+        assert loop.body[3].list_append.target == "confirmations"
 
     def test_loop_with_preamble(self, action_defs: dict[str, ActionDefinition]):
         """Test loop with Python code before the first action."""
@@ -328,7 +329,7 @@ class LoopWithPreambleWorkflow(Workflow):
                 break
 
         assert loop is not None
-        # Body contains: preamble (python_block), action, append (python_block)
+        # Body contains: preamble (python_block), action, append (list_append)
         assert len(loop.body) == 3
         # First statement is the preamble
         assert loop.body[0].WhichOneof("kind") == "python_block"
@@ -338,7 +339,8 @@ class LoopWithPreambleWorkflow(Workflow):
         # Second is the action
         assert loop.body[1].WhichOneof("kind") == "action_call"
         # Third is the append
-        assert loop.body[2].WhichOneof("kind") == "python_block"
+        assert loop.body[2].WhichOneof("kind") == "list_append"
+        assert loop.body[2].list_append.target == "results"
 
     def test_multi_accumulator_loop_raises_error(self, action_defs: dict[str, ActionDefinition]):
         """Test that loops with multiple accumulators raise an error."""
@@ -639,12 +641,12 @@ class SpreadWorkflow(Workflow):
         assert _expression_to_string(loop.iterator) == "numbers"
         assert loop.loop_var == "n"
 
-        # Loop body should have action call and append
+        # Loop body should have action call and list_append
         assert len(loop.body) == 2
         assert loop.body[0].WhichOneof("kind") == "action_call"
         assert loop.body[0].action_call.action == "double"
-        assert loop.body[1].WhichOneof("kind") == "python_block"
-        assert "append" in loop.body[1].python_block.code
+        assert loop.body[1].WhichOneof("kind") == "list_append"
+        assert loop.body[1].list_append.target == "doubled"
 
 
 class TestRunAction:
@@ -881,7 +883,7 @@ class LoopWorkflow(Workflow):
 
         assert "loop item in items -> results:" in text
         assert "@example_module.double(" in text
-        assert "results.append(doubled)" in text
+        assert "results += [doubled]" in text
 
     def test_serialize_conditional(self, action_defs: dict[str, ActionDefinition]):
         """Test serialization of conditional."""
@@ -1914,10 +1916,11 @@ class SpreadWorkflow(Workflow):
         assert _expression_to_string(loop.iterator) == "items"
         assert loop.accumulator == "results"
 
-        # Loop body should have action call and append
+        # Loop body should have action call and list_append
         assert len(loop.body) == 2
         assert loop.body[0].WhichOneof("kind") == "action_call"
-        assert loop.body[1].WhichOneof("kind") == "python_block"
+        assert loop.body[1].WhichOneof("kind") == "list_append"
+        assert loop.body[1].list_append.target == "results"
 
 
 class TestSerializerUnknownKind:

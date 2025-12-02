@@ -13,11 +13,9 @@
 use crate::dag::Dag;
 use crate::ir_dsl::format_workflow;
 use crate::ir_to_dag::convert_workflow;
-use crate::messages::proto::{
-    NodeDispatch, WorkflowArguments, WorkflowRegistration,
-};
+use crate::messages::proto::{NodeDispatch, WorkflowArguments, WorkflowRegistration};
 use crate::scheduler::{InstanceState, Scheduler, SchedulerAction};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Pool, Postgres, Row};
@@ -183,19 +181,23 @@ impl Store {
         &self,
         registration: &WorkflowRegistration,
     ) -> Result<(Uuid, Uuid)> {
-        let ir = registration.ir.as_ref()
+        let ir = registration
+            .ir
+            .as_ref()
             .ok_or_else(|| anyhow!("Registration missing IR"))?;
 
         // Print IR DSL for debugging
         let dsl = format_workflow(ir);
-        eprintln!("\n=== Registered Workflow IR ===\n{}\n==============================\n", dsl);
+        eprintln!(
+            "\n=== Registered Workflow IR ===\n{}\n==============================\n",
+            dsl
+        );
 
         // Convert IR to DAG
         let dag = convert_workflow(ir, registration.concurrent)
             .map_err(|e| anyhow!("Failed to convert IR to DAG: {}", e))?;
 
-        let dag_json = serde_json::to_string(&dag)
-            .context("Failed to serialize DAG")?;
+        let dag_json = serde_json::to_string(&dag).context("Failed to serialize DAG")?;
 
         // Create workflow record
         let workflow_id = Uuid::new_v4();
@@ -208,17 +210,25 @@ impl Store {
         .bind(registration.concurrent)
         .execute(&self.pool)
         .await
-        .map_err(|e| anyhow!("Failed to insert workflow: {} (name={}, dag_len={})", e, registration.workflow_name, dag_json.len()))?;
+        .map_err(|e| {
+            anyhow!(
+                "Failed to insert workflow: {} (name={}, dag_len={})",
+                e,
+                registration.workflow_name,
+                dag_json.len()
+            )
+        })?;
 
         // Create initial instance state
         let initial_context = decode_workflow_args(registration.initial_context.as_ref());
         let state = InstanceState::new(&dag, initial_context);
-        let state_json = serde_json::to_string(&state)
-            .context("Failed to serialize state")?;
+        let state_json = serde_json::to_string(&state).context("Failed to serialize state")?;
 
         // Encode workflow input for storage
-        let workflow_input_bytes = registration.initial_context.as_ref()
-            .map(|args| prost::Message::encode_to_vec(args));
+        let workflow_input_bytes = registration
+            .initial_context
+            .as_ref()
+            .map(prost::Message::encode_to_vec);
 
         // Create instance record
         let instance_id = Uuid::new_v4();
@@ -250,17 +260,15 @@ impl Store {
         let scheduler = Scheduler::new(dag);
 
         // Get workflow input from database
-        let row: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
-            "SELECT workflow_input FROM instances WHERE id = $1",
-        )
-        .bind(instance_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(Option<Vec<u8>>,)> =
+            sqlx::query_as("SELECT workflow_input FROM instances WHERE id = $1")
+                .bind(instance_id)
+                .fetch_optional(&self.pool)
+                .await?;
 
         let workflow_input = row
             .and_then(|(bytes,)| bytes)
-            .map(|bytes| prost::Message::decode(bytes.as_slice()).ok())
-            .flatten()
+            .and_then(|bytes| prost::Message::decode(bytes.as_slice()).ok())
             .unwrap_or_default();
 
         for node_id in state.ready_nodes() {
@@ -272,15 +280,16 @@ impl Store {
             // Process all ready nodes through the iterative handler
             // This handles both scheduler-evaluated nodes and dispatch nodes
             let mut state_copy = state.clone();
-            let action = scheduler.process_ready_node(
-                &mut state_copy,
-                &node_id,
-                &workflow_input,
-            )?;
+            let action =
+                scheduler.process_ready_node(&mut state_copy, &node_id, &workflow_input)?;
 
             match action {
-                SchedulerAction::Dispatch { node_id: dispatch_node_id, dispatch } => {
-                    self.enqueue_action(instance_id, &dispatch_node_id, &dispatch, node).await?;
+                SchedulerAction::Dispatch {
+                    node_id: dispatch_node_id,
+                    dispatch,
+                } => {
+                    self.enqueue_action(instance_id, &dispatch_node_id, &dispatch, node)
+                        .await?;
                 }
                 SchedulerAction::NodesReady { node_ids } => {
                     // Recursively process newly ready nodes
@@ -289,9 +298,13 @@ impl Store {
                 SchedulerAction::WorkflowComplete { result } => {
                     self.complete_instance(instance_id, result).await?;
                 }
-                SchedulerAction::Sleep { node_id: sleep_node_id, duration_seconds } => {
+                SchedulerAction::Sleep {
+                    node_id: sleep_node_id,
+                    duration_seconds,
+                } => {
                     // Enqueue sleep as a no-op action scheduled to be picked up after duration
-                    self.enqueue_sleep_action(instance_id, &sleep_node_id, duration_seconds).await?;
+                    self.enqueue_sleep_action(instance_id, &sleep_node_id, duration_seconds)
+                        .await?;
                 }
                 SchedulerAction::Idle => {}
             }
@@ -309,8 +322,8 @@ impl Store {
         node: &crate::dag::Node,
     ) -> Result<Uuid> {
         let action_id = Uuid::new_v4();
-        let dispatch_json = serde_json::to_string(dispatch)
-            .context("Failed to serialize dispatch")?;
+        let dispatch_json =
+            serde_json::to_string(dispatch).context("Failed to serialize dispatch")?;
 
         let timeout = node.timeout_seconds.unwrap_or(300) as i32;
         let max_retries = node.max_retries.unwrap_or(3) as i32;
@@ -357,8 +370,8 @@ impl Store {
             context: Vec::new(),
             resolved_kwargs: None,
         };
-        let dispatch_json = serde_json::to_string(&dispatch)
-            .context("Failed to serialize sleep dispatch")?;
+        let dispatch_json =
+            serde_json::to_string(&dispatch).context("Failed to serialize sleep dispatch")?;
 
         // Calculate scheduled_at as NOW() + duration
         let duration_interval = format!("{} seconds", duration_seconds);
@@ -442,7 +455,11 @@ impl Store {
             "#,
         )
         .bind(completion.action_id)
-        .bind(if completion.success { "completed" } else { "failed" })
+        .bind(if completion.success {
+            "completed"
+        } else {
+            "failed"
+        })
         .execute(&self.pool)
         .await
         .context("Failed to update action")?;
@@ -476,7 +493,8 @@ impl Store {
         );
 
         // Save updated state
-        self.save_instance_state(completion.instance_id, &state).await?;
+        self.save_instance_state(completion.instance_id, &state)
+            .await?;
 
         // Handle scheduler action
         match action {
@@ -486,7 +504,8 @@ impl Store {
                     ready_nodes = ?node_ids,
                     "Processing ready nodes"
                 );
-                self.process_ready_nodes(completion.instance_id, node_ids).await?;
+                self.process_ready_nodes(completion.instance_id, node_ids)
+                    .await?;
             }
             SchedulerAction::WorkflowComplete { result } => {
                 debug!(
@@ -494,7 +513,8 @@ impl Store {
                     has_result = result.is_some(),
                     "Workflow complete"
                 );
-                self.complete_instance(completion.instance_id, result).await?;
+                self.complete_instance(completion.instance_id, result)
+                    .await?;
             }
             SchedulerAction::Dispatch { node_id, dispatch } => {
                 debug!(
@@ -503,17 +523,22 @@ impl Store {
                     "Direct dispatch from completion"
                 );
                 if let Some(node) = dag.get_node(&node_id) {
-                    self.enqueue_action(completion.instance_id, &node_id, &dispatch, node).await?;
+                    self.enqueue_action(completion.instance_id, &node_id, &dispatch, node)
+                        .await?;
                 }
             }
-            SchedulerAction::Sleep { node_id: sleep_node_id, duration_seconds } => {
+            SchedulerAction::Sleep {
+                node_id: sleep_node_id,
+                duration_seconds,
+            } => {
                 debug!(
                     instance_id = %completion.instance_id,
                     sleep_node = %sleep_node_id,
                     duration = duration_seconds,
                     "Scheduling sleep from completion"
                 );
-                self.enqueue_sleep_action(completion.instance_id, &sleep_node_id, duration_seconds).await?;
+                self.enqueue_sleep_action(completion.instance_id, &sleep_node_id, duration_seconds)
+                    .await?;
             }
             SchedulerAction::Idle => {}
         }
@@ -522,7 +547,11 @@ impl Store {
     }
 
     /// Process all ready nodes iteratively (avoids recursive async)
-    async fn process_ready_nodes(&self, instance_id: Uuid, initial_node_ids: Vec<String>) -> Result<()> {
+    async fn process_ready_nodes(
+        &self,
+        instance_id: Uuid,
+        initial_node_ids: Vec<String>,
+    ) -> Result<()> {
         let mut pending = initial_node_ids;
 
         while let Some(node_id) = pending.pop() {
@@ -548,13 +577,26 @@ impl Store {
                     self.complete_instance(instance_id, result).await?;
                     return Ok(()); // Workflow done
                 }
-                SchedulerAction::Dispatch { node_id: dispatch_node_id, dispatch } => {
+                SchedulerAction::Dispatch {
+                    node_id: dispatch_node_id,
+                    dispatch,
+                } => {
                     if let Some(dispatch_node) = dag.get_node(&dispatch_node_id) {
-                        self.enqueue_action(instance_id, &dispatch_node_id, &dispatch, dispatch_node).await?;
+                        self.enqueue_action(
+                            instance_id,
+                            &dispatch_node_id,
+                            &dispatch,
+                            dispatch_node,
+                        )
+                        .await?;
                     }
                 }
-                SchedulerAction::Sleep { node_id: sleep_node_id, duration_seconds } => {
-                    self.enqueue_sleep_action(instance_id, &sleep_node_id, duration_seconds).await?;
+                SchedulerAction::Sleep {
+                    node_id: sleep_node_id,
+                    duration_seconds,
+                } => {
+                    self.enqueue_sleep_action(instance_id, &sleep_node_id, duration_seconds)
+                        .await?;
                 }
                 SchedulerAction::Idle => {}
             }
@@ -564,7 +606,10 @@ impl Store {
     }
 
     /// Load instance state and DAG
-    async fn load_instance(&self, instance_id: Uuid) -> Result<(InstanceState, Dag, WorkflowArguments)> {
+    async fn load_instance(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<(InstanceState, Dag, WorkflowArguments)> {
         let row = sqlx::query(
             r#"
             SELECT i.state_json::text, w.dag_json::text, i.workflow_input
@@ -582,13 +627,11 @@ impl Store {
         let dag_json: String = row.get("dag_json");
         let workflow_input_bytes: Option<Vec<u8>> = row.get("workflow_input");
 
-        let state: InstanceState = serde_json::from_str(&state_json)
-            .context("Failed to deserialize state")?;
-        let dag: Dag = serde_json::from_str(&dag_json)
-            .context("Failed to deserialize DAG")?;
+        let state: InstanceState =
+            serde_json::from_str(&state_json).context("Failed to deserialize state")?;
+        let dag: Dag = serde_json::from_str(&dag_json).context("Failed to deserialize DAG")?;
         let workflow_input: WorkflowArguments = workflow_input_bytes
-            .map(|bytes| prost::Message::decode(bytes.as_slice()).ok())
-            .flatten()
+            .and_then(|bytes| prost::Message::decode(bytes.as_slice()).ok())
             .unwrap_or_default();
 
         Ok((state, dag, workflow_input))
@@ -596,8 +639,7 @@ impl Store {
 
     /// Save instance state
     async fn save_instance_state(&self, instance_id: Uuid, state: &InstanceState) -> Result<()> {
-        let state_json = serde_json::to_string(state)
-            .context("Failed to serialize state")?;
+        let state_json = serde_json::to_string(state).context("Failed to serialize state")?;
 
         sqlx::query("UPDATE instances SET state_json = $2::jsonb WHERE id = $1")
             .bind(instance_id)
@@ -611,7 +653,7 @@ impl Store {
 
     /// Mark instance as completed
     async fn complete_instance(&self, instance_id: Uuid, result: Option<Value>) -> Result<()> {
-        let result_bytes = result.map(|v| serde_json::to_vec(&v).ok()).flatten();
+        let result_bytes = result.and_then(|v| serde_json::to_vec(&v).ok());
 
         sqlx::query(
             r#"
@@ -631,20 +673,18 @@ impl Store {
 
     /// Get workflow by name
     pub async fn get_workflow_by_name(&self, name: &str) -> Result<Option<(Uuid, Dag)>> {
-        let row = sqlx::query(
-            "SELECT id, dag_json::text FROM workflows WHERE name = $1",
-        )
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await
-        .context("Failed to get workflow by name")?;
+        let row = sqlx::query("SELECT id, dag_json::text FROM workflows WHERE name = $1")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .context("Failed to get workflow by name")?;
 
         match row {
             Some(row) => {
                 let id: Uuid = row.get("id");
                 let dag_json: String = row.get("dag_json");
-                let dag: Dag = serde_json::from_str(&dag_json)
-                    .context("Failed to deserialize DAG")?;
+                let dag: Dag =
+                    serde_json::from_str(&dag_json).context("Failed to deserialize DAG")?;
                 Ok(Some((id, dag)))
             }
             None => Ok(None),
@@ -665,18 +705,16 @@ impl Store {
             .context("Workflow not found")?;
 
         let dag_json: String = row.get("dag_json");
-        let dag: Dag = serde_json::from_str(&dag_json)
-            .context("Failed to deserialize DAG")?;
+        let dag: Dag = serde_json::from_str(&dag_json).context("Failed to deserialize DAG")?;
 
         // Decode workflow input
-        let workflow_args: WorkflowArguments = prost::Message::decode(workflow_input)
-            .context("Failed to decode workflow input")?;
+        let workflow_args: WorkflowArguments =
+            prost::Message::decode(workflow_input).context("Failed to decode workflow input")?;
         let initial_context = decode_workflow_args(Some(&workflow_args));
 
         // Create initial instance state
         let state = InstanceState::new(&dag, initial_context);
-        let state_json = serde_json::to_string(&state)
-            .context("Failed to serialize state")?;
+        let state_json = serde_json::to_string(&state).context("Failed to serialize state")?;
 
         // Create instance record
         let instance_id = Uuid::new_v4();
@@ -699,7 +737,10 @@ impl Store {
     }
 
     /// Get the latest instance for a workflow
-    pub async fn get_latest_instance_for_workflow(&self, workflow_id: Uuid) -> Result<Option<Uuid>> {
+    pub async fn get_latest_instance_for_workflow(
+        &self,
+        workflow_id: Uuid,
+    ) -> Result<Option<Uuid>> {
         let row = sqlx::query(
             "SELECT id FROM instances WHERE workflow_id = $1 ORDER BY created_at DESC LIMIT 1",
         )
@@ -713,21 +754,17 @@ impl Store {
 
     /// Get instance status and result
     pub async fn get_instance(&self, instance_id: Uuid) -> Result<Option<(String, Option<Value>)>> {
-        let row = sqlx::query(
-            "SELECT status, result FROM instances WHERE id = $1",
-        )
-        .bind(instance_id)
-        .fetch_optional(&self.pool)
-        .await
-        .context("Failed to get instance")?;
+        let row = sqlx::query("SELECT status, result FROM instances WHERE id = $1")
+            .bind(instance_id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("Failed to get instance")?;
 
         match row {
             Some(row) => {
                 let status: String = row.get("status");
                 let result_bytes: Option<Vec<u8>> = row.get("result");
-                let result = result_bytes
-                    .map(|bytes| serde_json::from_slice(&bytes).ok())
-                    .flatten();
+                let result = result_bytes.and_then(|bytes| serde_json::from_slice(&bytes).ok());
                 Ok(Some((status, result)))
             }
             None => Ok(None),
@@ -772,18 +809,16 @@ fn decode_workflow_args(args: Option<&WorkflowArguments>) -> HashMap<String, Val
 
 /// Decode a single WorkflowArgumentValue to JSON Value
 fn decode_arg_value(value: &crate::messages::proto::WorkflowArgumentValue) -> Value {
-    use crate::messages::proto::workflow_argument_value::Kind;
     use crate::messages::proto::primitive_workflow_argument::Kind as PrimitiveKind;
+    use crate::messages::proto::workflow_argument_value::Kind;
 
     match &value.kind {
         Some(Kind::Primitive(p)) => match &p.kind {
             Some(PrimitiveKind::StringValue(s)) => Value::String(s.clone()),
             Some(PrimitiveKind::IntValue(i)) => Value::Number((*i).into()),
-            Some(PrimitiveKind::DoubleValue(d)) => {
-                serde_json::Number::from_f64(*d)
-                    .map(Value::Number)
-                    .unwrap_or(Value::Null)
-            }
+            Some(PrimitiveKind::DoubleValue(d)) => serde_json::Number::from_f64(*d)
+                .map(Value::Number)
+                .unwrap_or(Value::Null),
             Some(PrimitiveKind::BoolValue(b)) => Value::Bool(*b),
             Some(PrimitiveKind::NullValue(_)) => Value::Null,
             None => Value::Null,
@@ -795,9 +830,14 @@ fn decode_arg_value(value: &crate::messages::proto::WorkflowArgumentValue) -> Va
             Value::Array(tuple.items.iter().map(decode_arg_value).collect())
         }
         Some(Kind::DictValue(dict)) => {
-            let map: serde_json::Map<String, Value> = dict.entries.iter()
+            let map: serde_json::Map<String, Value> = dict
+                .entries
+                .iter()
                 .filter_map(|entry| {
-                    entry.value.as_ref().map(|v| (entry.key.clone(), decode_arg_value(v)))
+                    entry
+                        .value
+                        .as_ref()
+                        .map(|v| (entry.key.clone(), decode_arg_value(v)))
                 })
                 .collect();
             Value::Object(map)
@@ -805,7 +845,10 @@ fn decode_arg_value(value: &crate::messages::proto::WorkflowArgumentValue) -> Va
         Some(Kind::Basemodel(bm)) => {
             // Convert BaseModel to object with __type__ marker
             let mut map = serde_json::Map::new();
-            map.insert("__type__".to_string(), Value::String(format!("{}.{}", bm.module, bm.name)));
+            map.insert(
+                "__type__".to_string(),
+                Value::String(format!("{}.{}", bm.module, bm.name)),
+            );
             if let Some(data) = &bm.data {
                 for entry in &data.entries {
                     if let Some(v) = &entry.value {

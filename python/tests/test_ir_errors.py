@@ -74,7 +74,9 @@ def parse_workflow(code: str, action_defs: dict[str, ActionDefinition]):
     assert run_method is not None, "Could not find run method"
 
     parser = IRParser(action_defs=action_defs)
-    return parser.parse_workflow(run_method)
+    workflow = parser.parse_workflow(run_method)
+    workflow.name = workflow_class.name  # Set class name as workflow name
+    return workflow
 
 
 # =============================================================================
@@ -204,23 +206,24 @@ class TupleUnpackWorkflow(Workflow):
 
         assert "must be a simple variable" in str(exc_info.value).lower()
 
-    def test_statement_after_first_action(self, action_defs: dict[str, ActionDefinition]):
-        """Non-action statement after first action in loop should error."""
+    def test_statement_after_first_action_is_allowed(
+        self, action_defs: dict[str, ActionDefinition]
+    ):
+        """Non-action statement after first action in loop is now allowed as PythonBlock."""
         code = """
 class StatementAfterActionWorkflow(Workflow):
     async def run(self, items: list) -> list:
         results = []
         for item in items:
             first = await fetch_left()
-            intermediate = first * 2  # Non-action after action
+            intermediate = first * 2  # Non-action becomes PythonBlock
             second = await double(value=intermediate)
             results.append(second)
         return results
 """
-        with pytest.raises(IRParseError) as exc_info:
-            parse_workflow(code, action_defs)
-
-        assert "non-action statements after first action" in str(exc_info.value).lower()
+        # This should now parse successfully
+        workflow = parse_workflow(code, action_defs)
+        assert workflow.name == "StatementAfterActionWorkflow"
 
 
 # =============================================================================
@@ -283,39 +286,37 @@ class ExceptionBindingWorkflow(Workflow):
 
         assert "cannot bind exception to variable" in str(exc_info.value).lower()
 
-    def test_try_body_must_be_actions(self, action_defs: dict[str, ActionDefinition]):
-        """Non-action in try body should error."""
+    def test_try_body_accepts_preamble(self, action_defs: dict[str, ActionDefinition]):
+        """Non-action preamble in try body is now allowed as PythonBlock."""
         code = """
-class TryNonActionWorkflow(Workflow):
+class TryPreambleWorkflow(Workflow):
     async def run(self) -> int:
         try:
-            x = 10  # Non-action
+            x = 10  # Preamble becomes PythonBlock
             result = await risky_action()
         except ValueError:
             result = await fallback_action()
         return result
 """
-        with pytest.raises(IRParseError) as exc_info:
-            parse_workflow(code, action_defs)
+        # This should now parse successfully
+        workflow = parse_workflow(code, action_defs)
+        assert workflow.name == "TryPreambleWorkflow"
 
-        assert "try block must contain only action calls" in str(exc_info.value).lower()
-
-    def test_except_body_must_be_actions(self, action_defs: dict[str, ActionDefinition]):
-        """Non-action in except body should error."""
+    def test_except_body_accepts_preamble(self, action_defs: dict[str, ActionDefinition]):
+        """Non-action preamble in except body is now allowed as PythonBlock."""
         code = """
-class ExceptNonActionWorkflow(Workflow):
+class ExceptPreambleWorkflow(Workflow):
     async def run(self) -> int:
         try:
             result = await risky_action()
         except ValueError:
-            x = 10  # Non-action
-            result = x
+            x = 10  # Preamble becomes PythonBlock
+            result = await fallback_action()
         return result
 """
-        with pytest.raises(IRParseError) as exc_info:
-            parse_workflow(code, action_defs)
-
-        assert "except block must contain only action calls" in str(exc_info.value).lower()
+        # This should now parse successfully
+        workflow = parse_workflow(code, action_defs)
+        assert workflow.name == "ExceptPreambleWorkflow"
 
 
 # =============================================================================

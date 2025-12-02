@@ -71,6 +71,12 @@ package rappel.ir;
 //       code here
 //   }
 //
+// List Append (scheduler-evaluated):
+//   list_var += [value_expr]
+//
+// Dict Set (scheduler-evaluated):
+//   dict_var[key_expr] = value_expr
+//
 // =============================================================================
 
 // -----------------------------------------------------------------------------
@@ -405,6 +411,23 @@ message Spread {
   optional SourceLocation location = 5;
 }
 
+// Append a value to a list (scheduler-evaluated, no worker dispatch)
+// DSL: list_var += [value_expr]
+message ListAppend {
+  string target = 1;               // The list variable to append to
+  Expression value = 2;            // The value to append
+  optional SourceLocation location = 3;
+}
+
+// Set a key in a dictionary (scheduler-evaluated, no worker dispatch)
+// DSL: dict_var[key_expr] = value_expr
+message DictSet {
+  string target = 1;               // The dict variable to modify
+  Expression key = 2;              // The key (can be variable or literal)
+  Expression value = 3;            // The value to set
+  optional SourceLocation location = 4;
+}
+
 // -----------------------------------------------------------------------------
 // Statement Union
 // -----------------------------------------------------------------------------
@@ -420,6 +443,8 @@ message Statement {
     Sleep sleep = 7;               // DSL: @sleep(duration)
     Return return_stmt = 8;        // DSL: return ...
     Spread spread = 9;             // DSL: spread @action() over collection as var
+    ListAppend list_append = 10;   // DSL: list_var += [value]
+    DictSet dict_set = 11;         // DSL: dict_var[key] = value
   }
 }
 

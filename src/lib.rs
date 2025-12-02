@@ -10,12 +10,12 @@ pub mod ir_dsl;
 pub mod ir_parser;
 pub mod ir_to_dag;
 pub mod messages;
-pub mod scheduler;
-pub mod store;
 pub mod retry;
+pub mod scheduler;
 pub mod server_client;
 pub mod server_web;
 pub mod server_worker;
+pub mod store;
 pub mod worker;
 
 #[cfg(test)]
@@ -27,8 +27,8 @@ pub use benchmark::fanout::{FanoutBenchmarkConfig, FanoutBenchmarkHarness};
 pub use benchmark::instances::{WorkflowBenchmarkConfig, WorkflowBenchmarkHarness};
 pub use benchmark::stress::{StressBenchmarkConfig, StressBenchmarkHarness};
 pub use config::AppConfig;
-pub use store::Store;
 pub use dispatcher::{Dispatcher, DispatcherConfig};
+pub use store::Store;
 pub use worker::{ActionDispatchPayload, PythonWorker, PythonWorkerConfig, PythonWorkerPool};
 
 pub type WorkflowVersionId = uuid::Uuid;

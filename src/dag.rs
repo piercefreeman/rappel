@@ -129,7 +129,7 @@ pub struct Node {
     // For action/computed nodes
     pub action: Option<String>,
     pub module: Option<String>,
-    pub kwargs: HashMap<String, String>,  // Expression strings
+    pub kwargs: HashMap<String, String>, // Expression strings
 
     // What this node produces
     pub produces: Vec<String>,
@@ -367,7 +367,7 @@ impl Node {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dag {
     pub nodes: HashMap<String, Node>,
-    pub entry_nodes: Vec<String>,  // Nodes with no dependencies
+    pub entry_nodes: Vec<String>, // Nodes with no dependencies
     pub return_variable: Option<String>,
     pub concurrent: bool,
 }
@@ -396,11 +396,15 @@ impl Dag {
 
     /// Compute entry nodes (nodes with no incoming edges)
     pub fn compute_entry_nodes(&mut self) {
-        let all_targets: HashSet<String> = self.nodes.values()
+        let all_targets: HashSet<String> = self
+            .nodes
+            .values()
             .flat_map(|n| n.edges.iter().map(|e| e.target.clone()))
             .collect();
 
-        self.entry_nodes = self.nodes.keys()
+        self.entry_nodes = self
+            .nodes
+            .keys()
             .filter(|id| !all_targets.contains(*id))
             .cloned()
             .collect();
@@ -419,8 +423,7 @@ mod tests {
         node1.produces = vec!["data".into()];
         node1.add_edge("action_1", EdgeKind::Data);
 
-        let node2 = Node::action("action_1", "process")
-            .with_kwarg("input", "data");
+        let node2 = Node::action("action_1", "process").with_kwarg("input", "data");
 
         dag.add_node(node1);
         dag.add_node(node2);

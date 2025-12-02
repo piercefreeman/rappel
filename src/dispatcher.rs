@@ -288,14 +288,16 @@ impl DispatcherTask {
                 match proto::WorkflowArguments::decode(record.result_payload.as_slice()) {
                     Ok(args) => {
                         // Extract the "result" key from arguments (for success case)
-                        let result = args.arguments
+                        let result = args
+                            .arguments
                             .iter()
                             .find(|arg| arg.key == "result")
                             .and_then(|arg| arg.value.as_ref())
-                            .map(|v| decode_arg_value(v));
+                            .map(decode_arg_value);
 
                         // Extract exception info from "error" key (for failure case)
-                        let (exc_type, exc_module) = args.arguments
+                        let (exc_type, exc_module) = args
+                            .arguments
                             .iter()
                             .find(|arg| arg.key == "error")
                             .and_then(|arg| arg.value.as_ref())
@@ -347,18 +349,16 @@ impl DispatcherTask {
 
 /// Decode a WorkflowArgumentValue to serde_json::Value
 fn decode_arg_value(value: &proto::WorkflowArgumentValue) -> serde_json::Value {
-    use proto::workflow_argument_value::Kind;
     use proto::primitive_workflow_argument::Kind as PrimitiveKind;
+    use proto::workflow_argument_value::Kind;
 
     match &value.kind {
         Some(Kind::Primitive(p)) => match &p.kind {
             Some(PrimitiveKind::StringValue(s)) => serde_json::Value::String(s.clone()),
             Some(PrimitiveKind::IntValue(i)) => serde_json::Value::Number((*i).into()),
-            Some(PrimitiveKind::DoubleValue(d)) => {
-                serde_json::Number::from_f64(*d)
-                    .map(serde_json::Value::Number)
-                    .unwrap_or(serde_json::Value::Null)
-            }
+            Some(PrimitiveKind::DoubleValue(d)) => serde_json::Number::from_f64(*d)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
             Some(PrimitiveKind::BoolValue(b)) => serde_json::Value::Bool(*b),
             Some(PrimitiveKind::NullValue(_)) => serde_json::Value::Null,
             None => serde_json::Value::Null,
@@ -370,16 +370,24 @@ fn decode_arg_value(value: &proto::WorkflowArgumentValue) -> serde_json::Value {
             serde_json::Value::Array(tuple.items.iter().map(decode_arg_value).collect())
         }
         Some(Kind::DictValue(dict)) => {
-            let map: serde_json::Map<String, serde_json::Value> = dict.entries.iter()
+            let map: serde_json::Map<String, serde_json::Value> = dict
+                .entries
+                .iter()
                 .filter_map(|entry| {
-                    entry.value.as_ref().map(|v| (entry.key.clone(), decode_arg_value(v)))
+                    entry
+                        .value
+                        .as_ref()
+                        .map(|v| (entry.key.clone(), decode_arg_value(v)))
                 })
                 .collect();
             serde_json::Value::Object(map)
         }
         Some(Kind::Basemodel(bm)) => {
             let mut map = serde_json::Map::new();
-            map.insert("__type__".to_string(), serde_json::Value::String(format!("{}.{}", bm.module, bm.name)));
+            map.insert(
+                "__type__".to_string(),
+                serde_json::Value::String(format!("{}.{}", bm.module, bm.name)),
+            );
             if let Some(data) = &bm.data {
                 for entry in &data.entries {
                     if let Some(v) = &entry.value {
@@ -392,9 +400,18 @@ fn decode_arg_value(value: &proto::WorkflowArgumentValue) -> serde_json::Value {
         Some(Kind::Exception(e)) => {
             let mut map = serde_json::Map::new();
             map.insert("__error__".to_string(), serde_json::Value::Bool(true));
-            map.insert("type".to_string(), serde_json::Value::String(e.r#type.clone()));
-            map.insert("module".to_string(), serde_json::Value::String(e.module.clone()));
-            map.insert("message".to_string(), serde_json::Value::String(e.message.clone()));
+            map.insert(
+                "type".to_string(),
+                serde_json::Value::String(e.r#type.clone()),
+            );
+            map.insert(
+                "module".to_string(),
+                serde_json::Value::String(e.module.clone()),
+            );
+            map.insert(
+                "message".to_string(),
+                serde_json::Value::String(e.message.clone()),
+            );
             serde_json::Value::Object(map)
         }
         None => serde_json::Value::Null,

@@ -1,6 +1,6 @@
 //! Integration test harness using the new Store API.
 
-use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration, sync::Once};
+use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, sync::Once, time::Duration};
 
 static INIT_TRACING: Once = Once::new();
 
@@ -23,9 +23,11 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response as GrpcResponse, Status, async_trait, transport::Server};
 
 use crate::{
-    Store, PythonWorkerConfig, PythonWorkerPool, WorkflowInstanceId,
+    PythonWorkerConfig, PythonWorkerPool, Store, WorkflowInstanceId,
     dag::Dag,
-    messages::proto::{self, NodeDispatch, WorkflowArguments, workflow_service_server::WorkflowServiceServer},
+    messages::proto::{
+        self, NodeDispatch, WorkflowArguments, workflow_service_server::WorkflowServiceServer,
+    },
     server_worker::WorkerBridgeServer,
     store::ActionCompletion,
     worker::{ActionDispatchPayload, RoundTripMetrics},
@@ -33,6 +35,7 @@ use crate::{
 use sqlx::postgres::PgPoolOptions;
 
 /// Configuration for a workflow test
+#[allow(dead_code)]
 pub struct WorkflowHarnessConfig<'a> {
     pub files: &'a [(&'static str, &'static str)],
     pub entrypoint: &'static str,
@@ -42,6 +45,7 @@ pub struct WorkflowHarnessConfig<'a> {
 }
 
 /// Test harness that manages store, workers, and dispatching
+#[allow(dead_code)]
 pub struct WorkflowHarness {
     store: Arc<Store>,
     worker_server: Arc<WorkerBridgeServer>,
@@ -53,6 +57,7 @@ pub struct WorkflowHarness {
     instance_id: WorkflowInstanceId,
 }
 
+#[allow(dead_code)]
 impl WorkflowHarness {
     pub async fn new(config: WorkflowHarnessConfig<'_>) -> Result<Option<Self>> {
         init_tracing();
@@ -73,7 +78,10 @@ impl WorkflowHarness {
             .context("Failed to connect to database")?;
 
         let store = Arc::new(Store::new(pool));
-        store.init_schema().await.context("Failed to initialize schema")?;
+        store
+            .init_schema()
+            .await
+            .context("Failed to initialize schema")?;
 
         // Clean up any existing data
         cleanup_store(&store).await?;
@@ -154,10 +162,10 @@ impl WorkflowHarness {
                     break;
                 }
                 // Check if workflow is complete
-                if let Some((status, _)) = self.store.get_instance(self.instance_id).await? {
-                    if status == "completed" || status == "failed" {
-                        break;
-                    }
+                if let Some((status, _)) = self.store.get_instance(self.instance_id).await?
+                    && (status == "completed" || status == "failed")
+                {
+                    break;
                 }
                 sleep(Duration::from_millis(50)).await;
                 continue;
@@ -170,7 +178,9 @@ impl WorkflowHarness {
                     .context("Failed to decode dispatch")?;
 
                 // Check if this is a sleep action (no-op)
-                let is_sleep = dispatch.node.as_ref()
+                let is_sleep = dispatch
+                    .node
+                    .as_ref()
                     .map(|n| n.action == "__sleep__")
                     .unwrap_or(false);
 
@@ -225,10 +235,10 @@ impl WorkflowHarness {
 
     /// Get the stored result for the workflow instance
     pub async fn stored_result(&self) -> Result<Option<serde_json::Value>> {
-        if let Some((status, result)) = self.store.get_instance(self.instance_id).await? {
-            if status == "completed" {
-                return Ok(result);
-            }
+        if let Some((status, result)) = self.store.get_instance(self.instance_id).await?
+            && status == "completed"
+        {
+            return Ok(result);
         }
         Ok(None)
     }
@@ -280,8 +290,8 @@ async fn setup_python_env(
     entrypoint: &str,
     grpc_port: u16,
 ) -> Result<TempDir> {
-    use std::process::Command;
     use std::fs;
+    use std::process::Command;
 
     let temp_dir = TempDir::new()?;
 
@@ -331,10 +341,9 @@ async fn setup_python_env(
     let child = cmd.spawn().context("Failed to spawn Python entrypoint")?;
     let output = tokio::time::timeout(
         Duration::from_secs(30),
-        tokio::task::spawn_blocking(move || {
-            child.wait_with_output()
-        })
-    ).await
+        tokio::task::spawn_blocking(move || child.wait_with_output()),
+    )
+    .await
     .context("Python entrypoint timed out after 30s")?
     .context("Task join failed")?
     .context("Failed to run Python entrypoint")?;
@@ -353,6 +362,7 @@ async fn setup_python_env(
 }
 
 /// Encode workflow inputs as protobuf
+#[allow(dead_code)]
 fn encode_workflow_input(inputs: &[(&str, &str)]) -> Vec<u8> {
     let arguments: Vec<proto::WorkflowArgument> = inputs
         .iter()
@@ -393,21 +403,27 @@ fn decode_result(payload: &[u8]) -> DecodedResult {
 
     let args = match proto::WorkflowArguments::decode(payload) {
         Ok(a) => a,
-        Err(_) => return DecodedResult {
-            result: None,
-            exception_type: None,
-            exception_module: None,
-        },
+        Err(_) => {
+            return DecodedResult {
+                result: None,
+                exception_type: None,
+                exception_module: None,
+            };
+        }
     };
 
     // Extract result (for success case)
-    let result = args.arguments.iter()
+    let result = args
+        .arguments
+        .iter()
         .find(|a| a.key == "result")
         .and_then(|arg| arg.value.as_ref())
         .map(proto_value_to_json);
 
     // Extract exception info (for failure case)
-    let (exception_type, exception_module) = args.arguments.iter()
+    let (exception_type, exception_module) = args
+        .arguments
+        .iter()
         .find(|a| a.key == "error")
         .and_then(|arg| arg.value.as_ref())
         .and_then(|v| {
@@ -429,18 +445,16 @@ fn decode_result(payload: &[u8]) -> DecodedResult {
 
 /// Convert proto value to JSON
 fn proto_value_to_json(value: &proto::WorkflowArgumentValue) -> serde_json::Value {
-    use proto::workflow_argument_value::Kind;
     use proto::primitive_workflow_argument::Kind as PrimitiveKind;
+    use proto::workflow_argument_value::Kind;
 
     match &value.kind {
         Some(Kind::Primitive(p)) => match &p.kind {
             Some(PrimitiveKind::StringValue(s)) => serde_json::Value::String(s.clone()),
             Some(PrimitiveKind::IntValue(i)) => serde_json::Value::Number((*i).into()),
-            Some(PrimitiveKind::DoubleValue(d)) => {
-                serde_json::Number::from_f64(*d)
-                    .map(serde_json::Value::Number)
-                    .unwrap_or(serde_json::Value::Null)
-            }
+            Some(PrimitiveKind::DoubleValue(d)) => serde_json::Number::from_f64(*d)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
             Some(PrimitiveKind::BoolValue(b)) => serde_json::Value::Bool(*b),
             Some(PrimitiveKind::NullValue(_)) => serde_json::Value::Null,
             None => serde_json::Value::Null,
@@ -452,9 +466,14 @@ fn proto_value_to_json(value: &proto::WorkflowArgumentValue) -> serde_json::Valu
             serde_json::Value::Array(tuple.items.iter().map(proto_value_to_json).collect())
         }
         Some(Kind::DictValue(dict)) => {
-            let map: serde_json::Map<String, serde_json::Value> = dict.entries.iter()
+            let map: serde_json::Map<String, serde_json::Value> = dict
+                .entries
+                .iter()
                 .filter_map(|entry| {
-                    entry.value.as_ref().map(|v| (entry.key.clone(), proto_value_to_json(v)))
+                    entry
+                        .value
+                        .as_ref()
+                        .map(|v| (entry.key.clone(), proto_value_to_json(v)))
                 })
                 .collect();
             serde_json::Value::Object(map)
@@ -463,9 +482,14 @@ fn proto_value_to_json(value: &proto::WorkflowArgumentValue) -> serde_json::Valu
             // Convert Pydantic BaseModel to JSON object with "variables" key
             // The model.data contains the dict entries (e.g., {"variables": {...}})
             if let Some(data) = &model.data {
-                let data_map: serde_json::Map<String, serde_json::Value> = data.entries.iter()
+                let data_map: serde_json::Map<String, serde_json::Value> = data
+                    .entries
+                    .iter()
                     .filter_map(|entry| {
-                        entry.value.as_ref().map(|v| (entry.key.clone(), proto_value_to_json(v)))
+                        entry
+                            .value
+                            .as_ref()
+                            .map(|v| (entry.key.clone(), proto_value_to_json(v)))
                     })
                     .collect();
                 serde_json::Value::Object(data_map)
@@ -478,11 +502,13 @@ fn proto_value_to_json(value: &proto::WorkflowArgumentValue) -> serde_json::Valu
 }
 
 /// GRPC server for workflow registration during tests
+#[allow(dead_code)]
 struct TestRegistrationServer {
     addr: SocketAddr,
     handle: JoinHandle<()>,
 }
 
+#[allow(dead_code)]
 impl TestRegistrationServer {
     async fn start(store: Arc<Store>) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -525,13 +551,14 @@ impl proto::workflow_service_server::WorkflowService for TestWorkflowService {
             .registration
             .ok_or_else(|| Status::invalid_argument("registration missing"))?;
 
-        let (version_id, instance_id) = self.store
-            .register_workflow(&registration)
-            .await
-            .map_err(|e| {
-                eprintln!("register_workflow error: {:?}", e);
-                Status::internal(format!("{:?}", e))
-            })?;
+        let (version_id, instance_id) =
+            self.store
+                .register_workflow(&registration)
+                .await
+                .map_err(|e| {
+                    eprintln!("register_workflow error: {:?}", e);
+                    Status::internal(format!("{:?}", e))
+                })?;
 
         Ok(GrpcResponse::new(proto::RegisterWorkflowResponse {
             workflow_version_id: version_id.to_string(),

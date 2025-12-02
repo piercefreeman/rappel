@@ -13,7 +13,8 @@ import google.protobuf.internal.containers
 import google.protobuf.internal.enum_type_wrapper
 import google.protobuf.message
 import google.protobuf.struct_pb2
-import ir_pb2
+
+from proto import ir_pb2
 
 if sys.version_info >= (3, 10):
     import typing as typing_extensions

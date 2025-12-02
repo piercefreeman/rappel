@@ -14,10 +14,8 @@
 
 use crate::dag::{Dag, EdgeKind, Node, NodeKind};
 use crate::ir_parser::{self as ir, Expression};
-use crate::messages::proto::{
-    NodeContext, NodeDispatch, NodeInfo, WorkflowArguments,
-};
-use anyhow::{anyhow, Result};
+use crate::messages::proto::{NodeContext, NodeDispatch, NodeInfo, WorkflowArguments};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -63,7 +61,7 @@ impl InstanceState {
         let mut deps_required = HashMap::new();
 
         // Calculate required dependencies for each node
-        for (node_id, _node) in &dag.nodes {
+        for node_id in dag.nodes.keys() {
             node_states.insert(node_id.clone(), NodeState::Pending);
             deps_satisfied.insert(node_id.clone(), 0);
 
@@ -76,7 +74,8 @@ impl InstanceState {
         // EXCEPT for exception handler entries which should only become ready on exception
         for (node_id, &required) in &deps_required {
             if required == 0 {
-                let is_exception_handler = dag.get_node(node_id)
+                let is_exception_handler = dag
+                    .get_node(node_id)
                     .map(|n| n.is_exception_handler_entry)
                     .unwrap_or(false);
                 if !is_exception_handler {
@@ -105,7 +104,8 @@ impl InstanceState {
 
     /// Mark a node as running
     pub fn mark_running(&mut self, node_id: &str) {
-        self.node_states.insert(node_id.to_string(), NodeState::Running);
+        self.node_states
+            .insert(node_id.to_string(), NodeState::Running);
     }
 
     /// Get a variable from eval_context
@@ -127,7 +127,8 @@ impl InstanceState {
 
     /// Get a summary of the current eval_context for debugging
     pub fn context_summary(&self) -> String {
-        let vars: Vec<String> = self.eval_context
+        let vars: Vec<String> = self
+            .eval_context
             .iter()
             .map(|(k, v)| format!("{}={}", k, value_preview(v)))
             .collect();
@@ -163,12 +164,15 @@ fn value_preview(v: &Value) -> String {
 /// Count required dependencies for a node (excluding back/guarded edges)
 fn count_required_deps(node_id: &str, dag: &Dag) -> u32 {
     let mut count = 0;
-    for (_source_id, source_node) in &dag.nodes {
+    for source_node in dag.nodes.values() {
         for edge in &source_node.edges {
             if edge.target == node_id {
                 match edge.kind {
                     // These edges don't count as dependencies
-                    EdgeKind::Back | EdgeKind::GuardTrue | EdgeKind::GuardFalse | EdgeKind::Exception => {}
+                    EdgeKind::Back
+                    | EdgeKind::GuardTrue
+                    | EdgeKind::GuardFalse
+                    | EdgeKind::Exception => {}
                     // These edges are real dependencies
                     EdgeKind::Data | EdgeKind::Continue | EdgeKind::Exit => {
                         count += 1;
@@ -186,16 +190,12 @@ pub enum SchedulerAction {
     /// Dispatch a node to a worker for execution
     Dispatch {
         node_id: String,
-        dispatch: NodeDispatch,
+        dispatch: Box<NodeDispatch>,
     },
     /// Node completed, here are the newly ready nodes
-    NodesReady {
-        node_ids: Vec<String>,
-    },
+    NodesReady { node_ids: Vec<String> },
     /// Workflow completed with result
-    WorkflowComplete {
-        result: Option<Value>,
-    },
+    WorkflowComplete { result: Option<Value> },
     /// Sleep for a duration (durable sleep)
     Sleep {
         node_id: String,
@@ -222,7 +222,9 @@ impl<'a> Scheduler<'a> {
         node_id: &str,
         workflow_input: &WorkflowArguments,
     ) -> Result<SchedulerAction> {
-        let node = self.dag.get_node(node_id)
+        let node = self
+            .dag
+            .get_node(node_id)
             .ok_or_else(|| anyhow!("Node {} not found", node_id))?;
 
         debug!(
@@ -247,7 +249,7 @@ impl<'a> Scheduler<'a> {
                 debug!(node_id = %node_id, "Evaluating gather join locally");
                 self.evaluate_gather_join(state, node)
             }
-            NodeKind::Action | NodeKind::Computed => {
+            NodeKind::Action => {
                 debug!(
                     node_id = %node_id,
                     kwargs = ?node.kwargs,
@@ -262,8 +264,41 @@ impl<'a> Scheduler<'a> {
                 );
                 Ok(SchedulerAction::Dispatch {
                     node_id: node_id.to_string(),
-                    dispatch,
+                    dispatch: Box::new(dispatch),
                 })
+            }
+            NodeKind::Computed => {
+                // Check if this is a scheduler-evaluated mutation or a python_block
+                let action = node.action.as_deref().unwrap_or("");
+                match action {
+                    "list_append" => {
+                        debug!(node_id = %node_id, "Evaluating list_append locally");
+                        self.evaluate_list_append(state, node)
+                    }
+                    "dict_set" => {
+                        debug!(node_id = %node_id, "Evaluating dict_set locally");
+                        self.evaluate_dict_set(state, node)
+                    }
+                    _ => {
+                        // python_block - dispatch to worker
+                        debug!(
+                            node_id = %node_id,
+                            kwargs = ?node.kwargs,
+                            "Building dispatch for worker (python_block)"
+                        );
+                        let dispatch = self.build_dispatch(state, node, workflow_input)?;
+                        state.mark_running(node_id);
+                        debug!(
+                            node_id = %node_id,
+                            context_vars = dispatch.context.len(),
+                            "Dispatching to worker"
+                        );
+                        Ok(SchedulerAction::Dispatch {
+                            node_id: node_id.to_string(),
+                            dispatch: Box::new(dispatch),
+                        })
+                    }
+                }
             }
             NodeKind::Sleep => {
                 debug!(node_id = %node_id, "Evaluating sleep node");
@@ -274,7 +309,10 @@ impl<'a> Scheduler<'a> {
                 self.mark_complete_and_unlock(state, node, None)
             }
             NodeKind::Return => {
-                let result = self.dag.return_variable.as_ref()
+                let result = self
+                    .dag
+                    .return_variable
+                    .as_ref()
                     .and_then(|var| state.get_var(var).cloned());
                 debug!(
                     node_id = %node_id,
@@ -297,7 +335,9 @@ impl<'a> Scheduler<'a> {
         exception_type: Option<String>,
         exception_module: Option<String>,
     ) -> Result<SchedulerAction> {
-        let node = self.dag.get_node(node_id)
+        let node = self
+            .dag
+            .get_node(node_id)
             .ok_or_else(|| anyhow!("Node {} not found", node_id))?;
 
         debug!(
@@ -364,15 +404,19 @@ impl<'a> Scheduler<'a> {
         state: &mut InstanceState,
         node: &Node,
     ) -> Result<SchedulerAction> {
-        let meta = node.loop_meta.as_ref()
+        let meta = node
+            .loop_meta
+            .as_ref()
             .ok_or_else(|| anyhow!("Loop head {} missing metadata", node.id))?;
 
         // Get iterator from eval_context
-        let iterator = state.get_var(&meta.iterator_var)
+        let iterator = state
+            .get_var(&meta.iterator_var)
             .cloned()
             .unwrap_or(Value::Array(vec![]));
 
-        let items = iterator.as_array()
+        let items = iterator
+            .as_array()
             .ok_or_else(|| anyhow!("Loop iterator {} is not an array", meta.iterator_var))?;
 
         let current_idx = *state.loop_indices.get(&node.id).unwrap_or(&0);
@@ -388,33 +432,38 @@ impl<'a> Scheduler<'a> {
 
         if current_idx >= items.len() {
             // Loop complete - mark loop head and all body nodes as completed
-            state.node_states.insert(node.id.clone(), NodeState::Completed);
+            state
+                .node_states
+                .insert(node.id.clone(), NodeState::Completed);
 
             // Mark body nodes as completed so they don't block workflow completion
             for body_node_id in &meta.body_nodes {
-                state.node_states.insert(body_node_id.clone(), NodeState::Completed);
+                state
+                    .node_states
+                    .insert(body_node_id.clone(), NodeState::Completed);
             }
 
             // Find and unlock nodes via Exit edges
             let mut newly_ready = Vec::new();
             for edge in &node.edges {
-                if edge.kind == EdgeKind::Exit {
-                    if self.try_unlock_node(state, &edge.target) {
-                        newly_ready.push(edge.target.clone());
-                    }
+                if edge.kind == EdgeKind::Exit && self.try_unlock_node(state, &edge.target) {
+                    newly_ready.push(edge.target.clone());
                 }
             }
 
             // Also unlock any nodes that depend on the loop's output
             for edge in &node.edges {
-                if edge.kind == EdgeKind::Data && !meta.body_nodes.contains(&edge.target) {
-                    if self.try_unlock_node(state, &edge.target) {
-                        newly_ready.push(edge.target.clone());
-                    }
+                if edge.kind == EdgeKind::Data
+                    && !meta.body_nodes.contains(&edge.target)
+                    && self.try_unlock_node(state, &edge.target)
+                {
+                    newly_ready.push(edge.target.clone());
                 }
             }
 
-            Ok(SchedulerAction::NodesReady { node_ids: newly_ready })
+            Ok(SchedulerAction::NodesReady {
+                node_ids: newly_ready,
+            })
         } else {
             // More iterations - bind loop var and unlock body
             let current_item = items[current_idx].clone();
@@ -422,24 +471,28 @@ impl<'a> Scheduler<'a> {
 
             // Reset body nodes for this iteration
             for body_node_id in &meta.body_nodes {
-                state.node_states.insert(body_node_id.clone(), NodeState::Pending);
+                state
+                    .node_states
+                    .insert(body_node_id.clone(), NodeState::Pending);
                 state.deps_satisfied.insert(body_node_id.clone(), 0);
             }
 
             // Mark loop head as "running" (waiting for body)
-            state.node_states.insert(node.id.clone(), NodeState::Running);
+            state
+                .node_states
+                .insert(node.id.clone(), NodeState::Running);
 
             // Unlock body entry via Continue edge
             let mut newly_ready = Vec::new();
             for edge in &node.edges {
-                if edge.kind == EdgeKind::Continue {
-                    if self.try_unlock_node(state, &edge.target) {
-                        newly_ready.push(edge.target.clone());
-                    }
+                if edge.kind == EdgeKind::Continue && self.try_unlock_node(state, &edge.target) {
+                    newly_ready.push(edge.target.clone());
                 }
             }
 
-            Ok(SchedulerAction::NodesReady { node_ids: newly_ready })
+            Ok(SchedulerAction::NodesReady {
+                node_ids: newly_ready,
+            })
         }
     }
 
@@ -451,11 +504,16 @@ impl<'a> Scheduler<'a> {
         loop_head_id: &str,
     ) -> Result<SchedulerAction> {
         // Increment loop index
-        let idx = state.loop_indices.entry(loop_head_id.to_string()).or_insert(0);
+        let idx = state
+            .loop_indices
+            .entry(loop_head_id.to_string())
+            .or_insert(0);
         *idx += 1;
 
         // Re-queue loop head for next iteration
-        state.node_states.insert(loop_head_id.to_string(), NodeState::Ready);
+        state
+            .node_states
+            .insert(loop_head_id.to_string(), NodeState::Ready);
 
         Ok(SchedulerAction::NodesReady {
             node_ids: vec![loop_head_id.to_string()],
@@ -463,12 +521,10 @@ impl<'a> Scheduler<'a> {
     }
 
     /// Evaluate a branch (conditional) node
-    fn evaluate_branch(
-        &self,
-        state: &mut InstanceState,
-        node: &Node,
-    ) -> Result<SchedulerAction> {
-        let meta = node.branch_meta.as_ref()
+    fn evaluate_branch(&self, state: &mut InstanceState, node: &Node) -> Result<SchedulerAction> {
+        let meta = node
+            .branch_meta
+            .as_ref()
             .ok_or_else(|| anyhow!("Branch {} missing metadata", node.id))?;
 
         debug!(
@@ -498,7 +554,9 @@ impl<'a> Scheduler<'a> {
             "Guard evaluation result"
         );
 
-        state.node_states.insert(node.id.clone(), NodeState::Completed);
+        state
+            .node_states
+            .insert(node.id.clone(), NodeState::Completed);
 
         let mut newly_ready = Vec::new();
 
@@ -516,16 +574,19 @@ impl<'a> Scheduler<'a> {
             }
             // First mark ALL false branch nodes as skipped
             for skipped_id in &meta.false_nodes {
-                state.node_states.insert(skipped_id.clone(), NodeState::Skipped);
+                state
+                    .node_states
+                    .insert(skipped_id.clone(), NodeState::Skipped);
             }
             // Then unlock downstream nodes of skipped nodes (but only if target is NOT also skipped)
             for skipped_id in &meta.false_nodes {
                 if let Some(skipped_node) = self.dag.get_node(skipped_id) {
                     for edge in &skipped_node.edges {
-                        if edge.kind == EdgeKind::Data && !meta.false_nodes.contains(&edge.target) {
-                            if self.try_unlock_node(state, &edge.target) {
-                                newly_ready.push(edge.target.clone());
-                            }
+                        if edge.kind == EdgeKind::Data
+                            && !meta.false_nodes.contains(&edge.target)
+                            && self.try_unlock_node(state, &edge.target)
+                        {
+                            newly_ready.push(edge.target.clone());
                         }
                     }
                 }
@@ -549,16 +610,19 @@ impl<'a> Scheduler<'a> {
             }
             // First mark ALL true branch nodes as skipped
             for skipped_id in &meta.true_nodes {
-                state.node_states.insert(skipped_id.clone(), NodeState::Skipped);
+                state
+                    .node_states
+                    .insert(skipped_id.clone(), NodeState::Skipped);
             }
             // Then unlock downstream nodes of skipped nodes (but only if target is NOT also skipped)
             for skipped_id in &meta.true_nodes {
                 if let Some(skipped_node) = self.dag.get_node(skipped_id) {
                     for edge in &skipped_node.edges {
-                        if edge.kind == EdgeKind::Data && !meta.true_nodes.contains(&edge.target) {
-                            if self.try_unlock_node(state, &edge.target) {
-                                newly_ready.push(edge.target.clone());
-                            }
+                        if edge.kind == EdgeKind::Data
+                            && !meta.true_nodes.contains(&edge.target)
+                            && self.try_unlock_node(state, &edge.target)
+                        {
+                            newly_ready.push(edge.target.clone());
                         }
                     }
                 }
@@ -576,7 +640,9 @@ impl<'a> Scheduler<'a> {
             "Branch evaluation complete"
         );
 
-        Ok(SchedulerAction::NodesReady { node_ids: newly_ready })
+        Ok(SchedulerAction::NodesReady {
+            node_ids: newly_ready,
+        })
     }
 
     /// Evaluate a gather join node
@@ -607,12 +673,105 @@ impl<'a> Scheduler<'a> {
         self.mark_complete_and_unlock(state, node, None)
     }
 
-    /// Evaluate a sleep node - returns Sleep action for executor to handle
-    fn evaluate_sleep(
+    /// Evaluate a list_append node (scheduler-side, no worker dispatch)
+    fn evaluate_list_append(
         &self,
         state: &mut InstanceState,
         node: &Node,
     ) -> Result<SchedulerAction> {
+        let target = node
+            .kwargs
+            .get("target")
+            .ok_or_else(|| anyhow!("list_append missing target"))?;
+        let value_expr = node
+            .kwargs
+            .get("value")
+            .ok_or_else(|| anyhow!("list_append missing value"))?;
+
+        // Get the current list (or create empty if doesn't exist)
+        let mut list = match state.get_var(target) {
+            Some(Value::Array(arr)) => arr.clone(),
+            Some(_) => return Err(anyhow!("list_append target {} is not a list", target)),
+            None => Vec::new(),
+        };
+
+        // Evaluate the value expression (could be a variable name or a literal)
+        let value = if let Some(v) = state.get_var(value_expr) {
+            v.clone()
+        } else {
+            // Try to parse as JSON literal
+            serde_json::from_str(value_expr).unwrap_or(Value::String(value_expr.clone()))
+        };
+
+        debug!(
+            node_id = %node.id,
+            target = %target,
+            value = ?value,
+            list_len_before = list.len(),
+            "Appending to list"
+        );
+
+        list.push(value);
+        state.set_var(target.clone(), Value::Array(list));
+
+        self.mark_complete_and_unlock(state, node, None)
+    }
+
+    /// Evaluate a dict_set node (scheduler-side, no worker dispatch)
+    fn evaluate_dict_set(&self, state: &mut InstanceState, node: &Node) -> Result<SchedulerAction> {
+        let target = node
+            .kwargs
+            .get("target")
+            .ok_or_else(|| anyhow!("dict_set missing target"))?;
+        let key_expr = node
+            .kwargs
+            .get("key")
+            .ok_or_else(|| anyhow!("dict_set missing key"))?;
+        let value_expr = node
+            .kwargs
+            .get("value")
+            .ok_or_else(|| anyhow!("dict_set missing value"))?;
+
+        // Get the current dict (or create empty if doesn't exist)
+        let mut dict = match state.get_var(target) {
+            Some(Value::Object(obj)) => obj.clone(),
+            Some(_) => return Err(anyhow!("dict_set target {} is not a dict", target)),
+            None => serde_json::Map::new(),
+        };
+
+        // Evaluate the key expression
+        let key = if let Some(Value::String(s)) = state.get_var(key_expr) {
+            s.clone()
+        } else if key_expr.starts_with('"') && key_expr.ends_with('"') {
+            // String literal - strip quotes
+            key_expr[1..key_expr.len() - 1].to_string()
+        } else {
+            key_expr.clone()
+        };
+
+        // Evaluate the value expression
+        let value = if let Some(v) = state.get_var(value_expr) {
+            v.clone()
+        } else {
+            serde_json::from_str(value_expr).unwrap_or(Value::String(value_expr.clone()))
+        };
+
+        debug!(
+            node_id = %node.id,
+            target = %target,
+            key = %key,
+            value = ?value,
+            "Setting dict key"
+        );
+
+        dict.insert(key, value);
+        state.set_var(target.clone(), Value::Object(dict));
+
+        self.mark_complete_and_unlock(state, node, None)
+    }
+
+    /// Evaluate a sleep node - returns Sleep action for executor to handle
+    fn evaluate_sleep(&self, state: &mut InstanceState, node: &Node) -> Result<SchedulerAction> {
         // Parse duration from the expression
         let duration_str = node.sleep_duration_expr.as_deref().unwrap_or("0");
         let duration_seconds: f64 = duration_str.parse().unwrap_or(0.0);
@@ -645,20 +804,20 @@ impl<'a> Scheduler<'a> {
         state.node_states.insert(node.id.clone(), NodeState::Failed);
 
         // Look for exception edges on this node pointing to handlers
-        let matching_handler = node.edges.iter()
+        let matching_handler = node
+            .edges
+            .iter()
             .filter(|e| e.kind == EdgeKind::Exception)
             .find(|e| {
                 // Check if this handler matches the exception type
                 // Match if: (1) handler catches all (None), or (2) types match
-                let type_matches = match (&e.exception_type, &exception_type) {
+                // For now, we don't strictly check module (most builtins work without it)
+                // A more strict implementation would also match on module
+                match (&e.exception_type, &exception_type) {
                     (None, _) => true, // Bare except catches all
                     (Some(handler_type), Some(exc_type)) => handler_type == exc_type,
                     _ => false,
-                };
-
-                // For now, we don't strictly check module (most builtins work without it)
-                // A more strict implementation would also match on module
-                type_matches
+                }
             });
 
         if let Some(handler_edge) = matching_handler {
@@ -684,18 +843,28 @@ impl<'a> Scheduler<'a> {
 
             // Find all try-block nodes (nodes that have exception edges to this handler)
             // and mark them as skipped, unlocking their downstream Data edges
-            let try_nodes: Vec<String> = self.dag.nodes.values()
-                .filter(|n| n.edges.iter().any(|e| {
-                    e.kind == EdgeKind::Exception && e.target == handler_edge.target
-                }))
+            let try_nodes: Vec<String> = self
+                .dag
+                .nodes
+                .values()
+                .filter(|n| {
+                    n.edges
+                        .iter()
+                        .any(|e| e.kind == EdgeKind::Exception && e.target == handler_edge.target)
+                })
                 .map(|n| n.id.clone())
                 .collect();
 
             for try_node_id in &try_nodes {
                 let current_state = state.node_states.get(try_node_id).cloned();
                 // Skip nodes that haven't completed (Pending, Ready, Running)
-                if matches!(current_state, Some(NodeState::Pending) | Some(NodeState::Ready) | Some(NodeState::Running)) {
-                    state.node_states.insert(try_node_id.clone(), NodeState::Skipped);
+                if matches!(
+                    current_state,
+                    Some(NodeState::Pending) | Some(NodeState::Ready) | Some(NodeState::Running)
+                ) {
+                    state
+                        .node_states
+                        .insert(try_node_id.clone(), NodeState::Skipped);
                     debug!(try_node_id = %try_node_id, "Marking try-block node as skipped due to exception");
 
                     // Unlock downstream Data edges from skipped nodes
@@ -721,7 +890,9 @@ impl<'a> Scheduler<'a> {
                     );
 
                     // Mark the handler entry as skipped
-                    state.node_states.insert(edge.target.clone(), NodeState::Skipped);
+                    state
+                        .node_states
+                        .insert(edge.target.clone(), NodeState::Skipped);
 
                     // Unlock its downstream edges (to the merge node)
                     if let Some(handler_node) = self.dag.get_node(&edge.target) {
@@ -735,11 +906,15 @@ impl<'a> Scheduler<'a> {
             }
 
             // Mark the handler entry as ready
-            state.node_states.insert(handler_edge.target.clone(), NodeState::Ready);
+            state
+                .node_states
+                .insert(handler_edge.target.clone(), NodeState::Ready);
 
             // The handler doesn't depend on normal data flow, so set deps_satisfied = deps_required
             if let Some(required) = state.deps_required.get(&handler_edge.target) {
-                state.deps_satisfied.insert(handler_edge.target.clone(), *required);
+                state
+                    .deps_satisfied
+                    .insert(handler_edge.target.clone(), *required);
             }
 
             return Ok(SchedulerAction::NodesReady {
@@ -764,7 +939,9 @@ impl<'a> Scheduler<'a> {
         node: &Node,
         _result: Option<Value>,
     ) -> Result<SchedulerAction> {
-        state.node_states.insert(node.id.clone(), NodeState::Completed);
+        state
+            .node_states
+            .insert(node.id.clone(), NodeState::Completed);
 
         let mut newly_ready = Vec::new();
 
@@ -782,12 +959,17 @@ impl<'a> Scheduler<'a> {
 
         // If no more ready nodes, check if workflow is complete
         if newly_ready.is_empty() && self.is_workflow_complete(state) {
-            let result = self.dag.return_variable.as_ref()
+            let result = self
+                .dag
+                .return_variable
+                .as_ref()
                 .and_then(|var| state.get_var(var).cloned());
             return Ok(SchedulerAction::WorkflowComplete { result });
         }
 
-        Ok(SchedulerAction::NodesReady { node_ids: newly_ready })
+        Ok(SchedulerAction::NodesReady {
+            node_ids: newly_ready,
+        })
     }
 
     /// Check if all nodes in the workflow are completed (or skipped/failed with handled exception)
@@ -811,11 +993,13 @@ impl<'a> Scheduler<'a> {
 
         if *satisfied >= required {
             // Check current state - only unlock if pending
-            if let Some(current_state) = state.node_states.get(node_id) {
-                if *current_state == NodeState::Pending {
-                    state.node_states.insert(node_id.to_string(), NodeState::Ready);
-                    return true;
-                }
+            if let Some(current_state) = state.node_states.get(node_id)
+                && *current_state == NodeState::Pending
+            {
+                state
+                    .node_states
+                    .insert(node_id.to_string(), NodeState::Ready);
+                return true;
             }
         }
         false
@@ -823,7 +1007,8 @@ impl<'a> Scheduler<'a> {
 
     /// Get back edge target for a node, if any
     fn get_back_edge_target(&self, node: &Node) -> Option<String> {
-        node.edges.iter()
+        node.edges
+            .iter()
             .find(|e| e.kind == EdgeKind::Back)
             .map(|e| e.target.clone())
     }
@@ -862,13 +1047,13 @@ impl<'a> Scheduler<'a> {
 fn build_context_for_node(state: &InstanceState, node: &Node) -> Vec<NodeContext> {
     // For now, include all variables in context
     // TODO: Optimize to only include variables referenced in kwargs
-    let context: Vec<NodeContext> = state.eval_context.iter()
-        .map(|(var, value)| {
-            NodeContext {
-                variable: var.clone(),
-                payload: Some(value_to_workflow_args(var, value)),
-                source_node_id: String::new(),
-            }
+    let context: Vec<NodeContext> = state
+        .eval_context
+        .iter()
+        .map(|(var, value)| NodeContext {
+            variable: var.clone(),
+            payload: Some(value_to_workflow_args(var, value)),
+            source_node_id: String::new(),
         })
         .collect();
 
@@ -886,9 +1071,8 @@ fn build_context_for_node(state: &InstanceState, node: &Node) -> Vec<NodeContext
 /// Convert a Value to WorkflowArguments with "result" key (matches Python's serialize_result_payload)
 fn value_to_workflow_args(_key: &str, value: &Value) -> WorkflowArguments {
     use crate::messages::proto::{
-        WorkflowArgument, WorkflowArgumentValue, PrimitiveWorkflowArgument,
-        WorkflowListArgument, WorkflowDictArgument,
-        primitive_workflow_argument::Kind as PrimitiveKind,
+        PrimitiveWorkflowArgument, WorkflowArgument, WorkflowArgumentValue, WorkflowDictArgument,
+        WorkflowListArgument, primitive_workflow_argument::Kind as PrimitiveKind,
         workflow_argument_value::Kind as ValueKind,
     };
 
@@ -931,7 +1115,8 @@ fn value_to_workflow_args(_key: &str, value: &Value) -> WorkflowArguments {
             },
             Value::Object(obj) => WorkflowArgumentValue {
                 kind: Some(ValueKind::DictValue(WorkflowDictArgument {
-                    entries: obj.iter()
+                    entries: obj
+                        .iter()
                         .map(|(k, v)| WorkflowArgument {
                             key: k.clone(),
                             value: Some(convert_value(v)),
@@ -965,39 +1150,38 @@ fn value_to_bool(value: &Value) -> bool {
 
 /// Evaluate a proto Expression against a context
 fn eval_expression(expr: &Expression, context: &HashMap<String, Value>) -> Result<Value> {
-    use ir::expression::Kind;
     use ir::binary_op::Op as BinaryOp;
-    use ir::unary_op::Op as UnaryOp;
+    use ir::expression::Kind;
     use ir::literal::Value as LiteralValue;
+    use ir::unary_op::Op as UnaryOp;
 
     match &expr.kind {
         None => Err(anyhow!("Expression has no kind")),
 
-        Some(Kind::Literal(lit)) => {
-            match &lit.value {
-                None => Ok(Value::Null),
-                Some(LiteralValue::NullValue(_)) => Ok(Value::Null),
-                Some(LiteralValue::BoolValue(b)) => Ok(Value::Bool(*b)),
-                Some(LiteralValue::IntValue(i)) => Ok(Value::Number((*i).into())),
-                Some(LiteralValue::FloatValue(d)) => {
-                    serde_json::Number::from_f64(*d)
-                        .map(Value::Number)
-                        .ok_or_else(|| anyhow!("Invalid float: {}", d))
-                }
-                Some(LiteralValue::StringValue(s)) => Ok(Value::String(s.clone())),
-            }
-        }
+        Some(Kind::Literal(lit)) => match &lit.value {
+            None => Ok(Value::Null),
+            Some(LiteralValue::NullValue(_)) => Ok(Value::Null),
+            Some(LiteralValue::BoolValue(b)) => Ok(Value::Bool(*b)),
+            Some(LiteralValue::IntValue(i)) => Ok(Value::Number((*i).into())),
+            Some(LiteralValue::FloatValue(d)) => serde_json::Number::from_f64(*d)
+                .map(Value::Number)
+                .ok_or_else(|| anyhow!("Invalid float: {}", d)),
+            Some(LiteralValue::StringValue(s)) => Ok(Value::String(s.clone())),
+        },
 
-        Some(Kind::Variable(var_name)) => {
-            context.get(var_name)
-                .cloned()
-                .ok_or_else(|| anyhow!("Variable '{}' not found in context", var_name))
-        }
+        Some(Kind::Variable(var_name)) => context
+            .get(var_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("Variable '{}' not found in context", var_name)),
 
         Some(Kind::Subscript(sub)) => {
-            let base = sub.base.as_ref()
+            let base = sub
+                .base
+                .as_ref()
                 .ok_or_else(|| anyhow!("Subscript missing base"))?;
-            let key = sub.key.as_ref()
+            let key = sub
+                .key
+                .as_ref()
                 .ok_or_else(|| anyhow!("Subscript missing key"))?;
 
             let base_val = eval_expression(base, context)?;
@@ -1005,18 +1189,26 @@ fn eval_expression(expr: &Expression, context: &HashMap<String, Value>) -> Resul
 
             match (&base_val, &key_val) {
                 (Value::Array(arr), Value::Number(n)) => {
-                    let idx = n.as_i64().ok_or_else(|| anyhow!("Array index must be integer"))? as usize;
-                    arr.get(idx).cloned().ok_or_else(|| anyhow!("Array index {} out of bounds", idx))
+                    let idx = n
+                        .as_i64()
+                        .ok_or_else(|| anyhow!("Array index must be integer"))?
+                        as usize;
+                    arr.get(idx)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("Array index {} out of bounds", idx))
                 }
-                (Value::Object(obj), Value::String(k)) => {
-                    obj.get(k).cloned().ok_or_else(|| anyhow!("Key '{}' not found in object", k))
-                }
-                _ => Err(anyhow!("Invalid subscript: {:?}[{:?}]", base_val, key_val))
+                (Value::Object(obj), Value::String(k)) => obj
+                    .get(k)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Key '{}' not found in object", k)),
+                _ => Err(anyhow!("Invalid subscript: {:?}[{:?}]", base_val, key_val)),
             }
         }
 
         Some(Kind::Array(arr)) => {
-            let items: Result<Vec<Value>> = arr.elements.iter()
+            let items: Result<Vec<Value>> = arr
+                .elements
+                .iter()
                 .map(|e| eval_expression(e, context))
                 .collect();
             Ok(Value::Array(items?))
@@ -1027,7 +1219,9 @@ fn eval_expression(expr: &Expression, context: &HashMap<String, Value>) -> Resul
             for entry in &dict.entries {
                 // Dict keys are strings directly in the proto
                 let key_str = entry.key.clone();
-                let val = entry.value.as_ref()
+                let val = entry
+                    .value
+                    .as_ref()
                     .ok_or_else(|| anyhow!("Dict entry missing value"))?;
 
                 map.insert(key_str, eval_expression(val, context)?);
@@ -1036,9 +1230,13 @@ fn eval_expression(expr: &Expression, context: &HashMap<String, Value>) -> Resul
         }
 
         Some(Kind::BinaryOp(binop)) => {
-            let left = binop.left.as_ref()
+            let left = binop
+                .left
+                .as_ref()
                 .ok_or_else(|| anyhow!("BinaryOp missing left operand"))?;
-            let right = binop.right.as_ref()
+            let right = binop
+                .right
+                .as_ref()
                 .ok_or_else(|| anyhow!("BinaryOp missing right operand"))?;
 
             let left_val = eval_expression(left, context)?;
@@ -1072,63 +1270,85 @@ fn eval_expression(expr: &Expression, context: &HashMap<String, Value>) -> Resul
                 Ok(BinaryOp::Mod) => numeric_binop(&left_val, &right_val, |a, b| a % b),
                 Ok(BinaryOp::Eq) => Ok(Value::Bool(left_val == right_val)),
                 Ok(BinaryOp::Ne) => Ok(Value::Bool(left_val != right_val)),
-                Ok(BinaryOp::Lt) => Ok(Value::Bool(compare_numeric(&left_val, &right_val, |a, b| a < b))),
-                Ok(BinaryOp::Le) => Ok(Value::Bool(compare_numeric(&left_val, &right_val, |a, b| a <= b))),
-                Ok(BinaryOp::Gt) => Ok(Value::Bool(compare_numeric(&left_val, &right_val, |a, b| a > b))),
-                Ok(BinaryOp::Ge) => Ok(Value::Bool(compare_numeric(&left_val, &right_val, |a, b| a >= b))),
+                Ok(BinaryOp::Lt) => Ok(Value::Bool(compare_numeric(
+                    &left_val,
+                    &right_val,
+                    |a, b| a < b,
+                ))),
+                Ok(BinaryOp::Le) => Ok(Value::Bool(compare_numeric(
+                    &left_val,
+                    &right_val,
+                    |a, b| a <= b,
+                ))),
+                Ok(BinaryOp::Gt) => Ok(Value::Bool(compare_numeric(
+                    &left_val,
+                    &right_val,
+                    |a, b| a > b,
+                ))),
+                Ok(BinaryOp::Ge) => Ok(Value::Bool(compare_numeric(
+                    &left_val,
+                    &right_val,
+                    |a, b| a >= b,
+                ))),
                 Ok(BinaryOp::And) | Ok(BinaryOp::Or) => unreachable!(), // handled above
                 Ok(BinaryOp::In) => {
                     // Check if left is in right (array/object)
                     match &right_val {
                         Value::Array(arr) => Ok(Value::Bool(arr.contains(&left_val))),
-                        Value::Object(obj) => {
-                            match &left_val {
-                                Value::String(s) => Ok(Value::Bool(obj.contains_key(s))),
-                                _ => Ok(Value::Bool(false)),
-                            }
-                        }
-                        _ => Err(anyhow!("'in' operator requires array or object on right side"))
+                        Value::Object(obj) => match &left_val {
+                            Value::String(s) => Ok(Value::Bool(obj.contains_key(s))),
+                            _ => Ok(Value::Bool(false)),
+                        },
+                        _ => Err(anyhow!(
+                            "'in' operator requires array or object on right side"
+                        )),
                     }
                 }
                 Ok(BinaryOp::NotIn) => {
                     // Check if left is NOT in right
                     match &right_val {
                         Value::Array(arr) => Ok(Value::Bool(!arr.contains(&left_val))),
-                        Value::Object(obj) => {
-                            match &left_val {
-                                Value::String(s) => Ok(Value::Bool(!obj.contains_key(s))),
-                                _ => Ok(Value::Bool(true)),
-                            }
-                        }
-                        _ => Err(anyhow!("'not in' operator requires array or object on right side"))
+                        Value::Object(obj) => match &left_val {
+                            Value::String(s) => Ok(Value::Bool(!obj.contains_key(s))),
+                            _ => Ok(Value::Bool(true)),
+                        },
+                        _ => Err(anyhow!(
+                            "'not in' operator requires array or object on right side"
+                        )),
                     }
                 }
-                Ok(BinaryOp::Unspecified) | Err(_) => Err(anyhow!("Unknown binary operator: {}", binop.op))
+                Ok(BinaryOp::Unspecified) | Err(_) => {
+                    Err(anyhow!("Unknown binary operator: {}", binop.op))
+                }
             }
         }
 
         Some(Kind::UnaryOp(unop)) => {
-            let operand = unop.operand.as_ref()
+            let operand = unop
+                .operand
+                .as_ref()
                 .ok_or_else(|| anyhow!("UnaryOp missing operand"))?;
             let val = eval_expression(operand, context)?;
 
             match UnaryOp::try_from(unop.op) {
                 Ok(UnaryOp::Not) => Ok(Value::Bool(!value_to_bool(&val))),
-                Ok(UnaryOp::Neg) => {
-                    match val.as_f64() {
-                        Some(n) => serde_json::Number::from_f64(-n)
-                            .map(Value::Number)
-                            .ok_or_else(|| anyhow!("Invalid negation result")),
-                        None => Err(anyhow!("Cannot negate non-number: {:?}", val))
-                    }
+                Ok(UnaryOp::Neg) => match val.as_f64() {
+                    Some(n) => serde_json::Number::from_f64(-n)
+                        .map(Value::Number)
+                        .ok_or_else(|| anyhow!("Invalid negation result")),
+                    None => Err(anyhow!("Cannot negate non-number: {:?}", val)),
+                },
+                Ok(UnaryOp::Unspecified) | Err(_) => {
+                    Err(anyhow!("Unknown unary operator: {}", unop.op))
                 }
-                Ok(UnaryOp::Unspecified) | Err(_) => Err(anyhow!("Unknown unary operator: {}", unop.op))
             }
         }
 
         Some(Kind::Call(call)) => {
             // Handle built-in functions
-            let args: Result<Vec<Value>> = call.args.iter()
+            let args: Result<Vec<Value>> = call
+                .args
+                .iter()
                 .map(|e| eval_expression(e, context))
                 .collect();
             let args = args?;
@@ -1142,7 +1362,7 @@ fn eval_expression(expr: &Expression, context: &HashMap<String, Value>) -> Resul
                         Value::Array(a) => Ok(Value::Number((a.len() as i64).into())),
                         Value::String(s) => Ok(Value::Number((s.len() as i64).into())),
                         Value::Object(o) => Ok(Value::Number((o.len() as i64).into())),
-                        _ => Err(anyhow!("len() not supported for {:?}", args[0]))
+                        _ => Err(anyhow!("len() not supported for {:?}", args[0])),
                     }
                 }
                 "str" => {
@@ -1157,28 +1377,30 @@ fn eval_expression(expr: &Expression, context: &HashMap<String, Value>) -> Resul
                     }
                     match &args[0] {
                         Value::Number(n) => Ok(Value::Number((n.as_i64().unwrap_or(0)).into())),
-                        Value::String(s) => s.parse::<i64>()
+                        Value::String(s) => s
+                            .parse::<i64>()
                             .map(|n| Value::Number(n.into()))
                             .map_err(|_| anyhow!("Cannot convert '{}' to int", s)),
-                        _ => Err(anyhow!("int() not supported for {:?}", args[0]))
+                        _ => Err(anyhow!("int() not supported for {:?}", args[0])),
                     }
                 }
-                _ => Err(anyhow!("Unknown function: {}", call.function))
+                _ => Err(anyhow!("Unknown function: {}", call.function)),
             }
         }
 
         Some(Kind::Attribute(attr)) => {
-            let base = attr.base.as_ref()
+            let base = attr
+                .base
+                .as_ref()
                 .ok_or_else(|| anyhow!("Attribute access missing base"))?;
             let base_val = eval_expression(base, context)?;
 
             match base_val {
-                Value::Object(obj) => {
-                    obj.get(&attr.attribute)
-                        .cloned()
-                        .ok_or_else(|| anyhow!("Attribute '{}' not found", attr.attribute))
-                }
-                _ => Err(anyhow!("Cannot access attribute on {:?}", base_val))
+                Value::Object(obj) => obj
+                    .get(&attr.attribute)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Attribute '{}' not found", attr.attribute)),
+                _ => Err(anyhow!("Cannot access attribute on {:?}", base_val)),
             }
         }
     }
@@ -1200,7 +1422,11 @@ where
                     .ok_or_else(|| anyhow!("Invalid arithmetic result"))
             }
         }
-        _ => Err(anyhow!("Cannot perform arithmetic on non-numbers: {:?} and {:?}", left, right))
+        _ => Err(anyhow!(
+            "Cannot perform arithmetic on non-numbers: {:?} and {:?}",
+            left,
+            right
+        )),
     }
 }
 
@@ -1240,14 +1466,16 @@ mod tests {
         assert_eq!(ready, vec!["a"]);
 
         // Complete A with result
-        let result = scheduler.handle_completion(
-            &mut state,
-            "a",
-            Some(Value::String("hello".to_string())),
-            true,
-            None,
-            None,
-        ).unwrap();
+        let result = scheduler
+            .handle_completion(
+                &mut state,
+                "a",
+                Some(Value::String("hello".to_string())),
+                true,
+                None,
+                None,
+            )
+            .unwrap();
 
         // B should now be ready
         if let SchedulerAction::NodesReady { node_ids } = result {
@@ -1288,10 +1516,10 @@ mod tests {
 
         // Initialize with iterator
         let mut initial = HashMap::new();
-        initial.insert("items".to_string(), Value::Array(vec![
-            Value::Number(1.into()),
-            Value::Number(2.into()),
-        ]));
+        initial.insert(
+            "items".to_string(),
+            Value::Array(vec![Value::Number(1.into()), Value::Number(2.into())]),
+        );
 
         let mut state = InstanceState::new(&dag, initial);
         let scheduler = Scheduler::new(&dag);
@@ -1301,11 +1529,9 @@ mod tests {
         assert!(ready.contains(&"loop".to_string()));
 
         // Process loop head - should unlock body with first item
-        let action = scheduler.process_ready_node(
-            &mut state,
-            "loop",
-            &WorkflowArguments::default(),
-        ).unwrap();
+        let action = scheduler
+            .process_ready_node(&mut state, "loop", &WorkflowArguments::default())
+            .unwrap();
 
         if let SchedulerAction::NodesReady { node_ids } = action {
             assert!(node_ids.contains(&"body".to_string()));

@@ -105,7 +105,7 @@ def _ast_to_expression(node: ast.expr) -> ir_pb2.Expression:
 
     if isinstance(node, ast.Dict):
         entries = []
-        for k, v in zip(node.keys, node.values):
+        for k, v in zip(node.keys, node.values, strict=True):
             if k is None:
                 # dict unpacking (**d) - not supported in IR
                 raise IRParseError(
@@ -161,7 +161,7 @@ def _ast_to_expression(node: ast.expr) -> ir_pb2.Expression:
             # Chain comparison like a < b < c becomes (a < b) and (b < c)
             exprs = []
             left = node.left
-            for op_node, right in zip(node.ops, node.comparators):
+            for op_node, right in zip(node.ops, node.comparators, strict=True):
                 op = _CMPOP_MAP.get(type(op_node))
                 if op is None:
                     raise IRParseError(
@@ -838,11 +838,12 @@ class IRParser:
         for body_stmt in stmt.body:
             body_location = _source_location_from_node(body_stmt)
 
-            # Check for append - becomes a PythonBlock
+            # Check for append - becomes a ListAppend
             append_info = self._extract_append(body_stmt)
             if append_info is not None:
-                block = self._make_python_block([body_stmt], body_location, loop_known_vars)
-                body_statements.append(ir_pb2.Statement(python_block=block))
+                acc_name, value_expr_str = append_info
+                list_append = self._make_list_append(acc_name, body_stmt, body_location)
+                body_statements.append(ir_pb2.Statement(list_append=list_append))
                 continue
 
             # Check for action call with assignment
@@ -1581,9 +1582,6 @@ class IRParser:
         temp_var = f"__{target}_item"
         action.target = temp_var
 
-        # Track variables available in loop body
-        loop_known_vars = self._known_vars | {loop_var, temp_var}
-
         # Create the loop body:
         # 1. Action call that produces temp_var
         # 2. Append temp_var to accumulator
@@ -1593,13 +1591,11 @@ class IRParser:
         action.location.CopyFrom(location)
         body_statements.append(ir_pb2.Statement(action_call=action))
 
-        # Create the append statement as a PythonBlock
-        append_code = f"{target}.append({temp_var})"
-        append_block = ir_pb2.PythonBlock(code=append_code)
-        append_block.inputs.extend([target, temp_var])
-        append_block.outputs.append(target)
-        append_block.location.CopyFrom(location)
-        body_statements.append(ir_pb2.Statement(python_block=append_block))
+        # Create the append statement as a ListAppend
+        list_append = ir_pb2.ListAppend(target=target)
+        list_append.value.CopyFrom(ir_pb2.Expression(variable=temp_var))
+        list_append.location.CopyFrom(location)
+        body_statements.append(ir_pb2.Statement(list_append=list_append))
 
         # Create the Loop IR
         loop = ir_pb2.Loop(
@@ -1672,6 +1668,57 @@ class IRParser:
         accumulator = func.value.id
         source_expr = ast.unparse(call.args[0])
         return (accumulator, source_expr)
+
+    def _make_list_append(
+        self, target: str, stmt: ast.stmt, location: ir_pb2.SourceLocation
+    ) -> ir_pb2.ListAppend:
+        """Create a ListAppend IR from an append call statement."""
+        # Extract the value being appended
+        call = stmt.value  # type: ignore[union-attr]
+        value_ast = call.args[0]
+        value_expr = _ast_to_expression(value_ast)
+
+        list_append = ir_pb2.ListAppend(target=target)
+        list_append.value.CopyFrom(value_expr)
+        list_append.location.CopyFrom(location)
+        return list_append
+
+    def _extract_dict_set(self, stmt: ast.stmt) -> tuple[str, ast.expr, ast.expr] | None:
+        """Extract dict[key] = value pattern.
+
+        Returns (dict_name, key_expr, value_expr) or None if not a dict set.
+        """
+        if not isinstance(stmt, ast.Assign):
+            return None
+
+        if len(stmt.targets) != 1:
+            return None
+
+        target = stmt.targets[0]
+        if not isinstance(target, ast.Subscript):
+            return None
+
+        if not isinstance(target.value, ast.Name):
+            # Only support simple variable names as dict target
+            return None
+
+        dict_name = target.value.id
+        key_expr = target.slice
+        value_expr = stmt.value
+        return (dict_name, key_expr, value_expr)
+
+    def _make_dict_set(
+        self, target: str, key_ast: ast.expr, value_ast: ast.expr, location: ir_pb2.SourceLocation
+    ) -> ir_pb2.DictSet:
+        """Create a DictSet IR from a dict subscript assignment."""
+        key_expr = _ast_to_expression(key_ast)
+        value_expr = _ast_to_expression(value_ast)
+
+        dict_set = ir_pb2.DictSet(target=target)
+        dict_set.key.CopyFrom(key_expr)
+        dict_set.value.CopyFrom(value_expr)
+        dict_set.location.CopyFrom(location)
+        return dict_set
 
     def _get_action_name(self, node: ast.expr) -> str | None:
         """Get action name from a call's func."""
@@ -1804,6 +1851,10 @@ class IRSerializer:
             return self._serialize_return(stmt.return_stmt)
         if kind == "spread":
             return self._serialize_spread(stmt.spread)
+        if kind == "list_append":
+            return self._serialize_list_append(stmt.list_append)
+        if kind == "dict_set":
+            return self._serialize_dict_set(stmt.dict_set)
         # Defensive: handle unknown statement kinds for forward compatibility
         # with new IR statement types.
         return [f"# UNKNOWN: {kind}"]
@@ -2076,3 +2127,14 @@ class IRSerializer:
         # Spread without target - parallel action over collection without collecting results.
         # This is a valid pattern when the actions have side effects but results aren't needed.
         return [f"spread {call_str} over {iterable_str} as {spread.loop_var}{loc}"]
+
+    def _serialize_list_append(self, append: ir_pb2.ListAppend) -> list[str]:
+        loc = self._loc_comment(append.location if append.HasField("location") else None)
+        value_str = _expression_to_string(append.value) if append.HasField("value") else "?"
+        return [f"{append.target} += [{value_str}]{loc}"]
+
+    def _serialize_dict_set(self, dict_set: ir_pb2.DictSet) -> list[str]:
+        loc = self._loc_comment(dict_set.location if dict_set.HasField("location") else None)
+        key_str = _expression_to_string(dict_set.key) if dict_set.HasField("key") else "?"
+        value_str = _expression_to_string(dict_set.value) if dict_set.HasField("value") else "?"
+        return [f"{dict_set.target}[{key_str}] = {value_str}{loc}"]

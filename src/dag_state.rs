@@ -89,7 +89,10 @@ pub fn deps_satisfied(node: &Node, dag: &Dag, completed: &HashSet<String>) -> bo
             if edge.target == node.id {
                 // Skip back edges and guarded edges - they're handled specially
                 match edge.kind {
-                    EdgeKind::Back | EdgeKind::GuardTrue | EdgeKind::GuardFalse | EdgeKind::Exception => {
+                    EdgeKind::Back
+                    | EdgeKind::GuardTrue
+                    | EdgeKind::GuardFalse
+                    | EdgeKind::Exception => {
                         continue;
                     }
                     EdgeKind::Data | EdgeKind::Continue | EdgeKind::Exit => {
@@ -155,7 +158,11 @@ mod tests {
         assert!(deps_satisfied(dag.get_node("a").unwrap(), &dag, &completed));
 
         // Node B depends on A, should not be ready
-        assert!(!deps_satisfied(dag.get_node("b").unwrap(), &dag, &completed));
+        assert!(!deps_satisfied(
+            dag.get_node("b").unwrap(),
+            &dag,
+            &completed
+        ));
 
         // After A completes, B should be ready
         let mut completed = HashSet::new();

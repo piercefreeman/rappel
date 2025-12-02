@@ -10,9 +10,7 @@ use sqlx::postgres::PgPoolOptions;
 use tokio::{runtime::Runtime, time::sleep};
 
 use crate::{
-    WorkflowInstanceId, WorkflowVersionId,
-    messages::proto::WorkflowRegistration,
-    store::Store,
+    WorkflowInstanceId, WorkflowVersionId, messages::proto::WorkflowRegistration, store::Store,
 };
 
 /// Run a workflow instance from a serialized registration payload

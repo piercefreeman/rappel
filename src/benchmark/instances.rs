@@ -2,14 +2,10 @@
 //!
 //! NOTE: Stubbed out pending migration to new store/scheduler model.
 
-use std::time::Duration;
 use anyhow::Result;
+use std::time::Duration;
 
-use crate::{
-    benchmark::common::BenchmarkSummary,
-    worker::PythonWorkerConfig,
-    store::Store,
-};
+use crate::{benchmark::common::BenchmarkSummary, store::Store, worker::PythonWorkerConfig};
 
 #[derive(Debug, Clone)]
 pub struct WorkflowBenchmarkConfig {

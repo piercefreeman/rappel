@@ -17,7 +17,11 @@ pub struct ConversionError {
 impl std::fmt::Display for ConversionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(loc) = &self.location {
-            write!(f, "{} (line {}, col {})", self.message, loc.lineno, loc.col_offset)
+            write!(
+                f,
+                "{} (line {}, col {})",
+                self.message, loc.lineno, loc.col_offset
+            )
         } else {
             write!(f, "{}", self.message)
         }
@@ -51,10 +55,10 @@ impl ConversionState {
 
     fn add_node(&mut self, node: Node) {
         // Add data edge from last node if exists
-        if let Some(last_id) = &self.last_node_id {
-            if let Some(last_node) = self.dag.get_node_mut(last_id) {
-                last_node.add_edge(node.id.clone(), EdgeKind::Data);
-            }
+        if let Some(last_id) = &self.last_node_id
+            && let Some(last_node) = self.dag.get_node_mut(last_id)
+        {
+            last_node.add_edge(node.id.clone(), EdgeKind::Data);
         }
 
         self.last_node_id = Some(node.id.clone());
@@ -75,7 +79,10 @@ pub fn convert_workflow(workflow: &ir::Workflow, concurrent: bool) -> Result<Dag
     Ok(state.dag)
 }
 
-fn convert_statement(state: &mut ConversionState, stmt: &ir::Statement) -> Result<(), ConversionError> {
+fn convert_statement(
+    state: &mut ConversionState,
+    stmt: &ir::Statement,
+) -> Result<(), ConversionError> {
     let kind = stmt.kind.as_ref().ok_or_else(|| ConversionError {
         message: "Statement has no kind".to_string(),
         location: None,
@@ -109,12 +116,21 @@ fn convert_statement(state: &mut ConversionState, stmt: &ir::Statement) -> Resul
         ir::statement::Kind::Spread(spread) => {
             convert_spread(state, spread)?;
         }
+        ir::statement::Kind::ListAppend(append) => {
+            convert_list_append(state, append)?;
+        }
+        ir::statement::Kind::DictSet(dict_set) => {
+            convert_dict_set(state, dict_set)?;
+        }
     }
 
     Ok(())
 }
 
-fn convert_action_call(state: &mut ConversionState, action: &ir::ActionCall) -> Result<String, ConversionError> {
+fn convert_action_call(
+    state: &mut ConversionState,
+    action: &ir::ActionCall,
+) -> Result<String, ConversionError> {
     let node_id = state.next_node_id("action");
 
     let mut node = Node::action(&node_id, &action.action);
@@ -154,19 +170,18 @@ fn convert_action_call(state: &mut ConversionState, action: &ir::ActionCall) -> 
 }
 
 fn convert_backoff(ir_backoff: &ir::BackoffConfig) -> BackoffPolicy {
-    let kind = ir::backoff_config::Kind::try_from(ir_backoff.kind).unwrap_or(ir::backoff_config::Kind::Linear);
+    let kind = ir::backoff_config::Kind::try_from(ir_backoff.kind)
+        .unwrap_or(ir::backoff_config::Kind::Linear);
     match kind {
         ir::backoff_config::Kind::Linear | ir::backoff_config::Kind::Unspecified => {
             BackoffPolicy::Linear {
                 base_delay_ms: ir_backoff.base_delay_ms,
             }
         }
-        ir::backoff_config::Kind::Exponential => {
-            BackoffPolicy::Exponential {
-                base_delay_ms: ir_backoff.base_delay_ms,
-                multiplier: ir_backoff.multiplier.unwrap_or(2.0),
-            }
-        }
+        ir::backoff_config::Kind::Exponential => BackoffPolicy::Exponential {
+            base_delay_ms: ir_backoff.base_delay_ms,
+            multiplier: ir_backoff.multiplier.unwrap_or(2.0),
+        },
     }
 }
 
@@ -195,7 +210,8 @@ fn convert_gather(state: &mut ConversionState, gather: &ir::Gather) -> Result<()
             ir::gather_call::Kind::Subgraph(subgraph) => {
                 // Create placeholder for subgraph
                 let node_id = state.next_node_id("subgraph");
-                let mut node = Node::action(&node_id, format!("__subgraph_{}", subgraph.method_name));
+                let mut node =
+                    Node::action(&node_id, format!("__subgraph_{}", subgraph.method_name));
                 if let Some(target) = &gather.target {
                     node.produces.push(format!("{}__item{}", target, i));
                 }
@@ -227,7 +243,10 @@ fn convert_gather(state: &mut ConversionState, gather: &ir::Gather) -> Result<()
     Ok(())
 }
 
-fn convert_python_block(state: &mut ConversionState, block: &ir::PythonBlock) -> Result<String, ConversionError> {
+fn convert_python_block(
+    state: &mut ConversionState,
+    block: &ir::PythonBlock,
+) -> Result<String, ConversionError> {
     let node_id = state.next_node_id("python");
 
     let mut node = Node::computed(&node_id);
@@ -237,16 +256,76 @@ fn convert_python_block(state: &mut ConversionState, block: &ir::PythonBlock) ->
 
     // Store imports and definitions
     if !block.imports.is_empty() {
-        node.kwargs.insert("imports".to_string(), block.imports.join("\n"));
+        node.kwargs
+            .insert("imports".to_string(), block.imports.join("\n"));
     }
     if !block.definitions.is_empty() {
-        node.kwargs.insert("definitions".to_string(), block.definitions.join("\n"));
+        node.kwargs
+            .insert("definitions".to_string(), block.definitions.join("\n"));
     }
 
     // Track outputs
     for output in &block.outputs {
         node.produces.push(output.clone());
     }
+
+    state.add_node(node);
+    Ok(node_id)
+}
+
+fn convert_list_append(
+    state: &mut ConversionState,
+    append: &ir::ListAppend,
+) -> Result<String, ConversionError> {
+    let node_id = state.next_node_id("list_append");
+
+    let mut node = Node::computed(&node_id);
+    node.action = Some("list_append".to_string());
+
+    // Store the target list variable
+    node.kwargs
+        .insert("target".to_string(), append.target.clone());
+
+    // Store the value expression to append
+    if let Some(value) = &append.value {
+        node.kwargs
+            .insert("value".to_string(), expression_to_code(value));
+    }
+
+    // The list is both read and written
+    node.produces.push(append.target.clone());
+
+    state.add_node(node);
+    Ok(node_id)
+}
+
+fn convert_dict_set(
+    state: &mut ConversionState,
+    dict_set: &ir::DictSet,
+) -> Result<String, ConversionError> {
+    let node_id = state.next_node_id("dict_set");
+
+    let mut node = Node::computed(&node_id);
+    node.action = Some("dict_set".to_string());
+
+    // Store the target dict variable
+    node.kwargs
+        .insert("target".to_string(), dict_set.target.clone());
+
+    // Store the key expression
+    if let Some(key) = &dict_set.key {
+        node.kwargs
+            .insert("key".to_string(), expression_to_code(key));
+    }
+
+    // Store the value expression
+    if let Some(value) = &dict_set.value {
+        node.kwargs
+            .insert("value".to_string(), expression_to_code(value));
+    }
+
+    // The dict is both read and written
+    node.produces.push(dict_set.target.clone());
 
     state.add_node(node);
     Ok(node_id)
@@ -283,7 +362,10 @@ fn convert_loop(state: &mut ConversionState, loop_: &ir::Loop) -> Result<(), Con
     let body_tail = state.last_node_id.clone();
 
     // Get all body nodes - those that weren't in nodes_before
-    let body_nodes: HashSet<String> = state.dag.nodes.keys()
+    let body_nodes: HashSet<String> = state
+        .dag
+        .nodes
+        .keys()
         .filter(|k| !nodes_before.contains(*k))
         .cloned()
         .collect();
@@ -299,7 +381,9 @@ fn convert_loop(state: &mut ConversionState, loop_: &ir::Loop) -> Result<(), Con
     let body_tail_id = body_tail.unwrap_or_default();
 
     // Convert iterator expression to string
-    let iterator_var = loop_.iterator.as_ref()
+    let iterator_var = loop_
+        .iterator
+        .as_ref()
         .map(expression_to_code)
         .unwrap_or_default();
 
@@ -323,19 +407,19 @@ fn convert_loop(state: &mut ConversionState, loop_: &ir::Loop) -> Result<(), Con
     }
 
     // Connect to previous node
-    if let Some(prev_id) = &prev_last {
-        if let Some(prev_node) = state.dag.get_node_mut(prev_id) {
-            prev_node.add_edge(loop_head_id.clone(), EdgeKind::Data);
-        }
+    if let Some(prev_id) = &prev_last
+        && let Some(prev_node) = state.dag.get_node_mut(prev_id)
+    {
+        prev_node.add_edge(loop_head_id.clone(), EdgeKind::Data);
     }
 
     state.dag.add_node(loop_head);
 
     // Add Back edge from body_tail to loop_head
-    if !body_tail_id.is_empty() {
-        if let Some(tail_node) = state.dag.get_node_mut(&body_tail_id) {
-            tail_node.add_edge(loop_head_id.clone(), EdgeKind::Back);
-        }
+    if !body_tail_id.is_empty()
+        && let Some(tail_node) = state.dag.get_node_mut(&body_tail_id)
+    {
+        tail_node.add_edge(loop_head_id.clone(), EdgeKind::Back);
     }
 
     // Set last_node_id to loop_head (downstream nodes wait for loop completion)
@@ -344,7 +428,10 @@ fn convert_loop(state: &mut ConversionState, loop_: &ir::Loop) -> Result<(), Con
     Ok(())
 }
 
-fn convert_conditional(state: &mut ConversionState, cond: &ir::Conditional) -> Result<(), ConversionError> {
+fn convert_conditional(
+    state: &mut ConversionState,
+    cond: &ir::Conditional,
+) -> Result<(), ConversionError> {
     let prev_last = state.last_node_id.clone();
 
     // For if/elif/else, we create a chain of branch nodes.
@@ -399,7 +486,10 @@ fn convert_conditional(state: &mut ConversionState, cond: &ir::Conditional) -> R
         }
 
         // Collect nodes for this branch
-        let branch_nodes: HashSet<String> = state.dag.nodes.keys()
+        let branch_nodes: HashSet<String> = state
+            .dag
+            .nodes
+            .keys()
             .filter(|k| !nodes_before.contains(*k))
             .cloned()
             .collect();
@@ -421,10 +511,10 @@ fn convert_conditional(state: &mut ConversionState, cond: &ir::Conditional) -> R
 
     // Add edges from branch ends to merge
     for info in &branch_infos {
-        if let Some(end_id) = &info.end_node {
-            if let Some(end_node) = state.dag.get_node_mut(end_id) {
-                end_node.add_edge(merge_id.clone(), EdgeKind::Data);
-            }
+        if let Some(end_id) = &info.end_node
+            && let Some(end_node) = state.dag.get_node_mut(end_id)
+        {
+            end_node.add_edge(merge_id.clone(), EdgeKind::Data);
         }
     }
 
@@ -448,8 +538,8 @@ fn convert_conditional(state: &mut ConversionState, cond: &ir::Conditional) -> R
         // Collect all nodes that belong to branches AFTER this one (to mark as skipped when true)
         // This includes both body nodes AND the branch nodes themselves
         let mut later_branch_nodes: HashSet<String> = HashSet::new();
-        for j in (i + 1)..branch_infos.len() {
-            later_branch_nodes.extend(branch_infos[j].nodes.clone());
+        for later_info in branch_infos.iter().skip(i + 1) {
+            later_branch_nodes.extend(later_info.nodes.clone());
         }
         // Also include the later branch node IDs (they need to be skipped too)
         later_branch_nodes.extend(later_branch_node_ids.clone());
@@ -457,7 +547,11 @@ fn convert_conditional(state: &mut ConversionState, cond: &ir::Conditional) -> R
         let branch_meta = BranchMeta {
             guard: info.guard.clone(),
             true_entry: info.entry.clone(),
-            false_entry: if is_else_branch { None } else { next_branch_id.clone().or(info.entry.clone()) },
+            false_entry: if is_else_branch {
+                None
+            } else {
+                next_branch_id.clone().or(info.entry.clone())
+            },
             true_nodes: info.nodes.clone(),
             false_nodes: later_branch_nodes,
             merge_node: Some(merge_id.clone()),
@@ -485,12 +579,11 @@ fn convert_conditional(state: &mut ConversionState, cond: &ir::Conditional) -> R
     let first_branch_id = branch_node_ids.last().cloned();
 
     // Connect previous node to first branch
-    if let Some(prev_id) = &prev_last {
-        if let Some(first_branch) = &first_branch_id {
-            if let Some(prev_node) = state.dag.get_node_mut(prev_id) {
-                prev_node.add_edge(first_branch.clone(), EdgeKind::Data);
-            }
-        }
+    if let Some(prev_id) = &prev_last
+        && let Some(first_branch) = &first_branch_id
+        && let Some(prev_node) = state.dag.get_node_mut(prev_id)
+    {
+        prev_node.add_edge(first_branch.clone(), EdgeKind::Data);
     }
 
     state.last_node_id = Some(merge_id);
@@ -498,7 +591,10 @@ fn convert_conditional(state: &mut ConversionState, cond: &ir::Conditional) -> R
     Ok(())
 }
 
-fn convert_try_except(state: &mut ConversionState, te: &ir::TryExcept) -> Result<(), ConversionError> {
+fn convert_try_except(
+    state: &mut ConversionState,
+    te: &ir::TryExcept,
+) -> Result<(), ConversionError> {
     let prev_last = state.last_node_id.clone();
 
     // Process try block - capture nodes before
@@ -515,7 +611,10 @@ fn convert_try_except(state: &mut ConversionState, te: &ir::TryExcept) -> Result
         convert_python_block(state, postamble)?;
     }
 
-    let try_nodes: HashSet<String> = state.dag.nodes.keys()
+    let try_nodes: HashSet<String> = state
+        .dag
+        .nodes
+        .keys()
         .filter(|k| !nodes_before_try.contains(*k))
         .cloned()
         .collect();
@@ -541,19 +640,27 @@ fn convert_try_except(state: &mut ConversionState, te: &ir::TryExcept) -> Result
             convert_python_block(state, postamble)?;
         }
 
-        let handler_nodes: HashSet<String> = state.dag.nodes.keys()
+        let handler_nodes: HashSet<String> = state
+            .dag
+            .nodes
+            .keys()
             .filter(|k| !nodes_before_handler.contains(*k))
             .cloned()
             .collect();
 
-        let entry = state.dag.nodes.keys()
+        let entry = state
+            .dag
+            .nodes
+            .keys()
             .find(|k| !nodes_before_handler.contains(*k))
             .cloned()
             .unwrap_or_default();
 
         // Add exception edges FROM try nodes TO handler entry
         // This allows the scheduler to find the handler when a try node fails
-        let exc_types: Vec<_> = handler.exception_types.iter()
+        let exc_types: Vec<_> = handler
+            .exception_types
+            .iter()
             .map(|et| (et.module.clone(), et.name.clone()))
             .collect();
 
@@ -564,27 +671,25 @@ fn convert_try_except(state: &mut ConversionState, te: &ir::TryExcept) -> Result
                     try_node.add_exception_edge(entry.clone(), None, None);
                 } else {
                     for (module, name) in &exc_types {
-                        try_node.add_exception_edge(
-                            entry.clone(),
-                            name.clone(),
-                            module.clone(),
-                        );
+                        try_node.add_exception_edge(entry.clone(), name.clone(), module.clone());
                     }
                 }
             }
         }
 
         // Mark the handler entry as an exception handler entry (won't be made ready at init)
-        if !entry.is_empty() {
-            if let Some(entry_node) = state.dag.get_node_mut(&entry) {
-                entry_node.is_exception_handler_entry = true;
-            }
+        if !entry.is_empty()
+            && let Some(entry_node) = state.dag.get_node_mut(&entry)
+        {
+            entry_node.is_exception_handler_entry = true;
         }
 
         _handlers_meta.push(HandlerMeta {
             entry: entry.clone(),
             nodes: handler_nodes,
-            exception_types: handler.exception_types.iter()
+            exception_types: handler
+                .exception_types
+                .iter()
                 .map(|et| (et.module.clone(), et.name.clone()))
                 .collect(),
         });
@@ -599,10 +704,10 @@ fn convert_try_except(state: &mut ConversionState, te: &ir::TryExcept) -> Result
     let merge_node = Node::gather_join(&merge_id);
 
     // Add edges from try_end and handler ends to merge
-    if let Some(try_end_id) = &try_end {
-        if let Some(try_end_node) = state.dag.get_node_mut(try_end_id) {
-            try_end_node.add_edge(merge_id.clone(), EdgeKind::Data);
-        }
+    if let Some(try_end_id) = &try_end
+        && let Some(try_end_node) = state.dag.get_node_mut(try_end_id)
+    {
+        try_end_node.add_edge(merge_id.clone(), EdgeKind::Data);
     }
     for handler_end_id in &handler_end_ids {
         if let Some(handler_end_node) = state.dag.get_node_mut(handler_end_id) {
@@ -618,7 +723,9 @@ fn convert_try_except(state: &mut ConversionState, te: &ir::TryExcept) -> Result
 
 fn convert_sleep(state: &mut ConversionState, sleep: &ir::Sleep) -> Result<(), ConversionError> {
     let node_id = state.next_node_id("sleep");
-    let duration_str = sleep.duration.as_ref()
+    let duration_str = sleep
+        .duration
+        .as_ref()
         .map(expression_to_code)
         .unwrap_or_default();
     let node = Node::sleep(&node_id, &duration_str);
@@ -642,7 +749,10 @@ fn convert_return(state: &mut ConversionState, ret: &ir::Return) -> Result<(), C
             } else {
                 let node_id = state.next_node_id("return");
                 let mut node = Node::computed(&node_id);
-                node.kwargs.insert("code".to_string(), format!("__workflow_return = {}", expr_str));
+                node.kwargs.insert(
+                    "code".to_string(),
+                    format!("__workflow_return = {}", expr_str),
+                );
                 node.produces.push("__workflow_return".to_string());
                 state.add_node(node);
                 state.dag.return_variable = Some("__workflow_return".to_string());
@@ -671,7 +781,10 @@ fn convert_spread(state: &mut ConversionState, spread: &ir::Spread) -> Result<()
     let loop_id = state.next_node_id("spread");
     let loop_head_id = format!("{}_head", loop_id);
 
-    let target = spread.target.clone().unwrap_or_else(|| format!("__spread_{}_result", loop_id));
+    let target = spread
+        .target
+        .clone()
+        .unwrap_or_else(|| format!("__spread_{}_result", loop_id));
 
     // Create the body action node
     let action_node_id = state.next_node_id("action");
@@ -699,7 +812,9 @@ fn convert_spread(state: &mut ConversionState, spread: &ir::Spread) -> Result<()
     state.dag.add_node(action_node);
 
     // Convert iterable expression to string
-    let iterator_var = spread.iterable.as_ref()
+    let iterator_var = spread
+        .iterable
+        .as_ref()
         .map(expression_to_code)
         .unwrap_or_default();
 
@@ -717,10 +832,10 @@ fn convert_spread(state: &mut ConversionState, spread: &ir::Spread) -> Result<()
     loop_head.add_edge(action_node_id.clone(), EdgeKind::Continue);
 
     // Connect to previous
-    if let Some(prev_id) = &state.last_node_id {
-        if let Some(prev_node) = state.dag.get_node_mut(prev_id) {
-            prev_node.add_edge(loop_head_id.clone(), EdgeKind::Data);
-        }
+    if let Some(prev_id) = &state.last_node_id
+        && let Some(prev_node) = state.dag.get_node_mut(prev_id)
+    {
+        prev_node.add_edge(loop_head_id.clone(), EdgeKind::Data);
     }
 
     state.dag.add_node(loop_head);
@@ -746,8 +861,16 @@ fn expression_to_code(expr: &ir::Expression) -> String {
         ir::expression::Kind::Literal(lit) => literal_to_code(lit),
         ir::expression::Kind::Variable(name) => name.clone(),
         ir::expression::Kind::Subscript(sub) => {
-            let base = sub.base.as_ref().map(|e| expression_to_code(e)).unwrap_or_default();
-            let key = sub.key.as_ref().map(|e| expression_to_code(e)).unwrap_or_default();
+            let base = sub
+                .base
+                .as_ref()
+                .map(|e| expression_to_code(e))
+                .unwrap_or_default();
+            let key = sub
+                .key
+                .as_ref()
+                .map(|e| expression_to_code(e))
+                .unwrap_or_default();
             format!("{}[{}]", base, key)
         }
         ir::expression::Kind::Array(arr) => {
@@ -755,7 +878,9 @@ fn expression_to_code(expr: &ir::Expression) -> String {
             format!("[{}]", elements.join(", "))
         }
         ir::expression::Kind::Dict(dict) => {
-            let entries: Vec<String> = dict.entries.iter()
+            let entries: Vec<String> = dict
+                .entries
+                .iter()
                 .map(|e| {
                     let val = e.value.as_ref().map(expression_to_code).unwrap_or_default();
                     format!("\"{}\": {}", e.key, val)
@@ -764,8 +889,16 @@ fn expression_to_code(expr: &ir::Expression) -> String {
             format!("{{{}}}", entries.join(", "))
         }
         ir::expression::Kind::BinaryOp(binop) => {
-            let left = binop.left.as_ref().map(|e| expression_to_code(e)).unwrap_or_default();
-            let right = binop.right.as_ref().map(|e| expression_to_code(e)).unwrap_or_default();
+            let left = binop
+                .left
+                .as_ref()
+                .map(|e| expression_to_code(e))
+                .unwrap_or_default();
+            let right = binop
+                .right
+                .as_ref()
+                .map(|e| expression_to_code(e))
+                .unwrap_or_default();
             let op = match ir::binary_op::Op::try_from(binop.op) {
                 Ok(ir::binary_op::Op::Add) => "+",
                 Ok(ir::binary_op::Op::Sub) => "-",
@@ -787,7 +920,11 @@ fn expression_to_code(expr: &ir::Expression) -> String {
             format!("({} {} {})", left, op, right)
         }
         ir::expression::Kind::UnaryOp(unop) => {
-            let operand = unop.operand.as_ref().map(|e| expression_to_code(e)).unwrap_or_default();
+            let operand = unop
+                .operand
+                .as_ref()
+                .map(|e| expression_to_code(e))
+                .unwrap_or_default();
             match ir::unary_op::Op::try_from(unop.op) {
                 Ok(ir::unary_op::Op::Not) => format!("(not {})", operand),
                 Ok(ir::unary_op::Op::Neg) => format!("(-{})", operand),
@@ -799,7 +936,11 @@ fn expression_to_code(expr: &ir::Expression) -> String {
             format!("{}({})", call.function, args.join(", "))
         }
         ir::expression::Kind::Attribute(attr) => {
-            let base = attr.base.as_ref().map(|e| expression_to_code(e)).unwrap_or_default();
+            let base = attr
+                .base
+                .as_ref()
+                .map(|e| expression_to_code(e))
+                .unwrap_or_default();
             format!("{}.{}", base, attr.attribute)
         }
     }
@@ -849,8 +990,14 @@ mod tests {
             name: "test".to_string(),
             params: vec![],
             body: vec![
-                make_statement(ir::statement::Kind::ActionCall(make_action("fetch", Some("data")))),
-                make_statement(ir::statement::Kind::ActionCall(make_action("process", Some("result")))),
+                make_statement(ir::statement::Kind::ActionCall(make_action(
+                    "fetch",
+                    Some("data"),
+                ))),
+                make_statement(ir::statement::Kind::ActionCall(make_action(
+                    "process",
+                    Some("result"),
+                ))),
             ],
             return_type: None,
         };
@@ -859,10 +1006,18 @@ mod tests {
 
         assert_eq!(dag.nodes.len(), 2);
 
-        let fetch_node = dag.nodes.values().find(|n| n.action.as_deref() == Some("fetch")).unwrap();
+        let fetch_node = dag
+            .nodes
+            .values()
+            .find(|n| n.action.as_deref() == Some("fetch"))
+            .unwrap();
         assert_eq!(fetch_node.produces, vec!["data"]);
 
-        let _process_node = dag.nodes.values().find(|n| n.action.as_deref() == Some("process")).unwrap();
+        let _process_node = dag
+            .nodes
+            .values()
+            .find(|n| n.action.as_deref() == Some("process"))
+            .unwrap();
     }
 
     #[test]
@@ -870,20 +1025,18 @@ mod tests {
         let workflow = ir::Workflow {
             name: "test".to_string(),
             params: vec![],
-            body: vec![
-                make_statement(ir::statement::Kind::Gather(ir::Gather {
-                    calls: vec![
-                        ir::GatherCall {
-                            kind: Some(ir::gather_call::Kind::Action(make_action("fetch_a", None))),
-                        },
-                        ir::GatherCall {
-                            kind: Some(ir::gather_call::Kind::Action(make_action("fetch_b", None))),
-                        },
-                    ],
-                    target: Some("results".to_string()),
-                    location: None,
-                })),
-            ],
+            body: vec![make_statement(ir::statement::Kind::Gather(ir::Gather {
+                calls: vec![
+                    ir::GatherCall {
+                        kind: Some(ir::gather_call::Kind::Action(make_action("fetch_a", None))),
+                    },
+                    ir::GatherCall {
+                        kind: Some(ir::gather_call::Kind::Action(make_action("fetch_b", None))),
+                    },
+                ],
+                target: Some("results".to_string()),
+                location: None,
+            }))],
             return_type: None,
         };
 
@@ -892,7 +1045,11 @@ mod tests {
         // Should have 2 parallel action nodes + 1 join node
         assert_eq!(dag.nodes.len(), 3);
 
-        let join = dag.nodes.values().find(|n| n.kind == NodeKind::GatherJoin).unwrap();
+        let join = dag
+            .nodes
+            .values()
+            .find(|n| n.kind == NodeKind::GatherJoin)
+            .unwrap();
         assert!(join.produces.contains(&"results".to_string()));
     }
 
@@ -902,7 +1059,10 @@ mod tests {
             name: "test".to_string(),
             params: vec![],
             body: vec![
-                make_statement(ir::statement::Kind::ActionCall(make_action("fetch", Some("data")))),
+                make_statement(ir::statement::Kind::ActionCall(make_action(
+                    "fetch",
+                    Some("data"),
+                ))),
                 make_statement(ir::statement::Kind::ReturnStmt(ir::Return {
                     value: Some(ir::r#return::Value::Expression(make_var_expr("data"))),
                     location: None,

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use rappel::{
-    AppConfig, Store, Dispatcher, DispatcherConfig, PythonWorkerConfig, PythonWorkerPool,
+    AppConfig, Dispatcher, DispatcherConfig, PythonWorkerConfig, PythonWorkerPool, Store,
     server_worker::WorkerBridgeServer,
 };
 use sqlx::postgres::PgPoolOptions;

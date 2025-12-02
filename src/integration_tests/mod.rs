@@ -15,8 +15,10 @@ const INTEGRATION_LOOP_ACCUM: &str = include_str!("fixtures/integration_loop_acc
 const INTEGRATION_CONDITIONAL: &str = include_str!("fixtures/integration_conditional.py");
 const INTEGRATION_EXCEPTION: &str = include_str!("fixtures/integration_exception.py");
 const INTEGRATION_EXCEPTION_MULTI: &str = include_str!("fixtures/integration_exception_multi.py");
-const INTEGRATION_NESTED_CONDITIONALS: &str = include_str!("fixtures/integration_nested_conditionals.py");
-const INTEGRATION_MULTI_ACTION_LOOP: &str = include_str!("fixtures/integration_multi_action_loop.py");
+const INTEGRATION_NESTED_CONDITIONALS: &str =
+    include_str!("fixtures/integration_nested_conditionals.py");
+const INTEGRATION_MULTI_ACTION_LOOP: &str =
+    include_str!("fixtures/integration_multi_action_loop.py");
 const INTEGRATION_SLEEP: &str = include_str!("fixtures/integration_sleep.py");
 
 const INTEGRATION_MODULE_ENTRYPOINT: &str = r#"
@@ -384,7 +386,7 @@ async fn test_integration_exception() {
         successes.len()
     );
     assert!(
-        failures.len() >= 1,
+        !failures.is_empty(),
         "Expected at least 1 failed action (explode), got {}",
         failures.len()
     );
@@ -428,7 +430,10 @@ if __name__ == "__main__":
 #[serial]
 async fn test_integration_nested_conditionals() {
     let config = WorkflowHarnessConfig {
-        files: &[("integration_nested_conditionals.py", INTEGRATION_NESTED_CONDITIONALS)],
+        files: &[(
+            "integration_nested_conditionals.py",
+            INTEGRATION_NESTED_CONDITIONALS,
+        )],
         entrypoint: INTEGRATION_NESTED_CONDITIONALS_ENTRYPOINT,
         workflow_name: "nestedconditionalsworkflow",
         user_module: "integration_nested_conditionals",
@@ -489,7 +494,10 @@ if __name__ == "__main__":
 #[serial]
 async fn test_integration_multi_action_loop() {
     let config = WorkflowHarnessConfig {
-        files: &[("integration_multi_action_loop.py", INTEGRATION_MULTI_ACTION_LOOP)],
+        files: &[(
+            "integration_multi_action_loop.py",
+            INTEGRATION_MULTI_ACTION_LOOP,
+        )],
         entrypoint: INTEGRATION_MULTI_ACTION_LOOP_ENTRYPOINT,
         workflow_name: "multiactionloopworkflow",
         user_module: "integration_multi_action_loop",
@@ -629,7 +637,10 @@ if __name__ == "__main__":
 #[serial]
 async fn test_integration_exception_multi_value_error() {
     let config = WorkflowHarnessConfig {
-        files: &[("integration_exception_multi.py", INTEGRATION_EXCEPTION_MULTI)],
+        files: &[(
+            "integration_exception_multi.py",
+            INTEGRATION_EXCEPTION_MULTI,
+        )],
         entrypoint: INTEGRATION_EXCEPTION_MULTI_VALUE_ERROR_ENTRYPOINT,
         workflow_name: "exceptionmultivalueerrorworkflow",
         user_module: "integration_exception_multi",
@@ -653,12 +664,12 @@ async fn test_integration_exception_multi_value_error() {
     let failures: Vec<_> = metrics.iter().filter(|m| !m.success).collect();
 
     assert!(
-        successes.len() >= 1,
+        !successes.is_empty(),
         "Expected at least 1 successful action (handle_value_error), got {}",
         successes.len()
     );
     assert!(
-        failures.len() >= 1,
+        !failures.is_empty(),
         "Expected at least 1 failed action (raise_value_error), got {}",
         failures.len()
     );
@@ -690,7 +701,10 @@ async fn test_integration_exception_multi_value_error() {
 #[serial]
 async fn test_integration_exception_multi_type_error() {
     let config = WorkflowHarnessConfig {
-        files: &[("integration_exception_multi.py", INTEGRATION_EXCEPTION_MULTI)],
+        files: &[(
+            "integration_exception_multi.py",
+            INTEGRATION_EXCEPTION_MULTI,
+        )],
         entrypoint: INTEGRATION_EXCEPTION_MULTI_TYPE_ERROR_ENTRYPOINT,
         workflow_name: "exceptionmultitypeerrorworkflow",
         user_module: "integration_exception_multi",
@@ -714,12 +728,12 @@ async fn test_integration_exception_multi_type_error() {
     let failures: Vec<_> = metrics.iter().filter(|m| !m.success).collect();
 
     assert!(
-        successes.len() >= 1,
+        !successes.is_empty(),
         "Expected at least 1 successful action (handle_type_error), got {}",
         successes.len()
     );
     assert!(
-        failures.len() >= 1,
+        !failures.is_empty(),
         "Expected at least 1 failed action (raise_type_error), got {}",
         failures.len()
     );

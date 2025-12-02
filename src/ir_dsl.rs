@@ -104,6 +104,12 @@ impl<'a> DslFormatter<'a> {
             ir::statement::Kind::Spread(spread) => {
                 self.format_spread(spread);
             }
+            ir::statement::Kind::ListAppend(append) => {
+                self.format_list_append(append);
+            }
+            ir::statement::Kind::DictSet(dict_set) => {
+                self.format_dict_set(dict_set);
+            }
         }
     }
 
@@ -156,7 +162,8 @@ impl<'a> DslFormatter<'a> {
         }
         if let Some(backoff) = &config.backoff {
             let backoff_str = match ir::backoff_config::Kind::try_from(backoff.kind) {
-                Ok(ir::backoff_config::Kind::Linear) | Ok(ir::backoff_config::Kind::Unspecified) => {
+                Ok(ir::backoff_config::Kind::Linear)
+                | Ok(ir::backoff_config::Kind::Unspecified) => {
                     format!("backoff=linear({}ms)", backoff.base_delay_ms)
                 }
                 Ok(ir::backoff_config::Kind::Exponential) => {
@@ -289,7 +296,7 @@ impl<'a> DslFormatter<'a> {
             self.write_indent();
 
             // Check if guard is present and not empty
-            let has_guard = branch.guard.as_ref().map_or(false, |g| g.kind.is_some());
+            let has_guard = branch.guard.as_ref().is_some_and(|g| g.kind.is_some());
 
             if i == 0 {
                 self.write("branch if ");
@@ -299,10 +306,8 @@ impl<'a> DslFormatter<'a> {
                 self.write("branch elif ");
             }
 
-            if has_guard {
-                if let Some(guard) = &branch.guard {
-                    self.format_expression(guard);
-                }
+            if has_guard && let Some(guard) = &branch.guard {
+                self.format_expression(guard);
             }
             self.write(":\n");
 
@@ -355,7 +360,9 @@ impl<'a> DslFormatter<'a> {
 
             if !handler.exception_types.is_empty() {
                 self.write(" ");
-                let types: Vec<String> = handler.exception_types.iter()
+                let types: Vec<String> = handler
+                    .exception_types
+                    .iter()
                     .map(|et| {
                         let mut s = String::new();
                         if let Some(module) = &et.module {
@@ -442,7 +449,7 @@ impl<'a> DslFormatter<'a> {
                     self.write(")");
                 }
                 ir::r#return::Value::Gather(_gather) => {
-                    self.write("parallel(...)");  // Simplified
+                    self.write("parallel(...)"); // Simplified
                 }
             }
         }
@@ -620,6 +627,30 @@ impl<'a> DslFormatter<'a> {
         self.write(&spread.loop_var);
         self.write("\n");
     }
+
+    fn format_list_append(&mut self, append: &ir::ListAppend) {
+        self.write_indent();
+        self.write(&append.target);
+        self.write(" += [");
+        if let Some(value) = &append.value {
+            self.format_expression(value);
+        }
+        self.write("]\n");
+    }
+
+    fn format_dict_set(&mut self, dict_set: &ir::DictSet) {
+        self.write_indent();
+        self.write(&dict_set.target);
+        self.write("[");
+        if let Some(key) = &dict_set.key {
+            self.format_expression(key);
+        }
+        self.write("] = ");
+        if let Some(value) = &dict_set.value {
+            self.format_expression(value);
+        }
+        self.write("\n");
+    }
 }
 
 #[cfg(test)]
@@ -648,15 +679,16 @@ mod tests {
     fn test_simple_workflow() {
         let workflow = ir::Workflow {
             name: "my_workflow".to_string(),
-            params: vec![
-                ir::WorkflowParam {
-                    name: "x".to_string(),
-                    type_annotation: Some("int".to_string()),
-                },
-            ],
+            params: vec![ir::WorkflowParam {
+                name: "x".to_string(),
+                type_annotation: Some("int".to_string()),
+            }],
             body: vec![
                 ir::Statement {
-                    kind: Some(ir::statement::Kind::ActionCall(make_action("fetch", Some("data")))),
+                    kind: Some(ir::statement::Kind::ActionCall(make_action(
+                        "fetch",
+                        Some("data"),
+                    ))),
                 },
                 ir::Statement {
                     kind: Some(ir::statement::Kind::ReturnStmt(ir::Return {
@@ -679,22 +711,20 @@ mod tests {
         let workflow = ir::Workflow {
             name: "parallel_workflow".to_string(),
             params: vec![],
-            body: vec![
-                ir::Statement {
-                    kind: Some(ir::statement::Kind::Gather(ir::Gather {
-                        calls: vec![
-                            ir::GatherCall {
-                                kind: Some(ir::gather_call::Kind::Action(make_action("fetch_a", None))),
-                            },
-                            ir::GatherCall {
-                                kind: Some(ir::gather_call::Kind::Action(make_action("fetch_b", None))),
-                            },
-                        ],
-                        target: Some("results".to_string()),
-                        location: None,
-                    })),
-                },
-            ],
+            body: vec![ir::Statement {
+                kind: Some(ir::statement::Kind::Gather(ir::Gather {
+                    calls: vec![
+                        ir::GatherCall {
+                            kind: Some(ir::gather_call::Kind::Action(make_action("fetch_a", None))),
+                        },
+                        ir::GatherCall {
+                            kind: Some(ir::gather_call::Kind::Action(make_action("fetch_b", None))),
+                        },
+                    ],
+                    target: Some("results".to_string()),
+                    location: None,
+                })),
+            }],
             return_type: None,
         };
 
@@ -709,21 +739,20 @@ mod tests {
         let workflow = ir::Workflow {
             name: "loop_workflow".to_string(),
             params: vec![],
-            body: vec![
-                ir::Statement {
-                    kind: Some(ir::statement::Kind::Loop(ir::Loop {
-                        iterator: Some(make_var_expr("items")),
-                        loop_var: "item".to_string(),
-                        accumulator: "results".to_string(),
-                        body: vec![
-                            ir::Statement {
-                                kind: Some(ir::statement::Kind::ActionCall(make_action("process", Some("result")))),
-                            },
-                        ],
-                        location: None,
-                    })),
-                },
-            ],
+            body: vec![ir::Statement {
+                kind: Some(ir::statement::Kind::Loop(ir::Loop {
+                    iterator: Some(make_var_expr("items")),
+                    loop_var: "item".to_string(),
+                    accumulator: "results".to_string(),
+                    body: vec![ir::Statement {
+                        kind: Some(ir::statement::Kind::ActionCall(make_action(
+                            "process",
+                            Some("result"),
+                        ))),
+                    }],
+                    location: None,
+                })),
+            }],
             return_type: None,
         };
 

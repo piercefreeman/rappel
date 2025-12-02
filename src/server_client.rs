@@ -47,12 +47,7 @@ pub async fn run_servers(config: ServerConfig) -> Result<()> {
         .max_connections(10)
         .connect(database_url.as_ref())
         .await
-        .with_context(|| {
-            format!(
-                "failed to connect to database at {}",
-                database_url.as_ref()
-            )
-        })?;
+        .with_context(|| format!("failed to connect to database at {}", database_url.as_ref()))?;
 
     let store = Arc::new(Store::new(pool));
     store.init_schema().await?;
