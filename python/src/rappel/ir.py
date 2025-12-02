@@ -479,6 +479,12 @@ class IRParser:
             ]
             return ir_pb2.Statement(gather=gather)
 
+        # Check for async list comprehension pattern: [await action(x) for x in collection]
+        # Transform this into a Loop IR
+        loop = self._extract_async_list_comp(stmt.value, target_name, location)
+        if loop is not None:
+            return ir_pb2.Statement(loop=loop)
+
         spread = self._extract_spread(stmt.value, target_name)
         if spread is not None:
             spread.location.CopyFrom(location)
@@ -1187,6 +1193,90 @@ class IRParser:
         sleep.location.CopyFrom(_source_location_from_node(expr))
 
         return sleep
+
+    def _extract_async_list_comp(
+        self, expr: ast.expr, target: str, location: ir_pb2.SourceLocation
+    ) -> ir_pb2.Loop | None:
+        """Transform async list comprehension into Loop IR.
+
+        Transforms:
+            values = [await action(x) for x in collection]
+
+        Into equivalent Loop IR for:
+            values = []
+            for x in collection:
+                __temp = await action(x)
+                values.append(__temp)
+
+        This allows async list comprehensions to be properly scheduled
+        as sequential action executions.
+        """
+        if not isinstance(expr, ast.ListComp):
+            return None
+
+        if len(expr.generators) != 1:
+            return None
+
+        gen = expr.generators[0]
+        # We specifically DON'T check gen.is_async here because
+        # [await action(x) for x in items] is NOT an async comprehension
+        # (that would be [x async for x in async_iter]).
+        # What we're looking for is a sync comprehension with an await in the element.
+        if gen.ifs:
+            # Don't support filtered comprehensions for now
+            return None
+
+        if not isinstance(gen.target, ast.Name):
+            return None
+
+        loop_var = gen.target.id
+        iterator_expr = ast.unparse(gen.iter)
+
+        # Check if the element contains an await action call
+        action = self._extract_action_call(expr.elt)
+        if action is None:
+            return None
+
+        # Generate a temp variable for the action result
+        temp_var = f"__{target}_item"
+        action.target = temp_var
+
+        # Track variables available in loop body
+        loop_known_vars = self._known_vars | {loop_var, temp_var}
+
+        # Create the loop body:
+        # 1. Action call that produces temp_var
+        # 2. Append temp_var to accumulator
+        body_statements: list[ir_pb2.Statement] = []
+
+        # Add the action call
+        action.location.CopyFrom(location)
+        body_statements.append(ir_pb2.Statement(action_call=action))
+
+        # Create the append statement as a PythonBlock
+        append_code = f"{target}.append({temp_var})"
+        append_block = ir_pb2.PythonBlock(code=append_code)
+        append_block.inputs.extend([target, temp_var])
+        append_block.outputs.append(target)
+        append_block.location.CopyFrom(location)
+        body_statements.append(ir_pb2.Statement(python_block=append_block))
+
+        # Create the Loop IR
+        loop = ir_pb2.Loop(
+            iterator_expr=iterator_expr,
+            loop_var=loop_var,
+            accumulator=target,
+        )
+        loop.body.extend(body_statements)
+        loop.location.CopyFrom(location)
+
+        # Mark that we need an empty list initialization
+        # This is handled by _is_empty_list_init returning true for explicit
+        # empty list inits, but for async list comp we need to synthesize one.
+        # We'll track this so the caller knows to add the init.
+        self._known_vars.add(target)
+
+        return loop
 
     def _extract_spread(self, expr: ast.expr, target: str) -> ir_pb2.Spread | None:
         """Extract [await action(x=v) for v in collection] pattern."""

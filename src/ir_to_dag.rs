@@ -262,26 +262,35 @@ fn convert_loop(state: &mut ConversionState, loop_: &ir::Loop) -> Result<(), Con
     let loop_id = state.next_node_id("loop");
     let loop_head_id = format!("{}_head", loop_id);
 
-    // Track body nodes
-    let mut body_node_ids: Vec<String> = Vec::new();
-
-    // Process loop body to get all node IDs
-    let body_start_idx = state.dag.nodes.len();
+    // Track body nodes - capture node IDs that exist BEFORE processing body
+    let nodes_before: HashSet<String> = state.dag.nodes.keys().cloned().collect();
     let prev_last = state.last_node_id.clone();
 
     // Temporarily set last_node_id to None so body nodes don't depend on previous
     state.last_node_id = None;
 
+    // Track first and last node IDs during body processing
+    let mut body_entry: Option<String> = None;
+
     for stmt in &loop_.body {
         convert_statement(state, stmt)?;
-        if let Some(last_id) = &state.last_node_id {
-            body_node_ids.push(last_id.clone());
+        // Capture first node created for body_entry
+        if body_entry.is_none() {
+            // Find the first node that was added (wasn't in nodes_before)
+            for key in state.dag.nodes.keys() {
+                if !nodes_before.contains(key) {
+                    body_entry = Some(key.clone());
+                    break;
+                }
+            }
         }
     }
 
-    // Get all body nodes
+    let body_tail = state.last_node_id.clone();
+
+    // Get all body nodes - those that weren't in nodes_before
     let body_nodes: HashSet<String> = state.dag.nodes.keys()
-        .skip(body_start_idx)
+        .filter(|k| !nodes_before.contains(*k))
         .cloned()
         .collect();
 
@@ -292,15 +301,15 @@ fn convert_loop(state: &mut ConversionState, loop_: &ir::Loop) -> Result<(), Con
         }
     }
 
-    let body_entry = body_node_ids.first().cloned().unwrap_or_default();
-    let body_tail = body_node_ids.last().cloned().unwrap_or_default();
+    let body_entry_id = body_entry.unwrap_or_default();
+    let body_tail_id = body_tail.unwrap_or_default();
 
     // Create loop head node
     let loop_meta = LoopHeadMeta {
         iterator_var: loop_.iterator_expr.clone(),
         loop_var: loop_.loop_var.clone(),
-        body_entry: body_entry.clone(),
-        body_tail: body_tail.clone(),
+        body_entry: body_entry_id.clone(),
+        body_tail: body_tail_id.clone(),
         body_nodes: body_nodes.clone(),
     };
 
@@ -311,8 +320,8 @@ fn convert_loop(state: &mut ConversionState, loop_: &ir::Loop) -> Result<(), Con
     state.variable_producers.insert(loop_.accumulator.clone(), loop_head_id.clone());
 
     // Add Continue edge from loop_head to body entry
-    if !body_entry.is_empty() {
-        loop_head.add_edge(body_entry.clone(), EdgeKind::Continue);
+    if !body_entry_id.is_empty() {
+        loop_head.add_edge(body_entry_id.clone(), EdgeKind::Continue);
     }
 
     // Connect to previous node
@@ -325,8 +334,8 @@ fn convert_loop(state: &mut ConversionState, loop_: &ir::Loop) -> Result<(), Con
     state.dag.add_node(loop_head);
 
     // Add Back edge from body_tail to loop_head
-    if !body_tail.is_empty() {
-        if let Some(tail_node) = state.dag.get_node_mut(&body_tail) {
+    if !body_tail_id.is_empty() {
+        if let Some(tail_node) = state.dag.get_node_mut(&body_tail_id) {
             tail_node.add_edge(loop_head_id.clone(), EdgeKind::Back);
         }
     }
@@ -349,7 +358,8 @@ fn convert_conditional(state: &mut ConversionState, cond: &ir::Conditional) -> R
     let mut false_entry: Option<String> = None;
 
     for (i, branch) in cond.branches.iter().enumerate() {
-        let start_idx = state.dag.nodes.len();
+        // Capture nodes before processing this branch
+        let nodes_before: HashSet<String> = state.dag.nodes.keys().cloned().collect();
         state.last_node_id = None;
 
         // Process preamble
@@ -367,13 +377,16 @@ fn convert_conditional(state: &mut ConversionState, cond: &ir::Conditional) -> R
             convert_python_block(state, post)?;
         }
 
-        // Collect nodes for this branch
+        // Collect nodes for this branch - those not in nodes_before
         let branch_nodes: HashSet<String> = state.dag.nodes.keys()
-            .skip(start_idx)
+            .filter(|k| !nodes_before.contains(*k))
             .cloned()
             .collect();
 
-        let entry = state.dag.nodes.keys().nth(start_idx).cloned();
+        // Find entry node - first node added
+        let entry = state.dag.nodes.keys()
+            .find(|k| !nodes_before.contains(*k))
+            .cloned();
 
         // First branch is "true", rest are "false" (elif/else)
         if i == 0 {
@@ -439,8 +452,8 @@ fn convert_conditional(state: &mut ConversionState, cond: &ir::Conditional) -> R
 fn convert_try_except(state: &mut ConversionState, te: &ir::TryExcept) -> Result<(), ConversionError> {
     let prev_last = state.last_node_id.clone();
 
-    // Process try block
-    let try_start_idx = state.dag.nodes.len();
+    // Process try block - capture nodes before
+    let nodes_before_try: HashSet<String> = state.dag.nodes.keys().cloned().collect();
     state.last_node_id = prev_last.clone();
 
     for preamble in &te.try_preamble {
@@ -454,7 +467,7 @@ fn convert_try_except(state: &mut ConversionState, te: &ir::TryExcept) -> Result
     }
 
     let try_nodes: HashSet<String> = state.dag.nodes.keys()
-        .skip(try_start_idx)
+        .filter(|k| !nodes_before_try.contains(*k))
         .cloned()
         .collect();
 
@@ -465,7 +478,8 @@ fn convert_try_except(state: &mut ConversionState, te: &ir::TryExcept) -> Result
     let mut handler_end_ids = Vec::new();
 
     for handler in &te.handlers {
-        let handler_start_idx = state.dag.nodes.len();
+        // Capture nodes before this handler
+        let nodes_before_handler: HashSet<String> = state.dag.nodes.keys().cloned().collect();
         state.last_node_id = prev_last.clone();
 
         for preamble in &handler.preamble {
@@ -479,11 +493,14 @@ fn convert_try_except(state: &mut ConversionState, te: &ir::TryExcept) -> Result
         }
 
         let handler_nodes: HashSet<String> = state.dag.nodes.keys()
-            .skip(handler_start_idx)
+            .filter(|k| !nodes_before_handler.contains(*k))
             .cloned()
             .collect();
 
-        let entry = state.dag.nodes.keys().nth(handler_start_idx).cloned().unwrap_or_default();
+        let entry = state.dag.nodes.keys()
+            .find(|k| !nodes_before_handler.contains(*k))
+            .cloned()
+            .unwrap_or_default();
 
         // Add exception edges from try nodes to handler nodes
         for handler_node_id in &handler_nodes {

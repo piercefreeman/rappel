@@ -600,10 +600,15 @@ class SleepExprWorkflow(Workflow):
 
 
 class TestSpread:
-    """Test spread (list comprehension) patterns."""
+    """Test spread (list comprehension) patterns.
+
+    Note: Async list comprehensions like [await action(x) for x in items]
+    are now transformed into Loop IR instead of Spread IR. This allows
+    proper sequential scheduling of the action calls.
+    """
 
     def test_simple_spread(self, action_defs: dict[str, ActionDefinition]):
-        """Test list comprehension with action."""
+        """Test list comprehension with action is transformed to loop."""
         code = """
 class SpreadWorkflow(Workflow):
     async def run(self) -> list:
@@ -613,17 +618,24 @@ class SpreadWorkflow(Workflow):
 """
         workflow = parse_workflow_class(code, action_defs)
 
-        spread = None
+        # Async list comprehensions now become Loop IR
+        loop = None
         for stmt in workflow.body:
-            if stmt.WhichOneof("kind") == "spread":
-                spread = stmt.spread
+            if stmt.WhichOneof("kind") == "loop":
+                loop = stmt.loop
                 break
 
-        assert spread is not None
-        assert spread.target == "doubled"
-        assert spread.iterable == "numbers"
-        assert spread.loop_var == "n"
-        assert spread.action.action == "double"
+        assert loop is not None
+        assert loop.accumulator == "doubled"
+        assert loop.iterator_expr == "numbers"
+        assert loop.loop_var == "n"
+
+        # Loop body should have action call and append
+        assert len(loop.body) == 2
+        assert loop.body[0].WhichOneof("kind") == "action_call"
+        assert loop.body[0].action_call.action == "double"
+        assert loop.body[1].WhichOneof("kind") == "python_block"
+        assert "append" in loop.body[1].python_block.code
 
 
 class TestRunAction:
@@ -1195,8 +1207,8 @@ class DefWorkflow(Workflow):
         # Should have python block with definition reference
         assert "python" in text
 
-    def test_serialize_spread(self, action_defs: dict[str, ActionDefinition]):
-        """Test serialization of spread."""
+    def test_serialize_async_list_comp_as_loop(self, action_defs: dict[str, ActionDefinition]):
+        """Test serialization of async list comp (transformed to loop)."""
         code = """
 class SpreadSerializeWorkflow(Workflow):
     async def run(self) -> list:
@@ -1209,8 +1221,9 @@ class SpreadSerializeWorkflow(Workflow):
         serializer = IRSerializer()
         text = serializer.serialize(workflow)
 
-        assert "spread" in text
-        assert "over numbers as n" in text
+        # Async list comprehensions now become loops
+        assert "loop n in numbers -> doubled:" in text
+        assert "@example_module.double" in text
 
     def test_serialize_run_action_with_full_config(self, action_defs: dict[str, ActionDefinition]):
         """Test serialization of run_action with all config options."""
@@ -1874,10 +1887,10 @@ class SleepWorkflow(Workflow):
 
 
 class TestSpreadEdgeCases:
-    """Test spread pattern edge cases."""
+    """Test spread pattern edge cases (now transformed to loops)."""
 
     def test_spread_with_action_await(self, action_defs: dict[str, ActionDefinition]):
-        """Test spread pattern [await action(x=v) for v in items]."""
+        """Test async list comp [await action(x=v) for v in items] becomes loop."""
         code = """
 class SpreadWorkflow(Workflow):
     async def run(self, items: list) -> list:
@@ -1886,11 +1899,16 @@ class SpreadWorkflow(Workflow):
 """
         workflow = parse_workflow_class(code, action_defs)
 
-        # Should be a spread statement
-        spread = workflow.body[0].spread
-        assert spread.loop_var == "v"
-        assert spread.iterable == "items"
-        assert spread.target == "results"
+        # Async list comprehensions now become Loop IR
+        loop = workflow.body[0].loop
+        assert loop.loop_var == "v"
+        assert loop.iterator_expr == "items"
+        assert loop.accumulator == "results"
+
+        # Loop body should have action call and append
+        assert len(loop.body) == 2
+        assert loop.body[0].WhichOneof("kind") == "action_call"
+        assert loop.body[1].WhichOneof("kind") == "python_block"
 
 
 class TestSerializerUnknownKind:

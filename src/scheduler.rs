@@ -224,8 +224,19 @@ impl<'a> Scheduler<'a> {
 
         // Store result in eval_context
         if let Some(value) = result {
-            for var in &node.produces {
-                state.set_var(var.clone(), value.clone());
+            // Check if this is a WorkflowNodeResult with variables dict
+            // (returned by python_block nodes)
+            if let Some(variables) = value.get("variables").and_then(|v| v.as_object()) {
+                for var in &node.produces {
+                    if let Some(var_value) = variables.get(var) {
+                        state.set_var(var.clone(), var_value.clone());
+                    }
+                }
+            } else {
+                // Simple result - assign to all produces (typically just one)
+                for var in &node.produces {
+                    state.set_var(var.clone(), value.clone());
+                }
             }
         }
 
@@ -257,9 +268,23 @@ impl<'a> Scheduler<'a> {
 
         let current_idx = *state.loop_indices.get(&node.id).unwrap_or(&0);
 
+        // Initialize accumulator on first iteration
+        if current_idx == 0 {
+            for var in &node.produces {
+                if state.get_var(var).is_none() {
+                    state.set_var(var.clone(), Value::Array(vec![]));
+                }
+            }
+        }
+
         if current_idx >= items.len() {
-            // Loop complete - unlock exit edges
+            // Loop complete - mark loop head and all body nodes as completed
             state.node_states.insert(node.id.clone(), NodeState::Completed);
+
+            // Mark body nodes as completed so they don't block workflow completion
+            for body_node_id in &meta.body_nodes {
+                state.node_states.insert(body_node_id.clone(), NodeState::Completed);
+            }
 
             // Find and unlock nodes via Exit edges
             let mut newly_ready = Vec::new();
@@ -377,8 +402,25 @@ impl<'a> Scheduler<'a> {
         state: &mut InstanceState,
         node: &Node,
     ) -> Result<SchedulerAction> {
-        // Gather join just passes through - the results are already in eval_context
-        // from the parallel nodes that completed
+        // Collect individual item results into the target array
+        // The parallel actions produce: {target}__item0, {target}__item1, etc.
+        // We need to collect them into: {target} = [item0_value, item1_value, ...]
+        for target in &node.produces {
+            let mut items = Vec::new();
+            let mut i = 0;
+            loop {
+                let item_var = format!("{}__item{}", target, i);
+                if let Some(value) = state.get_var(&item_var) {
+                    items.push(value.clone());
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            if !items.is_empty() {
+                state.set_var(target.clone(), Value::Array(items));
+            }
+        }
         self.mark_complete_and_unlock(state, node, None)
     }
 
@@ -532,8 +574,8 @@ fn build_context_for_node(state: &InstanceState, _node: &Node) -> Vec<NodeContex
         .collect()
 }
 
-/// Convert a Value to WorkflowArguments
-fn value_to_workflow_args(key: &str, value: &Value) -> WorkflowArguments {
+/// Convert a Value to WorkflowArguments with "result" key (matches Python's serialize_result_payload)
+fn value_to_workflow_args(_key: &str, value: &Value) -> WorkflowArguments {
     use crate::messages::proto::{
         WorkflowArgument, WorkflowArgumentValue, PrimitiveWorkflowArgument,
         WorkflowListArgument, WorkflowDictArgument,
@@ -591,9 +633,10 @@ fn value_to_workflow_args(key: &str, value: &Value) -> WorkflowArguments {
         }
     }
 
+    // Use "result" as key to match Python's serialize_result_payload format
     WorkflowArguments {
         arguments: vec![WorkflowArgument {
-            key: key.to_string(),
+            key: "result".to_string(),
             value: Some(convert_value(value)),
         }],
     }

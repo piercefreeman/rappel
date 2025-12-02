@@ -382,6 +382,20 @@ fn proto_value_to_json(value: &proto::WorkflowArgumentValue) -> serde_json::Valu
                 .collect();
             serde_json::Value::Object(map)
         }
+        Some(Kind::Basemodel(model)) => {
+            // Convert Pydantic BaseModel to JSON object with "variables" key
+            // The model.data contains the dict entries (e.g., {"variables": {...}})
+            if let Some(data) = &model.data {
+                let data_map: serde_json::Map<String, serde_json::Value> = data.entries.iter()
+                    .filter_map(|entry| {
+                        entry.value.as_ref().map(|v| (entry.key.clone(), proto_value_to_json(v)))
+                    })
+                    .collect();
+                serde_json::Value::Object(data_map)
+            } else {
+                serde_json::Value::Null
+            }
+        }
         _ => serde_json::Value::Null,
     }
 }
