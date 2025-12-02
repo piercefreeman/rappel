@@ -234,7 +234,7 @@ async fn main() -> Result<()> {
                 messages, in_flight, payload_size
             );
 
-            let harness = BenchmarkHarness::new(worker_config, cli.workers, store).await?;
+            let harness = BenchmarkHarness::new(cli.workers, store).await?;
 
             let config = HarnessConfig {
                 total_messages: messages,

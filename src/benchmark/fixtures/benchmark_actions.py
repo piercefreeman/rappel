@@ -2,7 +2,7 @@
 
 from rappel import Workflow, action, workflow
 
-from .benchmark_common import PayloadResponse, summarize_payload
+from benchmark_common import PayloadResponse, summarize_payload
 
 
 @action(name="benchmark.echo_payload")
@@ -19,4 +19,5 @@ class EchoActionWorkflow(Workflow):
     concurrent = True
 
     async def run(self, payload: str = "") -> PayloadResponse:
-        return await echo_payload(payload=payload)
+        result = await echo_payload(payload=payload)
+        return result

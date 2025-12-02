@@ -20,8 +20,55 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Pool, Postgres, Row};
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::debug;
 use uuid::Uuid;
+
+/// Default cache size for workflow DAGs
+const DEFAULT_DAG_CACHE_SIZE: usize = 64;
+
+/// Cached workflow DAG data
+#[derive(Debug, Clone)]
+struct CachedWorkflow {
+    dag: Arc<Dag>,
+}
+
+/// LRU-style cache for workflow DAGs. Uses a simple HashMap with a max size.
+/// When full, clears the entire cache (simple but effective for workflow orchestration
+/// where versions are relatively stable during a run).
+#[derive(Debug)]
+struct DagCache {
+    entries: HashMap<Uuid, CachedWorkflow>,
+    max_size: usize,
+}
+
+impl DagCache {
+    fn new(max_size: usize) -> Self {
+        Self {
+            entries: HashMap::with_capacity(max_size),
+            max_size,
+        }
+    }
+
+    fn get(&self, workflow_id: &Uuid) -> Option<Arc<Dag>> {
+        self.entries.get(workflow_id).map(|c| Arc::clone(&c.dag))
+    }
+
+    fn insert(&mut self, workflow_id: Uuid, dag: Dag) {
+        // Simple eviction: if at capacity, clear everything
+        // This is fine because in practice we have very few workflows active at once
+        if self.entries.len() >= self.max_size && !self.entries.contains_key(&workflow_id) {
+            self.entries.clear();
+        }
+        self.entries.insert(
+            workflow_id,
+            CachedWorkflow {
+                dag: Arc::new(dag),
+            },
+        );
+    }
+}
 
 /// Workflow version stored in database
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,11 +126,15 @@ pub struct ActionCompletion {
 /// The workflow store - handles all persistence operations
 pub struct Store {
     pool: Pool<Postgres>,
+    dag_cache: Arc<RwLock<DagCache>>,
 }
 
 impl Store {
     pub fn new(pool: Pool<Postgres>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            dag_cache: Arc::new(RwLock::new(DagCache::new(DEFAULT_DAG_CACHE_SIZE))),
+        }
     }
 
     /// Get the underlying database pool
@@ -328,7 +379,14 @@ impl Store {
         let timeout = node.timeout_seconds.unwrap_or(300) as i32;
         let max_retries = node.max_retries.unwrap_or(3) as i32;
 
-        sqlx::query(
+        debug!(
+            action_id = %action_id,
+            instance_id = %instance_id,
+            node_id = %node_id,
+            "Enqueueing action with status='pending'"
+        );
+
+        let result = sqlx::query(
             r#"
             INSERT INTO action_queue (id, instance_id, node_id, dispatch_json, timeout_seconds, max_retries)
             VALUES ($1, $2, $3, $4::jsonb, $5, $6)
@@ -343,6 +401,12 @@ impl Store {
         .execute(&self.pool)
         .await
         .context("Failed to enqueue action")?;
+
+        debug!(
+            action_id = %action_id,
+            rows_affected = result.rows_affected(),
+            "Action enqueued"
+        );
 
         Ok(action_id)
     }
@@ -403,26 +467,36 @@ impl Store {
 
     /// Dequeue an action for a worker
     pub async fn dequeue_action(&self) -> Result<Option<QueuedAction>> {
-        let row = sqlx::query(
+        let mut actions = self.dequeue_actions(1).await?;
+        Ok(actions.pop())
+    }
+
+    /// Dequeue multiple actions for workers (batch dequeue)
+    pub async fn dequeue_actions(&self, limit: i64) -> Result<Vec<QueuedAction>> {
+        let rows = sqlx::query(
             r#"
-            UPDATE action_queue
-            SET status = 'running', started_at = NOW(), attempt = attempt + 1
-            WHERE id = (
+            WITH next_actions AS (
                 SELECT id FROM action_queue
                 WHERE status = 'pending' AND scheduled_at <= NOW()
                 ORDER BY scheduled_at, created_at
-                LIMIT 1
+                LIMIT $1
                 FOR UPDATE SKIP LOCKED
             )
-            RETURNING id, instance_id, node_id, dispatch_json::text, timeout_seconds, max_retries, attempt
+            UPDATE action_queue AS aq
+            SET status = 'running', started_at = NOW(), attempt = attempt + 1
+            FROM next_actions
+            WHERE aq.id = next_actions.id
+            RETURNING aq.id, aq.instance_id, aq.node_id, aq.dispatch_json::text, aq.timeout_seconds, aq.max_retries, aq.attempt
             "#,
         )
-        .fetch_optional(&self.pool)
+        .bind(limit)
+        .fetch_all(&self.pool)
         .await
-        .context("Failed to dequeue action")?;
+        .context("Failed to dequeue actions")?;
 
-        match row {
-            Some(row) => Ok(Some(QueuedAction {
+        let actions = rows
+            .into_iter()
+            .map(|row| QueuedAction {
                 id: row.get("id"),
                 instance_id: row.get("instance_id"),
                 node_id: row.get("node_id"),
@@ -430,9 +504,10 @@ impl Store {
                 timeout_seconds: row.get("timeout_seconds"),
                 max_retries: row.get("max_retries"),
                 attempt: row.get("attempt"),
-            })),
-            None => Ok(None),
-        }
+            })
+            .collect();
+
+        Ok(actions)
     }
 
     /// Complete an action and process the result
@@ -605,16 +680,44 @@ impl Store {
         Ok(())
     }
 
-    /// Load instance state and DAG
+    /// Get a cached DAG for a workflow, or fetch from DB and cache it
+    async fn get_cached_dag(&self, workflow_id: Uuid) -> Result<Arc<Dag>> {
+        // Try cache first (read lock)
+        {
+            let cache = self.dag_cache.read().await;
+            if let Some(dag) = cache.get(&workflow_id) {
+                return Ok(dag);
+            }
+        }
+
+        // Not in cache, fetch from DB
+        let row = sqlx::query("SELECT dag_json::text FROM workflows WHERE id = $1")
+            .bind(workflow_id)
+            .fetch_one(&self.pool)
+            .await
+            .context("Failed to load workflow DAG")?;
+
+        let dag_json: String = row.get("dag_json");
+        let dag: Dag = serde_json::from_str(&dag_json).context("Failed to deserialize DAG")?;
+
+        // Insert into cache (write lock)
+        {
+            let mut cache = self.dag_cache.write().await;
+            cache.insert(workflow_id, dag.clone());
+        }
+
+        Ok(Arc::new(dag))
+    }
+
+    /// Load instance state and DAG (with DAG caching)
     async fn load_instance(
         &self,
         instance_id: Uuid,
-    ) -> Result<(InstanceState, Dag, WorkflowArguments)> {
+    ) -> Result<(InstanceState, Arc<Dag>, WorkflowArguments)> {
         let row = sqlx::query(
             r#"
-            SELECT i.state_json::text, w.dag_json::text, i.workflow_input
+            SELECT i.state_json::text, i.workflow_id, i.workflow_input
             FROM instances i
-            JOIN workflows w ON i.workflow_id = w.id
             WHERE i.id = $1
             "#,
         )
@@ -624,12 +727,12 @@ impl Store {
         .context("Failed to load instance")?;
 
         let state_json: String = row.get("state_json");
-        let dag_json: String = row.get("dag_json");
+        let workflow_id: Uuid = row.get("workflow_id");
         let workflow_input_bytes: Option<Vec<u8>> = row.get("workflow_input");
 
         let state: InstanceState =
             serde_json::from_str(&state_json).context("Failed to deserialize state")?;
-        let dag: Dag = serde_json::from_str(&dag_json).context("Failed to deserialize DAG")?;
+        let dag = self.get_cached_dag(workflow_id).await?;
         let workflow_input: WorkflowArguments = workflow_input_bytes
             .and_then(|bytes| prost::Message::decode(bytes.as_slice()).ok())
             .unwrap_or_default();

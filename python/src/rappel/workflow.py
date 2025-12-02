@@ -481,7 +481,12 @@ def _dedent_source(source: str) -> str:
 
 
 def _build_action_definitions() -> dict[str, ActionDefinition]:
-    """Build ActionDefinition dict from the registry for the IR parser."""
+    """Build ActionDefinition dict from the registry for the IR parser.
+
+    The dict is keyed by the Python function name (e.g., "echo_payload") because
+    that's what the IR parser sees in the AST. The ActionDefinition.name contains
+    the full action name (e.g., "benchmark.echo_payload") for gRPC dispatch.
+    """
     action_defs: dict[str, ActionDefinition] = {}
 
     for name in registry.names():
@@ -496,8 +501,10 @@ def _build_action_definitions() -> dict[str, ActionDefinition]:
         # Get module from function attribute
         module = getattr(func, "__rappel_action_module__", func.__module__)
 
-        action_defs[name] = ActionDefinition(
-            name=name,
+        # Key by function name (what appears in AST), not action name
+        func_name = func.__name__
+        action_defs[func_name] = ActionDefinition(
+            name=name,  # Full action name for dispatch
             module=module,
             signature=sig,
             param_names=param_names,

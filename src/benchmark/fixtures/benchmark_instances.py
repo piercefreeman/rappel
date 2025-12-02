@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 from rappel import Workflow, action, workflow
 
-from .benchmark_common import InstanceRunStats, build_requests, summarize_payload
+from benchmark_common import InstanceRunStats, build_requests, summarize_payload
 
 
 @action(name="benchmark.instances.prepare_requests")

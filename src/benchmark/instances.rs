@@ -89,6 +89,17 @@ impl WorkflowBenchmarkHarness {
             .await?
             .ok_or_else(|| anyhow!("Benchmark instances workflow not registered"))?;
 
+        // Clear action queue and instances from registration
+        // (registration creates an initial instance with empty input that we don't want)
+        sqlx::query("DELETE FROM action_queue")
+            .execute(store.pool())
+            .await
+            .ok();
+        sqlx::query("DELETE FROM instances")
+            .execute(store.pool())
+            .await
+            .ok();
+
         // Set up workers
         let worker_server = WorkerBridgeServer::start(None).await?;
         let pool =

@@ -5,24 +5,38 @@
 //! complex workflow logic.
 
 use anyhow::{Context, Result, anyhow};
+use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use prost::Message;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response as GrpcResponse, Status, async_trait, transport::Server};
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::benchmark::common::BenchmarkSummary;
+use crate::benchmark::common::{BenchmarkResult, BenchmarkSummary};
 use crate::benchmark::fixtures;
 use crate::messages::proto::{self, NodeDispatch, workflow_service_server::WorkflowServiceServer};
 use crate::server_worker::WorkerBridgeServer;
-use crate::store::{ActionCompletion, Store};
+use crate::store::{ActionCompletion, QueuedAction, Store};
 use crate::worker::{ActionDispatchPayload, PythonWorkerConfig, PythonWorkerPool};
+
+/// Type alias for dispatch result
+type DispatchResult = Result<BenchmarkResult>;
+
+/// Completion record for async processing
+struct CompletionRecord {
+    action_id: uuid::Uuid,
+    node_id: String,
+    instance_id: uuid::Uuid,
+    success: bool,
+    result_payload: Vec<u8>,
+}
 
 /// Configuration for action benchmark
 #[derive(Debug, Clone)]
@@ -48,7 +62,7 @@ impl Default for HarnessConfig {
 pub struct BenchmarkHarness {
     store: Arc<Store>,
     worker_server: Arc<WorkerBridgeServer>,
-    pool: PythonWorkerPool,
+    pool: Arc<PythonWorkerPool>,
     _python_env: TempDir,
     _registration_server: BenchmarkRegistrationServer,
     workflow_id: uuid::Uuid,
@@ -57,7 +71,6 @@ pub struct BenchmarkHarness {
 impl BenchmarkHarness {
     /// Create a new benchmark harness
     pub async fn new(
-        worker_config: PythonWorkerConfig,
         worker_count: usize,
         store: Store,
     ) -> Result<Self> {
@@ -86,10 +99,34 @@ impl BenchmarkHarness {
             .await?
             .ok_or_else(|| anyhow!("Benchmark workflow not registered"))?;
 
-        // Set up workers
+        // Clear action queue and instances from registration
+        // (registration creates an initial instance with empty input that we don't want)
+        sqlx::query("DELETE FROM action_queue")
+            .execute(store.pool())
+            .await
+            .ok();
+        sqlx::query("DELETE FROM instances")
+            .execute(store.pool())
+            .await
+            .ok();
+
+        // Set up workers with extra_python_paths including the temp directory
         let worker_server = WorkerBridgeServer::start(None).await?;
-        let pool =
-            PythonWorkerPool::new(worker_config, worker_count, Arc::clone(&worker_server)).await?;
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let worker_script = repo_root
+            .join("python")
+            .join(".venv")
+            .join("bin")
+            .join("rappel-worker");
+        let worker_config = PythonWorkerConfig {
+            script_path: worker_script,
+            script_args: Vec::new(),
+            user_module: "benchmark_actions".to_string(),
+            extra_python_paths: vec![python_env.path().to_path_buf()],
+        };
+        let pool = Arc::new(
+            PythonWorkerPool::new(worker_config, worker_count, Arc::clone(&worker_server)).await?,
+        );
 
         Ok(Self {
             store,
@@ -103,146 +140,217 @@ impl BenchmarkHarness {
 
     /// Run the benchmark with the given configuration
     pub async fn run(&self, config: &HarnessConfig) -> Result<BenchmarkSummary> {
-        let mut results = Vec::with_capacity(config.total_messages);
+        let total = config.total_messages;
+        let mut completed = Vec::with_capacity(total);
         let start = Instant::now();
-        let mut last_progress = Instant::now();
+        let mut last_report = start;
 
         // Build payload for all instances
-        let payload = "x".repeat(config.payload_size);
-        let workflow_input = encode_workflow_input(&[("payload", &payload)]);
+        let payload_str = "x".repeat(config.payload_size);
+        let workflow_input = encode_workflow_input(&[("payload", &payload_str)]);
 
-        // Create instances to drive the benchmark
-        let mut pending_instances = Vec::new();
-        let mut completed_count = 0usize;
+        // Create all workflow instances up front
+        let mut pending_instances = Vec::with_capacity(total);
+        for _ in 0..total {
+            let instance_id = self
+                .store
+                .create_instance_with_input(self.workflow_id, &workflow_input)
+                .await?;
+            pending_instances.push(instance_id);
+        }
 
-        while completed_count < config.total_messages {
-            // Launch instances up to in_flight limit
-            while pending_instances.len() < config.in_flight
-                && (pending_instances.len() + completed_count) < config.total_messages
-            {
-                let instance_id = self
-                    .store
-                    .create_instance_with_input(self.workflow_id, &workflow_input)
-                    .await?;
-                pending_instances.push(instance_id);
-            }
+        // Set up completion channel for async completion processing
+        let (completion_tx, completion_rx) = mpsc::channel::<CompletionRecord>(config.in_flight * 4);
+        let store_for_completion = Arc::clone(&self.store);
+        let completion_handle = tokio::spawn(async move {
+            Self::completion_loop(store_for_completion, completion_rx).await;
+        });
 
-            // Process pending actions
-            let batch_results = self.process_pending_actions().await?;
-            results.extend(batch_results);
+        // Process actions with parallel dispatch
+        let worker_count = self.pool.len().max(1);
+        let max_inflight = config.in_flight.max(1) * worker_count;
+        let batch_size = max_inflight.min(100) as i64;
+        let mut inflight: FuturesUnordered<BoxFuture<'_, DispatchResult>> = FuturesUnordered::new();
+        let mut dispatched = 0usize;
 
-            // Check for completed instances
-            let mut still_pending = Vec::new();
-            for instance_id in pending_instances.drain(..) {
-                match self.store.get_instance(instance_id).await? {
-                    Some((status, _)) if status == "completed" || status == "failed" => {
-                        completed_count += 1;
-                    }
-                    _ => {
-                        still_pending.push(instance_id);
-                    }
+        while completed.len() < total {
+            // Dispatch more actions if we have capacity
+            while inflight.len() < max_inflight {
+                let available = max_inflight - inflight.len();
+                let actions = self.store.dequeue_actions(available.min(batch_size as usize) as i64).await?;
+                if actions.is_empty() {
+                    break;
+                }
+
+                for action in actions {
+                    let pool = Arc::clone(&self.pool);
+                    let tx = completion_tx.clone();
+                    let store = Arc::clone(&self.store);
+                    let fut: BoxFuture<'_, DispatchResult> = Box::pin(async move {
+                        Self::dispatch_single_action(store, pool, tx, action).await
+                    });
+                    inflight.push(fut);
+                    dispatched += 1;
                 }
             }
-            pending_instances = still_pending;
 
-            // Progress reporting
-            if let Some(interval) = config.progress_interval
-                && last_progress.elapsed() >= interval
-            {
-                let elapsed = start.elapsed().as_secs_f64();
-                let rate = completed_count as f64 / elapsed;
-                info!(
-                    completed = completed_count,
-                    total = config.total_messages,
-                    rate = format!("{:.0} msg/s", rate),
-                    "benchmark progress"
-                );
-                last_progress = Instant::now();
-            }
+            // Wait for at least one action to complete
+            match inflight.next().await {
+                Some(Ok(result)) => {
+                    completed.push(result);
 
-            // Small delay to prevent busy-loop
-            if pending_instances.is_empty() && completed_count < config.total_messages {
-                sleep(Duration::from_millis(1)).await;
+                    // Progress reporting
+                    if let Some(interval) = config.progress_interval {
+                        let now = Instant::now();
+                        if now.duration_since(last_report) >= interval {
+                            let elapsed = now.duration_since(start);
+                            let throughput = completed.len() as f64 / elapsed.as_secs_f64().max(1e-9);
+                            info!(
+                                processed = completed.len(),
+                                total,
+                                elapsed = %format!("{:.1}s", elapsed.as_secs_f64()),
+                                throughput = %format!("{:.0} msg/s", throughput),
+                                in_flight = inflight.len(),
+                                dispatched,
+                                "benchmark progress",
+                            );
+                            last_report = now;
+                        }
+                    }
+                }
+                Some(Err(err)) => {
+                    warn!(?err, "dispatch error");
+                }
+                None => {
+                    // No more inflight tasks, check if we need more
+                    if dispatched >= total {
+                        break;
+                    }
+                    // Small sleep to avoid busy-loop when waiting for new actions
+                    sleep(Duration::from_millis(1)).await;
+                }
             }
         }
+
+        // Wait for completion processing to finish
+        drop(completion_tx);
+        let _ = completion_handle.await;
 
         let elapsed = start.elapsed();
-        Ok(BenchmarkSummary::from_results(results, elapsed))
+        Ok(BenchmarkSummary::from_results(completed, elapsed))
     }
 
-    /// Process all pending actions in the queue
-    async fn process_pending_actions(
-        &self,
-    ) -> Result<Vec<crate::benchmark::common::BenchmarkResult>> {
-        let mut results = Vec::new();
+    /// Dispatch a single action and return the result
+    async fn dispatch_single_action(
+        store: Arc<Store>,
+        pool: Arc<PythonWorkerPool>,
+        completion_tx: mpsc::Sender<CompletionRecord>,
+        action: QueuedAction,
+    ) -> Result<BenchmarkResult> {
+        // Decode and dispatch to worker
+        let dispatch: NodeDispatch =
+            serde_json::from_str(&action.dispatch_json).context("Failed to decode dispatch")?;
 
-        loop {
-            let action = match self.store.dequeue_action().await? {
-                Some(a) => a,
-                None => break,
-            };
+        // Check if this is a sleep action (no-op)
+        let is_sleep = dispatch
+            .node
+            .as_ref()
+            .map(|n| n.action == "__sleep__")
+            .unwrap_or(false);
 
-            // Decode and dispatch to worker
-            let dispatch: NodeDispatch =
-                serde_json::from_str(&action.dispatch_json).context("Failed to decode dispatch")?;
-
-            // Check if this is a sleep action (no-op)
-            let is_sleep = dispatch
-                .node
-                .as_ref()
-                .map(|n| n.action == "__sleep__")
-                .unwrap_or(false);
-
-            if is_sleep {
-                let completion = ActionCompletion {
-                    action_id: action.id,
-                    node_id: action.node_id,
-                    instance_id: action.instance_id,
-                    success: true,
-                    result: None,
-                    exception_type: None,
-                    exception_module: None,
-                };
-                self.store.complete_action(completion).await?;
-                continue;
-            }
-
-            let payload = ActionDispatchPayload {
-                action_id: action.id,
-                instance_id: action.instance_id,
-                sequence: action.attempt,
-                dispatch,
-                timeout_seconds: action.timeout_seconds,
-                max_retries: action.max_retries,
-                attempt_number: action.attempt,
-                dispatch_token: action.id,
-            };
-
-            let worker = self.pool.next_worker();
-            let metrics = worker.send_action(payload).await?;
-
-            // Process completion
-            let decoded = decode_result(&metrics.response_payload);
+        if is_sleep {
             let completion = ActionCompletion {
-                action_id: metrics.action_id,
-                node_id: action.node_id,
+                action_id: action.id,
+                node_id: action.node_id.clone(),
                 instance_id: action.instance_id,
-                success: metrics.success,
-                result: decoded.result,
-                exception_type: decoded.exception_type,
-                exception_module: decoded.exception_module,
+                success: true,
+                result: None,
+                exception_type: None,
+                exception_module: None,
             };
-            self.store.complete_action(completion).await?;
-
-            results.push(metrics.into());
+            store.complete_action(completion).await?;
+            // Return a minimal result for sleep actions
+            return Ok(BenchmarkResult {
+                sequence: 0,
+                ack_latency: Duration::ZERO,
+                round_trip: Duration::ZERO,
+                worker_duration: Duration::ZERO,
+            });
         }
 
-        Ok(results)
+        let payload = ActionDispatchPayload {
+            action_id: action.id,
+            instance_id: action.instance_id,
+            sequence: action.attempt,
+            dispatch,
+            timeout_seconds: action.timeout_seconds,
+            max_retries: action.max_retries,
+            attempt_number: action.attempt,
+            dispatch_token: action.id,
+        };
+
+        let worker = pool.next_worker();
+        let metrics = worker.send_action(payload).await?;
+
+        // Send completion record to async processor
+        let record = CompletionRecord {
+            action_id: metrics.action_id,
+            node_id: action.node_id,
+            instance_id: action.instance_id,
+            success: metrics.success,
+            result_payload: metrics.response_payload.clone(),
+        };
+        if let Err(err) = completion_tx.send(record).await {
+            warn!(?err, "completion channel closed");
+        }
+
+        Ok(metrics.into())
+    }
+
+    /// Background loop to process completions (parallel processing)
+    async fn completion_loop(store: Arc<Store>, mut rx: mpsc::Receiver<CompletionRecord>) {
+        use tokio::sync::Semaphore;
+
+        // Process completions in parallel with bounded concurrency
+        let semaphore = Arc::new(Semaphore::new(32)); // Allow 32 concurrent completion tasks
+        let mut handles = Vec::new();
+
+        while let Some(record) = rx.recv().await {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let store = Arc::clone(&store);
+
+            let handle = tokio::spawn(async move {
+                let decoded = decode_result(&record.result_payload);
+                let completion = ActionCompletion {
+                    action_id: record.action_id,
+                    node_id: record.node_id,
+                    instance_id: record.instance_id,
+                    success: record.success,
+                    result: decoded.result,
+                    exception_type: decoded.exception_type,
+                    exception_module: decoded.exception_module,
+                };
+
+                if let Err(err) = store.complete_action(completion).await {
+                    warn!(?err, "failed to complete action");
+                }
+                drop(permit);
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all completion tasks to finish
+        for handle in handles {
+            let _ = handle.await;
+        }
     }
 
     /// Shutdown the harness
     pub async fn shutdown(self) -> Result<()> {
-        self.pool.shutdown().await?;
+        match Arc::try_unwrap(self.pool) {
+            Ok(pool) => pool.shutdown().await?,
+            Err(_) => warn!("pool still has references, skipping shutdown"),
+        }
         self.worker_server.shutdown().await;
         Ok(())
     }

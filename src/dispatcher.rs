@@ -169,14 +169,8 @@ impl DispatcherTask {
         }
         let limit = available.min(self.config.batch_size.max(1) as usize).max(1);
 
-        // Dequeue actions up to limit
-        let mut actions = Vec::with_capacity(limit);
-        for _ in 0..limit {
-            match self.store.dequeue_action().await? {
-                Some(action) => actions.push(action),
-                None => break,
-            }
-        }
+        // Dequeue actions up to limit (batch query)
+        let actions = self.store.dequeue_actions(limit as i64).await?;
 
         if actions.is_empty() {
             return Ok(());
