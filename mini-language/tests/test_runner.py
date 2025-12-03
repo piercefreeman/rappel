@@ -1273,3 +1273,233 @@ class TestDAGRunnerForLoopUnpacking:
         outputs = runner.run("process_triples", {"triples": [[1, 2, 3], [4, 5, 6]]})
         # Last result: 4 + 5 + 6 = 15
         assert outputs.get("result") == 15
+
+
+class TestDAGRunnerRetryPolicies:
+    """Tests for retry policies on action calls."""
+
+    def test_parser_retry_policy_basic(self):
+        """Test parsing a basic retry policy."""
+        source = """fn test_retry(input: [], output: [result]):
+    result = @might_fail() [retry: 3, backoff: 60, timeout: 30]
+    return result"""
+
+        from rappel import RappelActionCall
+
+        program = parse(source)
+        fn = program.statements[0]
+        assignment = fn.body[0]
+        action_call = assignment.value
+
+        assert isinstance(action_call, RappelActionCall)
+        assert len(action_call.retry_policies) == 1
+        policy = action_call.retry_policies[0]
+        assert policy.max_retries == 3
+        assert policy.backoff_seconds == 60.0
+        assert policy.timeout_seconds == 30.0
+        assert policy.exception_types == ()  # catch all
+
+    def test_parser_retry_policy_with_exception_type(self):
+        """Test parsing retry policy with specific exception type."""
+        source = """fn test_retry(input: [], output: [result]):
+    result = @might_fail() [ValueError: retry: 3, backoff: 120]
+    return result"""
+
+        from rappel import RappelActionCall
+
+        program = parse(source)
+        fn = program.statements[0]
+        assignment = fn.body[0]
+        action_call = assignment.value
+
+        assert isinstance(action_call, RappelActionCall)
+        assert len(action_call.retry_policies) == 1
+        policy = action_call.retry_policies[0]
+        assert policy.exception_types == ("ValueError",)
+        assert policy.max_retries == 3
+        assert policy.backoff_seconds == 120.0
+
+    def test_parser_retry_policy_duration_strings(self):
+        """Test parsing retry policy with duration strings."""
+        source = """fn test_retry(input: [], output: [result]):
+    result = @might_fail() [retry: 5, backoff: "2m", timeout: "30s"]
+    return result"""
+
+        from rappel import RappelActionCall
+
+        program = parse(source)
+        fn = program.statements[0]
+        assignment = fn.body[0]
+        action_call = assignment.value
+
+        policy = action_call.retry_policies[0]
+        assert policy.max_retries == 5
+        assert policy.backoff_seconds == 120.0  # 2 minutes
+        assert policy.timeout_seconds == 30.0
+
+    def test_retry_on_failure_schedules_retry(self):
+        """Test that a failed action with retry policy schedules a retry."""
+        source = """fn test_retry(input: [], output: [result]):
+    result = @might_fail() [retry: 3, backoff: 1]
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        fail_count = [0]
+
+        def mock_might_fail():
+            fail_count[0] += 1
+            if fail_count[0] < 3:
+                raise ValueError("Failed!")
+            return "success"
+
+        runner = DAGRunner(dag, action_handlers={"might_fail": mock_might_fail})
+
+        # Run until all scheduled actions complete
+        # Since backoff is 1s, retries should complete quickly
+        outputs = runner.run("test_retry", {})
+
+        # After 3 attempts (2 failures + 1 success), should succeed
+        assert outputs.get("result") == "success"
+        assert fail_count[0] == 3
+
+    def test_retry_exhausted_raises_error(self):
+        """Test that exhausting retries raises an error."""
+        source = """fn test_retry(input: [], output: [result]):
+    result = @always_fails() [retry: 2, backoff: 0]
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        def mock_always_fails():
+            raise ValueError("Always fails!")
+
+        runner = DAGRunner(dag, action_handlers={"always_fails": mock_always_fails})
+
+        with pytest.raises(RuntimeError):
+            runner.run("test_retry", {})
+
+    def test_retry_policy_specific_exception_match(self):
+        """Test that retry only happens for matching exception types."""
+        source = """fn test_retry(input: [], output: [result]):
+    result = @might_fail() [ValueError: retry: 3, backoff: 0]
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        def mock_raises_type_error():
+            raise TypeError("Wrong type!")
+
+        runner = DAGRunner(dag, action_handlers={"might_fail": mock_raises_type_error})
+
+        # TypeError doesn't match ValueError policy, so should fail immediately
+        with pytest.raises(RuntimeError):
+            runner.run("test_retry", {})
+
+    def test_action_queue_claim_and_release(self):
+        """Test claiming and releasing actions in the queue."""
+        db = InMemoryDB()
+        queue = ActionQueue(db)
+
+        action = RunnableAction(
+            id="action_1",
+            node_id="node_1",
+            function_name="test",
+            action_type=ActionType.DELEGATED,
+        )
+        queue.add(action)
+
+        # Claim with a worker UUID
+        worker_uuid = "worker_123"
+        assert queue.claim("action_1", worker_uuid, timeout_seconds=30) is True
+
+        # Can't claim again
+        assert queue.claim("action_1", "other_worker", timeout_seconds=30) is False
+
+        # Release
+        assert queue.release("action_1", worker_uuid) is True
+
+        # Can claim again after release
+        assert queue.claim("action_1", "other_worker", timeout_seconds=30) is True
+
+    def test_action_queue_schedule_retry(self):
+        """Test scheduling a retry action."""
+        db = InMemoryDB()
+        queue = ActionQueue(db)
+
+        # Use queue.next_id() to get a proper unique ID
+        action_id = queue.next_id()
+        action = RunnableAction(
+            id=action_id,
+            node_id="node_1",
+            function_name="test",
+            action_type=ActionType.DELEGATED,
+            retries_remaining=3,
+            backoff_seconds=60.0,
+            retry_attempt=0,
+        )
+        queue.add(action)
+
+        # Schedule retry
+        retry_action = queue.schedule_retry(action)
+
+        assert retry_action is not None
+        assert retry_action.retries_remaining == 2
+        assert retry_action.retry_attempt == 1
+        assert retry_action.original_action_id == action_id
+        assert retry_action.scheduled_at is not None
+        # Backoff should be 60 * 2^0 = 60 seconds from now
+        assert retry_action.scheduled_at > time.time()
+
+    def test_action_queue_no_retry_when_exhausted(self):
+        """Test that no retry is scheduled when retries are exhausted."""
+        db = InMemoryDB()
+        queue = ActionQueue(db)
+
+        action = RunnableAction(
+            id="action_1",
+            node_id="node_1",
+            function_name="test",
+            action_type=ActionType.DELEGATED,
+            retries_remaining=0,  # No retries left
+            backoff_seconds=60.0,
+        )
+        queue.add(action)
+
+        # Should not schedule retry
+        retry_action = queue.schedule_retry(action)
+        assert retry_action is None
+
+    def test_get_timed_out_actions(self):
+        """Test getting timed out actions from the queue."""
+        db = InMemoryDB()
+        queue = ActionQueue(db)
+
+        # Add an action with timeout in the past
+        action = RunnableAction(
+            id="action_1",
+            node_id="node_1",
+            function_name="test",
+            action_type=ActionType.DELEGATED,
+            lock_uuid="worker_1",
+            timeout_at=time.time() - 10,  # 10 seconds ago
+        )
+        queue.add(action)
+
+        # Add an action with timeout in the future
+        action2 = RunnableAction(
+            id="action_2",
+            node_id="node_2",
+            function_name="test",
+            action_type=ActionType.DELEGATED,
+            lock_uuid="worker_2",
+            timeout_at=time.time() + 3600,  # 1 hour from now
+        )
+        queue.add(action2)
+
+        timed_out = queue.get_timed_out_actions()
+        assert len(timed_out) == 1
+        assert timed_out[0].id == "action_1"

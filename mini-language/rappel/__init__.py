@@ -37,6 +37,7 @@ from .ir import (
     RappelSpread,
     RappelCall,
     RappelActionCall,
+    RappelRetryPolicy,
     RappelExpr,
     # Statements
     RappelAssignment,
@@ -116,6 +117,7 @@ __all__ = [
     "RappelSpread",
     "RappelCall",
     "RappelActionCall",
+    "RappelRetryPolicy",
     "RappelExpr",
     "RappelAssignment",
     "RappelMultiAssignment",

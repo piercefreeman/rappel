@@ -162,11 +162,31 @@ class RappelCall:
 
 
 @dataclass(frozen=True)
+class RappelRetryPolicy:
+    """
+    Retry policy for action calls.
+
+    @action(...) [ValueError: retry: 3, backoff: 120, timeout: 30]
+
+    - exception_types: tuple of exception type names to catch (empty = catch all)
+    - max_retries: maximum number of retry attempts
+    - backoff_seconds: base backoff duration in seconds (exponential: backoff * 2^attempt)
+    - timeout_seconds: how long before the action is considered timed out
+    """
+
+    exception_types: tuple[str, ...]  # Empty tuple means catch all exceptions
+    max_retries: int = 3
+    backoff_seconds: float = 60.0  # 1 minute default
+    timeout_seconds: float | None = None  # None means no timeout
+
+
+@dataclass(frozen=True)
 class RappelActionCall:
     """Action call: @action_name(kwarg=value). External action, kwargs only."""
 
     action_name: str
     kwargs: tuple[tuple[str, RappelExpr], ...]
+    retry_policies: tuple[RappelRetryPolicy, ...] = ()
     location: SourceLocation | None = None
 
 

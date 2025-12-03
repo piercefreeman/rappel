@@ -30,6 +30,7 @@ from .ir import (
     RappelDictExpr,
     RappelCall,
     RappelActionCall,
+    RappelRetryPolicy,
     RappelAssignment,
     RappelMultiAssignment,
     RappelReturn,
@@ -83,6 +84,20 @@ class RunnableAction:
     # For durable sleep - Unix timestamp when action should be executed
     # If None or in the past, action is ready immediately
     scheduled_at: float | None = None
+
+    # Retry policy fields
+    # lock_uuid: Worker that currently owns this action (for timeout detection)
+    lock_uuid: str | None = None
+    # timeout_at: Unix timestamp when action should be considered timed out (NOW + timeout)
+    timeout_at: float | None = None
+    # retries_remaining: How many retries are left for this action
+    retries_remaining: int = 0
+    # backoff_seconds: Base backoff duration for exponential retry
+    backoff_seconds: float = 60.0
+    # retry_attempt: Current retry attempt (0 = first attempt)
+    retry_attempt: int = 0
+    # original_action_id: If this is a retry, the original action ID
+    original_action_id: str | None = None
 
 
 @dataclass
@@ -142,6 +157,13 @@ class ActionQueue:
             "spread_item": action.spread_item,
             "parallel_index": action.parallel_index,
             "scheduled_at": action.scheduled_at,
+            # Retry policy fields
+            "lock_uuid": action.lock_uuid,
+            "timeout_at": action.timeout_at,
+            "retries_remaining": action.retries_remaining,
+            "backoff_seconds": action.backoff_seconds,
+            "retry_attempt": action.retry_attempt,
+            "original_action_id": action.original_action_id,
         }
         self._table.insert(action.id, action_dict)
 
@@ -241,7 +263,118 @@ class ActionQueue:
             spread_item=d["spread_item"],
             parallel_index=d.get("parallel_index"),
             scheduled_at=d.get("scheduled_at"),
+            # Retry policy fields
+            lock_uuid=d.get("lock_uuid"),
+            timeout_at=d.get("timeout_at"),
+            retries_remaining=d.get("retries_remaining", 0),
+            backoff_seconds=d.get("backoff_seconds", 60.0),
+            retry_attempt=d.get("retry_attempt", 0),
+            original_action_id=d.get("original_action_id"),
         )
+
+    def claim(self, action_id: str, worker_uuid: str, timeout_seconds: float | None = None) -> bool:
+        """
+        Claim an action with a lock and optional timeout.
+
+        Simulates: UPDATE action_queue SET lock_uuid = ?, timeout_at = NOW() + ?
+                   WHERE id = ? AND lock_uuid IS NULL
+
+        Returns True if successfully claimed, False if already claimed.
+        """
+        action_dict = self._table.get(action_id)
+        if action_dict is None:
+            return False
+
+        if action_dict.get("lock_uuid") is not None:
+            return False
+
+        action_dict["lock_uuid"] = worker_uuid
+        if timeout_seconds is not None:
+            action_dict["timeout_at"] = time.time() + timeout_seconds
+
+        self._table.update(action_id, action_dict)
+        return True
+
+    def release(self, action_id: str, worker_uuid: str) -> bool:
+        """
+        Release a lock on an action.
+
+        Simulates: UPDATE action_queue SET lock_uuid = NULL, timeout_at = NULL
+                   WHERE id = ? AND lock_uuid = ?
+
+        Returns True if lock was released, False if not owned.
+        """
+        action_dict = self._table.get(action_id)
+        if action_dict is None:
+            return False
+
+        if action_dict.get("lock_uuid") != worker_uuid:
+            return False
+
+        action_dict["lock_uuid"] = None
+        action_dict["timeout_at"] = None
+        self._table.update(action_id, action_dict)
+        return True
+
+    def get_timed_out_actions(self) -> list[RunnableAction]:
+        """
+        Get all actions that have timed out.
+
+        Simulates: SELECT * FROM action_queue
+                   WHERE timeout_at IS NOT NULL AND timeout_at < NOW()
+                   FOR UPDATE SKIP LOCKED
+
+        Returns list of timed out actions.
+        """
+        current_time = time.time()
+        timed_out = []
+
+        all_actions = self._table.all()
+        for action_dict in all_actions.values():
+            timeout_at = action_dict.get("timeout_at")
+            if timeout_at is not None and timeout_at < current_time:
+                timed_out.append(self._dict_to_action(action_dict))
+
+        return timed_out
+
+    def schedule_retry(self, action: RunnableAction) -> RunnableAction | None:
+        """
+        Schedule a retry for an action with exponential backoff.
+
+        Returns the new retry action, or None if no retries remaining.
+
+        The backoff is calculated as: backoff_seconds * 2^retry_attempt
+        """
+        if action.retries_remaining <= 0:
+            return None
+
+        # Calculate next scheduled time with exponential backoff
+        backoff = action.backoff_seconds * (2 ** action.retry_attempt)
+        scheduled_at = time.time() + backoff
+
+        # Create new retry action
+        retry_action = RunnableAction(
+            id=self.next_id(),
+            node_id=action.node_id,
+            function_name=action.function_name,
+            action_type=action.action_type,
+            input_data=action.input_data,
+            status=ActionStatus.PENDING,
+            spread_index=action.spread_index,
+            spread_item=action.spread_item,
+            parallel_index=action.parallel_index,
+            scheduled_at=scheduled_at,
+            # Updated retry fields
+            lock_uuid=None,
+            timeout_at=None,
+            retries_remaining=action.retries_remaining - 1,
+            backoff_seconds=action.backoff_seconds,
+            retry_attempt=action.retry_attempt + 1,
+            original_action_id=action.original_action_id or action.id,
+        )
+
+        self.add(retry_action)
+        return retry_action
 
 
 class DAGRunner:
@@ -335,15 +468,19 @@ class DAGRunner:
             start = 0
         return list(range(start, stop, step))
 
-    def _builtin_enumerate(self, items: list) -> list[list]:
+    def _builtin_enumerate(self, items) -> list[list]:
         """
         Built-in enumerate function.
 
         Returns a list of [index, item] pairs.
+        For dicts, treats as list of [key, value] pairs.
 
         Usage:
             enumerate(items=["a", "b", "c"]) -> [[0, "a"], [1, "b"], [2, "c"]]
+            enumerate(items={"a": 1, "b": 2}) -> [[0, ["a", 1]], [1, ["b", 2]]]
         """
+        if isinstance(items, dict):
+            return [[i, [k, v]] for i, (k, v) in enumerate(items.items())]
         return [[i, item] for i, item in enumerate(items)]
 
     def _builtin_len(self, items: list | dict | str) -> int:
@@ -358,6 +495,77 @@ class DAGRunner:
             len(items="hello") -> 5
         """
         return len(items)
+
+    def _get_retry_info(self, node: DAGNode) -> tuple[int, float, float | None]:
+        """
+        Extract retry policy info from a node's IR.
+
+        Returns (max_retries, backoff_seconds, timeout_seconds) tuple.
+        Uses the first matching policy's settings, or defaults if none.
+        """
+        ir_node = node.ir_node
+
+        # Check if this is an action call with retry policies
+        if isinstance(ir_node, RappelActionCall) and ir_node.retry_policies:
+            # Use the first policy's settings as defaults
+            # (In practice, the runner will match exception types at runtime)
+            policy = ir_node.retry_policies[0]
+            return (policy.max_retries, policy.backoff_seconds, policy.timeout_seconds)
+
+        # Check if it's an assignment with an action call on the RHS
+        if isinstance(ir_node, RappelAssignment):
+            if isinstance(ir_node.value, RappelActionCall) and ir_node.value.retry_policies:
+                policy = ir_node.value.retry_policies[0]
+                return (policy.max_retries, policy.backoff_seconds, policy.timeout_seconds)
+
+        # Check expression statement
+        if isinstance(ir_node, RappelExprStatement):
+            if isinstance(ir_node.expr, RappelActionCall) and ir_node.expr.retry_policies:
+                policy = ir_node.expr.retry_policies[0]
+                return (policy.max_retries, policy.backoff_seconds, policy.timeout_seconds)
+
+        # Default: no retries
+        return (0, 60.0, None)
+
+    def _find_matching_retry_policy(
+        self, node: DAGNode, exception: Exception
+    ) -> RappelRetryPolicy | None:
+        """
+        Find a retry policy that matches the given exception.
+
+        Returns the matching policy, or None if no match.
+        """
+        ir_node = node.ir_node
+
+        # Get retry policies from the action call
+        policies = []
+        if isinstance(ir_node, RappelActionCall):
+            policies = ir_node.retry_policies
+        elif isinstance(ir_node, RappelAssignment) and isinstance(ir_node.value, RappelActionCall):
+            policies = ir_node.value.retry_policies
+        elif isinstance(ir_node, RappelExprStatement) and isinstance(ir_node.expr, RappelActionCall):
+            policies = ir_node.expr.retry_policies
+
+        if not policies:
+            return None
+
+        exception_type_name = type(exception).__name__
+
+        # First, look for a specific match
+        for policy in policies:
+            if policy.exception_types:  # Non-empty means specific exception types
+                if exception_type_name in policy.exception_types:
+                    return policy
+            else:
+                # Empty tuple = catch all, but prioritize specific matches first
+                pass
+
+        # Then, look for a catch-all policy
+        for policy in policies:
+            if not policy.exception_types:  # Empty = catch all
+                return policy
+
+        return None
 
     def _get_node_data(self, node_id: str) -> RunnableActionData:
         """
@@ -565,6 +773,9 @@ class DAGRunner:
                 inbox_scope = self._read_inbox(node_id)
                 scheduled_at = self._get_scheduled_at(node, inbox_scope)
 
+                # Get retry policy info
+                max_retries, backoff_seconds, timeout_seconds = self._get_retry_info(node)
+
                 action = RunnableAction(
                     id=self.queue.next_id(),
                     node_id=node_id,
@@ -572,6 +783,9 @@ class DAGRunner:
                     action_type=ActionType.DELEGATED,
                     input_data=node_data.variable_values.copy(),
                     scheduled_at=scheduled_at,
+                    retries_remaining=max_retries,
+                    backoff_seconds=backoff_seconds,
+                    # timeout_at will be set when action is claimed
                 )
                 self.queue.add(action)
                 # Don't continue past delegated actions - they'll trigger
@@ -615,6 +829,27 @@ class DAGRunner:
 
         ready = []
         node_data = self._get_node_data(node_id)
+
+        # If the source node is not completed AND it's an action call with retry policies,
+        # don't trigger successors (a retry was scheduled)
+        # Skip this check for parallel/spread items which are never marked complete individually
+        if not node_data.completed:
+            # Check if this is an action call with retry policies
+            has_retry_policy = False
+            ir = node.ir_node
+            if isinstance(ir, RappelAssignment) and isinstance(ir.value, RappelActionCall):
+                if ir.value.retry_policies:
+                    has_retry_policy = True
+            elif isinstance(ir, RappelExprStatement) and isinstance(ir.expr, RappelActionCall):
+                if ir.expr.retry_policies:
+                    has_retry_policy = True
+            elif isinstance(ir, RappelActionCall):
+                if ir.retry_policies:
+                    has_retry_policy = True
+
+            if has_retry_policy:
+                # Retry was scheduled, don't trigger successors yet
+                return []
 
         # Check if this node has an exception (is in a try block and failed)
         if node_data.variable_values.get("_exception"):
@@ -811,6 +1046,17 @@ class DAGRunner:
             # Note: Successor handling is done by _execute_inline_batch, not here
 
         except Exception as e:
+            # First, check if this action has a retry policy that matches the exception
+            matching_policy = self._find_matching_retry_policy(node, e)
+
+            if matching_policy and action.retries_remaining > 0:
+                # Schedule a retry with exponential backoff
+                retry_action = self.queue.schedule_retry(action)
+                if retry_action:
+                    action.status = ActionStatus.COMPLETED  # Original action is done
+                    # Don't mark node as completed - the retry will handle it
+                    return
+
             # Check if this node is inside a try block (has a "success" outgoing edge)
             in_try_block = any(
                 edge.condition == "success"
