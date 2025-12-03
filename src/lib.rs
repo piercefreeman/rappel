@@ -28,6 +28,7 @@ pub mod lexer;
 pub mod messages;
 pub mod parser;
 pub mod runner;
+pub mod server_client;
 pub mod server_worker;
 pub mod worker;
 
@@ -42,21 +43,21 @@ pub use db::{
 };
 
 // Worker infrastructure
-pub use messages::{MessageError, proto};
+pub use messages::{MessageError, ast as ir_ast, proto};
 pub use server_worker::{WorkerBridgeChannels, WorkerBridgeServer};
 pub use worker::{
     ActionDispatchPayload, PythonWorker, PythonWorkerConfig, PythonWorkerPool, RoundTripMetrics,
 };
 
 // IR language
-pub use lexer::{lex, Lexer, LexerError, Span, SpannedToken, Token};
-pub use parser::{ast, parse, ParseError, Parser};
+pub use lexer::{Lexer, LexerError, Span, SpannedToken, Token, lex};
+pub use parser::{ParseError, Parser, ast, parse};
 
 // DAG
-pub use dag::{convert_to_dag, DAG, DAGConverter, DAGEdge, DAGNode, EdgeType};
+pub use dag::{DAG, DAGConverter, DAGEdge, DAGNode, EdgeType, convert_to_dag};
 
 // AST Printer
-pub use ast_printer::{print_expr, print_program, print_statement, AstPrinter};
+pub use ast_printer::{AstPrinter, print_expr, print_program, print_statement};
 
 // DAG State Helper
 pub use dag_state::{DAGHelper, DataFlowTarget, ExecutionMode, SuccessorInfo};

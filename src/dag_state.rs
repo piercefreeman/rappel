@@ -8,9 +8,15 @@
 //! - Locating aggregator nodes
 //! - Checking node types
 
+#![allow(
+    clippy::collapsible_if,
+    clippy::option_map_unit_fn,
+    clippy::manual_strip
+)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::dag::{DAGEdge, DAGNode, EdgeType, DAG};
+use crate::dag::{DAG, DAGEdge, DAGNode, EdgeType};
 
 /// Determines whether a node can be executed inline or requires delegation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -431,16 +437,16 @@ impl<'a> DAGHelper<'a> {
     }
 
     /// Find the matching except handler for an exception type.
-    pub fn find_except_handler(
-        &self,
-        try_node_id: &str,
-        exception_type: &str,
-    ) -> Option<String> {
+    pub fn find_except_handler(&self, try_node_id: &str, exception_type: &str) -> Option<String> {
         let handlers = self.get_except_handlers(try_node_id);
 
         // First, look for a specific match
         for handler in &handlers {
-            if !handler.is_catch_all && handler.exception_types.contains(&exception_type.to_string()) {
+            if !handler.is_catch_all
+                && handler
+                    .exception_types
+                    .contains(&exception_type.to_string())
+            {
                 return Some(handler.node_id.clone());
             }
         }
@@ -500,8 +506,10 @@ impl<'a> DAGHelper<'a> {
         }
 
         // Build in-degree map
-        let mut in_degree: HashMap<String, usize> = fn_nodes.iter().map(|n| (n.clone(), 0)).collect();
-        let mut adj: HashMap<String, Vec<String>> = fn_nodes.iter().map(|n| (n.clone(), Vec::new())).collect();
+        let mut in_degree: HashMap<String, usize> =
+            fn_nodes.iter().map(|n| (n.clone(), 0)).collect();
+        let mut adj: HashMap<String, Vec<String>> =
+            fn_nodes.iter().map(|n| (n.clone(), Vec::new())).collect();
 
         for edge in &self.dag.edges {
             if fn_nodes.contains(&edge.source)
@@ -510,9 +518,7 @@ impl<'a> DAGHelper<'a> {
             {
                 adj.get_mut(&edge.source)
                     .map(|v| v.push(edge.target.clone()));
-                in_degree
-                    .entry(edge.target.clone())
-                    .and_modify(|d| *d += 1);
+                in_degree.entry(edge.target.clone()).and_modify(|d| *d += 1);
             }
         }
 
@@ -812,12 +818,12 @@ fn multiply(input: [x, y], output: [product]):
         assert!(!order.is_empty());
 
         // Input should come before output
-        let input_pos = order.iter().position(|id| {
-            dag.nodes.get(id).map(|n| n.is_input).unwrap_or(false)
-        });
-        let output_pos = order.iter().position(|id| {
-            dag.nodes.get(id).map(|n| n.is_output).unwrap_or(false)
-        });
+        let input_pos = order
+            .iter()
+            .position(|id| dag.nodes.get(id).map(|n| n.is_input).unwrap_or(false));
+        let output_pos = order
+            .iter()
+            .position(|id| dag.nodes.get(id).map(|n| n.is_output).unwrap_or(false));
 
         assert!(input_pos.is_some());
         assert!(output_pos.is_some());
@@ -886,7 +892,12 @@ fn multiply(input: [x, y], output: [product]):
 
         assert!(specific.is_some());
         assert!(catch_all.is_some());
-        assert!(specific.unwrap().exception_types.contains(&"NetworkError".to_string()));
+        assert!(
+            specific
+                .unwrap()
+                .exception_types
+                .contains(&"NetworkError".to_string())
+        );
     }
 
     #[test]

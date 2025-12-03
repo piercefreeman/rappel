@@ -132,11 +132,49 @@ message WorkflowDictArgument {
 }
 
 // =============================================================================
-// gRPC Service Definition
+// Workflow Registration
+// =============================================================================
+// Messages for registering workflows and starting instances.
+
+// Workflow registration containing the IR program
+message WorkflowRegistration {
+  string workflow_name = 1;
+  bytes ir = 2;                      // Serialized IR program (from ast.proto)
+  string ir_hash = 3;                // Hash of the IR for versioning
+  WorkflowArguments initial_context = 4;
+  bool concurrent = 5;               // Whether multiple instances can run
+}
+
+message RegisterWorkflowRequest {
+  WorkflowRegistration registration = 1;
+}
+
+message RegisterWorkflowResponse {
+  string workflow_version_id = 1;
+  string workflow_instance_id = 2;
+}
+
+message WaitForInstanceRequest {
+  string instance_id = 1;
+  double poll_interval_secs = 2;
+}
+
+message WaitForInstanceResponse {
+  bytes payload = 1;
+}
+
+// =============================================================================
+// gRPC Service Definitions
 // =============================================================================
 
 // Bidirectional streaming service for worker communication.
 // Workers connect and maintain a persistent stream for action dispatch/results.
 service WorkerBridge {
   rpc Attach(stream Envelope) returns (stream Envelope);
+}
+
+// Workflow management service for client operations.
+service WorkflowService {
+  rpc RegisterWorkflow(RegisterWorkflowRequest) returns (RegisterWorkflowResponse);
+  rpc WaitForInstance(WaitForInstanceRequest) returns (WaitForInstanceResponse);
 }

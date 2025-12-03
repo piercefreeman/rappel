@@ -46,13 +46,13 @@ impl Config {
         // Load .env file if it exists
         dotenvy::dotenv().ok();
 
-        let database_url = env::var("DATABASE_URL")
-            .context("DATABASE_URL environment variable is required")?;
+        let database_url =
+            env::var("DATABASE_URL").context("DATABASE_URL environment variable is required")?;
 
-        let http_addr = env::var("RAPPEL_HTTP_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1:24117".to_string());
-        let http_addr = SocketAddr::from_str(&http_addr)
-            .context("invalid RAPPEL_HTTP_ADDR format")?;
+        let http_addr =
+            env::var("RAPPEL_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:24117".to_string());
+        let http_addr =
+            SocketAddr::from_str(&http_addr).context("invalid RAPPEL_HTTP_ADDR format")?;
 
         let grpc_addr = match env::var("RAPPEL_GRPC_ADDR") {
             Ok(s) => SocketAddr::from_str(&s).context("invalid RAPPEL_GRPC_ADDR format")?,
@@ -112,8 +112,7 @@ impl Config {
 /// Get the database URL from environment
 pub fn database_url() -> Result<String> {
     dotenvy::dotenv().ok();
-    env::var("DATABASE_URL")
-        .context("DATABASE_URL environment variable is required")
+    env::var("DATABASE_URL").context("DATABASE_URL environment variable is required")
 }
 
 #[cfg(test)]

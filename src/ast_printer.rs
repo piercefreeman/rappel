@@ -40,13 +40,19 @@ impl AstPrinter {
 
     /// Print a function definition.
     pub fn print_function_def(&mut self, func: &ast::FunctionDef) -> String {
-        let io = func.io.as_ref().map(|io| {
-            let inputs = io.inputs.join(", ");
-            let outputs = io.outputs.join(", ");
-            format!("input: [{}], output: [{}]", inputs, outputs)
-        }).unwrap_or_default();
+        let io = func
+            .io
+            .as_ref()
+            .map(|io| {
+                let inputs = io.inputs.join(", ");
+                let outputs = io.outputs.join(", ");
+                format!("input: [{}], output: [{}]", inputs, outputs)
+            })
+            .unwrap_or_default();
 
-        let body = func.body.as_ref()
+        let body = func
+            .body
+            .as_ref()
             .map(|b| self.print_block(b))
             .unwrap_or_default();
 
@@ -78,7 +84,9 @@ impl AstPrinter {
             Some(ast::statement::Kind::Assignment(assign)) => self.print_assignment(assign),
             Some(ast::statement::Kind::ActionCall(action)) => self.print_action_call(action),
             Some(ast::statement::Kind::SpreadAction(spread)) => self.print_spread_action(spread),
-            Some(ast::statement::Kind::ParallelBlock(parallel)) => self.print_parallel_block(parallel),
+            Some(ast::statement::Kind::ParallelBlock(parallel)) => {
+                self.print_parallel_block(parallel)
+            }
             Some(ast::statement::Kind::ForLoop(for_loop)) => self.print_for_loop(for_loop),
             Some(ast::statement::Kind::Conditional(cond)) => self.print_conditional(cond),
             Some(ast::statement::Kind::TryExcept(try_except)) => self.print_try_except(try_except),
@@ -91,7 +99,9 @@ impl AstPrinter {
     /// Print an assignment statement.
     fn print_assignment(&mut self, assign: &ast::Assignment) -> String {
         let targets = assign.targets.join(", ");
-        let value = assign.value.as_ref()
+        let value = assign
+            .value
+            .as_ref()
             .map(|v| self.print_expr(v))
             .unwrap_or_default();
         format!("{} = {}", targets, value)
@@ -113,10 +123,14 @@ impl AstPrinter {
 
     /// Print a spread action.
     fn print_spread_action(&mut self, spread: &ast::SpreadAction) -> String {
-        let collection = spread.collection.as_ref()
+        let collection = spread
+            .collection
+            .as_ref()
             .map(|c| self.print_expr(c))
             .unwrap_or_default();
-        let action = spread.action.as_ref()
+        let action = spread
+            .action
+            .as_ref()
             .map(|a| {
                 let kwargs = self.print_kwargs(&a.kwargs);
                 let policies = self.print_policies(&a.policies);
@@ -147,7 +161,12 @@ impl AstPrinter {
             let call_str = match &call.kind {
                 Some(ast::call::Kind::Action(action)) => {
                     let kwargs = self.print_kwargs(&action.kwargs);
-                    format!("{}@{}({})", self.current_indent(), action.action_name, kwargs)
+                    format!(
+                        "{}@{}({})",
+                        self.current_indent(),
+                        action.action_name,
+                        kwargs
+                    )
                 }
                 Some(ast::call::Kind::Function(func)) => {
                     let args = self.print_call_args(&func.args, &func.kwargs);
@@ -165,10 +184,14 @@ impl AstPrinter {
     /// Print a for loop.
     fn print_for_loop(&mut self, for_loop: &ast::ForLoop) -> String {
         let loop_vars = for_loop.loop_vars.join(", ");
-        let iterable = for_loop.iterable.as_ref()
+        let iterable = for_loop
+            .iterable
+            .as_ref()
             .map(|i| self.print_expr(i))
             .unwrap_or_default();
-        let body = for_loop.body.as_ref()
+        let body = for_loop
+            .body
+            .as_ref()
             .map(|b| self.print_block(b))
             .unwrap_or_default();
 
@@ -181,10 +204,14 @@ impl AstPrinter {
 
         // Print if branch
         if let Some(ref if_branch) = cond.if_branch {
-            let condition = if_branch.condition.as_ref()
+            let condition = if_branch
+                .condition
+                .as_ref()
                 .map(|c| self.print_expr(c))
                 .unwrap_or_default();
-            let body = if_branch.body.as_ref()
+            let body = if_branch
+                .body
+                .as_ref()
                 .map(|b| self.print_block(b))
                 .unwrap_or_default();
             result.push_str(&format!("if {}:\n{}", condition, body));
@@ -192,18 +219,29 @@ impl AstPrinter {
 
         // Print elif branches
         for elif in &cond.elif_branches {
-            let condition = elif.condition.as_ref()
+            let condition = elif
+                .condition
+                .as_ref()
                 .map(|c| self.print_expr(c))
                 .unwrap_or_default();
-            let body = elif.body.as_ref()
+            let body = elif
+                .body
+                .as_ref()
                 .map(|b| self.print_block(b))
                 .unwrap_or_default();
-            result.push_str(&format!("\n{}elif {}:\n{}", self.current_indent(), condition, body));
+            result.push_str(&format!(
+                "\n{}elif {}:\n{}",
+                self.current_indent(),
+                condition,
+                body
+            ));
         }
 
         // Print else branch
         if let Some(ref else_branch) = cond.else_branch {
-            let body = else_branch.body.as_ref()
+            let body = else_branch
+                .body
+                .as_ref()
                 .map(|b| self.print_block(b))
                 .unwrap_or_default();
             result.push_str(&format!("\n{}else:\n{}", self.current_indent(), body));
@@ -217,7 +255,9 @@ impl AstPrinter {
         let mut result = String::new();
 
         // Print try block
-        let try_body = try_except.try_body.as_ref()
+        let try_body = try_except
+            .try_body
+            .as_ref()
             .map(|b| self.print_block(b))
             .unwrap_or_default();
         result.push_str(&format!("try:\n{}", try_body));
@@ -229,10 +269,17 @@ impl AstPrinter {
             } else {
                 format!(" {}", handler.exception_types.join(", "))
             };
-            let body = handler.body.as_ref()
+            let body = handler
+                .body
+                .as_ref()
                 .map(|b| self.print_block(b))
                 .unwrap_or_default();
-            result.push_str(&format!("\n{}except{}:\n{}", self.current_indent(), exc_types, body));
+            result.push_str(&format!(
+                "\n{}except{}:\n{}",
+                self.current_indent(),
+                exc_types,
+                body
+            ));
         }
 
         result
@@ -249,7 +296,9 @@ impl AstPrinter {
 
     /// Print an expression statement.
     fn print_expr_statement(&mut self, expr_stmt: &ast::ExprStmt) -> String {
-        expr_stmt.expr.as_ref()
+        expr_stmt
+            .expr
+            .as_ref()
             .map(|e| self.print_expr(e))
             .unwrap_or_default()
     }
@@ -289,7 +338,11 @@ impl AstPrinter {
             }
             Some(ast::literal::Value::StringValue(s)) => format!("\"{}\"", s),
             Some(ast::literal::Value::BoolValue(b)) => {
-                if *b { "True".to_string() } else { "False".to_string() }
+                if *b {
+                    "True".to_string()
+                } else {
+                    "False".to_string()
+                }
             }
             Some(ast::literal::Value::IsNone(true)) => "None".to_string(),
             Some(ast::literal::Value::IsNone(false)) => "None".to_string(), // shouldn't happen
@@ -299,10 +352,14 @@ impl AstPrinter {
 
     /// Print a binary operation.
     fn print_binary_op(&mut self, binop: &ast::BinaryOp) -> String {
-        let left = binop.left.as_ref()
+        let left = binop
+            .left
+            .as_ref()
             .map(|l| self.print_expr(l))
             .unwrap_or_default();
-        let right = binop.right.as_ref()
+        let right = binop
+            .right
+            .as_ref()
             .map(|r| self.print_expr(r))
             .unwrap_or_default();
         let op = self.binary_op_to_str(binop.op);
@@ -336,7 +393,9 @@ impl AstPrinter {
 
     /// Print a unary operation.
     fn print_unary_op(&mut self, unop: &ast::UnaryOp) -> String {
-        let operand = unop.operand.as_ref()
+        let operand = unop
+            .operand
+            .as_ref()
             .map(|o| self.print_expr(o))
             .unwrap_or_default();
         let op = self.unary_op_to_str(unop.op);
@@ -359,20 +418,24 @@ impl AstPrinter {
 
     /// Print a list expression.
     fn print_list(&mut self, list: &ast::ListExpr) -> String {
-        let elements: Vec<String> = list.elements.iter()
-            .map(|e| self.print_expr(e))
-            .collect();
+        let elements: Vec<String> = list.elements.iter().map(|e| self.print_expr(e)).collect();
         format!("[{}]", elements.join(", "))
     }
 
     /// Print a dict expression.
     fn print_dict(&mut self, dict: &ast::DictExpr) -> String {
-        let entries: Vec<String> = dict.entries.iter()
+        let entries: Vec<String> = dict
+            .entries
+            .iter()
             .map(|entry| {
-                let key = entry.key.as_ref()
+                let key = entry
+                    .key
+                    .as_ref()
                     .map(|k| self.print_expr(k))
                     .unwrap_or_default();
-                let value = entry.value.as_ref()
+                let value = entry
+                    .value
+                    .as_ref()
                     .map(|v| self.print_expr(v))
                     .unwrap_or_default();
                 format!("{}: {}", key, value)
@@ -383,10 +446,14 @@ impl AstPrinter {
 
     /// Print an index access.
     fn print_index(&mut self, index: &ast::IndexAccess) -> String {
-        let object = index.object.as_ref()
+        let object = index
+            .object
+            .as_ref()
             .map(|o| self.print_expr(o))
             .unwrap_or_default();
-        let idx = index.index.as_ref()
+        let idx = index
+            .index
+            .as_ref()
             .map(|i| self.print_expr(i))
             .unwrap_or_default();
         format!("{}[{}]", object, idx)
@@ -394,7 +461,9 @@ impl AstPrinter {
 
     /// Print a dot access.
     fn print_dot(&mut self, dot: &ast::DotAccess) -> String {
-        let object = dot.object.as_ref()
+        let object = dot
+            .object
+            .as_ref()
             .map(|o| self.print_expr(o))
             .unwrap_or_default();
         format!("{}.{}", object, dot.attribute)
@@ -417,7 +486,9 @@ impl AstPrinter {
 
         // Keyword args
         for kwarg in kwargs {
-            let value = kwarg.value.as_ref()
+            let value = kwarg
+                .value
+                .as_ref()
                 .map(|v| self.print_expr(v))
                 .unwrap_or_default();
             parts.push(format!("{}={}", kwarg.name, value));
@@ -428,9 +499,12 @@ impl AstPrinter {
 
     /// Print keyword arguments.
     fn print_kwargs(&mut self, kwargs: &[ast::Kwarg]) -> String {
-        let parts: Vec<String> = kwargs.iter()
+        let parts: Vec<String> = kwargs
+            .iter()
             .map(|kwarg| {
-                let value = kwarg.value.as_ref()
+                let value = kwarg
+                    .value
+                    .as_ref()
                     .map(|v| self.print_expr(v))
                     .unwrap_or_default();
                 format!("{}={}", kwarg.name, value)
@@ -476,9 +550,9 @@ impl AstPrinter {
     /// Format a duration value.
     fn format_duration(&self, duration: &ast::Duration) -> String {
         let seconds = duration.seconds;
-        if seconds >= 3600 && seconds % 3600 == 0 {
+        if seconds >= 3600 && seconds.is_multiple_of(3600) {
             format!("{}h", seconds / 3600)
-        } else if seconds >= 60 && seconds % 60 == 0 {
+        } else if seconds >= 60 && seconds.is_multiple_of(60) {
             format!("{}m", seconds / 60)
         } else {
             format!("{}s", seconds)

@@ -292,10 +292,10 @@ impl WorkerBridgeServer {
         if let Some(tx) = self.shutdown_tx.lock().await.take() {
             let _ = tx.send(());
         }
-        if let Some(handle) = self.server_handle.lock().await.take() {
-            if let Err(err) = handle.await {
-                warn!(?err, "worker bridge task join failed");
-            }
+        if let Some(handle) = self.server_handle.lock().await.take()
+            && let Err(err) = handle.await
+        {
+            warn!(?err, "worker bridge task join failed");
         }
     }
 }

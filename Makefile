@@ -1,4 +1,3 @@
-PROTO_FILES := proto/messages.proto
 PY_PROTO_OUT := python/proto
 
 .PHONY: all build-proto clean lint lint-verify python-lint python-lint-verify rust-lint rust-lint-verify coverage python-coverage rust-coverage
@@ -13,7 +12,7 @@ build-proto:
 		--grpc_python_out=../$(PY_PROTO_OUT) \
 		--mypy_out=../$(PY_PROTO_OUT) \
 		--mypy_grpc_out=../$(PY_PROTO_OUT) \
-		../$(PROTO_FILES)
+		../proto/messages.proto ../proto/ast.proto
 	@python scripts/fix_proto_imports.py
 	$(MAKE) lint
 

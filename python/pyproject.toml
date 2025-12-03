@@ -40,11 +40,14 @@ ignore = ["E501"]
 "proto/messages_pb2.pyi" = ["N802"]
 "proto/messages_pb2_grpc.py" = ["N802"]
 "proto/messages_pb2_grpc.pyi" = ["N802"]
+"proto/ast_pb2.py" = ["E402", "N802"]
+"proto/ast_pb2.pyi" = ["N802"]
 
 [tool.ruff.format]
 exclude = [
     "proto/messages_pb2.py",
     "proto/messages_pb2_grpc.py",
+    "proto/ast_pb2.py",
 ]
 
 [build-system]

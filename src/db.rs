@@ -13,10 +13,7 @@
 //! ```
 
 use chrono::{DateTime, Utc};
-use sqlx::{
-    FromRow, PgPool, Row,
-    postgres::PgPoolOptions,
-};
+use sqlx::{FromRow, PgPool, Row, postgres::PgPoolOptions};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -111,7 +108,7 @@ impl InstanceStatus {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "running" => Some(Self::Running),
             "completed" => Some(Self::Completed),
@@ -142,7 +139,7 @@ impl ActionStatus {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "queued" => Some(Self::Queued),
             "dispatched" => Some(Self::Dispatched),
@@ -328,7 +325,10 @@ impl Database {
     }
 
     /// Connect with a custom pool size
-    pub async fn connect_with_pool_size(database_url: &str, max_connections: u32) -> DbResult<Self> {
+    pub async fn connect_with_pool_size(
+        database_url: &str,
+        max_connections: u32,
+    ) -> DbResult<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             .connect(database_url)
@@ -384,7 +384,7 @@ impl Database {
             SELECT id, workflow_name, dag_hash, program_proto, concurrent, created_at
             FROM workflow_versions
             WHERE id = $1
-            "#
+            "#,
         )
         .bind(id.0)
         .fetch_optional(&self.pool)
@@ -401,7 +401,7 @@ impl Database {
             SELECT id, workflow_name, dag_hash, concurrent, created_at
             FROM workflow_versions
             ORDER BY created_at DESC
-            "#
+            "#,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -425,7 +425,7 @@ impl Database {
             INSERT INTO workflow_instances (workflow_name, workflow_version_id, input_payload)
             VALUES ($1, $2, $3)
             RETURNING id
-            "#
+            "#,
         )
         .bind(workflow_name)
         .bind(version_id.0)
@@ -440,7 +440,7 @@ impl Database {
             r#"
             INSERT INTO instance_context (instance_id)
             VALUES ($1)
-            "#
+            "#,
         )
         .bind(id)
         .execute(&self.pool)
@@ -458,7 +458,7 @@ impl Database {
                    created_at, completed_at
             FROM workflow_instances
             WHERE id = $1
-            "#
+            "#,
         )
         .bind(id.0)
         .fetch_optional(&self.pool)
@@ -479,7 +479,7 @@ impl Database {
             UPDATE workflow_instances
             SET status = 'completed', result_payload = $2, completed_at = NOW()
             WHERE id = $1
-            "#
+            "#,
         )
         .bind(id.0)
         .bind(result_payload)
@@ -496,7 +496,7 @@ impl Database {
             UPDATE workflow_instances
             SET status = 'failed', completed_at = NOW()
             WHERE id = $1
-            "#
+            "#,
         )
         .bind(id.0)
         .execute(&self.pool)
@@ -518,7 +518,7 @@ impl Database {
             SET next_action_seq = next_action_seq + 1
             WHERE id = $1
             RETURNING next_action_seq - 1
-            "#
+            "#,
         )
         .bind(action.instance_id.0)
         .fetch_one(&self.pool)
@@ -535,7 +535,7 @@ impl Database {
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING id
-            "#
+            "#,
         )
         .bind(action.instance_id.0)
         .bind(seq)
@@ -600,14 +600,15 @@ impl Database {
                 aq.timeout_retry_limit,
                 aq.retry_kind,
                 aq.node_id
-            "#
+            "#,
         )
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
 
-        let actions = rows.into_iter().map(|row| {
-            QueuedAction {
+        let actions = rows
+            .into_iter()
+            .map(|row| QueuedAction {
                 id: row.get("id"),
                 instance_id: row.get("instance_id"),
                 partition_id: row.get("partition_id"),
@@ -622,8 +623,8 @@ impl Database {
                 timeout_retry_limit: row.get("timeout_retry_limit"),
                 retry_kind: row.get("retry_kind"),
                 node_id: row.get("node_id"),
-            }
-        }).collect();
+            })
+            .collect();
 
         Ok(actions)
     }
@@ -642,7 +643,7 @@ impl Database {
                 last_error = $4,
                 completed_at = NOW()
             WHERE id = $1 AND delivery_token = $5 AND status = 'dispatched'
-            "#
+            "#,
         )
         .bind(record.action_id.0)
         .bind(record.success)
@@ -675,7 +676,7 @@ impl Database {
                 retry_kind = 'timeout'
             FROM overdue
             WHERE aq.id = overdue.id
-            "#
+            "#,
         )
         .bind(limit)
         .execute(&self.pool)
@@ -725,7 +726,10 @@ impl Database {
     }
 
     /// Get all actions for an instance
-    pub async fn get_instance_actions(&self, instance_id: WorkflowInstanceId) -> DbResult<Vec<QueuedAction>> {
+    pub async fn get_instance_actions(
+        &self,
+        instance_id: WorkflowInstanceId,
+    ) -> DbResult<Vec<QueuedAction>> {
         let rows = sqlx::query(
             r#"
             SELECT
@@ -746,14 +750,15 @@ impl Database {
             FROM action_queue
             WHERE instance_id = $1
             ORDER BY action_seq
-            "#
+            "#,
         )
         .bind(instance_id.0)
         .fetch_all(&self.pool)
         .await?;
 
-        let actions = rows.into_iter().map(|row| {
-            QueuedAction {
+        let actions = rows
+            .into_iter()
+            .map(|row| QueuedAction {
                 id: row.get("id"),
                 instance_id: row.get("instance_id"),
                 partition_id: row.get("partition_id"),
@@ -768,8 +773,8 @@ impl Database {
                 timeout_retry_limit: row.get("timeout_retry_limit"),
                 retry_kind: row.get("retry_kind"),
                 node_id: row.get("node_id"),
-            }
-        }).collect();
+            })
+            .collect();
 
         Ok(actions)
     }
@@ -779,13 +784,16 @@ impl Database {
     // ========================================================================
 
     /// Get the execution context for an instance
-    pub async fn get_instance_context(&self, instance_id: WorkflowInstanceId) -> DbResult<InstanceContext> {
+    pub async fn get_instance_context(
+        &self,
+        instance_id: WorkflowInstanceId,
+    ) -> DbResult<InstanceContext> {
         let ctx = sqlx::query_as::<_, InstanceContext>(
             r#"
             SELECT instance_id, context_json, exceptions_json, updated_at
             FROM instance_context
             WHERE instance_id = $1
-            "#
+            "#,
         )
         .bind(instance_id.0)
         .fetch_optional(&self.pool)
@@ -806,7 +814,7 @@ impl Database {
             UPDATE instance_context
             SET context_json = $2, updated_at = NOW()
             WHERE instance_id = $1
-            "#
+            "#,
         )
         .bind(instance_id.0)
         .bind(context_json)
@@ -832,7 +840,7 @@ impl Database {
             VALUES ($1, $2)
             ON CONFLICT (instance_id, loop_id) DO UPDATE SET loop_id = EXCLUDED.loop_id
             RETURNING instance_id, loop_id, current_index, accumulators, updated_at
-            "#
+            "#,
         )
         .bind(instance_id.0)
         .bind(loop_id)
@@ -854,7 +862,7 @@ impl Database {
             SET current_index = current_index + 1, updated_at = NOW()
             WHERE instance_id = $1 AND loop_id = $2
             RETURNING current_index
-            "#
+            "#,
         )
         .bind(instance_id.0)
         .bind(loop_id)
@@ -877,7 +885,7 @@ impl Database {
             UPDATE loop_state
             SET accumulators = $3, updated_at = NOW()
             WHERE instance_id = $1 AND loop_id = $2
-            "#
+            "#,
         )
         .bind(instance_id.0)
         .bind(loop_id)
@@ -896,18 +904,42 @@ mod tests {
 
     #[test]
     fn test_status_roundtrip() {
-        assert_eq!(ActionStatus::from_str(ActionStatus::Queued.as_str()), Some(ActionStatus::Queued));
-        assert_eq!(ActionStatus::from_str(ActionStatus::Dispatched.as_str()), Some(ActionStatus::Dispatched));
-        assert_eq!(ActionStatus::from_str(ActionStatus::Completed.as_str()), Some(ActionStatus::Completed));
-        assert_eq!(ActionStatus::from_str(ActionStatus::Failed.as_str()), Some(ActionStatus::Failed));
-        assert_eq!(ActionStatus::from_str(ActionStatus::TimedOut.as_str()), Some(ActionStatus::TimedOut));
+        assert_eq!(
+            ActionStatus::parse(ActionStatus::Queued.as_str()),
+            Some(ActionStatus::Queued)
+        );
+        assert_eq!(
+            ActionStatus::parse(ActionStatus::Dispatched.as_str()),
+            Some(ActionStatus::Dispatched)
+        );
+        assert_eq!(
+            ActionStatus::parse(ActionStatus::Completed.as_str()),
+            Some(ActionStatus::Completed)
+        );
+        assert_eq!(
+            ActionStatus::parse(ActionStatus::Failed.as_str()),
+            Some(ActionStatus::Failed)
+        );
+        assert_eq!(
+            ActionStatus::parse(ActionStatus::TimedOut.as_str()),
+            Some(ActionStatus::TimedOut)
+        );
     }
 
     #[test]
     fn test_instance_status_roundtrip() {
-        assert_eq!(InstanceStatus::from_str(InstanceStatus::Running.as_str()), Some(InstanceStatus::Running));
-        assert_eq!(InstanceStatus::from_str(InstanceStatus::Completed.as_str()), Some(InstanceStatus::Completed));
-        assert_eq!(InstanceStatus::from_str(InstanceStatus::Failed.as_str()), Some(InstanceStatus::Failed));
+        assert_eq!(
+            InstanceStatus::parse(InstanceStatus::Running.as_str()),
+            Some(InstanceStatus::Running)
+        );
+        assert_eq!(
+            InstanceStatus::parse(InstanceStatus::Completed.as_str()),
+            Some(InstanceStatus::Completed)
+        );
+        assert_eq!(
+            InstanceStatus::parse(InstanceStatus::Failed.as_str()),
+            Some(InstanceStatus::Failed)
+        );
     }
 
     #[test]
@@ -924,8 +956,11 @@ mod tests {
 
     async fn test_db() -> Database {
         dotenvy::dotenv().ok();
-        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for integration tests");
-        Database::connect(&url).await.expect("failed to connect to database")
+        let url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for integration tests");
+        Database::connect(&url)
+            .await
+            .expect("failed to connect to database")
     }
 
     #[tokio::test]
@@ -960,7 +995,10 @@ mod tests {
         assert_eq!(version_id.0, version_id2.0);
 
         // List versions should include our version
-        let versions = db.list_workflow_versions().await.expect("failed to list versions");
+        let versions = db
+            .list_workflow_versions()
+            .await
+            .expect("failed to list versions");
         assert!(versions.iter().any(|v| v.id == version_id.0));
     }
 
@@ -1002,7 +1040,10 @@ mod tests {
             .expect("failed to complete instance");
 
         // Verify completion
-        let instance = db.get_instance(instance_id).await.expect("failed to get instance");
+        let instance = db
+            .get_instance(instance_id)
+            .await
+            .expect("failed to get instance");
         assert_eq!(instance.status, "completed");
         assert_eq!(instance.result_payload, Some(result.to_vec()));
         assert!(instance.completed_at.is_some());
@@ -1095,7 +1136,10 @@ mod tests {
 
         // Dispatch to get the delivery token
         let dispatched = db.dispatch_actions(10).await.unwrap();
-        let action = dispatched.iter().find(|a| a.action_name == "complete_action").unwrap();
+        let action = dispatched
+            .iter()
+            .find(|a| a.action_name == "complete_action")
+            .unwrap();
         let delivery_token = action.delivery_token;
 
         // Complete with correct token should succeed
@@ -1139,7 +1183,10 @@ mod tests {
             .await
             .expect("failed to attempt completion");
 
-        assert!(!completed_wrong, "completion with wrong token should return false");
+        assert!(
+            !completed_wrong,
+            "completion with wrong token should return false"
+        );
     }
 
     #[tokio::test]
@@ -1192,14 +1239,19 @@ mod tests {
         assert_eq!(batch3.len(), 1, "third batch should have 1 action");
 
         // No duplicates between batches
-        let all_ids: Vec<_> = batch1.iter()
+        let all_ids: Vec<_> = batch1
+            .iter()
             .chain(batch2.iter())
             .chain(batch3.iter())
             .map(|a| a.id)
             .collect();
 
         let unique_ids: std::collections::HashSet<_> = all_ids.iter().collect();
-        assert_eq!(all_ids.len(), unique_ids.len(), "should have no duplicate dispatches");
+        assert_eq!(
+            all_ids.len(),
+            unique_ids.len(),
+            "should have no duplicate dispatches"
+        );
     }
 
     #[tokio::test]
@@ -1219,7 +1271,10 @@ mod tests {
             .unwrap();
 
         // Get initial context (should be empty)
-        let ctx = db.get_instance_context(instance_id).await.expect("failed to get context");
+        let ctx = db
+            .get_instance_context(instance_id)
+            .await
+            .expect("failed to get context");
         assert_eq!(ctx.context_json, serde_json::json!({}));
 
         // Update context
@@ -1273,7 +1328,10 @@ mod tests {
         assert_eq!(new_idx, 1);
 
         // Increment again
-        let new_idx = db.increment_loop_index(instance_id, "loop_1").await.unwrap();
+        let new_idx = db
+            .increment_loop_index(instance_id, "loop_1")
+            .await
+            .unwrap();
         assert_eq!(new_idx, 2);
 
         // Update accumulators
@@ -1283,7 +1341,10 @@ mod tests {
             .expect("failed to update accumulators");
 
         // Verify
-        let state = db.get_or_create_loop_state(instance_id, "loop_1").await.unwrap();
+        let state = db
+            .get_or_create_loop_state(instance_id, "loop_1")
+            .await
+            .unwrap();
         assert_eq!(state.current_index, 2);
         assert_eq!(state.accumulators, Some(accum_data.to_vec()));
     }
@@ -1305,7 +1366,9 @@ mod tests {
             .unwrap();
 
         // Fail the instance
-        db.fail_instance(instance_id).await.expect("failed to fail instance");
+        db.fail_instance(instance_id)
+            .await
+            .expect("failed to fail instance");
 
         // Verify
         let instance = db.get_instance(instance_id).await.unwrap();

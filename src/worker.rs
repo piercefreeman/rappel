@@ -258,7 +258,10 @@ impl PythonWorker {
     /// - The process fails to spawn
     /// - The worker doesn't connect within 15 seconds
     /// - The bridge connection is dropped
-    pub async fn spawn(config: PythonWorkerConfig, bridge: Arc<WorkerBridgeServer>) -> AnyResult<Self> {
+    pub async fn spawn(
+        config: PythonWorkerConfig,
+        bridge: Arc<WorkerBridgeServer>,
+    ) -> AnyResult<Self> {
         let (worker_id, connection_rx) = bridge.reserve_worker().await;
 
         // Determine working directory and module paths
@@ -322,8 +325,7 @@ impl PythonWorker {
             let cwd = env::current_dir().context("failed to resolve current directory")?;
             info!(
                 ?cwd,
-                worker_id,
-                "package root missing, using current directory for worker process"
+                worker_id, "package root missing, using current directory for worker process"
             );
             command.current_dir(cwd);
         }
@@ -375,7 +377,11 @@ impl PythonWorker {
         let reader_worker_id = worker_id;
         let reader_handle = tokio::spawn(async move {
             if let Err(err) = Self::reader_loop(&mut from_worker, reader_shared).await {
-                error!(?err, worker_id = reader_worker_id, "python worker stream exited");
+                error!(
+                    ?err,
+                    worker_id = reader_worker_id,
+                    "python worker stream exited"
+                );
             }
         });
 
@@ -590,7 +596,11 @@ impl Drop for PythonWorker {
             handle.abort();
         }
         if let Err(err) = self.child.start_kill() {
-            warn!(?err, worker_id = self.worker_id, "failed to kill python worker during drop");
+            warn!(
+                ?err,
+                worker_id = self.worker_id,
+                "failed to kill python worker during drop"
+            );
         }
     }
 }
@@ -732,7 +742,10 @@ mod tests {
             .with_python_paths(vec![PathBuf::from("/extra/path")]);
 
         assert_eq!(config.user_modules, vec!["my_module".to_string()]);
-        assert_eq!(config.extra_python_paths, vec![PathBuf::from("/extra/path")]);
+        assert_eq!(
+            config.extra_python_paths,
+            vec![PathBuf::from("/extra/path")]
+        );
     }
 
     #[test]
@@ -827,8 +840,7 @@ mod tests {
     #[ignore] // Requires Python environment with test actions
     async fn test_send_action_roundtrip() {
         let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
-        let config = PythonWorkerConfig::new()
-            .with_user_module("tests.fixtures.test_actions");
+        let config = PythonWorkerConfig::new().with_user_module("tests.fixtures.test_actions");
 
         let pool = PythonWorkerPool::new(config, 1, Arc::clone(&bridge))
             .await
@@ -865,8 +877,7 @@ mod tests {
     #[ignore] // Requires Python environment
     async fn test_multiple_concurrent_actions() {
         let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
-        let config = PythonWorkerConfig::new()
-            .with_user_module("tests.fixtures.test_actions");
+        let config = PythonWorkerConfig::new().with_user_module("tests.fixtures.test_actions");
 
         let pool = Arc::new(
             PythonWorkerPool::new(config, 2, Arc::clone(&bridge))

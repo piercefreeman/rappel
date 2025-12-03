@@ -6,6 +6,8 @@
 //!
 //! Each function is converted into an isolated subgraph with input/output boundaries.
 
+#![allow(clippy::collapsible_if, clippy::option_map_unit_fn)]
+
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -369,10 +371,8 @@ impl DAGConverter {
                 let node_ids = self.convert_statement(stmt);
 
                 if let (Some(prev), Some(first)) = (&prev_node_id, node_ids.first()) {
-                    self.dag.add_edge(DAGEdge::state_machine(
-                        prev.clone(),
-                        first.clone(),
-                    ));
+                    self.dag
+                        .add_edge(DAGEdge::state_machine(prev.clone(), first.clone()));
                 }
 
                 if !node_ids.is_empty() {
@@ -482,8 +482,8 @@ impl DAGConverter {
             format!("{}() -> {}", call.name, target)
         };
 
-        let mut node = DAGNode::new(node_id.clone(), "fn_call".to_string(), label)
-            .with_fn_call(&call.name);
+        let mut node =
+            DAGNode::new(node_id.clone(), "fn_call".to_string(), label).with_fn_call(&call.name);
         if let Some(ref fn_name) = self.current_function {
             node = node.with_function_name(fn_name);
         }
@@ -575,8 +575,11 @@ impl DAGConverter {
 
         // Create parallel entry node
         let parallel_id = self.next_id("parallel");
-        let mut parallel_node =
-            DAGNode::new(parallel_id.clone(), "parallel".to_string(), "parallel".to_string());
+        let mut parallel_node = DAGNode::new(
+            parallel_id.clone(),
+            "parallel".to_string(),
+            "parallel".to_string(),
+        );
         if let Some(ref fn_name) = self.current_function {
             parallel_node = parallel_node.with_function_name(fn_name);
         }
@@ -670,13 +673,12 @@ impl DAGConverter {
         }
 
         // Track output variables from the loop body assignment
-        if let Some(body) = &for_loop.body {
-            if let Some(first_stmt) = body.statements.first() {
-                if let Some(ast::statement::Kind::Assignment(assign)) = &first_stmt.kind {
-                    for target in &assign.targets {
-                        self.track_var_definition(target, &loop_id);
-                    }
-                }
+        if let Some(body) = &for_loop.body
+            && let Some(first_stmt) = body.statements.first()
+            && let Some(ast::statement::Kind::Assignment(assign)) = &first_stmt.kind
+        {
+            for target in &assign.targets {
+                self.track_var_definition(target, &loop_id);
             }
         }
 
@@ -700,62 +702,58 @@ impl DAGConverter {
         let mut else_last: Option<String> = None;
 
         // Process then branch
-        if let Some(if_branch) = &cond.if_branch {
-            if let Some(body) = &if_branch.body {
-                let mut prev_id = cond_id.clone();
-                for (i, stmt) in body.statements.iter().enumerate() {
-                    let node_ids = self.convert_statement(stmt);
-                    if !node_ids.is_empty() {
-                        let condition = if i == 0 { Some("then") } else { None };
-                        if let Some(c) = condition {
-                            self.dag.add_edge(DAGEdge::state_machine_with_condition(
-                                prev_id.clone(),
-                                node_ids[0].clone(),
-                                c,
-                            ));
-                        } else {
-                            self.dag.add_edge(DAGEdge::state_machine(
-                                prev_id.clone(),
-                                node_ids[0].clone(),
-                            ));
-                        }
-                        prev_id = node_ids.last().unwrap().clone();
-                        result_nodes.extend(node_ids);
+        if let Some(if_branch) = &cond.if_branch
+            && let Some(body) = &if_branch.body
+        {
+            let mut prev_id = cond_id.clone();
+            for (i, stmt) in body.statements.iter().enumerate() {
+                let node_ids = self.convert_statement(stmt);
+                if !node_ids.is_empty() {
+                    let condition = if i == 0 { Some("then") } else { None };
+                    if let Some(c) = condition {
+                        self.dag.add_edge(DAGEdge::state_machine_with_condition(
+                            prev_id.clone(),
+                            node_ids[0].clone(),
+                            c,
+                        ));
+                    } else {
+                        self.dag
+                            .add_edge(DAGEdge::state_machine(prev_id.clone(), node_ids[0].clone()));
                     }
+                    prev_id = node_ids.last().unwrap().clone();
+                    result_nodes.extend(node_ids);
                 }
-                if prev_id != cond_id {
-                    then_last = Some(prev_id);
-                }
+            }
+            if prev_id != cond_id {
+                then_last = Some(prev_id);
             }
         }
 
         // Process else branch
-        if let Some(else_branch) = &cond.else_branch {
-            if let Some(body) = &else_branch.body {
-                let mut prev_id = cond_id.clone();
-                for (i, stmt) in body.statements.iter().enumerate() {
-                    let node_ids = self.convert_statement(stmt);
-                    if !node_ids.is_empty() {
-                        let condition = if i == 0 { Some("else") } else { None };
-                        if let Some(c) = condition {
-                            self.dag.add_edge(DAGEdge::state_machine_with_condition(
-                                prev_id.clone(),
-                                node_ids[0].clone(),
-                                c,
-                            ));
-                        } else {
-                            self.dag.add_edge(DAGEdge::state_machine(
-                                prev_id.clone(),
-                                node_ids[0].clone(),
-                            ));
-                        }
-                        prev_id = node_ids.last().unwrap().clone();
-                        result_nodes.extend(node_ids);
+        if let Some(else_branch) = &cond.else_branch
+            && let Some(body) = &else_branch.body
+        {
+            let mut prev_id = cond_id.clone();
+            for (i, stmt) in body.statements.iter().enumerate() {
+                let node_ids = self.convert_statement(stmt);
+                if !node_ids.is_empty() {
+                    let condition = if i == 0 { Some("else") } else { None };
+                    if let Some(c) = condition {
+                        self.dag.add_edge(DAGEdge::state_machine_with_condition(
+                            prev_id.clone(),
+                            node_ids[0].clone(),
+                            c,
+                        ));
+                    } else {
+                        self.dag
+                            .add_edge(DAGEdge::state_machine(prev_id.clone(), node_ids[0].clone()));
                     }
+                    prev_id = node_ids.last().unwrap().clone();
+                    result_nodes.extend(node_ids);
                 }
-                if prev_id != cond_id {
-                    else_last = Some(prev_id);
-                }
+            }
+            if prev_id != cond_id {
+                else_last = Some(prev_id);
             }
         }
 
@@ -788,9 +786,7 @@ impl DAGConverter {
             } else if cond.else_branch.is_some() {
                 // Empty else branch
                 self.dag.add_edge(DAGEdge::state_machine_with_condition(
-                    cond_id,
-                    join_id,
-                    "else",
+                    cond_id, join_id, "else",
                 ));
             }
         }
@@ -826,10 +822,8 @@ impl DAGConverter {
                             c,
                         ));
                     } else {
-                        self.dag.add_edge(DAGEdge::state_machine(
-                            prev_id.clone(),
-                            node_ids[0].clone(),
-                        ));
+                        self.dag
+                            .add_edge(DAGEdge::state_machine(prev_id.clone(), node_ids[0].clone()));
                     }
                     prev_id = node_ids.last().unwrap().clone();
                     result_nodes.extend(node_ids);
@@ -851,8 +845,7 @@ impl DAGConverter {
 
             let handler_id = self.next_id("except");
             let label = format!("except {}", exc_types_str);
-            let mut handler_node =
-                DAGNode::new(handler_id.clone(), "except".to_string(), label);
+            let mut handler_node = DAGNode::new(handler_id.clone(), "except".to_string(), label);
             if let Some(ref fn_name) = self.current_function {
                 handler_node = handler_node.with_function_name(fn_name);
             }
@@ -886,8 +879,11 @@ impl DAGConverter {
 
         // Create join node
         let join_id = self.next_id("try_join");
-        let mut join_node =
-            DAGNode::new(join_id.clone(), "try_join".to_string(), "try_join".to_string());
+        let mut join_node = DAGNode::new(
+            join_id.clone(),
+            "try_join".to_string(),
+            "try_join".to_string(),
+        );
         if let Some(ref fn_name) = self.current_function {
             join_node = join_node.with_function_name(fn_name);
         }
@@ -936,7 +932,11 @@ impl DAGConverter {
         }
 
         let node_id = self.next_id("expr");
-        let mut node = DAGNode::new(node_id.clone(), "expression".to_string(), "expr".to_string());
+        let mut node = DAGNode::new(
+            node_id.clone(),
+            "expression".to_string(),
+            "expr".to_string(),
+        );
         if let Some(ref fn_name) = self.current_function {
             node = node.with_function_name(fn_name);
         }
@@ -1042,12 +1042,15 @@ impl DAGConverter {
     /// Get nodes in topological (execution) order for a subset of nodes
     fn get_execution_order_for_nodes(&self, node_ids: &HashSet<String>) -> Vec<String> {
         // Simple topological sort using state machine edges
-        let mut in_degree: HashMap<String, usize> = node_ids.iter().map(|n| (n.clone(), 0)).collect();
-        let mut adj: HashMap<String, Vec<String>> = node_ids.iter().map(|n| (n.clone(), Vec::new())).collect();
+        let mut in_degree: HashMap<String, usize> =
+            node_ids.iter().map(|n| (n.clone(), 0)).collect();
+        let mut adj: HashMap<String, Vec<String>> =
+            node_ids.iter().map(|n| (n.clone(), Vec::new())).collect();
 
         for edge in self.dag.get_state_machine_edges() {
             if node_ids.contains(&edge.source) && node_ids.contains(&edge.target) {
-                adj.get_mut(&edge.source).map(|v| v.push(edge.target.clone()));
+                adj.get_mut(&edge.source)
+                    .map(|v| v.push(edge.target.clone()));
                 in_degree.entry(edge.target.clone()).and_modify(|d| *d += 1);
             }
         }
@@ -1289,9 +1292,11 @@ fn main(input: [], output: [result]):
         // Find fn_call nodes
         let fn_call_nodes: Vec<_> = dag.nodes.values().filter(|n| n.is_fn_call).collect();
         assert!(!fn_call_nodes.is_empty());
-        assert!(fn_call_nodes
-            .iter()
-            .any(|n| n.called_function == Some("helper".to_string())));
+        assert!(
+            fn_call_nodes
+                .iter()
+                .any(|n| n.called_function == Some("helper".to_string()))
+        );
     }
 
     #[test]
@@ -1411,10 +1416,17 @@ fn main(input: [], output: [result]):
 
         // At minimum, we should have some structure for this function
         let test_fn_nodes = dag.get_nodes_for_function("test");
-        assert!(test_fn_nodes.len() >= 4, "Should have at least input, 3 assignments, output, return");
+        assert!(
+            test_fn_nodes.len() >= 4,
+            "Should have at least input, 3 assignments, output, return"
+        );
 
         // Verify the input node has 'x' as an io_var
-        let input = dag.nodes.values().find(|n| n.is_input && n.function_name.as_deref() == Some("test")).unwrap();
+        let input = dag
+            .nodes
+            .values()
+            .find(|n| n.is_input && n.function_name.as_deref() == Some("test"))
+            .unwrap();
         assert_eq!(input.io_vars, Some(vec!["x".to_string()]));
     }
 
@@ -1431,7 +1443,10 @@ fn main(input: [], output: [result]):
         let sm_edges = dag.get_state_machine_edges();
 
         // Should have edges: input -> assign1 -> assign2 -> return -> output
-        assert!(sm_edges.len() >= 4, "Should have at least 4 state machine edges");
+        assert!(
+            sm_edges.len() >= 4,
+            "Should have at least 4 state machine edges"
+        );
     }
 
     #[test]
@@ -1453,7 +1468,10 @@ fn main(input: [], output: [result]):
             .expect("Should have for_loop node");
 
         assert!(for_node.is_loop_head);
-        assert_eq!(for_node.loop_vars, Some(vec!["i".to_string(), "item".to_string()]));
+        assert_eq!(
+            for_node.loop_vars,
+            Some(vec!["i".to_string(), "item".to_string()])
+        );
     }
 
     #[test]
@@ -1493,18 +1511,20 @@ fn main(input: [], output: [result]):
         assert!(node_types.contains("join"));
 
         // Check for conditional edges with "then" and "else" conditions
-        let cond_edges: Vec<_> = dag
-            .edges
-            .iter()
-            .filter(|e| e.condition.is_some())
-            .collect();
+        let cond_edges: Vec<_> = dag.edges.iter().filter(|e| e.condition.is_some()).collect();
 
         let conditions: HashSet<_> = cond_edges
             .iter()
             .filter_map(|e| e.condition.as_deref())
             .collect();
 
-        assert!(conditions.contains("then"), "Should have 'then' conditional edge");
-        assert!(conditions.contains("else"), "Should have 'else' conditional edge");
+        assert!(
+            conditions.contains("then"),
+            "Should have 'then' conditional edge"
+        );
+        assert!(
+            conditions.contains("else"),
+            "Should have 'else' conditional edge"
+        );
     }
 }

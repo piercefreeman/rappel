@@ -11,7 +11,14 @@ use thiserror::Error;
 
 /// Re-export generated protobuf types
 pub mod proto {
+    // Messages for worker bridge communication
     tonic::include_proto!("rappel.messages");
+}
+
+/// AST types from ast.proto for IR representation
+pub mod ast {
+    // IR AST types
+    tonic::include_proto!("rappel.ast");
 }
 
 /// Errors that can occur during message encoding/decoding

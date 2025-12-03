@@ -47,7 +47,7 @@ pub struct SpannedToken {
 
 /// Token types for the Rappel IR language
 #[derive(Logos, Debug, Clone, PartialEq)]
-#[logos(skip r"[ \t]+")]  // Skip horizontal whitespace (not newlines)
+#[logos(skip r"[ \t]+")] // Skip horizontal whitespace (not newlines)
 pub enum Token {
     // Keywords
     #[token("fn")]
@@ -309,10 +309,7 @@ impl<'source> Lexer<'source> {
 
     /// Find the start of the current line
     fn line_start(&self, pos: usize) -> usize {
-        self.source[..pos]
-            .rfind('\n')
-            .map(|i| i + 1)
-            .unwrap_or(0)
+        self.source[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0)
     }
 
     /// Check if a line is blank or comment-only
@@ -514,12 +511,12 @@ mod tests {
 
     #[test]
     fn test_literals() {
-        let tokens = token_types("42 3.14 \"hello\" True False None");
+        let tokens = token_types("42 3.15 \"hello\" True False None");
         assert_eq!(
             tokens,
             vec![
                 Token::Int(42),
-                Token::Float(3.14),
+                Token::Float(3.15),
                 Token::String("hello".to_string()),
                 Token::True,
                 Token::False,

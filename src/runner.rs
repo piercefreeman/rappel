@@ -51,12 +51,12 @@ use crate::{
     dag::{DAG, DAGConverter, DAGNode},
     dag_state::{DAGHelper, ExecutionMode},
     db::{
-        ActionId, BackoffKind, CompletionRecord, Database,
-        NewAction, QueuedAction, WorkflowInstanceId, WorkflowVersionId,
+        ActionId, BackoffKind, CompletionRecord, Database, NewAction, QueuedAction,
+        WorkflowInstanceId, WorkflowVersionId,
     },
+    messages::proto,
     parser::ast,
     worker::{ActionDispatchPayload, PythonWorkerPool, RoundTripMetrics},
-    messages::proto,
 };
 
 // ============================================================================
@@ -140,14 +140,14 @@ fn json_to_workflow_value(value: &JsonValue) -> proto::WorkflowArgumentValue {
         }
         JsonValue::String(s) => {
             proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                kind: Some(proto::primitive_workflow_argument::Kind::StringValue(s.clone())),
+                kind: Some(proto::primitive_workflow_argument::Kind::StringValue(
+                    s.clone(),
+                )),
             })
         }
         JsonValue::Array(arr) => {
-            let items: Vec<proto::WorkflowArgumentValue> = arr
-                .iter()
-                .map(json_to_workflow_value)
-                .collect();
+            let items: Vec<proto::WorkflowArgumentValue> =
+                arr.iter().map(json_to_workflow_value).collect();
             proto::workflow_argument_value::Kind::ListValue(proto::WorkflowListArgument { items })
         }
         JsonValue::Object(obj) => {
@@ -260,7 +260,10 @@ impl DAGCache {
     }
 
     /// Get the DAG for a workflow instance, looking up the version first.
-    pub async fn get_dag_for_instance(&self, instance_id: WorkflowInstanceId) -> RunnerResult<Option<Arc<DAG>>> {
+    pub async fn get_dag_for_instance(
+        &self,
+        instance_id: WorkflowInstanceId,
+    ) -> RunnerResult<Option<Arc<DAG>>> {
         // Check if we have the version cached for this instance
         let version_id = {
             let cache = self.instance_versions.read().await;
@@ -345,12 +348,10 @@ impl WorkerSlotTracker {
             let current = slots.load(Ordering::SeqCst);
             if current > 0 {
                 // Try to decrement
-                if slots.compare_exchange(
-                    current,
-                    current - 1,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ).is_ok() {
+                if slots
+                    .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
                     self.total_available.fetch_sub(1, Ordering::SeqCst);
                     return Some(idx);
                 }
@@ -426,11 +427,14 @@ impl InFlightTracker {
 
     /// Add an action to tracking.
     pub fn add(&mut self, action: QueuedAction, worker_idx: usize) {
-        self.actions.insert(action.delivery_token, InFlightAction {
-            action,
-            worker_idx,
-            dispatched_at: std::time::Instant::now(),
-        });
+        self.actions.insert(
+            action.delivery_token,
+            InFlightAction {
+                action,
+                worker_idx,
+                dispatched_at: std::time::Instant::now(),
+            },
+        );
     }
 
     /// Remove and return an action by delivery token.
@@ -465,7 +469,9 @@ impl CompletionBatch {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.completions.is_empty() && self.new_actions.is_empty() && self.context_updates.is_empty()
+        self.completions.is_empty()
+            && self.new_actions.is_empty()
+            && self.context_updates.is_empty()
     }
 }
 
@@ -494,7 +500,12 @@ impl WorkQueueHandler {
         slot_tracker: Arc<WorkerSlotTracker>,
         in_flight: Arc<Mutex<InFlightTracker>>,
     ) -> Self {
-        Self { db, worker_pool, slot_tracker, in_flight }
+        Self {
+            db,
+            worker_pool,
+            slot_tracker,
+            in_flight,
+        }
     }
 
     /// Get the number of available worker slots.
@@ -676,7 +687,9 @@ impl WorkCompletionHandler {
         if let Some(node) = dag.nodes.get(node_id) {
             // Determine target variable from node type
             if let Some(target_var) = self.get_target_variable(node) {
-                instance_context.variables.insert(target_var, result.clone());
+                instance_context
+                    .variables
+                    .insert(target_var, result.clone());
             }
         }
 
@@ -684,10 +697,9 @@ impl WorkCompletionHandler {
         let targets = helper.get_data_flow_targets(node_id);
         for target in targets {
             if let Some(var) = &target.variable {
-                instance_context.variables.insert(
-                    var.clone(),
-                    result.clone(),
-                );
+                instance_context
+                    .variables
+                    .insert(var.clone(), result.clone());
             }
         }
 
@@ -704,10 +716,7 @@ impl WorkCompletionHandler {
             match exec_mode {
                 ExecutionMode::Inline => {
                     // Execute inline node immediately
-                    let inline_result = self.execute_inline_node(
-                        succ_node,
-                        instance_context,
-                    )?;
+                    let inline_result = self.execute_inline_node(succ_node, instance_context)?;
 
                     // Recursively process inline successors
                     // Note: In production, we'd want to limit recursion depth
@@ -749,10 +758,12 @@ impl WorkCompletionHandler {
         let helper = DAGHelper::new(dag);
 
         // Store result
-        if let Some(node) = dag.nodes.get(node_id) {
-            if let Some(target_var) = self.get_target_variable(node) {
-                instance_context.variables.insert(target_var, result.clone());
-            }
+        if let Some(node) = dag.nodes.get(node_id)
+            && let Some(target_var) = self.get_target_variable(node)
+        {
+            instance_context
+                .variables
+                .insert(target_var, result.clone());
         }
 
         // Get successors
@@ -943,7 +954,9 @@ pub struct ExpressionEvaluator;
 impl ExpressionEvaluator {
     /// Evaluate an expression to a runtime value.
     pub fn evaluate(expr: &ast::Expr, context: &InstanceContext) -> RunnerResult<JsonValue> {
-        let kind = expr.kind.as_ref()
+        let kind = expr
+            .kind
+            .as_ref()
             .ok_or_else(|| RunnerError::Evaluation("Empty expression".to_string()))?;
 
         match kind {
@@ -956,22 +969,23 @@ impl ExpressionEvaluator {
             ast::expr::Kind::Index(idx) => Self::eval_index(idx, context),
             ast::expr::Kind::Dot(dot) => Self::eval_dot(dot, context),
             ast::expr::Kind::FunctionCall(call) => Self::eval_function_call(call, context),
-            ast::expr::Kind::ActionCall(_) => {
-                Err(RunnerError::Evaluation("Action calls cannot be evaluated inline".to_string()))
-            }
+            ast::expr::Kind::ActionCall(_) => Err(RunnerError::Evaluation(
+                "Action calls cannot be evaluated inline".to_string(),
+            )),
         }
     }
 
     fn eval_literal(lit: &ast::Literal) -> RunnerResult<JsonValue> {
-        let value = lit.value.as_ref()
+        let value = lit
+            .value
+            .as_ref()
             .ok_or_else(|| RunnerError::Evaluation("Empty literal".to_string()))?;
 
         Ok(match value {
             ast::literal::Value::IntValue(i) => JsonValue::Number((*i).into()),
-            ast::literal::Value::FloatValue(f) => {
-                JsonValue::Number(serde_json::Number::from_f64(*f)
-                    .unwrap_or_else(|| serde_json::Number::from(0)))
-            }
+            ast::literal::Value::FloatValue(f) => JsonValue::Number(
+                serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0)),
+            ),
             ast::literal::Value::StringValue(s) => JsonValue::String(s.clone()),
             ast::literal::Value::BoolValue(b) => JsonValue::Bool(*b),
             ast::literal::Value::IsNone(true) => JsonValue::Null,
@@ -980,21 +994,29 @@ impl ExpressionEvaluator {
     }
 
     fn eval_variable(var: &ast::Variable, context: &InstanceContext) -> RunnerResult<JsonValue> {
-        context.variables.get(&var.name)
+        context
+            .variables
+            .get(&var.name)
             .cloned()
             .ok_or_else(|| RunnerError::VariableNotFound(var.name.clone()))
     }
 
     fn eval_binary_op(op: &ast::BinaryOp, context: &InstanceContext) -> RunnerResult<JsonValue> {
-        let left_expr = op.left.as_ref()
+        let left_expr = op
+            .left
+            .as_ref()
             .ok_or_else(|| RunnerError::Evaluation("Missing left operand".to_string()))?;
-        let right_expr = op.right.as_ref()
+        let right_expr = op
+            .right
+            .as_ref()
             .ok_or_else(|| RunnerError::Evaluation("Missing right operand".to_string()))?;
 
         let left = Self::evaluate(left_expr, context)?;
         let right = Self::evaluate(right_expr, context)?;
 
-        match ast::BinaryOperator::try_from(op.op).unwrap_or(ast::BinaryOperator::BinaryOpUnspecified) {
+        match ast::BinaryOperator::try_from(op.op)
+            .unwrap_or(ast::BinaryOperator::BinaryOpUnspecified)
+        {
             ast::BinaryOperator::BinaryOpAdd => Self::apply_add(&left, &right),
             ast::BinaryOperator::BinaryOpSub => Self::apply_sub(&left, &right),
             ast::BinaryOperator::BinaryOpMul => Self::apply_mul(&left, &right),
@@ -1012,41 +1034,52 @@ impl ExpressionEvaluator {
                 let result = Self::apply_in(&left, &right)?;
                 Ok(JsonValue::Bool(!result.as_bool().unwrap_or(false)))
             }
-            _ => Err(RunnerError::Evaluation("Unknown binary operator".to_string())),
+            _ => Err(RunnerError::Evaluation(
+                "Unknown binary operator".to_string(),
+            )),
         }
     }
 
     fn eval_unary_op(op: &ast::UnaryOp, context: &InstanceContext) -> RunnerResult<JsonValue> {
-        let operand_expr = op.operand.as_ref()
+        let operand_expr = op
+            .operand
+            .as_ref()
             .ok_or_else(|| RunnerError::Evaluation("Missing operand".to_string()))?;
 
         let operand = Self::evaluate(operand_expr, context)?;
 
-        match ast::UnaryOperator::try_from(op.op).unwrap_or(ast::UnaryOperator::UnaryOpUnspecified) {
-            ast::UnaryOperator::UnaryOpNeg => {
-                match &operand {
-                    JsonValue::Number(n) => {
-                        if let Some(i) = n.as_i64() {
-                            Ok(JsonValue::Number((-i).into()))
-                        } else if let Some(f) = n.as_f64() {
-                            Ok(JsonValue::Number(serde_json::Number::from_f64(-f)
-                                .unwrap_or_else(|| serde_json::Number::from(0))))
-                        } else {
-                            Err(RunnerError::Evaluation("Cannot negate non-numeric value".to_string()))
-                        }
+        match ast::UnaryOperator::try_from(op.op).unwrap_or(ast::UnaryOperator::UnaryOpUnspecified)
+        {
+            ast::UnaryOperator::UnaryOpNeg => match &operand {
+                JsonValue::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        Ok(JsonValue::Number((-i).into()))
+                    } else if let Some(f) = n.as_f64() {
+                        Ok(JsonValue::Number(
+                            serde_json::Number::from_f64(-f)
+                                .unwrap_or_else(|| serde_json::Number::from(0)),
+                        ))
+                    } else {
+                        Err(RunnerError::Evaluation(
+                            "Cannot negate non-numeric value".to_string(),
+                        ))
                     }
-                    _ => Err(RunnerError::Evaluation("Cannot negate non-numeric value".to_string())),
                 }
-            }
-            ast::UnaryOperator::UnaryOpNot => {
-                Ok(JsonValue::Bool(!Self::is_truthy(&operand)))
-            }
-            _ => Err(RunnerError::Evaluation("Unknown unary operator".to_string())),
+                _ => Err(RunnerError::Evaluation(
+                    "Cannot negate non-numeric value".to_string(),
+                )),
+            },
+            ast::UnaryOperator::UnaryOpNot => Ok(JsonValue::Bool(!Self::is_truthy(&operand))),
+            _ => Err(RunnerError::Evaluation(
+                "Unknown unary operator".to_string(),
+            )),
         }
     }
 
     fn eval_list(list: &ast::ListExpr, context: &InstanceContext) -> RunnerResult<JsonValue> {
-        let elements: Result<Vec<JsonValue>, _> = list.elements.iter()
+        let elements: Result<Vec<JsonValue>, _> = list
+            .elements
+            .iter()
             .map(|e| Self::evaluate(e, context))
             .collect();
         Ok(JsonValue::Array(elements?))
@@ -1055,9 +1088,13 @@ impl ExpressionEvaluator {
     fn eval_dict(dict: &ast::DictExpr, context: &InstanceContext) -> RunnerResult<JsonValue> {
         let mut map = serde_json::Map::new();
         for entry in &dict.entries {
-            let key_expr = entry.key.as_ref()
+            let key_expr = entry
+                .key
+                .as_ref()
                 .ok_or_else(|| RunnerError::Evaluation("Missing dict key".to_string()))?;
-            let val_expr = entry.value.as_ref()
+            let val_expr = entry
+                .value
+                .as_ref()
                 .ok_or_else(|| RunnerError::Evaluation("Missing dict value".to_string()))?;
 
             let key = Self::evaluate(key_expr, context)?;
@@ -1073,9 +1110,13 @@ impl ExpressionEvaluator {
     }
 
     fn eval_index(idx: &ast::IndexAccess, context: &InstanceContext) -> RunnerResult<JsonValue> {
-        let obj_expr = idx.object.as_ref()
+        let obj_expr = idx
+            .object
+            .as_ref()
             .ok_or_else(|| RunnerError::Evaluation("Missing index object".to_string()))?;
-        let idx_expr = idx.index.as_ref()
+        let idx_expr = idx
+            .index
+            .as_ref()
             .ok_or_else(|| RunnerError::Evaluation("Missing index".to_string()))?;
 
         let obj = Self::evaluate(obj_expr, context)?;
@@ -1084,43 +1125,55 @@ impl ExpressionEvaluator {
         match (&obj, &index) {
             (JsonValue::Array(arr), JsonValue::Number(n)) => {
                 let i = n.as_i64().unwrap_or(0) as usize;
-                arr.get(i).cloned()
+                arr.get(i)
+                    .cloned()
                     .ok_or_else(|| RunnerError::Evaluation(format!("Index {} out of bounds", i)))
             }
-            (JsonValue::Object(map), JsonValue::String(key)) => {
-                map.get(key).cloned()
-                    .ok_or_else(|| RunnerError::Evaluation(format!("Key '{}' not found", key)))
-            }
+            (JsonValue::Object(map), JsonValue::String(key)) => map
+                .get(key)
+                .cloned()
+                .ok_or_else(|| RunnerError::Evaluation(format!("Key '{}' not found", key))),
             (JsonValue::String(s), JsonValue::Number(n)) => {
                 let i = n.as_i64().unwrap_or(0) as usize;
-                s.chars().nth(i)
+                s.chars()
+                    .nth(i)
                     .map(|c| JsonValue::String(c.to_string()))
                     .ok_or_else(|| RunnerError::Evaluation(format!("Index {} out of bounds", i)))
             }
-            _ => Err(RunnerError::Evaluation("Invalid index operation".to_string())),
+            _ => Err(RunnerError::Evaluation(
+                "Invalid index operation".to_string(),
+            )),
         }
     }
 
     fn eval_dot(dot: &ast::DotAccess, context: &InstanceContext) -> RunnerResult<JsonValue> {
-        let obj_expr = dot.object.as_ref()
+        let obj_expr = dot
+            .object
+            .as_ref()
             .ok_or_else(|| RunnerError::Evaluation("Missing dot object".to_string()))?;
 
         let obj = Self::evaluate(obj_expr, context)?;
 
         match &obj {
-            JsonValue::Object(map) => {
-                map.get(&dot.attribute).cloned()
-                    .ok_or_else(|| RunnerError::Evaluation(format!("Attribute '{}' not found", dot.attribute)))
-            }
-            _ => Err(RunnerError::Evaluation("Dot access on non-object".to_string())),
+            JsonValue::Object(map) => map.get(&dot.attribute).cloned().ok_or_else(|| {
+                RunnerError::Evaluation(format!("Attribute '{}' not found", dot.attribute))
+            }),
+            _ => Err(RunnerError::Evaluation(
+                "Dot access on non-object".to_string(),
+            )),
         }
     }
 
-    fn eval_function_call(call: &ast::FunctionCall, context: &InstanceContext) -> RunnerResult<JsonValue> {
+    fn eval_function_call(
+        call: &ast::FunctionCall,
+        context: &InstanceContext,
+    ) -> RunnerResult<JsonValue> {
         // Evaluate kwargs
         let mut kwargs = HashMap::new();
         for kwarg in &call.kwargs {
-            let val_expr = kwarg.value.as_ref()
+            let val_expr = kwarg
+                .value
+                .as_ref()
                 .ok_or_else(|| RunnerError::Evaluation("Missing kwarg value".to_string()))?;
             let val = Self::evaluate(val_expr, context)?;
             kwargs.insert(kwarg.name.clone(), val);
@@ -1142,10 +1195,14 @@ impl ExpressionEvaluator {
                 if let (Some(ai), Some(bi)) = (a.as_i64(), b.as_i64()) {
                     Ok(JsonValue::Number((ai + bi).into()))
                 } else if let (Some(af), Some(bf)) = (a.as_f64(), b.as_f64()) {
-                    Ok(JsonValue::Number(serde_json::Number::from_f64(af + bf)
-                        .unwrap_or_else(|| serde_json::Number::from(0))))
+                    Ok(JsonValue::Number(
+                        serde_json::Number::from_f64(af + bf)
+                            .unwrap_or_else(|| serde_json::Number::from(0)),
+                    ))
                 } else {
-                    Err(RunnerError::Evaluation("Cannot add incompatible numbers".to_string()))
+                    Err(RunnerError::Evaluation(
+                        "Cannot add incompatible numbers".to_string(),
+                    ))
                 }
             }
             (JsonValue::String(a), JsonValue::String(b)) => {
@@ -1156,7 +1213,9 @@ impl ExpressionEvaluator {
                 result.extend(b.clone());
                 Ok(JsonValue::Array(result))
             }
-            _ => Err(RunnerError::Evaluation("Cannot add incompatible types".to_string())),
+            _ => Err(RunnerError::Evaluation(
+                "Cannot add incompatible types".to_string(),
+            )),
         }
     }
 
@@ -1166,13 +1225,19 @@ impl ExpressionEvaluator {
                 if let (Some(ai), Some(bi)) = (a.as_i64(), b.as_i64()) {
                     Ok(JsonValue::Number((ai - bi).into()))
                 } else if let (Some(af), Some(bf)) = (a.as_f64(), b.as_f64()) {
-                    Ok(JsonValue::Number(serde_json::Number::from_f64(af - bf)
-                        .unwrap_or_else(|| serde_json::Number::from(0))))
+                    Ok(JsonValue::Number(
+                        serde_json::Number::from_f64(af - bf)
+                            .unwrap_or_else(|| serde_json::Number::from(0)),
+                    ))
                 } else {
-                    Err(RunnerError::Evaluation("Cannot subtract incompatible numbers".to_string()))
+                    Err(RunnerError::Evaluation(
+                        "Cannot subtract incompatible numbers".to_string(),
+                    ))
                 }
             }
-            _ => Err(RunnerError::Evaluation("Cannot subtract non-numbers".to_string())),
+            _ => Err(RunnerError::Evaluation(
+                "Cannot subtract non-numbers".to_string(),
+            )),
         }
     }
 
@@ -1182,13 +1247,19 @@ impl ExpressionEvaluator {
                 if let (Some(ai), Some(bi)) = (a.as_i64(), b.as_i64()) {
                     Ok(JsonValue::Number((ai * bi).into()))
                 } else if let (Some(af), Some(bf)) = (a.as_f64(), b.as_f64()) {
-                    Ok(JsonValue::Number(serde_json::Number::from_f64(af * bf)
-                        .unwrap_or_else(|| serde_json::Number::from(0))))
+                    Ok(JsonValue::Number(
+                        serde_json::Number::from_f64(af * bf)
+                            .unwrap_or_else(|| serde_json::Number::from(0)),
+                    ))
                 } else {
-                    Err(RunnerError::Evaluation("Cannot multiply incompatible numbers".to_string()))
+                    Err(RunnerError::Evaluation(
+                        "Cannot multiply incompatible numbers".to_string(),
+                    ))
                 }
             }
-            _ => Err(RunnerError::Evaluation("Cannot multiply non-numbers".to_string())),
+            _ => Err(RunnerError::Evaluation(
+                "Cannot multiply non-numbers".to_string(),
+            )),
         }
     }
 
@@ -1200,11 +1271,15 @@ impl ExpressionEvaluator {
                 if bf == 0.0 {
                     Err(RunnerError::Evaluation("Division by zero".to_string()))
                 } else {
-                    Ok(JsonValue::Number(serde_json::Number::from_f64(af / bf)
-                        .unwrap_or_else(|| serde_json::Number::from(0))))
+                    Ok(JsonValue::Number(
+                        serde_json::Number::from_f64(af / bf)
+                            .unwrap_or_else(|| serde_json::Number::from(0)),
+                    ))
                 }
             }
-            _ => Err(RunnerError::Evaluation("Cannot divide non-numbers".to_string())),
+            _ => Err(RunnerError::Evaluation(
+                "Cannot divide non-numbers".to_string(),
+            )),
         }
     }
 
@@ -1216,7 +1291,9 @@ impl ExpressionEvaluator {
                 Ok(JsonValue::Bool(af < bf))
             }
             (JsonValue::String(a), JsonValue::String(b)) => Ok(JsonValue::Bool(a < b)),
-            _ => Err(RunnerError::Evaluation("Cannot compare incompatible types".to_string())),
+            _ => Err(RunnerError::Evaluation(
+                "Cannot compare incompatible types".to_string(),
+            )),
         }
     }
 
@@ -1228,7 +1305,9 @@ impl ExpressionEvaluator {
                 Ok(JsonValue::Bool(af <= bf))
             }
             (JsonValue::String(a), JsonValue::String(b)) => Ok(JsonValue::Bool(a <= b)),
-            _ => Err(RunnerError::Evaluation("Cannot compare incompatible types".to_string())),
+            _ => Err(RunnerError::Evaluation(
+                "Cannot compare incompatible types".to_string(),
+            )),
         }
     }
 
@@ -1240,7 +1319,9 @@ impl ExpressionEvaluator {
                 Ok(JsonValue::Bool(af > bf))
             }
             (JsonValue::String(a), JsonValue::String(b)) => Ok(JsonValue::Bool(a > b)),
-            _ => Err(RunnerError::Evaluation("Cannot compare incompatible types".to_string())),
+            _ => Err(RunnerError::Evaluation(
+                "Cannot compare incompatible types".to_string(),
+            )),
         }
     }
 
@@ -1252,16 +1333,22 @@ impl ExpressionEvaluator {
                 Ok(JsonValue::Bool(af >= bf))
             }
             (JsonValue::String(a), JsonValue::String(b)) => Ok(JsonValue::Bool(a >= b)),
-            _ => Err(RunnerError::Evaluation("Cannot compare incompatible types".to_string())),
+            _ => Err(RunnerError::Evaluation(
+                "Cannot compare incompatible types".to_string(),
+            )),
         }
     }
 
     fn apply_and(left: &JsonValue, right: &JsonValue) -> RunnerResult<JsonValue> {
-        Ok(JsonValue::Bool(Self::is_truthy(left) && Self::is_truthy(right)))
+        Ok(JsonValue::Bool(
+            Self::is_truthy(left) && Self::is_truthy(right),
+        ))
     }
 
     fn apply_or(left: &JsonValue, right: &JsonValue) -> RunnerResult<JsonValue> {
-        Ok(JsonValue::Bool(Self::is_truthy(left) || Self::is_truthy(right)))
+        Ok(JsonValue::Bool(
+            Self::is_truthy(left) || Self::is_truthy(right),
+        ))
     }
 
     fn apply_in(left: &JsonValue, right: &JsonValue) -> RunnerResult<JsonValue> {
@@ -1281,7 +1368,9 @@ impl ExpressionEvaluator {
                 };
                 Ok(JsonValue::Bool(s.contains(&needle)))
             }
-            _ => Err(RunnerError::Evaluation("'in' requires array, object, or string".to_string())),
+            _ => Err(RunnerError::Evaluation(
+                "'in' requires array, object, or string".to_string(),
+            )),
         }
     }
 
@@ -1298,18 +1387,16 @@ impl ExpressionEvaluator {
 
     // Built-in functions
     fn builtin_range(kwargs: &HashMap<String, JsonValue>) -> RunnerResult<JsonValue> {
-        let start = kwargs.get("start")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let stop = kwargs.get("stop")
-            .and_then(|v| v.as_i64())
-            .ok_or_else(|| RunnerError::Evaluation("range() requires 'stop' argument".to_string()))?;
-        let step = kwargs.get("step")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(1);
+        let start = kwargs.get("start").and_then(|v| v.as_i64()).unwrap_or(0);
+        let stop = kwargs.get("stop").and_then(|v| v.as_i64()).ok_or_else(|| {
+            RunnerError::Evaluation("range() requires 'stop' argument".to_string())
+        })?;
+        let step = kwargs.get("step").and_then(|v| v.as_i64()).unwrap_or(1);
 
         if step == 0 {
-            return Err(RunnerError::Evaluation("range() step cannot be zero".to_string()));
+            return Err(RunnerError::Evaluation(
+                "range() step cannot be zero".to_string(),
+            ));
         }
 
         let mut result = Vec::new();
@@ -1323,34 +1410,42 @@ impl ExpressionEvaluator {
     }
 
     fn builtin_len(kwargs: &HashMap<String, JsonValue>) -> RunnerResult<JsonValue> {
-        let items = kwargs.get("items")
-            .ok_or_else(|| RunnerError::Evaluation("len() requires 'items' argument".to_string()))?;
+        let items = kwargs.get("items").ok_or_else(|| {
+            RunnerError::Evaluation("len() requires 'items' argument".to_string())
+        })?;
 
         let len = match items {
             JsonValue::Array(a) => a.len(),
             JsonValue::Object(o) => o.len(),
             JsonValue::String(s) => s.len(),
-            _ => return Err(RunnerError::Evaluation("len() requires array, object, or string".to_string())),
+            _ => {
+                return Err(RunnerError::Evaluation(
+                    "len() requires array, object, or string".to_string(),
+                ));
+            }
         };
 
         Ok(JsonValue::Number((len as i64).into()))
     }
 
     fn builtin_enumerate(kwargs: &HashMap<String, JsonValue>) -> RunnerResult<JsonValue> {
-        let items = kwargs.get("items")
-            .ok_or_else(|| RunnerError::Evaluation("enumerate() requires 'items' argument".to_string()))?;
+        let items = kwargs.get("items").ok_or_else(|| {
+            RunnerError::Evaluation("enumerate() requires 'items' argument".to_string())
+        })?;
 
         let arr = match items {
             JsonValue::Array(a) => a,
-            _ => return Err(RunnerError::Evaluation("enumerate() requires array".to_string())),
+            _ => {
+                return Err(RunnerError::Evaluation(
+                    "enumerate() requires array".to_string(),
+                ));
+            }
         };
 
-        let result: Vec<JsonValue> = arr.iter()
+        let result: Vec<JsonValue> = arr
+            .iter()
             .enumerate()
-            .map(|(i, v)| JsonValue::Array(vec![
-                JsonValue::Number((i as i64).into()),
-                v.clone(),
-            ]))
+            .map(|(i, v)| JsonValue::Array(vec![JsonValue::Number((i as i64).into()), v.clone()]))
             .collect();
 
         Ok(JsonValue::Array(result))
@@ -1412,7 +1507,10 @@ impl DAGRunner {
         worker_pool: Arc<PythonWorkerPool>,
     ) -> Self {
         let num_workers = worker_pool.len();
-        let slot_tracker = Arc::new(WorkerSlotTracker::new(num_workers, config.max_slots_per_worker));
+        let slot_tracker = Arc::new(WorkerSlotTracker::new(
+            num_workers,
+            config.max_slots_per_worker,
+        ));
         let in_flight = Arc::new(Mutex::new(InFlightTracker::new()));
 
         let work_handler = Arc::new(WorkQueueHandler::new(
@@ -1439,7 +1537,8 @@ impl DAGRunner {
         info!("Starting DAG runner");
 
         // Channel for completion results
-        let (completion_tx, mut completion_rx) = mpsc::channel::<(InFlightAction, RoundTripMetrics)>(1000);
+        let (completion_tx, mut completion_rx) =
+            mpsc::channel::<(InFlightAction, RoundTripMetrics)>(1000);
 
         loop {
             tokio::select! {
@@ -1514,7 +1613,8 @@ impl DAGRunner {
         let context = {
             let contexts = instance_contexts.read().await;
             contexts.get(&instance_id.0).cloned()
-        }.unwrap_or_else(|| InstanceContext::new(instance_id));
+        }
+        .unwrap_or_else(|| InstanceContext::new(instance_id));
 
         // Step 2: Async I/O - Get DAG for this workflow instance (loads from DB if not cached)
         let dag = dag_cache.get_dag_for_instance(instance_id).await?;
@@ -1605,10 +1705,10 @@ impl DAGRunner {
         let helper = DAGHelper::new(dag);
 
         // Store result in context
-        if let Some(node) = dag.nodes.get(node_id) {
-            if let Some(target_var) = Self::get_target_variable_static(node) {
-                context.variables.insert(target_var, result.clone());
-            }
+        if let Some(node) = dag.nodes.get(node_id)
+            && let Some(target_var) = Self::get_target_variable_static(node)
+        {
+            context.variables.insert(target_var, result.clone());
         }
 
         // Find data flow targets and push values
@@ -1669,10 +1769,10 @@ impl DAGRunner {
         let helper = DAGHelper::new(dag);
 
         // Store result
-        if let Some(node) = dag.nodes.get(node_id) {
-            if let Some(target_var) = Self::get_target_variable_static(node) {
-                context.variables.insert(target_var, result.clone());
-            }
+        if let Some(node) = dag.nodes.get(node_id)
+            && let Some(target_var) = Self::get_target_variable_static(node)
+        {
+            context.variables.insert(target_var, result.clone());
         }
 
         // Get successors
@@ -1714,11 +1814,11 @@ impl DAGRunner {
 
     /// Static helper to get target variable (for blocking context).
     fn get_target_variable_static(node: &DAGNode) -> Option<String> {
-        if node.node_type == "assignment" {
-            if let Some(eq_pos) = node.label.find('=') {
-                let target = node.label[..eq_pos].trim();
-                return Some(target.to_string());
-            }
+        if node.node_type == "assignment"
+            && let Some(eq_pos) = node.label.find('=')
+        {
+            let target = node.label[..eq_pos].trim();
+            return Some(target.to_string());
         }
         None
     }
@@ -1893,7 +1993,9 @@ mod tests {
     #[test]
     fn test_expression_evaluator_variable() {
         let mut context = InstanceContext::new(WorkflowInstanceId::new());
-        context.variables.insert("x".to_string(), JsonValue::Number(10.into()));
+        context
+            .variables
+            .insert("x".to_string(), JsonValue::Number(10.into()));
 
         let expr = ast::Expr {
             kind: Some(ast::expr::Kind::Variable(ast::Variable {
@@ -1982,10 +2084,13 @@ mod tests {
             span: None,
         };
         let result = ExpressionEvaluator::evaluate(&expr, &context).unwrap();
-        assert_eq!(result, JsonValue::Array(vec![
-            JsonValue::Number(1.into()),
-            JsonValue::Number(2.into()),
-        ]));
+        assert_eq!(
+            result,
+            JsonValue::Array(vec![
+                JsonValue::Number(1.into()),
+                JsonValue::Number(2.into()),
+            ])
+        );
     }
 
     #[test]
@@ -1996,28 +2101,29 @@ mod tests {
             kind: Some(ast::expr::Kind::FunctionCall(ast::FunctionCall {
                 name: "range".to_string(),
                 args: vec![],
-                kwargs: vec![
-                    ast::Kwarg {
-                        name: "stop".to_string(),
-                        value: Some(ast::Expr {
-                            kind: Some(ast::expr::Kind::Literal(ast::Literal {
-                                value: Some(ast::literal::Value::IntValue(5)),
-                            })),
-                            span: None,
-                        }),
-                    },
-                ],
+                kwargs: vec![ast::Kwarg {
+                    name: "stop".to_string(),
+                    value: Some(ast::Expr {
+                        kind: Some(ast::expr::Kind::Literal(ast::Literal {
+                            value: Some(ast::literal::Value::IntValue(5)),
+                        })),
+                        span: None,
+                    }),
+                }],
             })),
             span: None,
         };
         let result = ExpressionEvaluator::evaluate(&expr, &context).unwrap();
-        assert_eq!(result, JsonValue::Array(vec![
-            JsonValue::Number(0.into()),
-            JsonValue::Number(1.into()),
-            JsonValue::Number(2.into()),
-            JsonValue::Number(3.into()),
-            JsonValue::Number(4.into()),
-        ]));
+        assert_eq!(
+            result,
+            JsonValue::Array(vec![
+                JsonValue::Number(0.into()),
+                JsonValue::Number(1.into()),
+                JsonValue::Number(2.into()),
+                JsonValue::Number(3.into()),
+                JsonValue::Number(4.into()),
+            ])
+        );
     }
 
     #[test]
@@ -2028,36 +2134,34 @@ mod tests {
             kind: Some(ast::expr::Kind::FunctionCall(ast::FunctionCall {
                 name: "len".to_string(),
                 args: vec![],
-                kwargs: vec![
-                    ast::Kwarg {
-                        name: "items".to_string(),
-                        value: Some(ast::Expr {
-                            kind: Some(ast::expr::Kind::List(ast::ListExpr {
-                                elements: vec![
-                                    ast::Expr {
-                                        kind: Some(ast::expr::Kind::Literal(ast::Literal {
-                                            value: Some(ast::literal::Value::IntValue(1)),
-                                        })),
-                                        span: None,
-                                    },
-                                    ast::Expr {
-                                        kind: Some(ast::expr::Kind::Literal(ast::Literal {
-                                            value: Some(ast::literal::Value::IntValue(2)),
-                                        })),
-                                        span: None,
-                                    },
-                                    ast::Expr {
-                                        kind: Some(ast::expr::Kind::Literal(ast::Literal {
-                                            value: Some(ast::literal::Value::IntValue(3)),
-                                        })),
-                                        span: None,
-                                    },
-                                ],
-                            })),
-                            span: None,
-                        }),
-                    },
-                ],
+                kwargs: vec![ast::Kwarg {
+                    name: "items".to_string(),
+                    value: Some(ast::Expr {
+                        kind: Some(ast::expr::Kind::List(ast::ListExpr {
+                            elements: vec![
+                                ast::Expr {
+                                    kind: Some(ast::expr::Kind::Literal(ast::Literal {
+                                        value: Some(ast::literal::Value::IntValue(1)),
+                                    })),
+                                    span: None,
+                                },
+                                ast::Expr {
+                                    kind: Some(ast::expr::Kind::Literal(ast::Literal {
+                                        value: Some(ast::literal::Value::IntValue(2)),
+                                    })),
+                                    span: None,
+                                },
+                                ast::Expr {
+                                    kind: Some(ast::expr::Kind::Literal(ast::Literal {
+                                        value: Some(ast::literal::Value::IntValue(3)),
+                                    })),
+                                    span: None,
+                                },
+                            ],
+                        })),
+                        span: None,
+                    }),
+                }],
             })),
             span: None,
         };

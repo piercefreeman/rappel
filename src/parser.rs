@@ -50,8 +50,7 @@ pub struct Parser<'source> {
 impl<'source> Parser<'source> {
     /// Create a new parser from source code
     pub fn new(source: &'source str) -> Result<Self, ParseError> {
-        let tokens: Vec<SpannedToken> = Lexer::new(source)
-            .collect::<Result<Vec<_>, _>>()?;
+        let tokens: Vec<SpannedToken> = Lexer::new(source).collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
             source,
@@ -189,7 +188,11 @@ impl<'source> Parser<'source> {
         self.expect(&Token::Colon)?;
 
         let body = self.parse_block()?;
-        let end_span = body.span.clone().map(|s| Span::new(s.start_line as usize, s.end_col as usize)).unwrap_or(start_span);
+        let end_span = body
+            .span
+            .clone()
+            .map(|s| Span::new(s.start_line as usize, s.end_col as usize))
+            .unwrap_or(start_span);
 
         Ok(ast::FunctionDef {
             name,
@@ -278,8 +281,12 @@ impl<'source> Parser<'source> {
             Token::For => Some(ast::statement::Kind::ForLoop(self.parse_for_loop()?)),
             Token::Try => Some(ast::statement::Kind::TryExcept(self.parse_try_except()?)),
             Token::Return => Some(ast::statement::Kind::ReturnStmt(self.parse_return()?)),
-            Token::Spread => Some(ast::statement::Kind::SpreadAction(self.parse_spread_action()?)),
-            Token::Parallel => Some(ast::statement::Kind::ParallelBlock(self.parse_parallel_block(None)?)),
+            Token::Spread => Some(ast::statement::Kind::SpreadAction(
+                self.parse_spread_action()?,
+            )),
+            Token::Parallel => Some(ast::statement::Kind::ParallelBlock(
+                self.parse_parallel_block(None)?,
+            )),
             Token::Ident(_) => self.parse_assignment_or_expr()?,
             Token::At => Some(ast::statement::Kind::ActionCall(self.parse_action_call()?)),
             _ => return Err(self.error(format!("unexpected token in statement: {}", self.peek()))),
@@ -313,7 +320,7 @@ impl<'source> Parser<'source> {
             if self.check(&Token::Parallel) {
                 self.advance();
                 return Ok(Some(ast::statement::Kind::ParallelBlock(
-                    self.parse_parallel_block(Some(targets.remove(0)))?
+                    self.parse_parallel_block(Some(targets.remove(0)))?,
                 )));
             }
 
@@ -340,7 +347,11 @@ impl<'source> Parser<'source> {
     }
 
     /// Build an expression starting from an already-consumed identifier
-    fn build_expr_from_ident_and_rest(&mut self, name: String, span: Span) -> Result<ast::Expr, ParseError> {
+    fn build_expr_from_ident_and_rest(
+        &mut self,
+        name: String,
+        span: Span,
+    ) -> Result<ast::Expr, ParseError> {
         let mut expr = ast::Expr {
             kind: Some(ast::expr::Kind::Variable(ast::Variable { name })),
             span: self.make_span(span, span),
@@ -516,13 +527,17 @@ impl<'source> Parser<'source> {
     fn parse_return(&mut self) -> Result<ast::ReturnStmt, ParseError> {
         self.expect(&Token::Return)?;
 
-        let value = if !self.check(&Token::Dedent) && !self.at_end()
-            && !self.check(&Token::Indent)
+        let value = if !self.check(&Token::Dedent) && !self.at_end() && !self.check(&Token::Indent)
         {
             // Check if there's an expression to return
             match self.peek() {
-                Token::If | Token::For | Token::Try | Token::Return
-                | Token::Spread | Token::Parallel | Token::Fn => None,
+                Token::If
+                | Token::For
+                | Token::Try
+                | Token::Return
+                | Token::Spread
+                | Token::Parallel
+                | Token::Fn => None,
                 _ => Some(self.parse_expr()?),
             }
         } else {
@@ -548,7 +563,10 @@ impl<'source> Parser<'source> {
         })
     }
 
-    fn parse_parallel_block(&mut self, target: Option<String>) -> Result<ast::ParallelBlock, ParseError> {
+    fn parse_parallel_block(
+        &mut self,
+        target: Option<String>,
+    ) -> Result<ast::ParallelBlock, ParseError> {
         self.expect(&Token::Colon)?;
         self.expect(&Token::Indent)?;
 
@@ -648,14 +666,18 @@ impl<'source> Parser<'source> {
                     // It's a positional arg - restore position and parse as expr
                     self.pos = save_pos;
                     if seen_kwarg {
-                        return Err(self.error("positional argument follows keyword argument".to_string()));
+                        return Err(
+                            self.error("positional argument follows keyword argument".to_string())
+                        );
                     }
                     args.push(self.parse_expr()?);
                 }
             } else {
                 // Not an ident, must be a positional arg expression
                 if seen_kwarg {
-                    return Err(self.error("positional argument follows keyword argument".to_string()));
+                    return Err(
+                        self.error("positional argument follows keyword argument".to_string())
+                    );
                 }
                 args.push(self.parse_expr()?);
             }
@@ -882,7 +904,9 @@ impl<'source> Parser<'source> {
                         };
                         continue;
                     } else {
-                        return Err(self.error("expected 'in' after 'not' in comparison".to_string()));
+                        return Err(
+                            self.error("expected 'in' after 'not' in comparison".to_string())
+                        );
                     }
                 }
                 _ => break,
@@ -1199,7 +1223,7 @@ fn parse_duration_string(s: &str) -> Result<u64, ParseError> {
             return Err(ParseError {
                 message: format!("invalid duration unit: {}", unit),
                 span: Span::new(0, 0),
-            })
+            });
         }
     };
 
@@ -1361,7 +1385,8 @@ mod tests {
 
         // Check the action call has a retry policy with exception type
         if let Some(ast::statement::Kind::Assignment(assign)) = &body.statements[0].kind {
-            if let Some(ast::expr::Kind::ActionCall(action)) = &assign.value.as_ref().unwrap().kind {
+            if let Some(ast::expr::Kind::ActionCall(action)) = &assign.value.as_ref().unwrap().kind
+            {
                 assert_eq!(action.policies.len(), 1);
                 if let Some(ast::policy_bracket::Kind::Retry(retry)) = &action.policies[0].kind {
                     assert_eq!(retry.exception_types, vec!["NetworkError"]);
@@ -1389,12 +1414,17 @@ mod tests {
         let body = func.body.as_ref().unwrap();
 
         if let Some(ast::statement::Kind::Assignment(assign)) = &body.statements[0].kind {
-            if let Some(ast::expr::Kind::ActionCall(action)) = &assign.value.as_ref().unwrap().kind {
+            if let Some(ast::expr::Kind::ActionCall(action)) = &assign.value.as_ref().unwrap().kind
+            {
                 assert_eq!(action.policies.len(), 2);
                 // First is retry
-                assert!(matches!(&action.policies[0].kind, Some(ast::policy_bracket::Kind::Retry(_))));
+                assert!(matches!(
+                    &action.policies[0].kind,
+                    Some(ast::policy_bracket::Kind::Retry(_))
+                ));
                 // Second is timeout
-                if let Some(ast::policy_bracket::Kind::Timeout(timeout)) = &action.policies[1].kind {
+                if let Some(ast::policy_bracket::Kind::Timeout(timeout)) = &action.policies[1].kind
+                {
                     assert_eq!(timeout.timeout.as_ref().unwrap().seconds, 60);
                 } else {
                     panic!("expected timeout policy");
@@ -1443,7 +1473,9 @@ mod tests {
 
         if let Some(ast::statement::Kind::Conditional(cond)) = &body.statements[0].kind {
             let if_branch = cond.if_branch.as_ref().unwrap();
-            if let Some(ast::expr::Kind::BinaryOp(binop)) = &if_branch.condition.as_ref().unwrap().kind {
+            if let Some(ast::expr::Kind::BinaryOp(binop)) =
+                &if_branch.condition.as_ref().unwrap().kind
+            {
                 assert_eq!(binop.op, ast::BinaryOperator::BinaryOpIn as i32);
             } else {
                 panic!("expected binary op");
@@ -1577,7 +1609,8 @@ mod tests {
         let body = func.body.as_ref().unwrap();
 
         if let Some(ast::statement::Kind::Assignment(assign)) = &body.statements[0].kind {
-            if let Some(ast::expr::Kind::ActionCall(action)) = &assign.value.as_ref().unwrap().kind {
+            if let Some(ast::expr::Kind::ActionCall(action)) = &assign.value.as_ref().unwrap().kind
+            {
                 assert_eq!(action.kwargs.len(), 3);
             } else {
                 panic!("expected action call");

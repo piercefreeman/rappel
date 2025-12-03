@@ -11,17 +11,14 @@ from .actions import (
 )
 from .dependencies import Depend, provide_dependencies
 from .exceptions import ExhaustedRetries, ExhaustedRetriesError
+from .ir_builder import build_workflow_ir
 from .registry import registry
 from .workflow import (
-    BackoffPolicy,
-    ExponentialBackoff,
-    LinearBackoff,
     RetryPolicy,
     Workflow,
     workflow,
     workflow_registry,
 )
-from .workflow_dag import WorkflowDag, build_workflow_dag
 
 __all__ = [
     "action",
@@ -31,11 +28,7 @@ __all__ = [
     "workflow",
     "workflow_registry",
     "RetryPolicy",
-    "BackoffPolicy",
-    "LinearBackoff",
-    "ExponentialBackoff",
-    "WorkflowDag",
-    "build_workflow_dag",
+    "build_workflow_ir",
     "serialize_result_payload",
     "deserialize_result_payload",
     "serialize_error_payload",

@@ -24,6 +24,27 @@ def _rewrite_messages_pb2_grpc() -> None:
             stub_target.write_text(stub_text.replace(stub_needle, stub_replacement))
 
 
+def _rewrite_messages_pb2_imports() -> None:
+    """Fix ast_pb2 import in messages_pb2.py to use package-relative imports."""
+    target = PROTO_DIR / "messages_pb2.py"
+    if not target.exists():
+        return
+    text = target.read_text()
+    needle = "import ast_pb2 as ast__pb2"
+    replacement = "from proto import ast_pb2 as ast__pb2"
+    if needle in text and replacement not in text:
+        text = text.replace(needle, replacement)
+        target.write_text(text)
+
+    stub_target = PROTO_DIR / "messages_pb2.pyi"
+    if stub_target.exists():
+        stub_text = stub_target.read_text()
+        stub_needle = "import ast_pb2"
+        stub_replacement = "from proto import ast_pb2"
+        if stub_needle in stub_text and stub_replacement not in stub_text:
+            stub_target.write_text(stub_text.replace(stub_needle, stub_replacement))
+
+
 STRUCT_IMPORT_LINE = "from google.protobuf import struct_pb2 as google_dot_protobuf_dot_struct__pb2"
 REGISTER_LINE = "_sym_db.RegisterFileDescriptor(google_dot_protobuf_dot_struct__pb2.DESCRIPTOR)"
 
@@ -57,9 +78,19 @@ def _rewrite_messages_pb2() -> None:
     target.write_text(text)
 
 
+def _rewrite_ast_pb2() -> None:
+    """Handle ast_pb2.py - no grpc needed since it's pure data structures."""
+    target = PROTO_DIR / "ast_pb2.py"
+    if not target.exists():
+        return
+    # ast.proto doesn't need special import handling since it has no external deps
+
+
 def main() -> None:
     _rewrite_messages_pb2_grpc()
     _rewrite_messages_pb2()
+    _rewrite_messages_pb2_imports()
+    _rewrite_ast_pb2()
 
 
 if __name__ == "__main__":
