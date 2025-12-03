@@ -23,10 +23,13 @@ class TokenType(Enum):
     IN = auto()  # for x in list
     IF = auto()  # conditional
     ELSE = auto()  # else branch
+    TRY = auto()  # try block
+    EXCEPT = auto()  # except handler
     RETURN = auto()  # return statement
     INPUT = auto()  # input declaration
     OUTPUT = auto()  # output declaration
     SPREAD = auto()  # spread keyword
+    PARALLEL = auto()  # parallel block
     AT = auto()  # @ for action calls
 
     # Operators

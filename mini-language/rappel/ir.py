@@ -312,6 +312,69 @@ class RappelSpreadAction:
     location: SourceLocation | None = None
 
 
+@dataclass(frozen=True)
+class RappelExceptHandler:
+    """
+    A single except handler in a try/except block.
+
+    except ErrorType:
+        result = @fallback_action(...)
+
+    - exception_types: tuple of exception type names to catch (empty = catch all)
+    - body: statements to execute (should contain action calls)
+    """
+
+    exception_types: tuple[str, ...]  # Empty tuple means catch all
+    body: tuple[RappelStatement, ...]
+    location: SourceLocation | None = None
+
+
+@dataclass(frozen=True)
+class RappelTryExcept:
+    """
+    Try/except block for action error handling.
+
+    try:
+        result = @risky_action(...)
+    except NetworkError:
+        result = @fallback_action(...)
+    except:
+        result = @default_handler(...)
+
+    The try block and each except block should be treated as isolated
+    execution units - each containing action calls that are the unit
+    of durable execution.
+    """
+
+    try_body: tuple[RappelStatement, ...]
+    handlers: tuple[RappelExceptHandler, ...]
+    location: SourceLocation | None = None
+
+
+@dataclass(frozen=True)
+class RappelParallelBlock:
+    """
+    Parallel execution block for concurrent action/function calls.
+
+    results = parallel:
+        @action_a()
+        @action_b()
+        func_c()
+
+    Or without assignment:
+    parallel:
+        @action_a()
+        @action_b()
+
+    - calls: tuple of expressions (action calls or function calls)
+    - target: optional variable to store results as a list
+    """
+
+    calls: tuple[RappelExpr, ...]
+    target: str | None = None
+    location: SourceLocation | None = None
+
+
 # Type alias for statements
 RappelStatement = (
     RappelAssignment
@@ -323,6 +386,8 @@ RappelStatement = (
     | RappelForLoop
     | RappelIfStatement
     | RappelSpreadAction
+    | RappelTryExcept
+    | RappelParallelBlock
 )
 
 

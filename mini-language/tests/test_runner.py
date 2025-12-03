@@ -569,3 +569,495 @@ class TestThreadedDAGRunner:
 
         # Results should be in original order despite varying completion times
         assert results == [20, 40, 60, 80, 100]
+
+
+class TestDAGRunnerTryExcept:
+    """Tests for try/except exception handling."""
+
+    def test_try_succeeds(self):
+        """Test that successful try block skips except handlers."""
+        source = """fn safe_action(input: [], output: [result]):
+    try:
+        result = @might_fail()
+    except:
+        result = "caught error"
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        def mock_might_fail():
+            return "success"
+
+        runner = DAGRunner(dag, action_handlers={"might_fail": mock_might_fail})
+
+        outputs = runner.run("safe_action", {})
+        assert outputs.get("result") == "success"
+
+    def test_try_fails_catch_all(self):
+        """Test catch-all except handler catches any exception."""
+        source = """fn safe_action(input: [], output: [result]):
+    try:
+        result = @might_fail()
+    except:
+        result = "caught error"
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        def mock_might_fail():
+            raise RuntimeError("Something went wrong")
+
+        runner = DAGRunner(dag, action_handlers={"might_fail": mock_might_fail})
+
+        outputs = runner.run("safe_action", {})
+        assert outputs.get("result") == "caught error"
+
+    def test_try_specific_exception_match(self):
+        """Test that specific exception type matches correct handler."""
+        source = """fn typed_handler(input: [], output: [result]):
+    try:
+        result = @might_fail()
+    except ValueError:
+        result = "value error"
+    except:
+        result = "other error"
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        def mock_might_fail():
+            raise ValueError("bad value")
+
+        runner = DAGRunner(dag, action_handlers={"might_fail": mock_might_fail})
+
+        outputs = runner.run("typed_handler", {})
+        assert outputs.get("result") == "value error"
+
+    def test_try_exception_falls_through_to_catch_all(self):
+        """Test that unmatched exception falls through to catch-all."""
+        source = """fn typed_handler(input: [], output: [result]):
+    try:
+        result = @might_fail()
+    except ValueError:
+        result = "value error"
+    except:
+        result = "other error"
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        def mock_might_fail():
+            raise TypeError("wrong type")
+
+        runner = DAGRunner(dag, action_handlers={"might_fail": mock_might_fail})
+
+        outputs = runner.run("typed_handler", {})
+        assert outputs.get("result") == "other error"
+
+    def test_try_multiple_specific_handlers(self):
+        """Test multiple specific exception handlers."""
+        source = """fn multi_handler(input: [error_type], output: [result]):
+    try:
+        result = @might_fail(type=error_type)
+    except ValueError:
+        result = "value error"
+    except TypeError:
+        result = "type error"
+    except KeyError:
+        result = "key error"
+    except:
+        result = "other error"
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        def mock_might_fail(type):
+            if type == "value":
+                raise ValueError("bad value")
+            elif type == "type":
+                raise TypeError("wrong type")
+            elif type == "key":
+                raise KeyError("missing key")
+            else:
+                raise RuntimeError("unknown")
+
+        runner = DAGRunner(dag, action_handlers={"might_fail": mock_might_fail})
+
+        assert runner.run("multi_handler", {"error_type": "value"}).get("result") == "value error"
+        assert runner.run("multi_handler", {"error_type": "type"}).get("result") == "type error"
+        assert runner.run("multi_handler", {"error_type": "key"}).get("result") == "key error"
+        assert runner.run("multi_handler", {"error_type": "other"}).get("result") == "other error"
+
+    def test_try_with_multiple_statements_in_body(self):
+        """Test try block with multiple statements."""
+        source = """fn multi_stmt(input: [], output: [result]):
+    try:
+        x = @get_value()
+        y = x * 2
+        result = y + 1
+    except:
+        result = 0
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        def mock_get_value():
+            return 5
+
+        runner = DAGRunner(dag, action_handlers={"get_value": mock_get_value})
+
+        outputs = runner.run("multi_stmt", {})
+        assert outputs.get("result") == 11  # 5 * 2 + 1
+
+    def test_try_except_tuple_types(self):
+        """Test except handler with multiple exception types."""
+        source = """fn tuple_handler(input: [error_type], output: [result]):
+    try:
+        result = @might_fail(type=error_type)
+    except (ValueError, TypeError):
+        result = "value or type error"
+    except:
+        result = "other error"
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        def mock_might_fail(type):
+            if type == "value":
+                raise ValueError("bad value")
+            elif type == "type":
+                raise TypeError("wrong type")
+            else:
+                raise KeyError("missing key")
+
+        runner = DAGRunner(dag, action_handlers={"might_fail": mock_might_fail})
+
+        assert runner.run("tuple_handler", {"error_type": "value"}).get("result") == "value or type error"
+        assert runner.run("tuple_handler", {"error_type": "type"}).get("result") == "value or type error"
+        assert runner.run("tuple_handler", {"error_type": "other"}).get("result") == "other error"
+
+
+class TestDAGRunnerDurableSleep:
+    """Tests for durable sleep (@sleep) functionality."""
+
+    def test_sleep_delays_execution(self):
+        """Test that @sleep delays subsequent actions."""
+        source = """fn delayed(input: [], output: [result]):
+    @sleep(duration=0.05)
+    result = "done"
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+        runner = DAGRunner(dag)
+
+        start = time.time()
+        outputs = runner.run("delayed", {})
+        elapsed = time.time() - start
+
+        assert outputs.get("result") == "done"
+        # Should take at least 50ms due to sleep
+        assert elapsed >= 0.05, f"Expected at least 50ms delay, got {elapsed:.3f}s"
+
+    def test_sleep_with_variable_duration(self):
+        """Test @sleep with duration from variable."""
+        source = """fn delayed(input: [wait_time], output: [result]):
+    @sleep(duration=wait_time)
+    result = "done"
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+        runner = DAGRunner(dag)
+
+        start = time.time()
+        outputs = runner.run("delayed", {"wait_time": 0.03})
+        elapsed = time.time() - start
+
+        assert outputs.get("result") == "done"
+        assert elapsed >= 0.03, f"Expected at least 30ms delay, got {elapsed:.3f}s"
+
+    def test_sleep_with_action_before_and_after(self):
+        """Test @sleep between two actions."""
+        source = """fn delayed_action(input: [], output: [result]):
+    before = @get_time()
+    @sleep(duration=0.05)
+    after = @get_time()
+    result = after - before
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        runner = DAGRunner(dag, action_handlers={"get_time": lambda: time.time()})
+
+        outputs = runner.run("delayed_action", {})
+        elapsed = outputs.get("result")
+
+        # The time difference should be at least 50ms
+        assert elapsed >= 0.05, f"Expected at least 50ms between actions, got {elapsed:.3f}s"
+
+    def test_sleep_in_sequence(self):
+        """Test multiple sleeps in sequence."""
+        source = """fn multi_sleep(input: [], output: [result]):
+    @sleep(duration=0.02)
+    @sleep(duration=0.02)
+    result = "done"
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+        runner = DAGRunner(dag)
+
+        start = time.time()
+        outputs = runner.run("multi_sleep", {})
+        elapsed = time.time() - start
+
+        assert outputs.get("result") == "done"
+        # Should take at least 40ms (two 20ms sleeps)
+        assert elapsed >= 0.04, f"Expected at least 40ms delay, got {elapsed:.3f}s"
+
+    def test_threaded_sleep(self):
+        """Test @sleep with threaded runner."""
+        source = """fn delayed(input: [], output: [result]):
+    @sleep(duration=0.05)
+    result = "done"
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+        db = InMemoryDB()
+        runner = ThreadedDAGRunner(dag, db=db, num_workers=2)
+
+        start = time.time()
+        outputs = runner.run("delayed", {})
+        elapsed = time.time() - start
+
+        assert outputs.get("result") == "done"
+        assert elapsed >= 0.05, f"Expected at least 50ms delay, got {elapsed:.3f}s"
+
+    def test_sleep_preserves_scope(self):
+        """Test that @sleep preserves variable scope."""
+        source = """fn preserve_scope(input: [x], output: [result]):
+    y = x * 2
+    @sleep(duration=0.02)
+    result = y + 1
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+        runner = DAGRunner(dag)
+
+        outputs = runner.run("preserve_scope", {"x": 5})
+        # y = 5 * 2 = 10, result = 10 + 1 = 11
+        assert outputs.get("result") == 11
+
+
+class TestDAGRunnerParallel:
+    """Tests for parallel block execution."""
+
+    def test_parallel_actions(self):
+        """Test parallel execution of multiple actions."""
+        source = """fn multi_action(input: [], output: [results]):
+    results = parallel:
+        @action_a()
+        @action_b()
+        @action_c()
+    return results"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        def mock_a():
+            return "result_a"
+
+        def mock_b():
+            return "result_b"
+
+        def mock_c():
+            return "result_c"
+
+        runner = DAGRunner(
+            dag,
+            action_handlers={
+                "action_a": mock_a,
+                "action_b": mock_b,
+                "action_c": mock_c,
+            },
+        )
+
+        outputs = runner.run("multi_action", {})
+        results = outputs.get("results")
+        # Results should be in order of calls
+        assert results == ["result_a", "result_b", "result_c"]
+
+    def test_parallel_with_kwargs(self):
+        """Test parallel actions with different kwargs."""
+        source = """fn parallel_fetch(input: [], output: [results]):
+    results = parallel:
+        @fetch(id=1)
+        @fetch(id=2)
+        @fetch(id=3)
+    return results"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        def mock_fetch(id):
+            return f"data_{id}"
+
+        runner = DAGRunner(dag, action_handlers={"fetch": mock_fetch})
+
+        outputs = runner.run("parallel_fetch", {})
+        results = outputs.get("results")
+        assert results == ["data_1", "data_2", "data_3"]
+
+    def test_parallel_without_assignment(self):
+        """Test parallel block without capturing results."""
+        source = """fn side_effects(input: [], output: [done]):
+    parallel:
+        @log(msg="a")
+        @log(msg="b")
+    done = true
+    return done"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        logged = []
+
+        def mock_log(msg):
+            logged.append(msg)
+            return None
+
+        runner = DAGRunner(dag, action_handlers={"log": mock_log})
+
+        outputs = runner.run("side_effects", {})
+        assert outputs.get("done") is True
+        assert set(logged) == {"a", "b"}
+
+    def test_parallel_preserves_order(self):
+        """Test that parallel results are ordered correctly."""
+        source = """fn ordered(input: [], output: [results]):
+    results = parallel:
+        @slow()
+        @fast()
+        @medium()
+    return results"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        execution_order = []
+
+        def slow():
+            time.sleep(0.03)
+            execution_order.append("slow")
+            return "slow_result"
+
+        def fast():
+            execution_order.append("fast")
+            return "fast_result"
+
+        def medium():
+            time.sleep(0.01)
+            execution_order.append("medium")
+            return "medium_result"
+
+        runner = DAGRunner(
+            dag,
+            action_handlers={"slow": slow, "fast": fast, "medium": medium},
+        )
+
+        outputs = runner.run("ordered", {})
+        results = outputs.get("results")
+
+        # Results should be in declaration order, not execution order
+        assert results == ["slow_result", "fast_result", "medium_result"]
+
+    def test_parallel_with_scope_variables(self):
+        """Test parallel actions can access scope variables."""
+        source = """fn use_scope(input: [multiplier], output: [results]):
+    results = parallel:
+        @compute(x=1, m=multiplier)
+        @compute(x=2, m=multiplier)
+    return results"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        def mock_compute(x, m):
+            return x * m
+
+        runner = DAGRunner(dag, action_handlers={"compute": mock_compute})
+
+        outputs = runner.run("use_scope", {"multiplier": 10})
+        results = outputs.get("results")
+        assert results == [10, 20]
+
+    def test_parallel_with_function_calls(self):
+        """Test parallel block with function calls."""
+        source = """fn helper(input: [x], output: [result]):
+    result = x * 2
+    return result
+
+fn use_parallel_funcs(input: [], output: [results]):
+    results = parallel:
+        @action_a()
+        @action_b()
+    return results"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        runner = DAGRunner(
+            dag,
+            action_handlers={
+                "action_a": lambda: "a",
+                "action_b": lambda: "b",
+            },
+        )
+
+        outputs = runner.run("use_parallel_funcs", {})
+        results = outputs.get("results")
+        assert results == ["a", "b"]
+
+    def test_threaded_parallel(self):
+        """Test parallel block with threaded runner."""
+        source = """fn threaded_parallel(input: [], output: [results]):
+    results = parallel:
+        @slow_action()
+        @fast_action()
+    return results"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+        db = InMemoryDB()
+
+        def slow_action():
+            time.sleep(0.02)
+            return "slow"
+
+        def fast_action():
+            return "fast"
+
+        runner = ThreadedDAGRunner(
+            dag,
+            action_handlers={
+                "slow_action": slow_action,
+                "fast_action": fast_action,
+            },
+            db=db,
+            num_workers=2,
+        )
+
+        outputs = runner.run("threaded_parallel", {})
+        results = outputs.get("results")
+        assert results == ["slow", "fast"]

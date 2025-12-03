@@ -48,6 +48,8 @@ from .ir import (
     RappelForLoop,
     RappelIfStatement,
     RappelSpreadAction,
+    RappelTryExcept,
+    RappelExceptHandler,
     RappelStatement,
     # Program
     RappelProgram,
@@ -126,6 +128,8 @@ __all__ = [
     "RappelForLoop",
     "RappelIfStatement",
     "RappelSpreadAction",
+    "RappelTryExcept",
+    "RappelExceptHandler",
     "RappelStatement",
     "RappelProgram",
     # Lexer

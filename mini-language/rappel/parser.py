@@ -38,6 +38,9 @@ from .ir import (
     RappelForLoop,
     RappelIfStatement,
     RappelSpreadAction,
+    RappelTryExcept,
+    RappelExceptHandler,
+    RappelParallelBlock,
     RappelStatement,
     RappelProgram,
 )
@@ -108,6 +111,12 @@ class RappelParser:
 
         if self._check(TokenType.IF):
             return self._parse_if_statement()
+
+        if self._check(TokenType.TRY):
+            return self._parse_try_except()
+
+        if self._check(TokenType.PARALLEL):
+            return self._parse_parallel_block()
 
         if self._check(TokenType.RETURN):
             return self._parse_return()
@@ -295,6 +304,191 @@ class RappelParser:
             location=loc,
         )
 
+    def _parse_try_except(self) -> RappelTryExcept:
+        """
+        Parse a try/except block.
+
+        Syntax:
+            try:
+                result = @risky_action(...)
+            except ErrorType:
+                result = @fallback_action(...)
+            except:
+                result = @default_handler(...)
+
+        Each block (try and except) should be isolated execution units
+        containing action calls.
+        """
+        loc = self._location()
+        self._consume(TokenType.TRY, "Expected 'try'")
+        self._consume(TokenType.COLON, "Expected ':' after 'try'")
+        self._consume_newline()
+
+        # Parse try body
+        try_body = self._parse_block()
+
+        # Parse except handlers (at least one required)
+        handlers = []
+        while self._check(TokenType.EXCEPT):
+            handler = self._parse_except_handler()
+            handlers.append(handler)
+
+        if not handlers:
+            raise RappelSyntaxError(
+                "try block must have at least one except handler",
+                loc
+            )
+
+        return RappelTryExcept(
+            try_body=tuple(try_body),
+            handlers=tuple(handlers),
+            location=loc,
+        )
+
+    def _parse_except_handler(self) -> RappelExceptHandler:
+        """
+        Parse a single except handler.
+
+        Syntax:
+            except ErrorType:
+                body
+            except (ErrorType1, ErrorType2):
+                body
+            except:
+                body  # catch-all
+        """
+        loc = self._location()
+        self._consume(TokenType.EXCEPT, "Expected 'except'")
+
+        # Parse exception types (optional)
+        exception_types: list[str] = []
+
+        if not self._check(TokenType.COLON):
+            # Check for parenthesized list of exception types
+            if self._check(TokenType.LPAREN):
+                self._advance()
+                while not self._check(TokenType.RPAREN):
+                    exc_type = self._consume(
+                        TokenType.IDENTIFIER,
+                        "Expected exception type name"
+                    ).value
+                    exception_types.append(exc_type)
+                    if self._check(TokenType.COMMA):
+                        self._advance()
+                self._consume(TokenType.RPAREN, "Expected ')'")
+            else:
+                # Single exception type
+                exc_type = self._consume(
+                    TokenType.IDENTIFIER,
+                    "Expected exception type name or ':'"
+                ).value
+                exception_types.append(exc_type)
+
+        self._consume(TokenType.COLON, "Expected ':' after except clause")
+        self._consume_newline()
+
+        # Parse handler body
+        body = self._parse_block()
+
+        return RappelExceptHandler(
+            exception_types=tuple(exception_types),
+            body=tuple(body),
+            location=loc,
+        )
+
+    def _parse_parallel_block(self, target: str | None = None) -> RappelParallelBlock:
+        """
+        Parse a parallel execution block.
+
+        Syntax:
+            parallel:
+                @action_a()
+                @action_b()
+                func_c()
+
+        Or with assignment:
+            results = parallel:
+                @action_a()
+                @action_b()
+
+        Each statement in the block must be an expression statement
+        containing either an action call (@action) or function call.
+        """
+        loc = self._location()
+        self._consume(TokenType.PARALLEL, "Expected 'parallel'")
+        self._consume(TokenType.COLON, "Expected ':' after 'parallel'")
+        self._consume_newline()
+
+        # Parse the block of parallel calls
+        self._consume(TokenType.INDENT, "Expected indented block after 'parallel:'")
+
+        calls: list[RappelExpr] = []
+
+        while not self._check(TokenType.DEDENT) and not self._is_at_end():
+            # Skip newlines
+            while self._check(TokenType.NEWLINE):
+                self._advance()
+                if self._check(TokenType.DEDENT) or self._is_at_end():
+                    break
+
+            if self._check(TokenType.DEDENT) or self._is_at_end():
+                break
+
+            # Each line should be an action call or function call
+            call_loc = self._location()
+
+            if self._check(TokenType.AT):
+                # Action call: @action_name(kwargs)
+                self._advance()
+                action_name = self._consume(
+                    TokenType.IDENTIFIER, "Expected action name after '@'"
+                ).value
+                self._consume(TokenType.LPAREN, "Expected '(' after action name")
+                kwargs = self._parse_kwargs_only()
+                self._consume(TokenType.RPAREN, "Expected ')'")
+                call = RappelActionCall(
+                    action_name=action_name,
+                    kwargs=tuple(kwargs),
+                    location=call_loc,
+                )
+                calls.append(call)
+            elif self._check(TokenType.IDENTIFIER):
+                # Function call: func_name(kwargs)
+                func_name = self._advance().value
+                self._consume(TokenType.LPAREN, "Expected '(' after function name")
+                kwargs = self._parse_kwargs_only()
+                self._consume(TokenType.RPAREN, "Expected ')'")
+                call = RappelCall(
+                    target=func_name,
+                    kwargs=tuple(kwargs),
+                    location=call_loc,
+                )
+                calls.append(call)
+            else:
+                raise RappelSyntaxError(
+                    "parallel block must contain action calls (@action) or function calls",
+                    call_loc
+                )
+
+            # Consume newline after each call
+            if self._check(TokenType.NEWLINE):
+                self._advance()
+
+        if self._check(TokenType.DEDENT):
+            self._advance()
+
+        if not calls:
+            raise RappelSyntaxError(
+                "parallel block must contain at least one call",
+                loc
+            )
+
+        return RappelParallelBlock(
+            calls=tuple(calls),
+            target=target,
+            location=loc,
+        )
+
     def _parse_return(self) -> RappelReturn:
         """Parse a return statement."""
         loc = self._location()
@@ -344,6 +538,15 @@ class RappelParser:
                             f"got {len(targets)} at line {self._peek().line}"
                         )
                     return self._parse_spread_action(target=targets[0])
+
+                # Check if RHS is a parallel block: target = parallel: ...
+                if self._check(TokenType.PARALLEL):
+                    if len(targets) > 1:
+                        raise SyntaxError(
+                            f"Parallel assignment can only have one target, "
+                            f"got {len(targets)} at line {self._peek().line}"
+                        )
+                    return self._parse_parallel_block(target=targets[0])
 
                 value = self._parse_expression()
 

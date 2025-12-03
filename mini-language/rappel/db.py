@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from typing import Any, Generic, TypeVar
+from typing import Any, Callable, Generic, TypeVar
 
 T = TypeVar("T")
 
@@ -182,6 +182,37 @@ class Table(Generic[T]):
         self._db._stats.increment_deletes()
 
         return (row_id, data)
+
+    def pop_first_ready_and_delete(
+        self, is_ready: "Callable[[T], bool]"
+    ) -> tuple[str, T] | None:
+        """
+        Atomically pop and delete the first row that passes the filter.
+
+        Simulates: SELECT ... WHERE <condition> FOR UPDATE SKIP LOCKED + DELETE.
+        Used for durable sleep - only pop actions where scheduled_at <= now.
+
+        Args:
+            is_ready: Function that returns True if the row is ready to process
+        """
+        self._db._stats.increment_queries()
+        # Get all rows in order (simulates scanning for ready work)
+        results = self._db._execute(
+            f"SELECT id, data FROM {self.name} ORDER BY rowid"
+        ).fetchall()
+
+        for row in results:
+            row_id, data = row[0], json.loads(row[1])
+            if is_ready(data):
+                # Delete it
+                self._db._execute(
+                    f"DELETE FROM {self.name} WHERE id = ?",
+                    (row_id,),
+                )
+                self._db._stats.increment_deletes()
+                return (row_id, data)
+
+        return None
 
     def peek_first(self) -> tuple[str, T] | None:
         """

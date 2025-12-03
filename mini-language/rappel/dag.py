@@ -38,6 +38,9 @@ from .ir import (
     RappelForLoop,
     RappelIfStatement,
     RappelSpreadAction,
+    RappelTryExcept,
+    RappelExceptHandler,
+    RappelParallelBlock,
     RappelStatement,
     RappelProgram,
 )
@@ -597,6 +600,10 @@ class DAGConverter:
             return self._convert_expr_statement(stmt)
         elif isinstance(stmt, RappelSpreadAction):
             return self._convert_spread_action(stmt)
+        elif isinstance(stmt, RappelTryExcept):
+            return self._convert_try_except(stmt)
+        elif isinstance(stmt, RappelParallelBlock):
+            return self._convert_parallel_block(stmt)
         else:
             return []
 
@@ -889,6 +896,126 @@ class DAGConverter:
 
         return result_nodes
 
+    def _convert_try_except(self, stmt: RappelTryExcept) -> list[str]:
+        """
+        Convert a try/except block.
+
+        Creates:
+        - Try node (entry point)
+        - Try body nodes
+        - Exception edges to each handler
+        - Handler body nodes
+        - Join node (merge point)
+
+        Structure:
+            try_node -> try_body -> (success) -> join
+                     -> (exception: Type1) -> handler1_body -> join
+                     -> (exception: Type2) -> handler2_body -> join
+                     -> (exception: *) -> catch_all_body -> join
+        """
+        result_nodes = []
+
+        # Create try entry node
+        try_id = self._next_id("try")
+        try_node = DAGNode(
+            id=try_id,
+            node_type="try",
+            ir_node=stmt,
+            label="try",
+            function_name=self.current_function
+        )
+        self.dag.add_node(try_node)
+        result_nodes.append(try_id)
+
+        # Convert try body
+        try_body_last: str | None = None
+        prev_id = try_id
+        for body_stmt in stmt.try_body:
+            node_ids = self._convert_statement(body_stmt)
+            if node_ids:
+                self.dag.add_edge(DAGEdge(
+                    source=prev_id,
+                    target=node_ids[0],
+                    edge_type=EdgeType.STATE_MACHINE,
+                    condition="try" if prev_id == try_id else None
+                ))
+                prev_id = node_ids[-1]
+                result_nodes.extend(node_ids)
+        try_body_last = prev_id if prev_id != try_id else None
+
+        # Convert each except handler
+        handler_lasts: list[str] = []
+        for handler in stmt.handlers:
+            # Create handler entry node
+            exc_types_str = ", ".join(handler.exception_types) if handler.exception_types else "*"
+            handler_id = self._next_id("except")
+            handler_node = DAGNode(
+                id=handler_id,
+                node_type="except",
+                ir_node=handler,
+                label=f"except {exc_types_str}",
+                function_name=self.current_function
+            )
+            self.dag.add_node(handler_node)
+            result_nodes.append(handler_id)
+
+            # Edge from try node to handler (exception edge)
+            self.dag.add_edge(DAGEdge(
+                source=try_id,
+                target=handler_id,
+                edge_type=EdgeType.STATE_MACHINE,
+                condition=f"except:{exc_types_str}"
+            ))
+
+            # Convert handler body
+            handler_prev = handler_id
+            for body_stmt in handler.body:
+                node_ids = self._convert_statement(body_stmt)
+                if node_ids:
+                    self.dag.add_edge(DAGEdge(
+                        source=handler_prev,
+                        target=node_ids[0],
+                        edge_type=EdgeType.STATE_MACHINE
+                    ))
+                    handler_prev = node_ids[-1]
+                    result_nodes.extend(node_ids)
+
+            if handler_prev != handler_id:
+                handler_lasts.append(handler_prev)
+            else:
+                handler_lasts.append(handler_id)
+
+        # Create join node
+        join_id = self._next_id("try_join")
+        join_node = DAGNode(
+            id=join_id,
+            node_type="try_join",
+            ir_node=None,
+            label="try_join",
+            function_name=self.current_function
+        )
+        self.dag.add_node(join_node)
+        result_nodes.append(join_id)
+
+        # Connect try body success path to join
+        if try_body_last:
+            self.dag.add_edge(DAGEdge(
+                source=try_body_last,
+                target=join_id,
+                edge_type=EdgeType.STATE_MACHINE,
+                condition="success"
+            ))
+
+        # Connect all handler exits to join
+        for handler_last in handler_lasts:
+            self.dag.add_edge(DAGEdge(
+                source=handler_last,
+                target=join_id,
+                edge_type=EdgeType.STATE_MACHINE
+            ))
+
+        return result_nodes
+
     def _convert_python_block(self, stmt: RappelPythonBlock) -> list[str]:
         """Convert a python block."""
         node_id = self._next_id("python")
@@ -994,6 +1121,107 @@ class DAGConverter:
             self._track_var_definition(stmt.target, agg_id)
 
         return [action_id, agg_id]
+
+    def _convert_parallel_block(self, stmt: RappelParallelBlock) -> list[str]:
+        """
+        Convert a parallel block to fan-out nodes + aggregator.
+
+        parallel:
+            @action_a()
+            @action_b()
+            func_c()
+
+        Creates:
+        1. Parallel entry node (fan-out point)
+        2. One node per call (action or fn_call)
+        3. Aggregator node (collects results in order)
+
+        Structure:
+            parallel_node -> call_0 (index=0) -> aggregator
+                          -> call_1 (index=1) -> aggregator
+                          -> call_2 (index=2) -> aggregator
+        """
+        result_nodes = []
+
+        # Create parallel entry node
+        parallel_id = self._next_id("parallel")
+        parallel_node = DAGNode(
+            id=parallel_id,
+            node_type="parallel",
+            ir_node=stmt,
+            label="parallel",
+            function_name=self.current_function
+        )
+        self.dag.add_node(parallel_node)
+        result_nodes.append(parallel_id)
+
+        # Create a node for each call
+        call_node_ids = []
+        for i, call in enumerate(stmt.calls):
+            if isinstance(call, RappelActionCall):
+                call_id = self._next_id("parallel_action")
+                call_node = DAGNode(
+                    id=call_id,
+                    node_type="action_call",
+                    ir_node=call,
+                    label=f"@{call.action_name}() [{i}]",
+                    function_name=self.current_function
+                )
+            elif isinstance(call, RappelCall):
+                call_id = self._next_id("parallel_fn_call")
+                call_node = DAGNode(
+                    id=call_id,
+                    node_type="fn_call",
+                    ir_node=call,
+                    label=f"{call.target}() [{i}]",
+                    function_name=self.current_function,
+                    is_fn_call=True,
+                    called_function=call.target
+                )
+            else:
+                # Shouldn't happen if parser is correct
+                continue
+
+            self.dag.add_node(call_node)
+            call_node_ids.append(call_id)
+            result_nodes.append(call_id)
+
+            # Edge from parallel node to each call with index condition
+            self.dag.add_edge(DAGEdge(
+                source=parallel_id,
+                target=call_id,
+                edge_type=EdgeType.STATE_MACHINE,
+                condition=f"parallel:{i}"
+            ))
+
+        # Create aggregator node
+        agg_id = self._next_id("parallel_aggregator")
+        target_label = f" -> {stmt.target}" if stmt.target else ""
+        agg_node = DAGNode(
+            id=agg_id,
+            node_type="aggregator",
+            ir_node=None,
+            label=f"parallel_aggregate{target_label}",
+            function_name=self.current_function,
+            is_aggregator=True,
+            aggregates_from=parallel_id
+        )
+        self.dag.add_node(agg_node)
+        result_nodes.append(agg_id)
+
+        # Connect all call nodes to aggregator
+        for call_id in call_node_ids:
+            self.dag.add_edge(DAGEdge(
+                source=call_id,
+                target=agg_id,
+                edge_type=EdgeType.STATE_MACHINE
+            ))
+
+        # Track variable definition at aggregator (if target is specified)
+        if stmt.target:
+            self._track_var_definition(stmt.target, agg_id)
+
+        return result_nodes
 
     def _track_var_definition(self, var_name: str, node_id: str) -> None:
         """Track that a variable is defined/modified at a node."""
@@ -1155,6 +1383,10 @@ class DAGConverter:
                 self._collect_used_vars(arg, used)
             # Remove the item_var since it's defined by the spread, not used
             used.discard(node.item_var)
+        elif isinstance(node, RappelParallelBlock):
+            # Collect vars from all calls in the parallel block
+            for call in node.calls:
+                self._collect_used_vars(call, used)
 
     def _contains_spread_action(self, expr: RappelExpr) -> bool:
         """Check if expression contains a spread with an action."""

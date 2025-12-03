@@ -37,6 +37,9 @@ from .ir import (
     RappelForLoop,
     RappelIfStatement,
     RappelSpreadAction,
+    RappelTryExcept,
+    RappelExceptHandler,
+    RappelParallelBlock,
     RappelString,
     RappelNumber,
     RappelBoolean,
@@ -75,6 +78,11 @@ class RunnableAction:
     # For spread actions - tracks which iteration this is
     spread_index: int | None = None
     spread_item: Any = None
+    # For parallel blocks - tracks which call index this is
+    parallel_index: int | None = None
+    # For durable sleep - Unix timestamp when action should be executed
+    # If None or in the past, action is ready immediately
+    scheduled_at: float | None = None
 
 
 @dataclass
@@ -132,19 +140,30 @@ class ActionQueue:
             "status": action.status.value,
             "spread_index": action.spread_index,
             "spread_item": action.spread_item,
+            "parallel_index": action.parallel_index,
+            "scheduled_at": action.scheduled_at,
         }
         self._table.insert(action.id, action_dict)
 
     def pop(self) -> RunnableAction | None:
         """
-        Remove and return the next action (thread-safe, atomic).
+        Remove and return the next ready action (thread-safe, atomic).
 
-        Simulates: SELECT * FROM action_queue ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED
+        Simulates: SELECT * FROM action_queue
+                   WHERE scheduled_at IS NULL OR scheduled_at <= NOW()
+                   ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED
         followed by: DELETE FROM action_queue WHERE id = ?
 
-        Uses atomic pop_first_and_delete to prevent race conditions between workers.
+        Uses atomic pop_first_ready_and_delete to prevent race conditions between workers.
+        Actions with scheduled_at in the future are skipped (durable sleep).
         """
-        result = self._table.pop_first_and_delete()
+        current_time = time.time()
+
+        def is_ready(action_dict: dict) -> bool:
+            scheduled_at = action_dict.get("scheduled_at")
+            return scheduled_at is None or scheduled_at <= current_time
+
+        result = self._table.pop_first_ready_and_delete(is_ready)
         if result is None:
             return None
 
@@ -168,6 +187,37 @@ class ActionQueue:
         """Check if the queue is empty."""
         return self._table.count() == 0
 
+    def has_scheduled_actions(self) -> bool:
+        """
+        Check if there are any actions scheduled for the future.
+
+        Returns True if there are actions waiting for their scheduled time.
+        This is used to determine if the runner should keep polling.
+        """
+        current_time = time.time()
+        all_actions = self._table.all()
+        for action_dict in all_actions.values():
+            scheduled_at = action_dict.get("scheduled_at")
+            if scheduled_at is not None and scheduled_at > current_time:
+                return True
+        return False
+
+    def get_next_scheduled_time(self) -> float | None:
+        """
+        Get the earliest scheduled time of any pending action.
+
+        Returns None if no actions are scheduled for the future.
+        """
+        current_time = time.time()
+        earliest = None
+        all_actions = self._table.all()
+        for action_dict in all_actions.values():
+            scheduled_at = action_dict.get("scheduled_at")
+            if scheduled_at is not None and scheduled_at > current_time:
+                if earliest is None or scheduled_at < earliest:
+                    earliest = scheduled_at
+        return earliest
+
     def size(self) -> int:
         """Return the number of actions in the queue."""
         return self._table.count()
@@ -189,6 +239,8 @@ class ActionQueue:
             status=ActionStatus(d["status"]),
             spread_index=d["spread_index"],
             spread_item=d["spread_item"],
+            parallel_index=d.get("parallel_index"),
+            scheduled_at=d.get("scheduled_at"),
         )
 
 
@@ -372,10 +424,21 @@ class DAGRunner:
         self._execute_inline_batch(input_node.id)
 
         # Main execution loop - only processes delegated actions now
-        while not self.queue.is_empty():
+        # Handles both immediate and scheduled (durable sleep) actions
+        while True:
             action = self.queue.pop()
+
             if action is None:
-                break
+                # No ready actions - check if there are scheduled ones
+                next_time = self.queue.get_next_scheduled_time()
+                if next_time is None:
+                    # No more actions at all
+                    break
+                # Wait until the next scheduled action is ready
+                wait_time = next_time - time.time()
+                if wait_time > 0:
+                    time.sleep(wait_time)
+                continue
 
             # Execute the delegated action
             self._execute_action(action)
@@ -443,12 +506,19 @@ class DAGRunner:
                 #   4. Write results back to node_data
                 #   5. DELETE from action_queue
                 # --------------------------------------------------------------
+
+                # Check for @sleep - set scheduled_at for durable sleep
+                # Read from inbox to get the full scope (including inputs)
+                inbox_scope = self._read_inbox(node_id)
+                scheduled_at = self._get_scheduled_at(node, inbox_scope)
+
                 action = RunnableAction(
                     id=self.queue.next_id(),
                     node_id=node_id,
                     function_name=node.function_name,
                     action_type=ActionType.DELEGATED,
                     input_data=node_data.variable_values.copy(),
+                    scheduled_at=scheduled_at,
                 )
                 self.queue.add(action)
                 # Don't continue past delegated actions - they'll trigger
@@ -491,11 +561,38 @@ class DAGRunner:
             return []
 
         ready = []
+        node_data = self._get_node_data(node_id)
+
+        # Check if this node has an exception (is in a try block and failed)
+        if node_data.variable_values.get("_exception"):
+            # Find the parent try node by looking for incoming "try" edge
+            return self._route_to_except_handler(node_id, node_data)
+
+        # Handle try/except - only follow "try" edge, not "except" edges
+        # Except edges are only followed when an exception occurs (handled above)
+        if node.ir_node and isinstance(node.ir_node, RappelTryExcept):
+            for edge in self.dag.get_outgoing_edges(node_id):
+                if edge.edge_type != EdgeType.STATE_MACHINE:
+                    continue
+                # Only follow the "try" edge, not "except:*" edges
+                if edge.condition and edge.condition.startswith("except:"):
+                    continue
+                target_node = self.dag.nodes.get(edge.target)
+                if target_node:
+                    target_data = self._get_node_data(edge.target)
+                    if not target_data.completed:
+                        ready.append(edge.target)
+            return ready
+
+        # Handle parallel blocks - the call nodes are already queued by _handle_parallel_block
+        # Don't return them as successors to avoid double-queuing
+        if node.ir_node and isinstance(node.ir_node, RappelParallelBlock):
+            # Parallel blocks queue their own actions, no successors to return here
+            return []
 
         # Handle conditional branching (read condition from node_data)
         if node.ir_node and isinstance(node.ir_node, RappelIfStatement):
             # Read condition result from node's variable_values (stored there after execution)
-            node_data = self._get_node_data(node_id)
             condition_result = node_data.variable_values.get("_condition", True)
 
             for edge in self.dag.get_outgoing_edges(node_id):
@@ -518,29 +615,77 @@ class DAGRunner:
                             if target_data.pending_inputs > 0 and len(inbox_results) < target_data.pending_inputs:
                                 continue
                         ready.append(edge.target)
-        else:
-            # Normal node - follow all state machine edges
-            for edge in self.dag.get_outgoing_edges(node_id):
-                if edge.edge_type != EdgeType.STATE_MACHINE:
+            return ready
+
+        # Normal node - follow all state machine edges
+        for edge in self.dag.get_outgoing_edges(node_id):
+            if edge.edge_type != EdgeType.STATE_MACHINE:
+                continue
+
+            target_node = self.dag.nodes.get(edge.target)
+            if target_node is None:
+                continue
+
+            target_data = self._get_node_data(edge.target)
+            if target_data.completed:
+                continue
+
+            # Check if aggregator is ready (from inbox)
+            if target_node.is_aggregator:
+                inbox_results = self._read_inbox_for_aggregator(edge.target)
+                if target_data.pending_inputs > 0 and len(inbox_results) < target_data.pending_inputs:
                     continue
 
-                target_node = self.dag.nodes.get(edge.target)
-                if target_node is None:
-                    continue
-
-                target_data = self._get_node_data(edge.target)
-                if target_data.completed:
-                    continue
-
-                # Check if aggregator is ready (from inbox)
-                if target_node.is_aggregator:
-                    inbox_results = self._read_inbox_for_aggregator(edge.target)
-                    if target_data.pending_inputs > 0 and len(inbox_results) < target_data.pending_inputs:
-                        continue
-
-                ready.append(edge.target)
+            ready.append(edge.target)
 
         return ready
+
+    def _route_to_except_handler(self, node_id: str, node_data: RunnableActionData) -> list[str]:
+        """
+        Route from a failed try-block node to the matching except handler.
+
+        Finds the parent try node and returns the appropriate except handler
+        based on the exception type.
+        """
+        exception_type = node_data.variable_values.get("_exception_type", "Exception")
+
+        # Find the parent try node by looking for incoming edge with "try" condition
+        try_node_id = None
+        for edge in self.dag.edges:
+            if edge.target == node_id and edge.condition == "try":
+                try_node_id = edge.source
+                break
+
+        if try_node_id is None:
+            # No try node found - this shouldn't happen
+            return []
+
+        # Get all except handlers from the try node
+        except_handlers = []
+        catch_all_handler = None
+
+        for edge in self.dag.get_outgoing_edges(try_node_id):
+            if edge.condition and edge.condition.startswith("except:"):
+                handler_types = edge.condition[7:]  # Remove "except:" prefix
+                if handler_types == "*":
+                    catch_all_handler = edge.target
+                else:
+                    except_handlers.append((handler_types.split(", "), edge.target))
+
+        # Find matching handler
+        for types, handler_id in except_handlers:
+            if exception_type in types:
+                handler_data = self._get_node_data(handler_id)
+                if not handler_data.completed:
+                    return [handler_id]
+
+        # Fall back to catch-all handler
+        if catch_all_handler:
+            handler_data = self._get_node_data(catch_all_handler)
+            if not handler_data.completed:
+                return [catch_all_handler]
+
+        return []
 
     def _reset_function_state(self, function_name: str) -> None:
         """Reset state for all nodes in a function (DB writes)."""
@@ -588,16 +733,18 @@ class DAGRunner:
 
             action.status = ActionStatus.COMPLETED
 
-            # Store result in DB (use spread_index for spread items to avoid overwrite)
-            if action.spread_index is not None:
-                result_key = f"{node.id}::{action.spread_index}"
+            # Store result in DB (use spread_index/parallel_index for parallel items to avoid overwrite)
+            # Use whichever index is set (spread or parallel)
+            item_index = action.spread_index if action.spread_index is not None else action.parallel_index
+            if item_index is not None:
+                result_key = f"{node.id}::{item_index}"
             else:
                 result_key = node.id
             self._set_result(result_key, result)
 
             # Mark node as completed (single write)
-            # Skip for spread items - they don't update the spread node's state
-            if action.spread_index is None:
+            # Skip for spread/parallel items - they don't update the parent node's state
+            if item_index is None:
                 node_data = self._get_node_data(node.id)
                 node_data.completed = True
                 # Store _condition for if statements so _get_ready_successors can read it
@@ -611,8 +758,26 @@ class DAGRunner:
             # Note: Successor handling is done by _execute_inline_batch, not here
 
         except Exception as e:
-            action.status = ActionStatus.FAILED
-            raise RuntimeError(f"Action failed for node {node.id}: {e}") from e
+            # Check if this node is inside a try block (has a "success" outgoing edge)
+            in_try_block = any(
+                edge.condition == "success"
+                for edge in self.dag.get_outgoing_edges(node.id)
+            )
+
+            if in_try_block:
+                # Store exception info and mark as completed (with exception)
+                # This allows _get_ready_successors to route to except handler
+                action.status = ActionStatus.COMPLETED
+                node_data = self._get_node_data(node.id)
+                node_data.completed = True
+                node_data.variable_values["_exception"] = True
+                node_data.variable_values["_exception_type"] = type(e).__name__
+                node_data.variable_values["_exception_message"] = str(e)
+                self._set_node_data(node.id, node_data)
+                # Don't push outputs - exception handler will provide them
+            else:
+                action.status = ActionStatus.FAILED
+                raise RuntimeError(f"Action failed for node {node.id}: {e}") from e
 
     def _handle_inline(self, node: DAGNode, action: RunnableAction, scope: dict[str, Any]) -> Any:
         """
@@ -654,6 +819,15 @@ class DAGRunner:
         elif isinstance(ir_node, RappelIfStatement):
             return self._handle_if_statement(node, ir_node, scope)
 
+        elif isinstance(ir_node, RappelTryExcept):
+            # Try node just passes through - actual exception handling is done
+            # by modifying how we route after action execution
+            return scope
+
+        elif isinstance(ir_node, RappelExceptHandler):
+            # Except handler node just passes through - body is in child nodes
+            return scope
+
         elif isinstance(ir_node, RappelExprStatement):
             self._evaluate_expr(ir_node.expr, scope)
             return scope
@@ -661,11 +835,14 @@ class DAGRunner:
         elif isinstance(ir_node, RappelSpreadAction):
             return self._handle_spread_action(node, ir_node, scope, action)
 
+        elif isinstance(ir_node, RappelParallelBlock):
+            return self._handle_parallel_block(node, ir_node, scope, action)
+
         return scope
 
     def _handle_delegated(self, node: DAGNode, action: RunnableAction, scope: dict[str, Any]) -> Any:
         """
-        Handle delegated execution (@actions).
+        Handle delegated execution (@actions and function calls).
 
         These are pushed to external workers.
         Scope is passed in to avoid redundant DB reads.
@@ -674,6 +851,11 @@ class DAGRunner:
 
         if ir_node is None:
             return scope
+
+        # Handle function calls (from parallel blocks)
+        if isinstance(ir_node, RappelCall):
+            result = self._execute_function_call(ir_node, scope)
+            return {"_result": result}
 
         # Extract the action call
         action_call = None
@@ -689,8 +871,16 @@ class DAGRunner:
         elif isinstance(ir_node, RappelSpreadAction):
             action_call = ir_node.action
             target_var = ir_node.target
+        elif isinstance(ir_node, RappelActionCall):
+            # Direct action call (from parallel blocks)
+            action_call = ir_node
 
         if action_call is None:
+            return scope
+
+        # Handle built-in @sleep action - it's a no-op since the delay
+        # was handled by scheduled_at when the action was queued
+        if action_call.action_name == "sleep":
             return scope
 
         # Evaluate kwargs
@@ -714,7 +904,8 @@ class DAGRunner:
 
         if target_var:
             return {target_var: result}
-        return scope
+        # For parallel actions without assignment, return the result for aggregation
+        return {"_result": result}
 
     def _handle_for_loop(self, node: DAGNode, ir_node: RappelForLoop, scope: dict[str, Any]) -> Any:
         """Handle for loop execution."""
@@ -807,19 +998,95 @@ class DAGRunner:
         # Return empty - results will be collected by aggregator
         return {}
 
+    def _handle_parallel_block(
+        self,
+        node: DAGNode,
+        ir_node: RappelParallelBlock,
+        scope: dict[str, Any],
+        action: RunnableAction
+    ) -> Any:
+        """
+        Handle parallel block - queues multiple actions/calls concurrently.
+
+        parallel:
+            @action_a()
+            @action_b()
+            func_c()
+        """
+        # Find the aggregator node - it's connected to the call nodes, not the parallel node
+        # Look at outgoing edges of call nodes to find the aggregator
+        agg_node_id = None
+        for edge in self.dag.get_outgoing_edges(node.id):
+            if edge.condition and edge.condition.startswith("parallel:"):
+                call_node_id = edge.target
+                # Look for aggregator in call node's successors
+                for call_edge in self.dag.get_outgoing_edges(call_node_id):
+                    target_node = self.dag.nodes.get(call_edge.target)
+                    if target_node and target_node.is_aggregator:
+                        agg_node_id = call_edge.target
+                        break
+                if agg_node_id:
+                    break
+
+        if agg_node_id:
+            # Set up aggregator to expect results from all calls (DB read + write)
+            agg_data = self._get_node_data(agg_node_id)
+            agg_data.pending_inputs = len(ir_node.calls)
+            agg_data.collected_results = []
+            self._set_node_data(agg_node_id, agg_data)
+
+        # Queue each call as a separate action
+        # The DAG already has nodes for each call - find them via edges
+        for edge in self.dag.get_outgoing_edges(node.id):
+            if edge.condition and edge.condition.startswith("parallel:"):
+                # Get the parallel index from the condition
+                parallel_idx = int(edge.condition.split(":")[1])
+                call_node_id = edge.target
+                call_node = self.dag.nodes.get(call_node_id)
+
+                if call_node is None:
+                    continue
+
+                # Determine action type based on call type
+                call_ir = call_node.ir_node
+                if isinstance(call_ir, RappelActionCall):
+                    action_type = ActionType.DELEGATED
+                elif isinstance(call_ir, RappelCall):
+                    # Function calls are inline but still need to go through queue
+                    # for proper ordering
+                    action_type = ActionType.DELEGATED
+                else:
+                    continue
+
+                parallel_action = RunnableAction(
+                    id=self.queue.next_id(),
+                    node_id=call_node_id,
+                    function_name=call_node.function_name,
+                    action_type=action_type,
+                    input_data={
+                        **scope,
+                        "_parallel_index": parallel_idx,
+                    },
+                    parallel_index=parallel_idx,
+                )
+                self.queue.add(parallel_action)
+
+        # Return empty - results will be collected by aggregator
+        return {}
+
     def _handle_aggregator(self, node: DAGNode) -> Any:
-        """Handle aggregator node - collect spread results from INBOX."""
+        """Handle aggregator node - collect spread/parallel results from INBOX."""
         data = self._get_node_data(node.id)
 
-        # Read spread results from inbox (single query)
+        # Read results from inbox (single query)
         collected_results = self._read_inbox_for_aggregator(node.id)
 
-        # Check if all spread results are in
+        # Check if all results are in
         if len(collected_results) < data.pending_inputs:
             # Not ready yet
             return {}
 
-        # Sort by spread index and extract values
+        # Sort by index and extract values
         sorted_results = sorted(collected_results, key=lambda x: x[0])
         values = [r[1] for r in sorted_results]
 
@@ -829,6 +1096,8 @@ class DAGRunner:
 
         if source_node and source_node.ir_node:
             if isinstance(source_node.ir_node, RappelSpreadAction):
+                target_var = source_node.ir_node.target
+            elif isinstance(source_node.ir_node, RappelParallelBlock):
                 target_var = source_node.ir_node.target
 
         if target_var:
@@ -1014,23 +1283,22 @@ class DAGRunner:
             if target_node is None:
                 continue
 
-            # Handle aggregator collection for spread actions
-            if target_node.is_aggregator and action.spread_index is not None:
-                # This is a spread item result - append with spread_index for ordering
-                source_node = self.dag.nodes.get(node_id)
-                if source_node and source_node.ir_node:
-                    if isinstance(source_node.ir_node, RappelSpreadAction):
-                        for var, val in outputs.items():
-                            if var.startswith("_"):
-                                continue
-                            # Append to aggregator's inbox with spread_index
-                            self._append_to_inbox(
-                                target_node_id=edge.target,
-                                variable=f"_spread_{var}",
-                                value=val,
-                                source_node_id=node_id,
-                                spread_index=action.spread_index,
-                            )
+            # Handle aggregator collection for spread/parallel actions
+            item_index = action.spread_index if action.spread_index is not None else action.parallel_index
+            if target_node.is_aggregator and item_index is not None:
+                # This is a spread/parallel item result - append with index for ordering
+                for var, val in outputs.items():
+                    # Skip internal variables EXCEPT _result which holds action results
+                    if var.startswith("_") and var != "_result":
+                        continue
+                    # Append to aggregator's inbox with index
+                    self._append_to_inbox(
+                        target_node_id=edge.target,
+                        variable=f"_aggregate_{var}",
+                        value=val,
+                        source_node_id=node_id,
+                        spread_index=item_index,  # Reuse spread_index field for ordering
+                    )
             else:
                 # Normal data flow - append to target's inbox
                 if edge.edge_type == EdgeType.DATA_FLOW:
@@ -1135,6 +1403,14 @@ class DAGRunner:
         if node.ir_node is None:
             return ActionType.INLINE
 
+        # Direct action calls (from parallel blocks) are delegated
+        if isinstance(node.ir_node, RappelActionCall):
+            return ActionType.DELEGATED
+
+        # Direct function calls (from parallel blocks) are delegated
+        if isinstance(node.ir_node, RappelCall):
+            return ActionType.DELEGATED
+
         # Action calls are always delegated
         if isinstance(node.ir_node, RappelExprStatement):
             if isinstance(node.ir_node.expr, RappelActionCall):
@@ -1149,6 +1425,60 @@ class DAGRunner:
 
         # Everything else is inline
         return ActionType.INLINE
+
+    def _get_scheduled_at(self, node: DAGNode, scope: dict[str, Any]) -> float | None:
+        """
+        Get the scheduled_at time for an action, if applicable.
+
+        Handles @sleep(duration) by returning time.time() + duration.
+        Returns None for all other actions (execute immediately).
+        """
+        if node.ir_node is None:
+            return None
+
+        # Extract action call from various node types
+        action_call = None
+
+        if isinstance(node.ir_node, RappelExprStatement):
+            if isinstance(node.ir_node.expr, RappelActionCall):
+                action_call = node.ir_node.expr
+        elif isinstance(node.ir_node, RappelAssignment):
+            if isinstance(node.ir_node.value, RappelActionCall):
+                action_call = node.ir_node.value
+
+        if action_call is None:
+            return None
+
+        # Check if this is a @sleep action
+        if action_call.action_name == "sleep":
+            # Evaluate the duration argument
+            for name, expr in action_call.kwargs:
+                if name == "duration":
+                    duration = self._evaluate_expr(expr, scope)
+                    return time.time() + duration
+            # If no duration kwarg, check for positional (first arg)
+            if action_call.kwargs:
+                _, first_expr = action_call.kwargs[0]
+                duration = self._evaluate_expr(first_expr, scope)
+                return time.time() + duration
+
+        return None
+
+    def _is_sleep_action(self, node: DAGNode) -> bool:
+        """Check if a node is a @sleep action."""
+        if node.ir_node is None:
+            return False
+
+        action_call = None
+
+        if isinstance(node.ir_node, RappelExprStatement):
+            if isinstance(node.ir_node.expr, RappelActionCall):
+                action_call = node.ir_node.expr
+        elif isinstance(node.ir_node, RappelAssignment):
+            if isinstance(node.ir_node.value, RappelActionCall):
+                action_call = node.ir_node.value
+
+        return action_call is not None and action_call.action_name == "sleep"
 
 
 class ThreadedDAGRunner(DAGRunner):
@@ -1293,8 +1623,17 @@ class ThreadedDAGRunner(DAGRunner):
                 # No work available - check if we should exit
                 if self._check_completion():
                     break
-                # Brief sleep to avoid busy-waiting
-                time.sleep(0.001)
+
+                # Check if there are scheduled actions waiting
+                next_time = self.queue.get_next_scheduled_time()
+                if next_time is not None:
+                    # Wait until the next scheduled action is ready
+                    wait_time = min(next_time - time.time(), 0.1)  # Cap at 100ms
+                    if wait_time > 0:
+                        time.sleep(wait_time)
+                else:
+                    # Brief sleep to avoid busy-waiting
+                    time.sleep(0.001)
                 continue
 
             # Mark ourselves as active
@@ -1331,14 +1670,22 @@ class ThreadedDAGRunner(DAGRunner):
         Check if all work is complete.
 
         Work is complete when:
-        1. The action queue is empty
+        1. The action queue is empty (no ready actions AND no scheduled actions)
         2. No workers are currently processing actions
         """
         with self._active_lock:
-            if self.queue.is_empty() and self._active_workers == 0:
+            # Check if there are any actions at all (ready or scheduled)
+            queue_empty = self.queue.is_empty()
+            has_scheduled = self.queue.has_scheduled_actions() if not queue_empty else False
+
+            if queue_empty and self._active_workers == 0:
                 self._completion_event.set()
                 self._shutdown_event.set()
                 return True
+
+            # If there are only scheduled actions, don't exit yet
+            if not queue_empty and has_scheduled and self._active_workers == 0:
+                return False
         return False
 
     def _wait_for_completion(self, timeout: float = 30.0) -> None:
