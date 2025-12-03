@@ -13,12 +13,29 @@
 //!
 //! - [`lexer`]: Tokenizer for the Rappel IR language with indentation handling
 //! - [`parser`]: Recursive descent parser producing proto-based AST
+//!
+//! ## Database
+//!
+//! - [`db`]: PostgreSQL database layer with distributed queue (SKIP LOCKED)
+//! - [`config`]: Environment-based configuration
 
+pub mod config;
+pub mod db;
 pub mod lexer;
 pub mod messages;
 pub mod parser;
 pub mod server_worker;
 pub mod worker;
+
+// Configuration
+pub use config::Config;
+
+// Database
+pub use db::{
+    ActionId, ActionStatus, BackoffKind, CompletionRecord, Database, DbError, DbResult,
+    InstanceStatus, NewAction, QueuedAction, RetryKind, WorkflowInstance, WorkflowInstanceId,
+    WorkflowVersion, WorkflowVersionId, WorkflowVersionSummary,
+};
 
 // Worker infrastructure
 pub use messages::{MessageError, proto};
