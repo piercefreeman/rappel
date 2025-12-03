@@ -742,4 +742,172 @@ mod tests {
 
         assert_eq!(config.user_modules, vec!["module1", "module2"]);
     }
+
+    #[test]
+    fn test_default_runner_detection() {
+        // Should return uv as fallback if rappel-worker not in PATH
+        let (path, args) = default_runner();
+        // Either rappel-worker was found, or we get uv with args
+        if args.is_empty() {
+            assert!(path.to_string_lossy().contains("rappel-worker"));
+        } else {
+            assert_eq!(path, PathBuf::from("uv"));
+            assert_eq!(args, vec!["run", "python", "-m", "rappel.worker"]);
+        }
+    }
+
+    // Integration tests that require Python workers
+    // Run with: cargo test --features integration
+    // Or manually with: cargo test -- --ignored
+
+    /// Helper to create test kwargs
+    fn make_string_kwarg(key: &str, value: &str) -> proto::WorkflowArgument {
+        proto::WorkflowArgument {
+            key: key.to_string(),
+            value: Some(proto::WorkflowArgumentValue {
+                kind: Some(proto::workflow_argument_value::Kind::Primitive(
+                    proto::PrimitiveWorkflowArgument {
+                        kind: Some(proto::primitive_workflow_argument::Kind::StringValue(
+                            value.to_string(),
+                        )),
+                    },
+                )),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Python environment
+    async fn test_pool_spawn_and_shutdown() {
+        let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
+        let config = PythonWorkerConfig::new();
+
+        let pool = PythonWorkerPool::new(config, 2, Arc::clone(&bridge))
+            .await
+            .expect("create pool");
+
+        assert_eq!(pool.len(), 2);
+        assert!(!pool.is_empty());
+
+        // Verify workers have sequential IDs
+        let workers = pool.workers();
+        assert_eq!(workers[0].worker_id(), 1);
+        assert_eq!(workers[1].worker_id(), 2);
+
+        pool.shutdown().await.expect("shutdown pool");
+        bridge.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Python environment
+    async fn test_pool_round_robin_selection() {
+        let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
+        let config = PythonWorkerConfig::new();
+
+        let pool = PythonWorkerPool::new(config, 3, Arc::clone(&bridge))
+            .await
+            .expect("create pool");
+
+        // Round-robin should cycle through workers
+        let w1 = pool.next_worker();
+        let w2 = pool.next_worker();
+        let w3 = pool.next_worker();
+        let w4 = pool.next_worker(); // Should wrap to first
+
+        assert_eq!(w1.worker_id(), 1);
+        assert_eq!(w2.worker_id(), 2);
+        assert_eq!(w3.worker_id(), 3);
+        assert_eq!(w4.worker_id(), 1); // Wrapped
+
+        pool.shutdown().await.expect("shutdown pool");
+        bridge.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Python environment with test actions
+    async fn test_send_action_roundtrip() {
+        let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
+        let config = PythonWorkerConfig::new()
+            .with_user_module("tests.fixtures.test_actions");
+
+        let pool = PythonWorkerPool::new(config, 1, Arc::clone(&bridge))
+            .await
+            .expect("create pool");
+
+        let dispatch = ActionDispatchPayload {
+            action_id: "test-1".to_string(),
+            instance_id: "instance-1".to_string(),
+            sequence: 0,
+            action_name: "greet".to_string(),
+            module_name: "tests.fixtures.test_actions".to_string(),
+            kwargs: proto::WorkflowArguments {
+                arguments: vec![make_string_kwarg("name", "World")],
+            },
+            timeout_seconds: 30,
+            max_retries: 0,
+            attempt_number: 0,
+            dispatch_token: Uuid::new_v4(),
+        };
+
+        let worker = pool.next_worker();
+        let metrics = worker.send_action(dispatch).await.expect("send action");
+
+        assert!(metrics.success);
+        assert!(metrics.ack_latency.as_micros() > 0);
+        assert!(metrics.round_trip > metrics.ack_latency);
+        assert!(metrics.worker_duration.as_nanos() > 0);
+
+        pool.shutdown().await.expect("shutdown pool");
+        bridge.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Python environment
+    async fn test_multiple_concurrent_actions() {
+        let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
+        let config = PythonWorkerConfig::new()
+            .with_user_module("tests.fixtures.test_actions");
+
+        let pool = Arc::new(
+            PythonWorkerPool::new(config, 2, Arc::clone(&bridge))
+                .await
+                .expect("create pool"),
+        );
+
+        // Spawn multiple concurrent actions
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let pool = Arc::clone(&pool);
+            handles.push(tokio::spawn(async move {
+                let dispatch = ActionDispatchPayload {
+                    action_id: format!("test-{}", i),
+                    instance_id: "instance-1".to_string(),
+                    sequence: i,
+                    action_name: "greet".to_string(),
+                    module_name: "tests.fixtures.test_actions".to_string(),
+                    kwargs: proto::WorkflowArguments {
+                        arguments: vec![make_string_kwarg("name", &format!("User-{}", i))],
+                    },
+                    timeout_seconds: 30,
+                    max_retries: 0,
+                    attempt_number: 0,
+                    dispatch_token: Uuid::new_v4(),
+                };
+
+                let worker = pool.next_worker();
+                worker.send_action(dispatch).await
+            }));
+        }
+
+        // All should succeed
+        for handle in handles {
+            let result = handle.await.expect("task join");
+            let metrics = result.expect("action result");
+            assert!(metrics.success);
+        }
+
+        // Need to get the pool out of the Arc for shutdown
+        // In real code, you'd structure this differently
+        bridge.shutdown().await;
+    }
 }

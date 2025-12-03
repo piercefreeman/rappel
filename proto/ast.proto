@@ -1,0 +1,312 @@
+syntax = "proto3";
+
+package rappel.ast;
+
+// =============================================================================
+// Rappel IR Abstract Syntax Tree
+// =============================================================================
+// This defines the intermediate representation for Rappel workflows.
+// Both Rust (via parser) and Python (via AST walking) produce these structures.
+//
+// Design principles:
+// - Immutable variables (single assignment)
+// - Explicit I/O declarations on functions
+// - First-class actions (@action) as durable execution units
+// - All values JSON-serializable
+
+// -----------------------------------------------------------------------------
+// Top-Level Structure
+// -----------------------------------------------------------------------------
+
+// A complete Rappel program (one or more function definitions)
+message Program {
+  repeated FunctionDef functions = 1;
+}
+
+// Function definition with explicit input/output declarations
+message FunctionDef {
+  string name = 1;
+  IoDecl io = 2;
+  Block body = 3;
+  Span span = 4;
+}
+
+// Input/output declaration: fn foo(input: [a, b], output: [c])
+message IoDecl {
+  repeated string inputs = 1;
+  repeated string outputs = 2;
+  Span span = 3;
+}
+
+// A block of statements (function body, loop body, etc.)
+message Block {
+  repeated Statement statements = 1;
+  Span span = 2;
+}
+
+// -----------------------------------------------------------------------------
+// Statements
+// -----------------------------------------------------------------------------
+
+message Statement {
+  oneof kind {
+    Assignment assignment = 1;
+    ActionCall action_call = 2;
+    SpreadAction spread_action = 3;
+    ParallelBlock parallel_block = 4;
+    ForLoop for_loop = 5;
+    Conditional conditional = 6;
+    TryExcept try_except = 7;
+    ReturnStmt return_stmt = 8;
+    ExprStmt expr_stmt = 9;
+  }
+  Span span = 10;
+}
+
+// Variable assignment: x = expr
+message Assignment {
+  // Single variable or tuple unpacking (a, b = expr)
+  repeated string targets = 1;
+  Expr value = 2;
+}
+
+// Action call: result = @action(kwargs) [retry_policy] [timeout]
+message ActionCall {
+  optional string target = 1;        // Variable to assign result (optional)
+  string action_name = 2;
+  repeated Kwarg kwargs = 3;
+  repeated PolicyBracket policies = 4;
+}
+
+// Spread action: spread items:item -> @action(item=item)
+message SpreadAction {
+  optional string target = 1;        // Variable to collect results
+  Expr collection = 2;               // The collection to iterate
+  string loop_var = 3;               // Variable name for each item
+  ActionCall action = 4;             // The action to call per item
+}
+
+// Parallel block: results = parallel: @a() @b() @c()
+message ParallelBlock {
+  optional string target = 1;        // Variable to collect results
+  repeated Call calls = 2;           // Actions or function calls to run in parallel
+}
+
+// A call that can be either action or function (for parallel blocks)
+message Call {
+  oneof kind {
+    ActionCall action = 1;
+    FunctionCall function = 2;
+  }
+}
+
+// For loop: for i, item in enumerate(items): body
+message ForLoop {
+  repeated string loop_vars = 1;     // Loop variable(s) for unpacking
+  Expr iterable = 2;
+  Block body = 3;
+}
+
+// Conditional: if/elif/else
+message Conditional {
+  IfBranch if_branch = 1;
+  repeated ElifBranch elif_branches = 2;
+  optional ElseBranch else_branch = 3;
+}
+
+message IfBranch {
+  Expr condition = 1;
+  Block body = 2;
+  Span span = 3;
+}
+
+message ElifBranch {
+  Expr condition = 1;
+  Block body = 2;
+  Span span = 3;
+}
+
+message ElseBranch {
+  Block body = 1;
+  Span span = 2;
+}
+
+// Try/except block
+message TryExcept {
+  Block try_body = 1;
+  repeated ExceptHandler handlers = 2;
+}
+
+message ExceptHandler {
+  repeated string exception_types = 1;  // Empty = catch all
+  Block body = 2;
+  Span span = 3;
+}
+
+// Return statement
+message ReturnStmt {
+  optional Expr value = 1;
+}
+
+// Expression as statement
+message ExprStmt {
+  Expr expr = 1;
+}
+
+// -----------------------------------------------------------------------------
+// Expressions
+// -----------------------------------------------------------------------------
+
+message Expr {
+  oneof kind {
+    Literal literal = 1;
+    Variable variable = 2;
+    BinaryOp binary_op = 3;
+    UnaryOp unary_op = 4;
+    ListExpr list = 5;
+    DictExpr dict = 6;
+    IndexAccess index = 7;
+    DotAccess dot = 8;
+    FunctionCall function_call = 9;
+    ActionCall action_call = 10;
+  }
+  Span span = 11;
+}
+
+// Literals: 42, 3.14, "hello", True, False
+message Literal {
+  oneof value {
+    int64 int_value = 1;
+    double float_value = 2;
+    string string_value = 3;
+    bool bool_value = 4;
+    bool is_none = 5;  // true if None
+  }
+}
+
+// Variable reference: foo
+message Variable {
+  string name = 1;
+}
+
+// Binary operation: a + b, x and y, etc.
+message BinaryOp {
+  Expr left = 1;
+  BinaryOperator op = 2;
+  Expr right = 3;
+}
+
+enum BinaryOperator {
+  BINARY_OP_UNSPECIFIED = 0;
+  // Arithmetic
+  BINARY_OP_ADD = 1;
+  BINARY_OP_SUB = 2;
+  BINARY_OP_MUL = 3;
+  BINARY_OP_DIV = 4;
+  BINARY_OP_FLOOR_DIV = 5;
+  BINARY_OP_MOD = 6;
+  // Comparison
+  BINARY_OP_EQ = 10;
+  BINARY_OP_NE = 11;
+  BINARY_OP_LT = 12;
+  BINARY_OP_LE = 13;
+  BINARY_OP_GT = 14;
+  BINARY_OP_GE = 15;
+  BINARY_OP_IN = 16;
+  BINARY_OP_NOT_IN = 17;
+  // Logical
+  BINARY_OP_AND = 20;
+  BINARY_OP_OR = 21;
+}
+
+// Unary operation: -x, not x
+message UnaryOp {
+  UnaryOperator op = 1;
+  Expr operand = 2;
+}
+
+enum UnaryOperator {
+  UNARY_OP_UNSPECIFIED = 0;
+  UNARY_OP_NEG = 1;
+  UNARY_OP_NOT = 2;
+}
+
+// List literal: [1, 2, 3]
+message ListExpr {
+  repeated Expr elements = 1;
+}
+
+// Dict literal: {"a": 1, "b": 2}
+message DictExpr {
+  repeated DictEntry entries = 1;
+}
+
+message DictEntry {
+  Expr key = 1;
+  Expr value = 2;
+}
+
+// Index access: items[0]
+message IndexAccess {
+  Expr object = 1;
+  Expr index = 2;
+}
+
+// Dot access: obj.attr
+message DotAccess {
+  Expr object = 1;
+  string attribute = 2;
+}
+
+// Function call: range(10), len(items)
+message FunctionCall {
+  string name = 1;
+  repeated Kwarg kwargs = 2;
+}
+
+// Keyword argument: name=value
+message Kwarg {
+  string name = 1;
+  Expr value = 2;
+}
+
+// -----------------------------------------------------------------------------
+// Policies (for actions)
+// -----------------------------------------------------------------------------
+
+// Policy bracket on an action call
+message PolicyBracket {
+  oneof kind {
+    RetryPolicy retry = 1;
+    TimeoutPolicy timeout = 2;
+  }
+}
+
+// Retry policy: [ExceptionType -> retry: 3, backoff: 60s]
+message RetryPolicy {
+  repeated string exception_types = 1;  // Empty = catch all
+  uint32 max_retries = 2;
+  Duration backoff = 3;
+}
+
+// Timeout policy: [timeout: 2m]
+message TimeoutPolicy {
+  Duration timeout = 1;
+}
+
+// Duration value (e.g., 30s, 2m, 1h)
+message Duration {
+  uint64 seconds = 1;
+}
+
+// -----------------------------------------------------------------------------
+// Source Location
+// -----------------------------------------------------------------------------
+
+// Source span for error reporting
+message Span {
+  uint32 start_line = 1;
+  uint32 start_col = 2;
+  uint32 end_line = 3;
+  uint32 end_col = 4;
+}
