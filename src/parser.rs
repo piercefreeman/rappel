@@ -82,6 +82,10 @@ impl<'source> Parser<'source> {
         self.current().token.clone()
     }
 
+    fn peek_nth(&self, n: usize) -> Option<&Token> {
+        self.tokens.get(self.pos + n).map(|t| &t.token)
+    }
+
     fn peek_span(&self) -> Span {
         self.current().span
     }
@@ -269,6 +273,85 @@ impl<'source> Parser<'source> {
         })
     }
 
+    /// Parse a single call body (for control flow: try/except, conditionals)
+    /// Can contain EITHER:
+    /// 1. A single call (action or function), optionally with assignment
+    /// 2. Pure data statements (assignments, expressions)
+    ///
+    /// Grammar: INDENT statement+ DEDENT
+    fn parse_single_call_body(&mut self) -> Result<ast::SingleCallBody, ParseError> {
+        let start_span = self.peek_span();
+        self.expect(&Token::Indent)?;
+
+        let mut statements = Vec::new();
+        let mut target: Option<String> = None;
+        let mut call: Option<ast::Call> = None;
+
+        // Parse statements until dedent
+        while !self.check(&Token::Dedent) && !self.at_end() {
+            // Check for action call (with optional assignment)
+            if self.check(&Token::At)
+                || (matches!(self.peek(), Token::Ident(_)) && self.peek_nth(1) == Some(&Token::Eq))
+                    && self.peek_nth(2) == Some(&Token::At)
+            {
+                // Check if this is "target = @action"
+                if matches!(self.peek(), Token::Ident(_)) && self.peek_nth(1) == Some(&Token::Eq) {
+                    let (name, _) = self.expect_ident()?;
+                    self.expect(&Token::Eq)?;
+                    target = Some(name);
+                }
+
+                if self.check(&Token::At) {
+                    let action = self.parse_action_call()?;
+                    call = Some(ast::Call {
+                        kind: Some(ast::call::Kind::Action(action)),
+                    });
+                    continue;
+                }
+            }
+
+            // Check for function call (with optional assignment)
+            // This is complex because identifiers can be many things
+            // For now, just parse as regular statement
+            let stmt = self.parse_statement()?;
+            statements.push(stmt);
+        }
+
+        let end_span = self.peek_span();
+        self.expect(&Token::Dedent)?;
+
+        Ok(ast::SingleCallBody {
+            target,
+            call,
+            statements,
+            span: self.make_span(start_span, end_span),
+        })
+    }
+
+    /// Parse a data body (for for-loops - pure data manipulation, no calls)
+    ///
+    /// Grammar: INDENT statement+ DEDENT
+    /// Constraint: statements must not contain action_call or function_call
+    fn parse_data_body(&mut self) -> Result<ast::DataBody, ParseError> {
+        let start_span = self.peek_span();
+        self.expect(&Token::Indent)?;
+
+        let mut statements = Vec::new();
+        while !self.check(&Token::Dedent) && !self.at_end() {
+            let stmt = self.parse_statement()?;
+            // Note: We don't validate no-calls here; that's a semantic check
+            statements.push(stmt);
+        }
+
+        let end_span = self.peek_span();
+        self.expect(&Token::Dedent)?;
+
+        Ok(ast::DataBody {
+            statements,
+            span: self.make_span(start_span, end_span),
+        })
+    }
+
     // -------------------------------------------------------------------------
     // Statement parsing
     // -------------------------------------------------------------------------
@@ -415,7 +498,7 @@ impl<'source> Parser<'source> {
         self.expect(&Token::If)?;
         let if_condition = self.parse_expr()?;
         self.expect(&Token::Colon)?;
-        let if_body = self.parse_block()?;
+        let if_body = self.parse_single_call_body()?;
         let if_end = self.peek_span();
 
         let if_branch = ast::IfBranch {
@@ -431,7 +514,7 @@ impl<'source> Parser<'source> {
             self.advance();
             let elif_condition = self.parse_expr()?;
             self.expect(&Token::Colon)?;
-            let elif_body = self.parse_block()?;
+            let elif_body = self.parse_single_call_body()?;
             let elif_end = self.peek_span();
 
             elif_branches.push(ast::ElifBranch {
@@ -446,7 +529,7 @@ impl<'source> Parser<'source> {
             let else_start = self.peek_span();
             self.advance();
             self.expect(&Token::Colon)?;
-            let else_body = self.parse_block()?;
+            let else_body = self.parse_single_call_body()?;
             let else_end = self.peek_span();
 
             Some(ast::ElseBranch {
@@ -481,7 +564,7 @@ impl<'source> Parser<'source> {
         self.expect(&Token::In)?;
         let iterable = self.parse_expr()?;
         self.expect(&Token::Colon)?;
-        let body = self.parse_block()?;
+        let body = self.parse_data_body()?;
 
         Ok(ast::ForLoop {
             loop_vars,
@@ -493,7 +576,7 @@ impl<'source> Parser<'source> {
     fn parse_try_except(&mut self) -> Result<ast::TryExcept, ParseError> {
         self.expect(&Token::Try)?;
         self.expect(&Token::Colon)?;
-        let try_body = self.parse_block()?;
+        let try_body = self.parse_single_call_body()?;
 
         let mut handlers = Vec::new();
         while self.check(&Token::Except) {
@@ -508,7 +591,7 @@ impl<'source> Parser<'source> {
             };
 
             self.expect(&Token::Colon)?;
-            let handler_body = self.parse_block()?;
+            let handler_body = self.parse_single_call_body()?;
             let handler_end = self.peek_span();
 
             handlers.push(ast::ExceptHandler {
@@ -1272,11 +1355,11 @@ mod tests {
     fn test_parse_conditional() {
         let source = r#"fn check(input: [x], output: [result]):
     if x > 0:
-        result = "positive"
+        result = @check_positive(x=x)
     elif x < 0:
-        result = "negative"
+        result = @check_negative(x=x)
     else:
-        result = "zero"
+        result = @check_zero()
     return result"#;
 
         let program = parse(source).unwrap();
@@ -1342,7 +1425,7 @@ mod tests {
     except NetworkError:
         result = @fallback(x=x)
     except:
-        result = "error"
+        result = @default_handler()
     return result"#;
 
         let program = parse(source).unwrap();
@@ -1463,9 +1546,9 @@ mod tests {
     fn test_parse_in_operator() {
         let source = r#"fn check(input: [item, items], output: [result]):
     if item in items:
-        result = True
+        result = @found_item(item=item)
     else:
-        result = False
+        result = @not_found()
     return result"#;
 
         let program = parse(source).unwrap();

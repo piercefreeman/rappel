@@ -288,19 +288,14 @@ class IRBuilder(ast.NodeVisitor):
             stmts = self._visit_statement(body_node)
             body_stmts.extend(stmts)
 
-        # Count calls (action calls + function calls)
-        call_count = self._count_calls(body_stmts)
-
-        # Wrap if multiple calls
-        if call_count > 1:
-            body_stmts = self._wrap_body_as_function(body_stmts, "for_body", node, loop_vars)
-
-        # Create the for loop
+        # For loops use DataBody (pure data statements, no calls)
+        # Note: If there are action calls, the Rust runtime will handle them,
+        # but ideally Python code should use spread for action iteration.
         stmt = ir.Statement(span=_make_span(node))
         for_loop = ir.ForLoop(
             loop_vars=loop_vars,
             iterable=iterable,
-            body=ir.Block(statements=body_stmts),
+            body=self._stmts_to_data_body(body_stmts, _make_span(node)),
         )
         stmt.for_loop.CopyFrom(for_loop)
         return [stmt]
@@ -347,7 +342,7 @@ class IRBuilder(ast.NodeVisitor):
 
         if_branch = ir.IfBranch(
             condition=condition,
-            body=ir.Block(statements=body_stmts),
+            body=self._stmts_to_single_call_body(body_stmts, _make_span(node)),
             span=_make_span(node),
         )
 
@@ -372,7 +367,7 @@ class IRBuilder(ast.NodeVisitor):
 
                     elif_branch = ir.ElifBranch(
                         condition=elif_condition,
-                        body=ir.Block(statements=elif_body),
+                        body=self._stmts_to_single_call_body(elif_body, _make_span(elif_node)),
                         span=_make_span(elif_node),
                     )
                     conditional.elif_branches.append(elif_branch)
@@ -389,7 +384,9 @@ class IRBuilder(ast.NodeVisitor):
                     else_body = self._wrap_body_as_function(else_body, "if_else", current.orelse[0])
 
                 else_branch = ir.ElseBranch(
-                    body=ir.Block(statements=else_body),
+                    body=self._stmts_to_single_call_body(
+                        else_body, _make_span(current.orelse[0]) if current.orelse else ir.Span()
+                    ),
                     span=_make_span(current.orelse[0]) if current.orelse else None,
                 )
                 conditional.else_branch.CopyFrom(else_branch)
@@ -461,7 +458,7 @@ class IRBuilder(ast.NodeVisitor):
 
             except_handler = ir.ExceptHandler(
                 exception_types=exception_types,
-                body=ir.Block(statements=handler_body),
+                body=self._stmts_to_single_call_body(handler_body, _make_span(handler)),
                 span=_make_span(handler),
             )
             handlers.append(except_handler)
@@ -469,7 +466,7 @@ class IRBuilder(ast.NodeVisitor):
         # Build the try/except statement
         try_stmt = ir.Statement(span=_make_span(node))
         try_except = ir.TryExcept(
-            try_body=ir.Block(statements=try_body),
+            try_body=self._stmts_to_single_call_body(try_body, _make_span(node)),
             handlers=handlers,
         )
         try_stmt.try_except.CopyFrom(try_except)
@@ -491,6 +488,43 @@ class IRBuilder(ast.NodeVisitor):
                 if stmt.expr_stmt.expr.HasField("function_call"):
                     count += 1
         return count
+
+    def _stmts_to_single_call_body(
+        self, stmts: List[ir.Statement], span: ir.Span
+    ) -> ir.SingleCallBody:
+        """Convert statements to SingleCallBody.
+
+        Can contain EITHER:
+        1. A single action or function call (with optional target)
+        2. Pure data statements (no calls)
+        """
+        body = ir.SingleCallBody(span=span)
+
+        # Look for a single call in the statements
+        for stmt in stmts:
+            if stmt.HasField("action_call"):
+                action = stmt.action_call
+                if action.target:
+                    body.target = action.target
+                call = ir.Call()
+                call.action.CopyFrom(action)
+                body.call.CopyFrom(call)
+                return body
+            elif stmt.HasField("expr_stmt") and stmt.expr_stmt.expr.HasField("function_call"):
+                fn_call = stmt.expr_stmt.expr.function_call
+                call = ir.Call()
+                call.function.CopyFrom(fn_call)
+                body.call.CopyFrom(call)
+                return body
+
+        # No call found - this is a pure data body
+        # Add all statements as pure data
+        body.statements.extend(stmts)
+        return body
+
+    def _stmts_to_data_body(self, stmts: List[ir.Statement], span: ir.Span) -> ir.DataBody:
+        """Convert statements to DataBody (for for-loops, no calls allowed)."""
+        return ir.DataBody(statements=stmts, span=span)
 
     def _wrap_body_as_function(
         self,
@@ -517,8 +551,7 @@ class IRBuilder(ast.NodeVisitor):
 
         # Create a function call statement
         kwargs = [
-            ir.Kwarg(name=var, value=ir.Expr(variable=ir.Variable(name=var)))
-            for var in fn_inputs
+            ir.Kwarg(name=var, value=ir.Expr(variable=ir.Variable(name=var))) for var in fn_inputs
         ]
         fn_call_expr = ir.Expr(
             function_call=ir.FunctionCall(name=fn_name, kwargs=kwargs),

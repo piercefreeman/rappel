@@ -449,6 +449,57 @@ impl DAGConverter {
         }
     }
 
+    /// Convert a SingleCallBody to DAG node(s).
+    /// SingleCallBody can contain:
+    /// 1. A single call (action or function) with optional target
+    /// 2. Pure data statements (no calls)
+    fn convert_single_call_body(&mut self, body: &ast::SingleCallBody) -> Vec<String> {
+        // If there's a call, convert it
+        if let Some(call) = &body.call {
+            let target = body.target.as_deref();
+
+            return match &call.kind {
+                Some(ast::call::Kind::Action(action)) => self.convert_action_call(action, target),
+                Some(ast::call::Kind::Function(func)) => {
+                    if let Some(t) = target {
+                        self.convert_fn_call_assignment(t, &[t.to_string()], func)
+                    } else {
+                        // Function call without assignment target
+                        let node_id = self.next_id("fn_call");
+                        let label = format!("{}()", func.name);
+                        let mut node = DAGNode::new(node_id.clone(), "fn_call".to_string(), label)
+                            .with_fn_call(&func.name);
+                        if let Some(ref fn_name) = self.current_function {
+                            node = node.with_function_name(fn_name);
+                        }
+                        self.dag.add_node(node);
+                        vec![node_id]
+                    }
+                }
+                None => vec![],
+            };
+        }
+
+        // Otherwise, convert pure data statements
+        let mut result = vec![];
+        for stmt in &body.statements {
+            let node_ids = self.convert_statement(stmt);
+            result.extend(node_ids);
+        }
+        result
+    }
+
+    /// Convert a DataBody to DAG node(s).
+    /// DataBody contains pure data statements (no action/function calls).
+    fn convert_data_body(&mut self, body: &ast::DataBody) -> Vec<String> {
+        let mut result = vec![];
+        for stmt in &body.statements {
+            let node_ids = self.convert_statement(stmt);
+            result.extend(node_ids);
+        }
+        result
+    }
+
     /// Convert an assignment statement
     fn convert_assignment(&mut self, assign: &ast::Assignment) -> Vec<String> {
         let value = match &assign.value {
@@ -799,59 +850,35 @@ impl DAGConverter {
         let mut then_last: Option<String> = None;
         let mut else_last: Option<String> = None;
 
-        // Process then branch
+        // Process then branch (SingleCallBody - exactly one call)
         if let Some(if_branch) = &cond.if_branch
             && let Some(body) = &if_branch.body
         {
-            let mut prev_id = cond_id.clone();
-            for (i, stmt) in body.statements.iter().enumerate() {
-                let node_ids = self.convert_statement(stmt);
-                if !node_ids.is_empty() {
-                    let condition = if i == 0 { Some("then") } else { None };
-                    if let Some(c) = condition {
-                        self.dag.add_edge(DAGEdge::state_machine_with_condition(
-                            prev_id.clone(),
-                            node_ids[0].clone(),
-                            c,
-                        ));
-                    } else {
-                        self.dag
-                            .add_edge(DAGEdge::state_machine(prev_id.clone(), node_ids[0].clone()));
-                    }
-                    prev_id = node_ids.last().unwrap().clone();
-                    result_nodes.extend(node_ids);
-                }
-            }
-            if prev_id != cond_id {
-                then_last = Some(prev_id);
+            let node_ids = self.convert_single_call_body(body);
+            if !node_ids.is_empty() {
+                self.dag.add_edge(DAGEdge::state_machine_with_condition(
+                    cond_id.clone(),
+                    node_ids[0].clone(),
+                    "then",
+                ));
+                then_last = Some(node_ids.last().unwrap().clone());
+                result_nodes.extend(node_ids);
             }
         }
 
-        // Process else branch
+        // Process else branch (SingleCallBody - exactly one call)
         if let Some(else_branch) = &cond.else_branch
             && let Some(body) = &else_branch.body
         {
-            let mut prev_id = cond_id.clone();
-            for (i, stmt) in body.statements.iter().enumerate() {
-                let node_ids = self.convert_statement(stmt);
-                if !node_ids.is_empty() {
-                    let condition = if i == 0 { Some("else") } else { None };
-                    if let Some(c) = condition {
-                        self.dag.add_edge(DAGEdge::state_machine_with_condition(
-                            prev_id.clone(),
-                            node_ids[0].clone(),
-                            c,
-                        ));
-                    } else {
-                        self.dag
-                            .add_edge(DAGEdge::state_machine(prev_id.clone(), node_ids[0].clone()));
-                    }
-                    prev_id = node_ids.last().unwrap().clone();
-                    result_nodes.extend(node_ids);
-                }
-            }
-            if prev_id != cond_id {
-                else_last = Some(prev_id);
+            let node_ids = self.convert_single_call_body(body);
+            if !node_ids.is_empty() {
+                self.dag.add_edge(DAGEdge::state_machine_with_condition(
+                    cond_id.clone(),
+                    node_ids[0].clone(),
+                    "else",
+                ));
+                else_last = Some(node_ids.last().unwrap().clone());
+                result_nodes.extend(node_ids);
             }
         }
 
@@ -905,30 +932,18 @@ impl DAGConverter {
         self.dag.add_node(try_node);
         result_nodes.push(try_id.clone());
 
-        // Convert try body
+        // Convert try body (SingleCallBody - exactly one call)
         let mut try_body_last: Option<String> = None;
         if let Some(try_body) = &try_except.try_body {
-            let mut prev_id = try_id.clone();
-            for (i, stmt) in try_body.statements.iter().enumerate() {
-                let node_ids = self.convert_statement(stmt);
-                if !node_ids.is_empty() {
-                    let condition = if i == 0 { Some("try") } else { None };
-                    if let Some(c) = condition {
-                        self.dag.add_edge(DAGEdge::state_machine_with_condition(
-                            prev_id.clone(),
-                            node_ids[0].clone(),
-                            c,
-                        ));
-                    } else {
-                        self.dag
-                            .add_edge(DAGEdge::state_machine(prev_id.clone(), node_ids[0].clone()));
-                    }
-                    prev_id = node_ids.last().unwrap().clone();
-                    result_nodes.extend(node_ids);
-                }
-            }
-            if prev_id != try_id {
-                try_body_last = Some(prev_id);
+            let node_ids = self.convert_single_call_body(try_body);
+            if !node_ids.is_empty() {
+                self.dag.add_edge(DAGEdge::state_machine_with_condition(
+                    try_id.clone(),
+                    node_ids[0].clone(),
+                    "try",
+                ));
+                try_body_last = Some(node_ids.last().unwrap().clone());
+                result_nodes.extend(node_ids);
             }
         }
 
@@ -957,19 +972,17 @@ impl DAGConverter {
                 &format!("except:{}", exc_types_str),
             ));
 
-            // Convert handler body
+            // Convert handler body (SingleCallBody - exactly one call)
             let mut handler_prev = handler_id.clone();
             if let Some(body) = &handler.body {
-                for stmt in &body.statements {
-                    let node_ids = self.convert_statement(stmt);
-                    if !node_ids.is_empty() {
-                        self.dag.add_edge(DAGEdge::state_machine(
-                            handler_prev.clone(),
-                            node_ids[0].clone(),
-                        ));
-                        handler_prev = node_ids.last().unwrap().clone();
-                        result_nodes.extend(node_ids);
-                    }
+                let node_ids = self.convert_single_call_body(body);
+                if !node_ids.is_empty() {
+                    self.dag.add_edge(DAGEdge::state_machine(
+                        handler_prev.clone(),
+                        node_ids[0].clone(),
+                    ));
+                    handler_prev = node_ids.last().unwrap().clone();
+                    result_nodes.extend(node_ids);
                 }
             }
             handler_lasts.push(handler_prev);

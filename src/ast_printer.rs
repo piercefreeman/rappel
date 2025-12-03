@@ -73,6 +73,67 @@ impl AstPrinter {
         lines.join("\n")
     }
 
+    /// Print a single call body (for control flow structures).
+    fn print_single_call_body(&mut self, body: &ast::SingleCallBody) -> String {
+        self.indent_level += 1;
+
+        // If there's a call, print it
+        if let Some(ref call) = body.call {
+            let call_str = self.print_call(call);
+            let line = if let Some(ref target) = body.target {
+                format!("{}{} = {}", self.current_indent(), target, call_str)
+            } else {
+                format!("{}{}", self.current_indent(), call_str)
+            };
+            self.indent_level -= 1;
+            return line;
+        }
+
+        // Otherwise, print pure data statements
+        let mut lines = Vec::new();
+        for stmt in &body.statements {
+            let stmt_str = self.print_statement(stmt);
+            for line in stmt_str.lines() {
+                lines.push(format!("{}{}", self.current_indent(), line));
+            }
+        }
+        self.indent_level -= 1;
+        lines.join("\n")
+    }
+
+    /// Print a data body (for for-loops).
+    fn print_data_body(&mut self, body: &ast::DataBody) -> String {
+        self.indent_level += 1;
+        let mut lines = Vec::new();
+        for stmt in &body.statements {
+            let stmt_str = self.print_statement(stmt);
+            for line in stmt_str.lines() {
+                lines.push(format!("{}{}", self.current_indent(), line));
+            }
+        }
+        self.indent_level -= 1;
+        lines.join("\n")
+    }
+
+    /// Print a call (action or function).
+    fn print_call(&mut self, call: &ast::Call) -> String {
+        match &call.kind {
+            Some(ast::call::Kind::Action(action)) => self.print_action_call_inline(action),
+            Some(ast::call::Kind::Function(func)) => {
+                let kwargs = self.print_kwargs(&func.kwargs);
+                format!("{}({})", func.name, kwargs)
+            }
+            None => String::new(),
+        }
+    }
+
+    /// Print an action call without assignment (for use in Call).
+    fn print_action_call_inline(&mut self, action: &ast::ActionCall) -> String {
+        let kwargs = self.print_kwargs(&action.kwargs);
+        let policies = self.print_policies(&action.policies);
+        format!("@{}({}){}", action.action_name, kwargs, policies)
+    }
+
     /// Get the current indentation string.
     fn current_indent(&self) -> String {
         self.indent_str.repeat(self.indent_level)
@@ -192,7 +253,7 @@ impl AstPrinter {
         let body = for_loop
             .body
             .as_ref()
-            .map(|b| self.print_block(b))
+            .map(|b| self.print_data_body(b))
             .unwrap_or_default();
 
         format!("for {} in {}:\n{}", loop_vars, iterable, body)
@@ -212,7 +273,7 @@ impl AstPrinter {
             let body = if_branch
                 .body
                 .as_ref()
-                .map(|b| self.print_block(b))
+                .map(|b| self.print_single_call_body(b))
                 .unwrap_or_default();
             result.push_str(&format!("if {}:\n{}", condition, body));
         }
@@ -227,7 +288,7 @@ impl AstPrinter {
             let body = elif
                 .body
                 .as_ref()
-                .map(|b| self.print_block(b))
+                .map(|b| self.print_single_call_body(b))
                 .unwrap_or_default();
             result.push_str(&format!(
                 "\n{}elif {}:\n{}",
@@ -242,7 +303,7 @@ impl AstPrinter {
             let body = else_branch
                 .body
                 .as_ref()
-                .map(|b| self.print_block(b))
+                .map(|b| self.print_single_call_body(b))
                 .unwrap_or_default();
             result.push_str(&format!("\n{}else:\n{}", self.current_indent(), body));
         }
@@ -258,7 +319,7 @@ impl AstPrinter {
         let try_body = try_except
             .try_body
             .as_ref()
-            .map(|b| self.print_block(b))
+            .map(|b| self.print_single_call_body(b))
             .unwrap_or_default();
         result.push_str(&format!("try:\n{}", try_body));
 
@@ -272,7 +333,7 @@ impl AstPrinter {
             let body = handler
                 .body
                 .as_ref()
-                .map(|b| self.print_block(b))
+                .map(|b| self.print_single_call_body(b))
                 .unwrap_or_default();
             result.push_str(&format!(
                 "\n{}except{}:\n{}",

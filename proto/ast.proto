@@ -38,9 +38,51 @@ message IoDecl {
   Span span = 3;
 }
 
-// A block of statements (function body, loop body, etc.)
+// A block of statements (function body - no call restrictions)
 message Block {
   repeated Statement statements = 1;
+  Span span = 2;
+}
+
+// -----------------------------------------------------------------------------
+// Constrained Bodies for Control Flow
+// -----------------------------------------------------------------------------
+// Control flow structures (for, try, if) have stricter constraints than
+// general blocks. These types make the constraints explicit.
+
+// Body constrained to at most ONE action or function call.
+// Used by: TryExcept (try_body, handlers), Conditional branches
+//
+// Can contain EITHER:
+// 1. A single call (action or function) with optional assignment target
+// 2. Pure data statements (no calls) for data manipulation branches
+//
+// Example (with call):
+//   if score >= 75:
+//       result = @evaluate_high(score=score)
+//
+// Example (pure data):
+//   if item in inventory:
+//       valid_items = valid_items + [item]
+message SingleCallBody {
+  optional string target = 1;    // Variable to assign result (if call present)
+  optional Call call = 2;        // The single call (optional - missing = pure data)
+  repeated Statement statements = 3;  // Pure data statements (if no call)
+  Span span = 4;
+}
+
+// Body for pure data manipulation (NO action/function calls allowed).
+// Used by: ForLoop body
+//
+// Example (for loop with data manipulation):
+//   for i, order in enumerate(valid_orders):
+//       confirmation = { "order_id": order["id"], ... }
+//       confirmations = confirmations + [confirmation]
+//
+// For iterating with action calls, use SpreadAction instead:
+//   payments = spread valid_orders:order -> @process_payment(order_id=order["id"])
+message DataBody {
+  repeated Statement statements = 1;  // Must NOT contain action_call or function_call
   Span span = 2;
 }
 
@@ -102,10 +144,12 @@ message Call {
 }
 
 // For loop: for i, item in enumerate(items): body
+// Body is constrained to pure data manipulation (no calls).
+// Use SpreadAction for iterating with action calls.
 message ForLoop {
   repeated string loop_vars = 1;     // Loop variable(s) for unpacking
   Expr iterable = 2;
-  Block body = 3;
+  DataBody body = 3;                 // Pure data body (no calls allowed)
 }
 
 // Conditional: if/elif/else
@@ -117,30 +161,31 @@ message Conditional {
 
 message IfBranch {
   Expr condition = 1;
-  Block body = 2;
+  SingleCallBody body = 2;           // Single call body
   Span span = 3;
 }
 
 message ElifBranch {
   Expr condition = 1;
-  Block body = 2;
+  SingleCallBody body = 2;           // Single call body
   Span span = 3;
 }
 
 message ElseBranch {
-  Block body = 1;
+  SingleCallBody body = 1;           // Single call body
   Span span = 2;
 }
 
 // Try/except block
+// Both try body and handlers are constrained to single calls.
 message TryExcept {
-  Block try_body = 1;
+  SingleCallBody try_body = 1;       // Single call body
   repeated ExceptHandler handlers = 2;
 }
 
 message ExceptHandler {
   repeated string exception_types = 1;  // Empty = catch all
-  Block body = 2;
+  SingleCallBody body = 2;              // Single call body
   Span span = 3;
 }
 

@@ -192,7 +192,7 @@ Global___IoDecl: typing_extensions.TypeAlias = IoDecl
 
 @typing.final
 class Block(google.protobuf.message.Message):
-    """A block of statements (function body, loop body, etc.)"""
+    """A block of statements (function body - no call restrictions)"""
 
     DESCRIPTOR: google.protobuf.descriptor.Descriptor
 
@@ -218,6 +218,140 @@ class Block(google.protobuf.message.Message):
     ) -> None: ...
 
 Global___Block: typing_extensions.TypeAlias = Block
+
+@typing.final
+class SingleCallBody(google.protobuf.message.Message):
+    """-----------------------------------------------------------------------------
+    Constrained Bodies for Control Flow
+    -----------------------------------------------------------------------------
+    Control flow structures (for, try, if) have stricter constraints than
+    general blocks. These types make the constraints explicit.
+
+    Body constrained to at most ONE action or function call.
+    Used by: TryExcept (try_body, handlers), Conditional branches
+
+    Can contain EITHER:
+    1. A single call (action or function) with optional assignment target
+    2. Pure data statements (no calls) for data manipulation branches
+
+    Example (with call):
+      if score >= 75:
+          result = @evaluate_high(score=score)
+
+    Example (pure data):
+      if item in inventory:
+          valid_items = valid_items + [item]
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    TARGET_FIELD_NUMBER: builtins.int
+    CALL_FIELD_NUMBER: builtins.int
+    STATEMENTS_FIELD_NUMBER: builtins.int
+    SPAN_FIELD_NUMBER: builtins.int
+    target: builtins.str
+    """Variable to assign result (if call present)"""
+    @property
+    def call(self) -> Global___Call:
+        """The single call (optional - missing = pure data)"""
+
+    @property
+    def statements(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[Global___Statement]:
+        """Pure data statements (if no call)"""
+
+    @property
+    def span(self) -> Global___Span: ...
+    def __init__(
+        self,
+        *,
+        target: builtins.str | None = ...,
+        call: Global___Call | None = ...,
+        statements: collections.abc.Iterable[Global___Statement] | None = ...,
+        span: Global___Span | None = ...,
+    ) -> None: ...
+    def HasField(
+        self,
+        field_name: typing.Literal[
+            "_call",
+            b"_call",
+            "_target",
+            b"_target",
+            "call",
+            b"call",
+            "span",
+            b"span",
+            "target",
+            b"target",
+        ],
+    ) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing.Literal[
+            "_call",
+            b"_call",
+            "_target",
+            b"_target",
+            "call",
+            b"call",
+            "span",
+            b"span",
+            "statements",
+            b"statements",
+            "target",
+            b"target",
+        ],
+    ) -> None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_call", b"_call"]
+    ) -> typing.Literal["call"] | None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_target", b"_target"]
+    ) -> typing.Literal["target"] | None: ...
+
+Global___SingleCallBody: typing_extensions.TypeAlias = SingleCallBody
+
+@typing.final
+class DataBody(google.protobuf.message.Message):
+    """Body for pure data manipulation (NO action/function calls allowed).
+    Used by: ForLoop body
+
+    Example (for loop with data manipulation):
+      for i, order in enumerate(valid_orders):
+          confirmation = { "order_id": order["id"], ... }
+          confirmations = confirmations + [confirmation]
+
+    For iterating with action calls, use SpreadAction instead:
+      payments = spread valid_orders:order -> @process_payment(order_id=order["id"])
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    STATEMENTS_FIELD_NUMBER: builtins.int
+    SPAN_FIELD_NUMBER: builtins.int
+    @property
+    def statements(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[Global___Statement]:
+        """Must NOT contain action_call or function_call"""
+
+    @property
+    def span(self) -> Global___Span: ...
+    def __init__(
+        self,
+        *,
+        statements: collections.abc.Iterable[Global___Statement] | None = ...,
+        span: Global___Span | None = ...,
+    ) -> None: ...
+    def HasField(self, field_name: typing.Literal["span", b"span"]) -> builtins.bool: ...
+    def ClearField(
+        self, field_name: typing.Literal["span", b"span", "statements", b"statements"]
+    ) -> None: ...
+
+Global___DataBody: typing_extensions.TypeAlias = DataBody
 
 @typing.final
 class Statement(google.protobuf.message.Message):
@@ -585,7 +719,10 @@ Global___Call: typing_extensions.TypeAlias = Call
 
 @typing.final
 class ForLoop(google.protobuf.message.Message):
-    """For loop: for i, item in enumerate(items): body"""
+    """For loop: for i, item in enumerate(items): body
+    Body is constrained to pure data manipulation (no calls).
+    Use SpreadAction for iterating with action calls.
+    """
 
     DESCRIPTOR: google.protobuf.descriptor.Descriptor
 
@@ -601,13 +738,15 @@ class ForLoop(google.protobuf.message.Message):
     @property
     def iterable(self) -> Global___Expr: ...
     @property
-    def body(self) -> Global___Block: ...
+    def body(self) -> Global___DataBody:
+        """Pure data body (no calls allowed)"""
+
     def __init__(
         self,
         *,
         loop_vars: collections.abc.Iterable[builtins.str] | None = ...,
         iterable: Global___Expr | None = ...,
-        body: Global___Block | None = ...,
+        body: Global___DataBody | None = ...,
     ) -> None: ...
     def HasField(
         self, field_name: typing.Literal["body", b"body", "iterable", b"iterable"]
@@ -687,14 +826,16 @@ class IfBranch(google.protobuf.message.Message):
     @property
     def condition(self) -> Global___Expr: ...
     @property
-    def body(self) -> Global___Block: ...
+    def body(self) -> Global___SingleCallBody:
+        """Single call body"""
+
     @property
     def span(self) -> Global___Span: ...
     def __init__(
         self,
         *,
         condition: Global___Expr | None = ...,
-        body: Global___Block | None = ...,
+        body: Global___SingleCallBody | None = ...,
         span: Global___Span | None = ...,
     ) -> None: ...
     def HasField(
@@ -718,14 +859,16 @@ class ElifBranch(google.protobuf.message.Message):
     @property
     def condition(self) -> Global___Expr: ...
     @property
-    def body(self) -> Global___Block: ...
+    def body(self) -> Global___SingleCallBody:
+        """Single call body"""
+
     @property
     def span(self) -> Global___Span: ...
     def __init__(
         self,
         *,
         condition: Global___Expr | None = ...,
-        body: Global___Block | None = ...,
+        body: Global___SingleCallBody | None = ...,
         span: Global___Span | None = ...,
     ) -> None: ...
     def HasField(
@@ -746,13 +889,15 @@ class ElseBranch(google.protobuf.message.Message):
     BODY_FIELD_NUMBER: builtins.int
     SPAN_FIELD_NUMBER: builtins.int
     @property
-    def body(self) -> Global___Block: ...
+    def body(self) -> Global___SingleCallBody:
+        """Single call body"""
+
     @property
     def span(self) -> Global___Span: ...
     def __init__(
         self,
         *,
-        body: Global___Block | None = ...,
+        body: Global___SingleCallBody | None = ...,
         span: Global___Span | None = ...,
     ) -> None: ...
     def HasField(
@@ -764,14 +909,18 @@ Global___ElseBranch: typing_extensions.TypeAlias = ElseBranch
 
 @typing.final
 class TryExcept(google.protobuf.message.Message):
-    """Try/except block"""
+    """Try/except block
+    Both try body and handlers are constrained to single calls.
+    """
 
     DESCRIPTOR: google.protobuf.descriptor.Descriptor
 
     TRY_BODY_FIELD_NUMBER: builtins.int
     HANDLERS_FIELD_NUMBER: builtins.int
     @property
-    def try_body(self) -> Global___Block: ...
+    def try_body(self) -> Global___SingleCallBody:
+        """Single call body"""
+
     @property
     def handlers(
         self,
@@ -781,7 +930,7 @@ class TryExcept(google.protobuf.message.Message):
     def __init__(
         self,
         *,
-        try_body: Global___Block | None = ...,
+        try_body: Global___SingleCallBody | None = ...,
         handlers: collections.abc.Iterable[Global___ExceptHandler] | None = ...,
     ) -> None: ...
     def HasField(self, field_name: typing.Literal["try_body", b"try_body"]) -> builtins.bool: ...
@@ -805,14 +954,16 @@ class ExceptHandler(google.protobuf.message.Message):
         """Empty = catch all"""
 
     @property
-    def body(self) -> Global___Block: ...
+    def body(self) -> Global___SingleCallBody:
+        """Single call body"""
+
     @property
     def span(self) -> Global___Span: ...
     def __init__(
         self,
         *,
         exception_types: collections.abc.Iterable[builtins.str] | None = ...,
-        body: Global___Block | None = ...,
+        body: Global___SingleCallBody | None = ...,
         span: Global___Span | None = ...,
     ) -> None: ...
     def HasField(
