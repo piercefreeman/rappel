@@ -887,6 +887,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_status_roundtrip() {
@@ -909,5 +910,442 @@ mod tests {
         let id = WorkflowInstanceId::new();
         let s = id.to_string();
         assert!(!s.is_empty());
+    }
+
+    // ========================================================================
+    // Integration tests - require DATABASE_URL to be set
+    // Run with: cargo test --lib db::tests -- --ignored
+    // ========================================================================
+
+    async fn test_db() -> Database {
+        dotenvy::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for integration tests");
+        Database::connect(&url).await.expect("failed to connect to database")
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_workflow_version_lifecycle() {
+        let db = test_db().await;
+
+        // Create a workflow version
+        let program_proto = b"test program bytes";
+        let version_id = db
+            .upsert_workflow_version("test_workflow", "hash123", program_proto, false)
+            .await
+            .expect("failed to create version");
+
+        // Fetch it back
+        let version = db
+            .get_workflow_version(version_id)
+            .await
+            .expect("failed to get version");
+
+        assert_eq!(version.workflow_name, "test_workflow");
+        assert_eq!(version.dag_hash, "hash123");
+        assert_eq!(version.program_proto, program_proto);
+        assert!(!version.concurrent);
+
+        // Upsert with same hash should return same ID
+        let version_id2 = db
+            .upsert_workflow_version("test_workflow", "hash123", program_proto, false)
+            .await
+            .expect("failed to upsert version");
+
+        assert_eq!(version_id.0, version_id2.0);
+
+        // List versions should include our version
+        let versions = db.list_workflow_versions().await.expect("failed to list versions");
+        assert!(versions.iter().any(|v| v.id == version_id.0));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_workflow_instance_lifecycle() {
+        let db = test_db().await;
+
+        // Create a version first
+        let version_id = db
+            .upsert_workflow_version("instance_test", "hash_inst", b"proto", false)
+            .await
+            .expect("failed to create version");
+
+        // Create an instance
+        let input = b"input payload";
+        let instance_id = db
+            .create_instance("instance_test", version_id, Some(input))
+            .await
+            .expect("failed to create instance");
+
+        // Fetch it
+        let instance = db
+            .get_instance(instance_id)
+            .await
+            .expect("failed to get instance");
+
+        assert_eq!(instance.workflow_name, "instance_test");
+        assert_eq!(instance.workflow_version_id, Some(version_id.0));
+        assert_eq!(instance.status, "running");
+        assert_eq!(instance.input_payload, Some(input.to_vec()));
+        assert!(instance.result_payload.is_none());
+        assert!(instance.completed_at.is_none());
+
+        // Complete the instance
+        let result = b"result payload";
+        db.complete_instance(instance_id, Some(result))
+            .await
+            .expect("failed to complete instance");
+
+        // Verify completion
+        let instance = db.get_instance(instance_id).await.expect("failed to get instance");
+        assert_eq!(instance.status, "completed");
+        assert_eq!(instance.result_payload, Some(result.to_vec()));
+        assert!(instance.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_action_queue_enqueue_and_dispatch() {
+        let db = test_db().await;
+
+        // Setup: create version and instance
+        let version_id = db
+            .upsert_workflow_version("queue_test", "hash_queue", b"proto", false)
+            .await
+            .unwrap();
+
+        let instance_id = db
+            .create_instance("queue_test", version_id, None)
+            .await
+            .unwrap();
+
+        // Enqueue an action
+        let action_id = db
+            .enqueue_action(NewAction {
+                instance_id,
+                module_name: "test.module".to_string(),
+                action_name: "test_action".to_string(),
+                dispatch_payload: b"dispatch data".to_vec(),
+                timeout_seconds: 60,
+                max_retries: 3,
+                backoff_kind: BackoffKind::Exponential,
+                backoff_base_delay_ms: 1000,
+                node_id: Some("node_1".to_string()),
+            })
+            .await
+            .expect("failed to enqueue action");
+
+        // Dispatch should return our action
+        let dispatched = db
+            .dispatch_actions(10)
+            .await
+            .expect("failed to dispatch actions");
+
+        // Find our action in the dispatched list
+        let our_action = dispatched.iter().find(|a| a.id == action_id.0);
+        assert!(our_action.is_some(), "our action should be dispatched");
+
+        let action = our_action.unwrap();
+        assert_eq!(action.module_name, "test.module");
+        assert_eq!(action.action_name, "test_action");
+        assert_eq!(action.dispatch_payload, b"dispatch data");
+        assert_eq!(action.timeout_seconds, 60);
+        assert_eq!(action.max_retries, 3);
+        assert_eq!(action.attempt_number, 0);
+
+        // Dispatch again should NOT return the same action (it's now 'dispatched')
+        let dispatched2 = db.dispatch_actions(10).await.unwrap();
+        assert!(!dispatched2.iter().any(|a| a.id == action_id.0));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_action_completion_with_delivery_token() {
+        let db = test_db().await;
+
+        // Setup
+        let version_id = db
+            .upsert_workflow_version("complete_test", "hash_complete", b"proto", false)
+            .await
+            .unwrap();
+
+        let instance_id = db
+            .create_instance("complete_test", version_id, None)
+            .await
+            .unwrap();
+
+        db.enqueue_action(NewAction {
+            instance_id,
+            module_name: "test.module".to_string(),
+            action_name: "complete_action".to_string(),
+            dispatch_payload: b"data".to_vec(),
+            timeout_seconds: 60,
+            max_retries: 3,
+            backoff_kind: BackoffKind::None,
+            backoff_base_delay_ms: 0,
+            node_id: None,
+        })
+        .await
+        .unwrap();
+
+        // Dispatch to get the delivery token
+        let dispatched = db.dispatch_actions(10).await.unwrap();
+        let action = dispatched.iter().find(|a| a.action_name == "complete_action").unwrap();
+        let delivery_token = action.delivery_token;
+
+        // Complete with correct token should succeed
+        let completed = db
+            .complete_action(CompletionRecord {
+                action_id: ActionId(action.id),
+                success: true,
+                result_payload: b"result".to_vec(),
+                delivery_token,
+                error_message: None,
+            })
+            .await
+            .expect("failed to complete action");
+
+        assert!(completed, "completion with correct token should succeed");
+
+        // Complete again with same token should fail (already completed)
+        let completed_again = db
+            .complete_action(CompletionRecord {
+                action_id: ActionId(action.id),
+                success: true,
+                result_payload: b"result2".to_vec(),
+                delivery_token,
+                error_message: None,
+            })
+            .await
+            .expect("failed to attempt completion");
+
+        assert!(!completed_again, "duplicate completion should return false");
+
+        // Complete with wrong token should fail
+        let wrong_token = Uuid::new_v4();
+        let completed_wrong = db
+            .complete_action(CompletionRecord {
+                action_id: ActionId(action.id),
+                success: true,
+                result_payload: b"result3".to_vec(),
+                delivery_token: wrong_token,
+                error_message: None,
+            })
+            .await
+            .expect("failed to attempt completion");
+
+        assert!(!completed_wrong, "completion with wrong token should return false");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_skip_locked_concurrent_dispatch() {
+        let db = test_db().await;
+
+        // Setup: create version and instance with multiple actions
+        let version_id = db
+            .upsert_workflow_version("concurrent_test", "hash_concurrent", b"proto", false)
+            .await
+            .unwrap();
+
+        let instance_id = db
+            .create_instance("concurrent_test", version_id, None)
+            .await
+            .unwrap();
+
+        // Enqueue 5 actions
+        for i in 0..5 {
+            db.enqueue_action(NewAction {
+                instance_id,
+                module_name: "test.module".to_string(),
+                action_name: format!("action_{}", i),
+                dispatch_payload: vec![i as u8],
+                timeout_seconds: 60,
+                max_retries: 3,
+                backoff_kind: BackoffKind::None,
+                backoff_base_delay_ms: 0,
+                node_id: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        // Dispatch 2 at a time - simulates concurrent workers
+        let batch1 = db.dispatch_actions(2).await.unwrap();
+        let batch2 = db.dispatch_actions(2).await.unwrap();
+        let batch3 = db.dispatch_actions(2).await.unwrap();
+
+        // Should have gotten 2, 2, 1 actions respectively
+        assert_eq!(batch1.len(), 2, "first batch should have 2 actions");
+        assert_eq!(batch2.len(), 2, "second batch should have 2 actions");
+        assert_eq!(batch3.len(), 1, "third batch should have 1 action");
+
+        // No duplicates between batches
+        let all_ids: Vec<_> = batch1.iter()
+            .chain(batch2.iter())
+            .chain(batch3.iter())
+            .map(|a| a.id)
+            .collect();
+
+        let unique_ids: std::collections::HashSet<_> = all_ids.iter().collect();
+        assert_eq!(all_ids.len(), unique_ids.len(), "should have no duplicate dispatches");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_instance_context() {
+        let db = test_db().await;
+
+        // Setup
+        let version_id = db
+            .upsert_workflow_version("context_test", "hash_context", b"proto", false)
+            .await
+            .unwrap();
+
+        let instance_id = db
+            .create_instance("context_test", version_id, None)
+            .await
+            .unwrap();
+
+        // Get initial context (should be empty)
+        let ctx = db.get_instance_context(instance_id).await.expect("failed to get context");
+        assert_eq!(ctx.context_json, serde_json::json!({}));
+
+        // Update context
+        let new_context = serde_json::json!({
+            "x": 42,
+            "name": "test",
+            "nested": {"a": 1, "b": 2}
+        });
+
+        db.update_instance_context(instance_id, new_context.clone())
+            .await
+            .expect("failed to update context");
+
+        // Verify update
+        let ctx = db.get_instance_context(instance_id).await.unwrap();
+        assert_eq!(ctx.context_json, new_context);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_loop_state() {
+        let db = test_db().await;
+
+        // Setup
+        let version_id = db
+            .upsert_workflow_version("loop_test", "hash_loop", b"proto", false)
+            .await
+            .unwrap();
+
+        let instance_id = db
+            .create_instance("loop_test", version_id, None)
+            .await
+            .unwrap();
+
+        // Get or create loop state
+        let state = db
+            .get_or_create_loop_state(instance_id, "loop_1")
+            .await
+            .expect("failed to create loop state");
+
+        assert_eq!(state.loop_id, "loop_1");
+        assert_eq!(state.current_index, 0);
+        assert!(state.accumulators.is_none());
+
+        // Increment index
+        let new_idx = db
+            .increment_loop_index(instance_id, "loop_1")
+            .await
+            .expect("failed to increment");
+
+        assert_eq!(new_idx, 1);
+
+        // Increment again
+        let new_idx = db.increment_loop_index(instance_id, "loop_1").await.unwrap();
+        assert_eq!(new_idx, 2);
+
+        // Update accumulators
+        let accum_data = b"[1, 2, 3]";
+        db.update_loop_accumulators(instance_id, "loop_1", accum_data)
+            .await
+            .expect("failed to update accumulators");
+
+        // Verify
+        let state = db.get_or_create_loop_state(instance_id, "loop_1").await.unwrap();
+        assert_eq!(state.current_index, 2);
+        assert_eq!(state.accumulators, Some(accum_data.to_vec()));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_failed_instance() {
+        let db = test_db().await;
+
+        // Setup
+        let version_id = db
+            .upsert_workflow_version("fail_test", "hash_fail", b"proto", false)
+            .await
+            .unwrap();
+
+        let instance_id = db
+            .create_instance("fail_test", version_id, None)
+            .await
+            .unwrap();
+
+        // Fail the instance
+        db.fail_instance(instance_id).await.expect("failed to fail instance");
+
+        // Verify
+        let instance = db.get_instance(instance_id).await.unwrap();
+        assert_eq!(instance.status, "failed");
+        assert!(instance.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_get_instance_actions() {
+        let db = test_db().await;
+
+        // Setup
+        let version_id = db
+            .upsert_workflow_version("actions_list_test", "hash_list", b"proto", false)
+            .await
+            .unwrap();
+
+        let instance_id = db
+            .create_instance("actions_list_test", version_id, None)
+            .await
+            .unwrap();
+
+        // Enqueue 3 actions
+        for i in 0..3 {
+            db.enqueue_action(NewAction {
+                instance_id,
+                module_name: "test.module".to_string(),
+                action_name: format!("list_action_{}", i),
+                dispatch_payload: vec![i as u8],
+                timeout_seconds: 60,
+                max_retries: 3,
+                backoff_kind: BackoffKind::None,
+                backoff_base_delay_ms: 0,
+                node_id: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        // Get all actions for instance
+        let actions = db
+            .get_instance_actions(instance_id)
+            .await
+            .expect("failed to get instance actions");
+
+        assert_eq!(actions.len(), 3);
+
+        // Should be ordered by action_seq
+        assert_eq!(actions[0].action_seq, 0);
+        assert_eq!(actions[1].action_seq, 1);
+        assert_eq!(actions[2].action_seq, 2);
     }
 }
