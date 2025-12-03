@@ -61,6 +61,10 @@ pub struct DAGNode {
     pub is_output: bool,
     /// Variables at this boundary (for input/output nodes)
     pub io_vars: Option<Vec<String>>,
+    /// Action name (for action_call nodes)
+    pub action_name: Option<String>,
+    /// Python module containing the action (for action_call nodes)
+    pub module_name: Option<String>,
 }
 
 impl DAGNode {
@@ -81,6 +85,8 @@ impl DAGNode {
             is_input: false,
             is_output: false,
             io_vars: None,
+            action_name: None,
+            module_name: None,
         }
     }
 
@@ -122,6 +128,13 @@ impl DAGNode {
     pub fn with_output(mut self, io_vars: Vec<String>) -> Self {
         self.is_output = true;
         self.io_vars = Some(io_vars);
+        self
+    }
+
+    /// Builder method to set action info (for action_call nodes)
+    pub fn with_action(mut self, action_name: &str, module_name: Option<&str>) -> Self {
+        self.action_name = Some(action_name.to_string());
+        self.module_name = module_name.map(|s| s.to_string());
         self
     }
 }
@@ -510,7 +523,8 @@ impl DAGConverter {
             format!("@{}()", action.action_name)
         };
 
-        let mut node = DAGNode::new(node_id.clone(), "action_call".to_string(), label);
+        let mut node = DAGNode::new(node_id.clone(), "action_call".to_string(), label)
+            .with_action(&action.action_name, action.module_name.as_deref());
         if let Some(ref fn_name) = self.current_function {
             node = node.with_function_name(fn_name);
         }
@@ -536,7 +550,8 @@ impl DAGConverter {
         );
 
         let mut action_node =
-            DAGNode::new(action_id.clone(), "action_call".to_string(), action_label);
+            DAGNode::new(action_id.clone(), "action_call".to_string(), action_label)
+                .with_action(&action.action_name, action.module_name.as_deref());
         if let Some(ref fn_name) = self.current_function {
             action_node = action_node.with_function_name(fn_name);
         }

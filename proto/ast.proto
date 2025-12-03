@@ -76,6 +76,7 @@ message ActionCall {
   string action_name = 2;
   repeated Kwarg kwargs = 3;
   repeated PolicyBracket policies = 4;
+  optional string module_name = 5;   // Python module containing the action
 }
 
 // Spread action: spread items:item -> @action(item=item)

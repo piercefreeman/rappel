@@ -132,6 +132,28 @@ def test_workflow_builds_ir() -> None:
     assert func.name == "run"
 
 
+def test_workflow_ir_includes_module_name() -> None:
+    """Test that the IR includes module_name for action calls."""
+    program = TestActionWorkflow.workflow_ir()
+    func = program.functions[0]
+
+    # Find action calls in the IR
+    action_calls_found = []
+    for stmt in func.body.statements:
+        if stmt.HasField("action_call"):
+            action_calls_found.append(stmt.action_call)
+
+    # We should have at least 2 action calls (fetch_identifier, store_value)
+    assert len(action_calls_found) >= 2
+
+    # Each action call should have a module_name set
+    for action_call in action_calls_found:
+        assert action_call.action_name, "action_name should be set"
+        assert action_call.module_name, f"module_name should be set for action {action_call.action_name}"
+        # The module should be this test module
+        assert "test_workflow" in action_call.module_name
+
+
 def test_workflow_result_direct_return(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that workflow results are returned directly when not using WorkflowNodeResult."""
     os.environ.pop("PYTEST_CURRENT_TEST", None)

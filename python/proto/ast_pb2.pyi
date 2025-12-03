@@ -384,9 +384,12 @@ class ActionCall(google.protobuf.message.Message):
     ACTION_NAME_FIELD_NUMBER: builtins.int
     KWARGS_FIELD_NUMBER: builtins.int
     POLICIES_FIELD_NUMBER: builtins.int
+    MODULE_NAME_FIELD_NUMBER: builtins.int
     target: builtins.str
     """Variable to assign result (optional)"""
     action_name: builtins.str
+    module_name: builtins.str
+    """Python module containing the action"""
     @property
     def kwargs(
         self,
@@ -404,25 +407,45 @@ class ActionCall(google.protobuf.message.Message):
         action_name: builtins.str = ...,
         kwargs: collections.abc.Iterable[Global___Kwarg] | None = ...,
         policies: collections.abc.Iterable[Global___PolicyBracket] | None = ...,
+        module_name: builtins.str | None = ...,
     ) -> None: ...
     def HasField(
-        self, field_name: typing.Literal["_target", b"_target", "target", b"target"]
+        self,
+        field_name: typing.Literal[
+            "_module_name",
+            b"_module_name",
+            "_target",
+            b"_target",
+            "module_name",
+            b"module_name",
+            "target",
+            b"target",
+        ],
     ) -> builtins.bool: ...
     def ClearField(
         self,
         field_name: typing.Literal[
+            "_module_name",
+            b"_module_name",
             "_target",
             b"_target",
             "action_name",
             b"action_name",
             "kwargs",
             b"kwargs",
+            "module_name",
+            b"module_name",
             "policies",
             b"policies",
             "target",
             b"target",
         ],
     ) -> None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_module_name", b"_module_name"]
+    ) -> typing.Literal["module_name"] | None: ...
+    @typing.overload
     def WhichOneof(
         self, oneof_group: typing.Literal["_target", b"_target"]
     ) -> typing.Literal["target"] | None: ...

@@ -862,20 +862,29 @@ impl WorkCompletionHandler {
             return Ok(None);
         }
 
-        // Extract action name from label (format: "@action_name(...)")
-        let action_name = if node.label.starts_with('@') {
-            let end = node.label.find('(').unwrap_or(node.label.len());
-            node.label[1..end].to_string()
-        } else {
-            return Ok(None);
+        // Get action_name from node metadata (preferred) or fallback to parsing label
+        let action_name = match &node.action_name {
+            Some(name) => name.clone(),
+            None => {
+                // Fallback: extract from label (format: "@action_name(...)")
+                if node.label.starts_with('@') {
+                    let end = node.label.find('(').unwrap_or(node.label.len());
+                    node.label[1..end].to_string()
+                } else {
+                    return Ok(None);
+                }
+            }
         };
+
+        // Get module_name from node metadata (default to "default" for backwards compatibility)
+        let module_name = node.module_name.clone().unwrap_or_else(|| "default".to_string());
 
         // Build dispatch payload from context
         let payload = serde_json::to_vec(&context.variables)?;
 
         Ok(Some(NewAction {
             instance_id,
-            module_name: "default".to_string(), // TODO: Get from node metadata
+            module_name,
             action_name,
             dispatch_payload: payload,
             timeout_seconds: 300, // Default 5 minutes
@@ -1848,19 +1857,28 @@ impl DAGRunner {
             return Ok(None);
         }
 
-        let action_name = if node.label.starts_with('@') {
-            let end = node.label.find('(').unwrap_or(node.label.len());
-            node.label[1..end].to_string()
-        } else {
-            return Ok(None);
+        // Get action_name from node metadata (preferred) or fallback to parsing label
+        let action_name = match &node.action_name {
+            Some(name) => name.clone(),
+            None => {
+                // Fallback: extract from label (format: "@action_name(...)")
+                if node.label.starts_with('@') {
+                    let end = node.label.find('(').unwrap_or(node.label.len());
+                    node.label[1..end].to_string()
+                } else {
+                    return Ok(None);
+                }
+            }
         };
+
+        // Get module_name from node metadata (default to "default" for backwards compatibility)
+        let module_name = node.module_name.clone().unwrap_or_else(|| "default".to_string());
 
         let payload = serde_json::to_vec(&context.variables)?;
 
         Ok(Some(NewAction {
             instance_id,
-            // TODO: Get module_name from DAGNode metadata once added
-            module_name: "default".to_string(),
+            module_name,
             action_name,
             dispatch_payload: payload,
             timeout_seconds: 300,

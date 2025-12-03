@@ -614,6 +614,7 @@ impl<'source> Parser<'source> {
             action_name,
             kwargs,
             policies,
+            module_name: None, // Filled in by Python IR builder when registered
         })
     }
 

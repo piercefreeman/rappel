@@ -427,6 +427,10 @@ class IRBuilder(ast.NodeVisitor):
         action_def = self._action_defs[action_name]
         action_call = ir.ActionCall(action_name=action_def.action_name)
 
+        # Set the module name so the worker knows where to find the action
+        if action_def.module_name:
+            action_call.module_name = action_def.module_name
+
         # Add kwargs
         for kw in node.keywords:
             if kw.arg:
