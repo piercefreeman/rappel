@@ -217,7 +217,7 @@ def test_parser_for_loop():
 
     stmt = program.statements[0]
     assert isinstance(stmt, RappelForLoop)
-    assert stmt.loop_var == "item"
+    assert stmt.loop_vars == ("item",)
     assert isinstance(stmt.iterable, RappelVariable)
     assert stmt.iterable.name == "items"
     assert len(stmt.body) == 1

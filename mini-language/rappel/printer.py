@@ -121,7 +121,8 @@ class RappelPrettyPrinter:
     def _print_RappelForLoop(self, node: RappelForLoop) -> str:
         iterable = self._print_node(node.iterable)
         body = self._print_block(node.body)
-        return f"for {node.loop_var} in {iterable}:\n{body}"
+        loop_vars_str = ", ".join(node.loop_vars)
+        return f"for {loop_vars_str} in {iterable}:\n{body}"
 
     def _print_RappelIfStatement(self, node: RappelIfStatement) -> str:
         cond = self._print_node(node.condition)

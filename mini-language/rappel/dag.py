@@ -70,7 +70,7 @@ class DAGNode:
     function_name: str | None = None  # Which function this node belongs to (None = top-level)
     # For for loops
     is_loop_head: bool = False
-    loop_var: str | None = None
+    loop_vars: tuple[str, ...] | None = None
     # For aggregators
     is_aggregator: bool = False
     aggregates_from: str | None = None  # Node ID this aggregates from
@@ -765,19 +765,21 @@ class DAGConverter:
         """
         # Create loop head node
         loop_id = self._next_id("for_loop")
+        loop_vars_str = ", ".join(stmt.loop_vars)
         loop_node = DAGNode(
             id=loop_id,
             node_type="for_loop",
             ir_node=stmt,
-            label=f"for {stmt.loop_var} in ...",
+            label=f"for {loop_vars_str} in ...",
             function_name=self.current_function,
             is_loop_head=True,
-            loop_var=stmt.loop_var
+            loop_vars=stmt.loop_vars
         )
         self.dag.add_node(loop_node)
 
-        # Track loop variable
-        self._track_var_definition(stmt.loop_var, loop_id)
+        # Track loop variables
+        for loop_var in stmt.loop_vars:
+            self._track_var_definition(loop_var, loop_id)
 
         # Track output variables from the loop body assignment
         # Body contains exactly one assignment with a function call

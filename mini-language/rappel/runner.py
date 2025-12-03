@@ -278,6 +278,9 @@ class DAGRunner:
         self.action_handlers = action_handlers or {}
         self.function_handlers = function_handlers or {}
 
+        # Add built-in functions
+        self._add_builtin_functions()
+
         # Database for persistent storage (tracks read/write stats)
         self.db = db or InMemoryDB()
         self.queue = ActionQueue(self.db)
@@ -305,6 +308,56 @@ class DAGRunner:
             data = RunnableActionData(node_id=node_id)
             self._node_data_table.insert(node_id, data.to_dict())
             self._uuid_to_node_id[node.node_uuid] = node_id
+
+    def _add_builtin_functions(self) -> None:
+        """Add built-in functions that aren't already overridden by user handlers."""
+        builtins = {
+            "range": self._builtin_range,
+            "enumerate": self._builtin_enumerate,
+            "len": self._builtin_len,
+        }
+        for name, func in builtins.items():
+            if name not in self.function_handlers:
+                self.function_handlers[name] = func
+
+    def _builtin_range(self, start: int = 0, stop: int | None = None, step: int = 1) -> list[int]:
+        """
+        Built-in range function.
+
+        Usage:
+            range(stop=5) -> [0, 1, 2, 3, 4]
+            range(start=1, stop=5) -> [1, 2, 3, 4]
+            range(start=0, stop=10, step=2) -> [0, 2, 4, 6, 8]
+        """
+        if stop is None:
+            # range(stop=5) means range(0, 5)
+            stop = start
+            start = 0
+        return list(range(start, stop, step))
+
+    def _builtin_enumerate(self, items: list) -> list[list]:
+        """
+        Built-in enumerate function.
+
+        Returns a list of [index, item] pairs.
+
+        Usage:
+            enumerate(items=["a", "b", "c"]) -> [[0, "a"], [1, "b"], [2, "c"]]
+        """
+        return [[i, item] for i, item in enumerate(items)]
+
+    def _builtin_len(self, items: list | dict | str) -> int:
+        """
+        Built-in len function.
+
+        Returns the length of a list, dict, or string.
+
+        Usage:
+            len(items=[1, 2, 3]) -> 3
+            len(items={"a": 1}) -> 1
+            len(items="hello") -> 5
+        """
+        return len(items)
 
     def _get_node_data(self, node_id: str) -> RunnableActionData:
         """
@@ -787,8 +840,16 @@ class DAGRunner:
         Scope is passed in to avoid redundant DB reads.
         """
         # Add spread item if this is a spread iteration
-        if action.spread_item is not None and node.loop_var:
-            scope = {**scope, node.loop_var: action.spread_item}
+        if action.spread_item is not None and node.loop_vars:
+            # For a single loop var, just assign the item directly
+            # For multiple loop vars, unpack the item (which should be a list)
+            if len(node.loop_vars) == 1:
+                scope = {**scope, node.loop_vars[0]: action.spread_item}
+            else:
+                # Unpack the item into multiple variables
+                item = action.spread_item
+                for i, var in enumerate(node.loop_vars):
+                    scope = {**scope, var: item[i]}
 
         ir_node = node.ir_node
 
@@ -917,7 +978,13 @@ class DAGRunner:
         results = []
 
         for item in iterable:
-            loop_scope[ir_node.loop_var] = item
+            # Unpack item into loop variables
+            if len(ir_node.loop_vars) == 1:
+                loop_scope[ir_node.loop_vars[0]] = item
+            else:
+                # Multiple loop vars - item should be a list/tuple to unpack
+                for i, var in enumerate(ir_node.loop_vars):
+                    loop_scope[var] = item[i]
 
             # Execute body statements
             for stmt in ir_node.body:

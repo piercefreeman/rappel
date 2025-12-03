@@ -139,11 +139,11 @@ def test_ir_for_loop():
     )
 
     for_loop = RappelForLoop(
-        loop_var="item",
+        loop_vars=("item",),
         iterable=RappelVariable(name="items"),
         body=(body_stmt,),
     )
-    assert for_loop.loop_var == "item"
+    assert for_loop.loop_vars == ("item",)
     assert len(for_loop.body) == 1
     assert isinstance(for_loop.body[0], RappelAssignment)
 

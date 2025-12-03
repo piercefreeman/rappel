@@ -153,13 +153,25 @@ class RappelParser:
             for item in items:
                 result = process_item(x=item)
 
+            for i, item in enumerate(items):
+                result = process_item(idx=i, x=item)
+
         The body must contain exactly one statement: an assignment with a function call.
         """
         loc = self._location()
         self._consume(TokenType.FOR, "Expected 'for'")
-        loop_var = self._consume(
-            TokenType.IDENTIFIER, "Expected loop variable"
-        ).value
+
+        # Parse one or more loop variables separated by commas
+        loop_vars = []
+        loop_vars.append(
+            self._consume(TokenType.IDENTIFIER, "Expected loop variable").value
+        )
+        while self._check(TokenType.COMMA):
+            self._advance()  # consume comma
+            loop_vars.append(
+                self._consume(TokenType.IDENTIFIER, "Expected loop variable").value
+            )
+
         self._consume(TokenType.IN, "Expected 'in'")
         iterable = self._parse_expression()
 
@@ -189,7 +201,7 @@ class RappelParser:
             )
 
         return RappelForLoop(
-            loop_var=loop_var,
+            loop_vars=tuple(loop_vars),
             iterable=iterable,
             body=tuple(body),
             location=loc,

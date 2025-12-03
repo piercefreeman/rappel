@@ -1061,3 +1061,215 @@ fn use_parallel_funcs(input: [], output: [results]):
         outputs = runner.run("threaded_parallel", {})
         results = outputs.get("results")
         assert results == ["slow", "fast"]
+
+
+class TestDAGRunnerBuiltins:
+    """Tests for built-in functions: range, enumerate, len."""
+
+    def test_range_single_arg(self):
+        """Test range(stop=n) produces [0, 1, ..., n-1]."""
+        source = """fn use_range(input: [], output: [items]):
+    items = range(stop=5)
+    return items"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+        runner = DAGRunner(dag)
+
+        outputs = runner.run("use_range", {})
+        assert outputs.get("items") == [0, 1, 2, 3, 4]
+
+    def test_range_start_stop(self):
+        """Test range(start=a, stop=b) produces [a, a+1, ..., b-1]."""
+        source = """fn use_range(input: [], output: [items]):
+    items = range(start=2, stop=6)
+    return items"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+        runner = DAGRunner(dag)
+
+        outputs = runner.run("use_range", {})
+        assert outputs.get("items") == [2, 3, 4, 5]
+
+    def test_range_with_step(self):
+        """Test range(start=a, stop=b, step=s)."""
+        source = """fn use_range(input: [], output: [items]):
+    items = range(start=0, stop=10, step=2)
+    return items"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+        runner = DAGRunner(dag)
+
+        outputs = runner.run("use_range", {})
+        assert outputs.get("items") == [0, 2, 4, 6, 8]
+
+    def test_enumerate_basic(self):
+        """Test enumerate returns [[0, item0], [1, item1], ...]."""
+        source = """fn use_enumerate(input: [data], output: [pairs]):
+    pairs = enumerate(items=data)
+    return pairs"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+        runner = DAGRunner(dag)
+
+        outputs = runner.run("use_enumerate", {"data": ["a", "b", "c"]})
+        assert outputs.get("pairs") == [[0, "a"], [1, "b"], [2, "c"]]
+
+    def test_len_list(self):
+        """Test len returns length of a list."""
+        source = """fn use_len(input: [data], output: [size]):
+    size = len(items=data)
+    return size"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+        runner = DAGRunner(dag)
+
+        outputs = runner.run("use_len", {"data": [1, 2, 3, 4, 5]})
+        assert outputs.get("size") == 5
+
+    def test_len_dict(self):
+        """Test len returns length of a dict."""
+        source = """fn use_len(input: [data], output: [size]):
+    size = len(items=data)
+    return size"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+        runner = DAGRunner(dag)
+
+        outputs = runner.run("use_len", {"data": {"a": 1, "b": 2}})
+        assert outputs.get("size") == 2
+
+    def test_len_string(self):
+        """Test len returns length of a string."""
+        source = """fn use_len(input: [data], output: [size]):
+    size = len(items=data)
+    return size"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+        runner = DAGRunner(dag)
+
+        outputs = runner.run("use_len", {"data": "hello"})
+        assert outputs.get("size") == 5
+
+
+class TestDAGRunnerForLoopUnpacking:
+    """Tests for multi-variable for loop unpacking."""
+
+    def test_for_loop_single_variable(self):
+        """Test basic for loop with single variable still works."""
+        source = """fn process_items(input: [items], output: [result]):
+    for item in items:
+        result = double(x=item)
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        def double(x):
+            return x * 2
+
+        runner = DAGRunner(dag, function_handlers={"double": double})
+
+        outputs = runner.run("process_items", {"items": [1, 2, 3]})
+        # Last result from loop
+        assert outputs.get("result") == 6
+
+    def test_for_loop_two_variables(self):
+        """Test for loop unpacking with two variables (e.g., for i, val in enumerate(x))."""
+        source = """fn process_enumerated(input: [items], output: [result]):
+    indexed = enumerate(items=items)
+    for i, val in indexed:
+        result = format_pair(idx=i, value=val)
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        def format_pair(idx, value):
+            return f"{idx}: {value}"
+
+        runner = DAGRunner(dag, function_handlers={"format_pair": format_pair})
+
+        outputs = runner.run("process_enumerated", {"items": ["a", "b", "c"]})
+        # Last result from loop
+        assert outputs.get("result") == "2: c"
+
+    def test_for_loop_enumerate_with_action(self):
+        """Test for loop with enumerate and action call."""
+        source = """fn process_with_index(input: [data], output: [result]):
+    pairs = enumerate(items=data)
+    for idx, item in pairs:
+        result = process(i=idx, x=item)
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        results_log = []
+
+        def process(i, x):
+            result = f"item[{i}]={x}"
+            results_log.append(result)
+            return result
+
+        runner = DAGRunner(dag, function_handlers={"process": process})
+
+        outputs = runner.run("process_with_index", {"data": ["x", "y", "z"]})
+        assert outputs.get("result") == "item[2]=z"
+        assert results_log == ["item[0]=x", "item[1]=y", "item[2]=z"]
+
+    def test_for_loop_with_list_of_lists(self):
+        """Test unpacking a list of lists directly."""
+        source = """fn process_pairs(input: [pairs], output: [result]):
+    for a, b in pairs:
+        result = add(x=a, y=b)
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        def add(x, y):
+            return x + y
+
+        runner = DAGRunner(dag, function_handlers={"add": add})
+
+        outputs = runner.run("process_pairs", {"pairs": [[1, 2], [3, 4], [5, 6]]})
+        # Last result: 5 + 6 = 11
+        assert outputs.get("result") == 11
+
+    def test_parser_for_loop_multiple_vars(self):
+        """Test that parser correctly handles multiple loop variables."""
+        source = """for i, item in items:
+    result = process(x=i, y=item)"""
+
+        from rappel import RappelForLoop
+
+        program = parse(source)
+        stmt = program.statements[0]
+        assert isinstance(stmt, RappelForLoop)
+        assert stmt.loop_vars == ("i", "item")
+
+    def test_for_loop_three_variables(self):
+        """Test for loop unpacking with three variables."""
+        source = """fn process_triples(input: [triples], output: [result]):
+    for a, b, c in triples:
+        result = combine(x=a, y=b, z=c)
+    return result"""
+
+        program = parse(source)
+        dag = convert_to_dag(program)
+
+        def combine(x, y, z):
+            return x + y + z
+
+        runner = DAGRunner(dag, function_handlers={"combine": combine})
+
+        outputs = runner.run("process_triples", {"triples": [[1, 2, 3], [4, 5, 6]]})
+        # Last result: 4 + 5 + 6 = 15
+        assert outputs.get("result") == 15

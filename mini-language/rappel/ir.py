@@ -250,10 +250,14 @@ class RappelForLoop:
     for item in items:
         result = process_item(x=item)
 
+    Supports unpacking multiple variables:
+    for i, item in enumerate(items):
+        result = process_item(idx=i, x=item)
+
     The body must contain exactly one statement: an assignment with a function call.
     """
 
-    loop_var: str
+    loop_vars: tuple[str, ...]
     iterable: RappelExpr
     body: tuple[RappelStatement, ...]
     location: SourceLocation | None = None
