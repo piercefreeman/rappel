@@ -191,15 +191,6 @@ def test_lexer_index_access():
     assert TokenType.RBRACKET in [t.type for t in tokens]
 
 
-def test_lexer_python_block():
-    """Test lexing python block keyword."""
-    source = "python(input: [x], output: [y]):"
-    lexer = RappelLexer(source)
-    tokens = lexer.tokenize()
-
-    assert tokens[0].type == TokenType.PYTHON
-
-
 def test_lexer_action_call():
     """Test lexing action call with @ syntax."""
     source = "@fetch_data(url=x)"

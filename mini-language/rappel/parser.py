@@ -3,7 +3,6 @@ Rappel Parser - Converts tokens into an AST (IR nodes).
 
 Enforces:
 - No nested function definitions (fn inside fn)
-- No nested python blocks inside fn (python blocks at top level only)
 - For loop body functions are allowed (they're the loop mechanism)
 - All function calls must use kwargs (no positional args)
 - Actions are called with @action_name(kwargs) syntax
@@ -33,7 +32,6 @@ from .ir import (
     RappelMultiAssignment,
     RappelReturn,
     RappelExprStatement,
-    RappelPythonBlock,
     RappelFunctionDef,
     RappelForLoop,
     RappelIfStatement,
@@ -97,15 +95,6 @@ class RappelParser:
                 )
             return self._parse_function_def()
 
-        if self._check(TokenType.PYTHON):
-            if self._in_function:
-                raise SyntaxError(
-                    f"Python blocks are not allowed inside functions. "
-                    f"Define python blocks at the top level or use regular assignments. "
-                    f"Line {self._peek().line}"
-                )
-            return self._parse_python_block()
-
         if self._check(TokenType.FOR):
             return self._parse_for_loop()
 
@@ -153,29 +142,6 @@ class RappelParser:
             inputs=tuple(inputs),
             outputs=tuple(outputs),
             body=tuple(body),
-            location=loc,
-        )
-
-    def _parse_python_block(self) -> RappelPythonBlock:
-        """Parse a python block with explicit I/O."""
-        loc = self._location()
-        self._consume(TokenType.PYTHON, "Expected 'python'")
-
-        self._consume(TokenType.LPAREN, "Expected '(' after 'python'")
-        inputs, outputs = self._parse_io_spec()
-        self._consume(TokenType.RPAREN, "Expected ')' after python parameters")
-
-        self._consume(TokenType.COLON, "Expected ':' after python signature")
-        self._consume_newline()
-
-        # For python blocks, we capture the raw code
-        code_lines = self._parse_raw_block()
-        code = "\n".join(code_lines)
-
-        return RappelPythonBlock(
-            code=code,
-            inputs=tuple(inputs),
-            outputs=tuple(outputs),
             location=loc,
         )
 
@@ -872,51 +838,6 @@ class RappelParser:
             self._advance()
 
         return statements
-
-    def _parse_raw_block(self) -> list[str]:
-        """Parse raw code block for python blocks."""
-        lines = []
-
-        self._consume(TokenType.INDENT, "Expected indented block")
-
-        # For raw blocks, we need to collect all tokens until DEDENT
-        # and reconstruct the code
-        current_line = ""
-
-        while not self._check(TokenType.DEDENT) and not self._is_at_end():
-            token = self._advance()
-
-            if token.type == TokenType.NEWLINE:
-                if current_line.strip():
-                    lines.append(current_line)
-                current_line = ""
-            elif token.type == TokenType.INDENT:
-                current_line += "    "
-            elif token.type == TokenType.DEDENT:
-                self.pos -= 1  # Put it back
-                break
-            else:
-                # Reconstruct token value
-                if token.type == TokenType.STRING:
-                    current_line += f'"{token.value}"'
-                elif token.type == TokenType.IDENTIFIER:
-                    if current_line and current_line[-1] not in " \t([{,.:":
-                        current_line += " "
-                    current_line += token.value
-                elif token.type in (TokenType.NUMBER, TokenType.BOOLEAN):
-                    if current_line and current_line[-1] not in " \t([{,.:":
-                        current_line += " "
-                    current_line += str(token.value)
-                else:
-                    current_line += token.value if token.value else ""
-
-        if current_line.strip():
-            lines.append(current_line)
-
-        if self._check(TokenType.DEDENT):
-            self._advance()
-
-        return lines
 
     def _consume(self, token_type: TokenType, message: str) -> Token:
         """Consume a token of the expected type."""

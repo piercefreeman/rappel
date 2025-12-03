@@ -22,7 +22,6 @@ from .ir import (
     RappelActionCall,
     RappelSpreadAction,
     RappelFunctionDef,
-    RappelPythonBlock,
     RappelForLoop,
     RappelIfStatement,
     RappelReturn,
@@ -118,11 +117,6 @@ class RappelPrettyPrinter:
         outputs = ", ".join(node.outputs)
         body = self._print_block(node.body)
         return f"fn {node.name}(input: [{inputs}], output: [{outputs}]):\n{body}"
-
-    def _print_RappelPythonBlock(self, node: RappelPythonBlock) -> str:
-        inputs = ", ".join(node.inputs)
-        outputs = ", ".join(node.outputs)
-        return f"python(input: [{inputs}], output: [{outputs}]):\n    {node.code}"
 
     def _print_RappelForLoop(self, node: RappelForLoop) -> str:
         iterable = self._print_node(node.iterable)

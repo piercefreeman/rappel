@@ -18,7 +18,6 @@ class TokenType(Enum):
 
     # Keywords
     FN = auto()  # function definition
-    PYTHON = auto()  # python block
     FOR = auto()  # for loop
     IN = auto()  # for x in list
     IF = auto()  # conditional

@@ -109,19 +109,6 @@ else:
     assert "else" in output
 
 
-def test_printer_python_block():
-    """Test printing python block."""
-    source = """python(input: [x, y], output: [z]):
-    z = x + y"""
-    program = parse(source)
-    printer = RappelPrettyPrinter()
-    output = printer.print(program)
-
-    assert "python" in output
-    assert "input:" in output
-    assert "output:" in output
-
-
 def test_printer_spread_operator():
     """Test printing spread operator."""
     source = "combined = [...base, 1, 2]"

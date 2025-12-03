@@ -7,7 +7,6 @@ from rappel import (
     EXAMPLE_IMMUTABLE_VARS,
     EXAMPLE_LIST_OPERATIONS,
     EXAMPLE_DICT_OPERATIONS,
-    EXAMPLE_PYTHON_BLOCK,
     EXAMPLE_FUNCTION_DEF,
     EXAMPLE_ACTION_CALL,
     EXAMPLE_FOR_LOOP,
@@ -33,12 +32,6 @@ def test_example_list_operations():
 def test_example_dict_operations():
     """Test parsing dict operations example."""
     program = parse(EXAMPLE_DICT_OPERATIONS)
-    assert len(program.statements) > 0
-
-
-def test_example_python_block():
-    """Test parsing python block example."""
-    program = parse(EXAMPLE_PYTHON_BLOCK)
     assert len(program.statements) > 0
 
 
@@ -90,7 +83,6 @@ def test_all_examples_convert_to_dag():
         EXAMPLE_IMMUTABLE_VARS,
         EXAMPLE_LIST_OPERATIONS,
         EXAMPLE_DICT_OPERATIONS,
-        EXAMPLE_PYTHON_BLOCK,
         EXAMPLE_FUNCTION_DEF,
         EXAMPLE_ACTION_CALL,
         EXAMPLE_FOR_LOOP,
@@ -131,7 +123,6 @@ def test_all_examples_pretty_print():
         EXAMPLE_IMMUTABLE_VARS,
         EXAMPLE_LIST_OPERATIONS,
         EXAMPLE_DICT_OPERATIONS,
-        EXAMPLE_PYTHON_BLOCK,
         EXAMPLE_FUNCTION_DEF,
         EXAMPLE_ACTION_CALL,
         EXAMPLE_FOR_LOOP,

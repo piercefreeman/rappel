@@ -33,7 +33,6 @@ from .ir import (
     RappelMultiAssignment,
     RappelReturn,
     RappelExprStatement,
-    RappelPythonBlock,
     RappelFunctionDef,
     RappelForLoop,
     RappelIfStatement,
@@ -592,8 +591,6 @@ class DAGConverter:
             return self._convert_for_loop(stmt)
         elif isinstance(stmt, RappelIfStatement):
             return self._convert_if_statement(stmt)
-        elif isinstance(stmt, RappelPythonBlock):
-            return self._convert_python_block(stmt)
         elif isinstance(stmt, RappelReturn):
             return self._convert_return(stmt)
         elif isinstance(stmt, RappelExprStatement):
@@ -1015,25 +1012,6 @@ class DAGConverter:
             ))
 
         return result_nodes
-
-    def _convert_python_block(self, stmt: RappelPythonBlock) -> list[str]:
-        """Convert a python block."""
-        node_id = self._next_id("python")
-        outputs_str = ", ".join(stmt.outputs)
-        node = DAGNode(
-            id=node_id,
-            node_type="python_block",
-            ir_node=stmt,
-            label=f"python -> {outputs_str}",
-            function_name=self.current_function
-        )
-        self.dag.add_node(node)
-
-        # Track output variables
-        for output_var in stmt.outputs:
-            self._track_var_definition(output_var, node_id)
-
-        return [node_id]
 
     def _convert_return(self, stmt: RappelReturn) -> list[str]:
         """Convert a return statement."""

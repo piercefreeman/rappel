@@ -226,21 +226,6 @@ class RappelExprStatement:
 
 
 @dataclass(frozen=True)
-class RappelPythonBlock:
-    """
-    Python block with explicit input/output.
-
-    python(input: [x, y], output: [z]):
-        z = x + y
-    """
-
-    code: str
-    inputs: tuple[str, ...]
-    outputs: tuple[str, ...]
-    location: SourceLocation | None = None
-
-
-@dataclass(frozen=True)
 class RappelFunctionDef:
     """
     Function definition with explicit input/output.
@@ -381,7 +366,6 @@ RappelStatement = (
     | RappelMultiAssignment
     | RappelReturn
     | RappelExprStatement
-    | RappelPythonBlock
     | RappelFunctionDef
     | RappelForLoop
     | RappelIfStatement

@@ -45,18 +45,6 @@ host = config["host"]
 port = config["port"]
 """
 
-EXAMPLE_PYTHON_BLOCK = """
-# Python block with explicit I/O
-python(input: [x, y], output: [z]):
-    z = x + y
-
-# Python block for complex computation
-python(input: [data], output: [mean, std]):
-    import statistics
-    mean = statistics.mean(data)
-    std = statistics.stdev(data)
-"""
-
 EXAMPLE_FUNCTION_DEF = """
 # Function with explicit input/output
 fn calculate_area(input: [width, height], output: [area]):

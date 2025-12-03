@@ -18,7 +18,6 @@ from rappel import (
     RappelCall,
     RappelActionCall,
     RappelFunctionDef,
-    RappelPythonBlock,
     RappelForLoop,
     RappelIfStatement,
     RappelReturn,
@@ -209,18 +208,6 @@ def test_parser_spread_action_no_target():
     assert stmt.target is None
 
 
-def test_parser_python_block():
-    """Test parsing python block."""
-    source = """python(input: [x, y], output: [z]):
-    z = x + y"""
-    program = parse(source)
-
-    stmt = program.statements[0]
-    assert isinstance(stmt, RappelPythonBlock)
-    assert stmt.inputs == ("x", "y")
-    assert stmt.outputs == ("z",)
-
-
 def test_parser_for_loop():
     """Test parsing for loop with single function call body."""
     source = """for item in items:
@@ -335,15 +322,6 @@ def test_parser_rejects_nested_function():
     source = """fn outer(input: [], output: []):
     fn inner(input: [], output: []):
         x = 1"""
-    with pytest.raises(SyntaxError):
-        parse(source)
-
-
-def test_parser_rejects_python_block_in_function():
-    """Test that python blocks inside functions are rejected."""
-    source = """fn outer(input: [], output: []):
-    python(input: [], output: [z]):
-        z = 1"""
     with pytest.raises(SyntaxError):
         parse(source)
 

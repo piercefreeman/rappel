@@ -54,7 +54,6 @@ statement       = assignment
                 | spread_action
                 | for_loop
                 | conditional
-                | python_block
                 | return_stmt
                 | expr_stmt ;
 
@@ -94,18 +93,6 @@ conditional     = if_branch elif_branch* else_branch? ;
 if_branch       = "if" expr ":" body ;
 elif_branch     = "elif" expr ":" body ;
 else_branch     = "else:" body ;
-```
-
-### Python Escape Hatch
-
-```ebnf
-(* Python block for arbitrary computation *)
-python_block    = "python" io_spec "{" CODE "}" ;
-io_spec         = "(" io_parts ")" ;
-io_parts        = io_part (";" io_part)* ;
-io_part         = "reads:" ident_list
-                | "writes:" ident_list ;
-CODE            = <any valid Python code> ;
 ```
 
 ### Expressions

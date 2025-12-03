@@ -14,7 +14,6 @@ from rappel import (
     RappelAssignment,
     RappelMultiAssignment,
     RappelReturn,
-    RappelPythonBlock,
     RappelFunctionDef,
     RappelActionCall,
     RappelCall,
@@ -91,17 +90,6 @@ def test_ir_statements():
         value=RappelVariable(name="result"),
     )
     assert len(multi.targets) == 3
-
-
-def test_ir_python_block():
-    """Test Python block with explicit I/O."""
-    block = RappelPythonBlock(
-        code="z = x + y",
-        inputs=("x", "y"),
-        outputs=("z",),
-    )
-    assert block.inputs == ("x", "y")
-    assert block.outputs == ("z",)
 
 
 def test_ir_function_def():

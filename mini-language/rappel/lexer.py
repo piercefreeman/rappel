@@ -2,7 +2,7 @@
 Rappel Lexer - Tokenizes source code into tokens.
 
 Handles:
-- Keywords: fn, action, python, for, in, if, else, return, input, output
+- Keywords: fn, for, in, if, else, try, except, return, input, output, spread, parallel
 - Operators: =, +, -, *, /, ==, !=, <, >, <=, >=, and, or, not, ->
 - Literals: strings, numbers, booleans
 - Identifiers
@@ -20,7 +20,6 @@ class RappelLexer:
 
     KEYWORDS = {
         "fn": TokenType.FN,
-        "python": TokenType.PYTHON,
         "for": TokenType.FOR,
         "in": TokenType.IN,
         "if": TokenType.IF,
