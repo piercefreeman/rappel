@@ -45,12 +45,14 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use prost::Message;
+
 use crate::{
-    dag::{DAG, DAGNode},
+    dag::{DAG, DAGConverter, DAGNode},
     dag_state::{DAGHelper, ExecutionMode},
     db::{
         ActionId, BackoffKind, CompletionRecord, Database,
-        NewAction, QueuedAction, WorkflowInstanceId,
+        NewAction, QueuedAction, WorkflowInstanceId, WorkflowVersionId,
     },
     parser::ast,
     worker::{ActionDispatchPayload, PythonWorkerPool, RoundTripMetrics},
@@ -103,6 +105,202 @@ pub type RunnerResult<T> = Result<T, RunnerError>;
 /// Runtime value for expression evaluation.
 /// Uses serde_json::Value for JSON-compatible types.
 pub type Value = JsonValue;
+
+// ============================================================================
+// JSON to WorkflowArguments Conversion
+// ============================================================================
+
+/// Convert a JSON value to WorkflowArgumentValue.
+fn json_to_workflow_value(value: &JsonValue) -> proto::WorkflowArgumentValue {
+    let kind = match value {
+        JsonValue::Null => {
+            proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
+                kind: Some(proto::primitive_workflow_argument::Kind::NullValue(0)),
+            })
+        }
+        JsonValue::Bool(b) => {
+            proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
+                kind: Some(proto::primitive_workflow_argument::Kind::BoolValue(*b)),
+            })
+        }
+        JsonValue::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
+                    kind: Some(proto::primitive_workflow_argument::Kind::IntValue(i)),
+                })
+            } else if let Some(f) = n.as_f64() {
+                proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
+                    kind: Some(proto::primitive_workflow_argument::Kind::DoubleValue(f)),
+                })
+            } else {
+                proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
+                    kind: Some(proto::primitive_workflow_argument::Kind::DoubleValue(0.0)),
+                })
+            }
+        }
+        JsonValue::String(s) => {
+            proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
+                kind: Some(proto::primitive_workflow_argument::Kind::StringValue(s.clone())),
+            })
+        }
+        JsonValue::Array(arr) => {
+            let items: Vec<proto::WorkflowArgumentValue> = arr
+                .iter()
+                .map(json_to_workflow_value)
+                .collect();
+            proto::workflow_argument_value::Kind::ListValue(proto::WorkflowListArgument { items })
+        }
+        JsonValue::Object(obj) => {
+            let entries: Vec<proto::WorkflowArgument> = obj
+                .iter()
+                .map(|(k, v)| proto::WorkflowArgument {
+                    key: k.clone(),
+                    value: Some(json_to_workflow_value(v)),
+                })
+                .collect();
+            proto::workflow_argument_value::Kind::DictValue(proto::WorkflowDictArgument { entries })
+        }
+    };
+
+    proto::WorkflowArgumentValue { kind: Some(kind) }
+}
+
+/// Convert JSON bytes (expected to be an object) to WorkflowArguments.
+///
+/// The dispatch_payload is stored as JSON bytes representing the kwargs
+/// for the action. This function parses and converts them to the proto format.
+fn json_bytes_to_workflow_args(payload: &[u8]) -> proto::WorkflowArguments {
+    if payload.is_empty() {
+        return proto::WorkflowArguments { arguments: vec![] };
+    }
+
+    let json: JsonValue = match serde_json::from_slice(payload) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Failed to parse dispatch payload as JSON: {}", e);
+            return proto::WorkflowArguments { arguments: vec![] };
+        }
+    };
+
+    match json {
+        JsonValue::Object(obj) => {
+            let arguments: Vec<proto::WorkflowArgument> = obj
+                .iter()
+                .map(|(k, v)| proto::WorkflowArgument {
+                    key: k.clone(),
+                    value: Some(json_to_workflow_value(v)),
+                })
+                .collect();
+            proto::WorkflowArguments { arguments }
+        }
+        _ => {
+            warn!("dispatch_payload is not a JSON object, expected kwargs");
+            proto::WorkflowArguments { arguments: vec![] }
+        }
+    }
+}
+
+// ============================================================================
+// DAG Cache
+// ============================================================================
+
+/// Cache for DAGs loaded from workflow versions.
+///
+/// Since workflow versions are immutable (content-addressed by dag_hash),
+/// we can cache them indefinitely. The cache stores Arc<DAG> which can be
+/// used to create DAGHelper instances on-demand.
+pub struct DAGCache {
+    db: Arc<Database>,
+    /// Cached DAGs by workflow version ID
+    cache: RwLock<HashMap<Uuid, Arc<DAG>>>,
+    /// Cached version lookups by instance ID (instance -> version_id)
+    instance_versions: RwLock<HashMap<Uuid, Uuid>>,
+}
+
+impl DAGCache {
+    /// Create a new DAG cache.
+    pub fn new(db: Arc<Database>) -> Self {
+        Self {
+            db,
+            cache: RwLock::new(HashMap::new()),
+            instance_versions: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Get the DAG for a workflow version, loading from DB if not cached.
+    pub async fn get_dag(&self, version_id: WorkflowVersionId) -> RunnerResult<Arc<DAG>> {
+        // Check cache first
+        {
+            let cache = self.cache.read().await;
+            if let Some(dag) = cache.get(&version_id.0) {
+                return Ok(Arc::clone(dag));
+            }
+        }
+
+        // Load from DB
+        let version = self.db.get_workflow_version(version_id).await?;
+
+        // Decode the program proto
+        let program = ast::Program::decode(&version.program_proto[..])
+            .map_err(|e| RunnerError::Dag(format!("Failed to decode program proto: {}", e)))?;
+
+        // Convert to DAG
+        let mut converter = DAGConverter::new();
+        let dag = converter.convert(&program);
+
+        let dag = Arc::new(dag);
+
+        // Cache it
+        {
+            let mut cache = self.cache.write().await;
+            cache.insert(version_id.0, Arc::clone(&dag));
+        }
+
+        Ok(dag)
+    }
+
+    /// Get the DAG for a workflow instance, looking up the version first.
+    pub async fn get_dag_for_instance(&self, instance_id: WorkflowInstanceId) -> RunnerResult<Option<Arc<DAG>>> {
+        // Check if we have the version cached for this instance
+        let version_id = {
+            let cache = self.instance_versions.read().await;
+            cache.get(&instance_id.0).copied()
+        };
+
+        if let Some(version_id) = version_id {
+            return Ok(Some(self.get_dag(WorkflowVersionId(version_id)).await?));
+        }
+
+        // Load instance to get version_id
+        let instance = self.db.get_instance(instance_id).await?;
+
+        let version_id = match instance.workflow_version_id {
+            Some(id) => id,
+            None => return Ok(None), // No version associated
+        };
+
+        // Cache the instance -> version mapping
+        {
+            let mut cache = self.instance_versions.write().await;
+            cache.insert(instance_id.0, version_id);
+        }
+
+        Ok(Some(self.get_dag(WorkflowVersionId(version_id)).await?))
+    }
+
+    /// Pre-load a DAG into the cache (for testing or warm-up).
+    pub async fn preload(&self, version_id: Uuid, dag: DAG) {
+        let mut cache = self.cache.write().await;
+        cache.insert(version_id, Arc::new(dag));
+    }
+
+    /// Get cache statistics.
+    pub async fn stats(&self) -> (usize, usize) {
+        let dag_count = self.cache.read().await.len();
+        let instance_count = self.instance_versions.read().await.len();
+        (dag_count, instance_count)
+    }
+}
 
 // ============================================================================
 // Worker Slot Tracking
@@ -349,11 +547,8 @@ impl WorkQueueHandler {
             in_flight.add(action.clone(), worker_idx);
         }
 
-        // Build dispatch payload
-        // TODO: Parse dispatch_payload JSON and convert to WorkflowArguments
-        let kwargs = proto::WorkflowArguments {
-            arguments: vec![],
-        };
+        // Build dispatch payload - convert JSON to WorkflowArguments
+        let kwargs = json_bytes_to_workflow_args(&action.dispatch_payload);
 
         let dispatch = ActionDispatchPayload {
             action_id: action.id.to_string(),
@@ -600,7 +795,7 @@ impl WorkCompletionHandler {
     fn execute_inline_node(
         &self,
         node: &DAGNode,
-        context: &mut InstanceContext,
+        _context: &mut InstanceContext,
     ) -> RunnerResult<JsonValue> {
         // Dispatch based on node type
         match node.node_type.as_str() {
@@ -1201,8 +1396,8 @@ pub struct DAGRunner {
     config: RunnerConfig,
     work_handler: Arc<WorkQueueHandler>,
     completion_handler: WorkCompletionHandler,
-    /// Cached DAGs by workflow version ID
-    dag_cache: Arc<RwLock<HashMap<Uuid, Arc<DAG>>>>,
+    /// DAG cache with DB-backed loading
+    dag_cache: Arc<DAGCache>,
     /// Instance contexts by instance ID
     instance_contexts: Arc<RwLock<HashMap<Uuid, InstanceContext>>>,
     /// Shutdown signal
@@ -1226,13 +1421,14 @@ impl DAGRunner {
             slot_tracker,
             in_flight,
         ));
-        let completion_handler = WorkCompletionHandler::new(db);
+        let completion_handler = WorkCompletionHandler::new(Arc::clone(&db));
+        let dag_cache = Arc::new(DAGCache::new(db));
 
         Self {
             config,
             work_handler,
             completion_handler,
-            dag_cache: Arc::new(RwLock::new(HashMap::new())),
+            dag_cache,
             instance_contexts: Arc::new(RwLock::new(HashMap::new())),
             shutdown: Arc::new(tokio::sync::Notify::new()),
         }
@@ -1259,6 +1455,7 @@ impl DAGRunner {
                     let handler = self.completion_handler.clone();
                     let dag_cache = Arc::clone(&self.dag_cache);
                     let instance_contexts = Arc::clone(&self.instance_contexts);
+                    let instance_id = in_flight.action.instance_id;
 
                     tokio::spawn(async move {
                         if let Err(e) = Self::process_completion_task(
@@ -1267,6 +1464,7 @@ impl DAGRunner {
                             instance_contexts,
                             in_flight,
                             metrics,
+                            WorkflowInstanceId(instance_id),
                         ).await {
                             error!("Completion processing failed: {}", e);
                         }
@@ -1301,30 +1499,44 @@ impl DAGRunner {
     }
 
     /// Process a completion in a tokio task.
+    ///
+    /// The CPU-intensive DAG traversal and inline execution is offloaded to
+    /// `spawn_blocking` for true CPU parallelism across threads.
     async fn process_completion_task(
         handler: WorkCompletionHandler,
-        dag_cache: Arc<RwLock<HashMap<Uuid, Arc<DAG>>>>,
+        dag_cache: Arc<DAGCache>,
         instance_contexts: Arc<RwLock<HashMap<Uuid, InstanceContext>>>,
         in_flight: InFlightAction,
         metrics: RoundTripMetrics,
+        instance_id: WorkflowInstanceId,
     ) -> RunnerResult<()> {
-        let instance_id = in_flight.action.instance_id;
-
-        // Get or create instance context
-        let mut context = {
+        // Step 1: Async I/O - Get or create instance context
+        let context = {
             let contexts = instance_contexts.read().await;
-            contexts.get(&instance_id).cloned()
-        }.unwrap_or_else(|| InstanceContext::new(WorkflowInstanceId(instance_id)));
+            contexts.get(&instance_id.0).cloned()
+        }.unwrap_or_else(|| InstanceContext::new(instance_id));
 
-        // Get DAG for this workflow
-        // TODO: Load from workflow version
-        let dag = {
-            let cache = dag_cache.read().await;
-            cache.values().next().cloned()
-        };
+        // Step 2: Async I/O - Get DAG for this workflow instance (loads from DB if not cached)
+        let dag = dag_cache.get_dag_for_instance(instance_id).await?;
 
-        let batch = if let Some(dag) = dag {
-            handler.process_completion(in_flight, metrics, &dag, &mut context).await?
+        // Step 3: CPU-bound work - DAG traversal and inline execution
+        // Offload to blocking thread pool for true CPU parallelism
+        let (batch, updated_context) = if let Some(dag) = dag {
+            let dag_clone = dag;
+            let in_flight_clone = in_flight.clone();
+            let metrics_clone = metrics.clone();
+
+            tokio::task::spawn_blocking(move || {
+                // All CPU-intensive work happens here on a blocking thread
+                Self::process_completion_blocking(
+                    in_flight_clone,
+                    metrics_clone,
+                    &dag_clone,
+                    context,
+                )
+            })
+            .await
+            .map_err(|e| RunnerError::Worker(format!("Blocking task failed: {}", e)))??
         } else {
             // No DAG - just create completion record
             let mut batch = CompletionBatch::new();
@@ -1335,19 +1547,228 @@ impl DAGRunner {
                 delivery_token: in_flight.action.delivery_token,
                 error_message: metrics.error_message,
             });
-            batch
+            (batch, context)
         };
 
-        // Write batch to database (delegated to completion handler)
+        // Step 4: Async I/O - Write batch to database
         handler.write_batch(batch).await?;
 
-        // Update context cache
+        // Step 5: Async I/O - Update context cache
         {
             let mut contexts = instance_contexts.write().await;
-            contexts.insert(instance_id, context);
+            contexts.insert(instance_id.0, updated_context);
         }
 
         Ok(())
+    }
+
+    /// Synchronous, CPU-bound completion processing.
+    ///
+    /// This runs on a blocking thread and performs:
+    /// - DAG traversal to find successors
+    /// - Expression evaluation for inline nodes
+    /// - Recursive inline execution
+    fn process_completion_blocking(
+        in_flight: InFlightAction,
+        metrics: RoundTripMetrics,
+        dag: &DAG,
+        mut context: InstanceContext,
+    ) -> RunnerResult<(CompletionBatch, InstanceContext)> {
+        let mut batch = CompletionBatch::new();
+
+        // Create completion record
+        batch.completions.push(CompletionRecord {
+            action_id: ActionId(in_flight.action.id),
+            success: metrics.success,
+            result_payload: metrics.response_payload.clone(),
+            delivery_token: in_flight.action.delivery_token,
+            error_message: metrics.error_message.clone(),
+        });
+
+        if !metrics.success {
+            return Ok((batch, context));
+        }
+
+        // Parse result payload
+        let result: JsonValue = if metrics.response_payload.is_empty() {
+            JsonValue::Null
+        } else {
+            serde_json::from_slice(&metrics.response_payload)?
+        };
+
+        // Find the node that was executed
+        let node_id = match in_flight.action.node_id.as_deref() {
+            Some(id) => id,
+            None => return Ok((batch, context)),
+        };
+
+        let helper = DAGHelper::new(dag);
+
+        // Store result in context
+        if let Some(node) = dag.nodes.get(node_id) {
+            if let Some(target_var) = Self::get_target_variable_static(node) {
+                context.variables.insert(target_var, result.clone());
+            }
+        }
+
+        // Find data flow targets and push values
+        let targets = helper.get_data_flow_targets(node_id);
+        for target in targets {
+            if let Some(var) = &target.variable {
+                context.variables.insert(var.clone(), result.clone());
+            }
+        }
+
+        // Get successors and process inline nodes, queue delegated nodes
+        let successors = helper.get_ready_successors(node_id, None);
+
+        for successor in successors {
+            let succ_node = match dag.nodes.get(&successor.node_id) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            let exec_mode = helper.get_execution_mode(succ_node);
+            match exec_mode {
+                ExecutionMode::Inline => {
+                    // Execute inline node and recursively process successors
+                    let inline_result = Self::execute_inline_node_static(succ_node, &mut context)?;
+                    Self::process_inline_successors(
+                        &successor.node_id,
+                        inline_result,
+                        dag,
+                        &mut context,
+                        &mut batch,
+                        in_flight.action.instance_id,
+                    )?;
+                }
+                ExecutionMode::Delegated => {
+                    if let Some(new_action) = Self::create_action_for_node_static(
+                        succ_node,
+                        WorkflowInstanceId(in_flight.action.instance_id),
+                        &context,
+                    )? {
+                        batch.new_actions.push(new_action);
+                    }
+                }
+            }
+        }
+
+        Ok((batch, context))
+    }
+
+    /// Recursively process inline successors (CPU-bound helper).
+    fn process_inline_successors(
+        node_id: &str,
+        result: JsonValue,
+        dag: &DAG,
+        context: &mut InstanceContext,
+        batch: &mut CompletionBatch,
+        instance_id: Uuid,
+    ) -> RunnerResult<()> {
+        let helper = DAGHelper::new(dag);
+
+        // Store result
+        if let Some(node) = dag.nodes.get(node_id) {
+            if let Some(target_var) = Self::get_target_variable_static(node) {
+                context.variables.insert(target_var, result.clone());
+            }
+        }
+
+        // Get successors
+        let successors = helper.get_ready_successors(node_id, None);
+
+        for successor in successors {
+            let succ_node = match dag.nodes.get(&successor.node_id) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            let exec_mode = helper.get_execution_mode(succ_node);
+            match exec_mode {
+                ExecutionMode::Inline => {
+                    let inline_result = Self::execute_inline_node_static(succ_node, context)?;
+                    Self::process_inline_successors(
+                        &successor.node_id,
+                        inline_result,
+                        dag,
+                        context,
+                        batch,
+                        instance_id,
+                    )?;
+                }
+                ExecutionMode::Delegated => {
+                    if let Some(new_action) = Self::create_action_for_node_static(
+                        succ_node,
+                        WorkflowInstanceId(instance_id),
+                        context,
+                    )? {
+                        batch.new_actions.push(new_action);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Static helper to get target variable (for blocking context).
+    fn get_target_variable_static(node: &DAGNode) -> Option<String> {
+        if node.node_type == "assignment" {
+            if let Some(eq_pos) = node.label.find('=') {
+                let target = node.label[..eq_pos].trim();
+                return Some(target.to_string());
+            }
+        }
+        None
+    }
+
+    /// Static helper to execute inline node (for blocking context).
+    fn execute_inline_node_static(
+        node: &DAGNode,
+        _context: &mut InstanceContext,
+    ) -> RunnerResult<JsonValue> {
+        match node.node_type.as_str() {
+            "assignment" => Ok(JsonValue::Null),
+            "input" | "output" => Ok(JsonValue::Null),
+            "return" => Ok(JsonValue::Null),
+            "conditional" => Ok(JsonValue::Bool(true)),
+            "aggregator" => Ok(JsonValue::Array(vec![])),
+            _ => Ok(JsonValue::Null),
+        }
+    }
+
+    /// Static helper to create action for node (for blocking context).
+    fn create_action_for_node_static(
+        node: &DAGNode,
+        instance_id: WorkflowInstanceId,
+        context: &InstanceContext,
+    ) -> RunnerResult<Option<NewAction>> {
+        if node.node_type != "action_call" {
+            return Ok(None);
+        }
+
+        let action_name = if node.label.starts_with('@') {
+            let end = node.label.find('(').unwrap_or(node.label.len());
+            node.label[1..end].to_string()
+        } else {
+            return Ok(None);
+        };
+
+        let payload = serde_json::to_vec(&context.variables)?;
+
+        Ok(Some(NewAction {
+            instance_id,
+            // TODO: Get module_name from DAGNode metadata once added
+            module_name: "default".to_string(),
+            action_name,
+            dispatch_payload: payload,
+            timeout_seconds: 300,
+            max_retries: 3,
+            backoff_kind: BackoffKind::Exponential,
+            backoff_base_delay_ms: 1000,
+            node_id: Some(node.id.clone()),
+        }))
     }
 
     /// Request shutdown.
@@ -1355,10 +1776,9 @@ impl DAGRunner {
         self.shutdown.notify_one();
     }
 
-    /// Register a DAG for a workflow version.
+    /// Register a DAG for a workflow version (for testing or warm-up).
     pub async fn register_dag(&self, version_id: Uuid, dag: DAG) {
-        let mut cache = self.dag_cache.write().await;
-        cache.insert(version_id, Arc::new(dag));
+        self.dag_cache.preload(version_id, dag).await;
     }
 
     /// Get count of in-flight actions.
