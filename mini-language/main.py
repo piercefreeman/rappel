@@ -128,8 +128,14 @@ def main():
     print("-" * 60)
     print(f"   {db.stats}")
     print("   ")
-    print("   Key insight: Only 2 queue writes (for the 2 @actions).")
-    print("   All other inline nodes executed in-memory without queue roundtrips!")
+    print("   Breakdown:")
+    print("   - reads/writes: node_data table (all nodes persist state)")
+    print("   - queries: SELECT ... FOR UPDATE SKIP LOCKED (2 @actions)")
+    print("   - deletes: DELETE from action_queue after processing")
+    print("   ")
+    print("   Key insight: Only 2 action_queue operations!")
+    print("   Inline nodes still persist to node_data, but skip the queue.")
+    print("   In a distributed cluster, this means 2 worker handoffs instead of N.")
     print("-" * 60)
 
     # Also demonstrate running individual functions

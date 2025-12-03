@@ -225,15 +225,16 @@ class DAGRunner:
         self.db = db or InMemoryDB()
         self.queue = ActionQueue(self.db)
 
-        # Node data - kept in memory as a "cache" during inline execution.
-        # In a real implementation with a DB backend:
-        # - Inline execution uses this cache (no DB writes)
-        # - Delegated actions would persist to DB before queuing
-        # The ActionQueue writes show the real difference.
-        self.node_data: dict[str, RunnableActionData] = {}
+        # Node data table - stores variable_values, completion status, etc.
+        # In a distributed system, workers read/write this to share state.
+        # This is SEPARATE from the action queue optimization:
+        # - Action queue: only delegated @actions get queued (our optimization)
+        # - Node data: ALL nodes persist state here (required for distribution)
+        self._node_data_table: Table[dict[str, Any]] = self.db.create_table("node_data")
 
-        # Execution results per node
-        self.results: dict[str, Any] = {}
+        # Execution results per node (could also be in DB for full distribution)
+        self._results_table: Table[dict[str, Any]] = self.db.create_table("results")
+
         # Track which functions have completed
         self.completed_functions: set[str] = set()
         # Mapping from node UUID to node ID
@@ -241,8 +242,37 @@ class DAGRunner:
 
         # Initialize node data for all nodes
         for node_id, node in self.dag.nodes.items():
-            self.node_data[node_id] = RunnableActionData(node_id=node_id)
+            data = RunnableActionData(node_id=node_id)
+            self._node_data_table.insert(node_id, data.to_dict())
             self._uuid_to_node_id[node.node_uuid] = node_id
+
+    def _get_node_data(self, node_id: str) -> RunnableActionData:
+        """
+        Read node data from DB.
+
+        Simulates: SELECT * FROM node_data WHERE node_id = ?
+        """
+        data_dict = self._node_data_table.get(node_id)
+        if data_dict is None:
+            raise KeyError(f"Node data not found for {node_id}")
+        return RunnableActionData.from_dict(data_dict)
+
+    def _set_node_data(self, node_id: str, data: RunnableActionData) -> None:
+        """
+        Write node data to DB.
+
+        Simulates: UPDATE node_data SET ... WHERE node_id = ?
+        """
+        self._node_data_table.upsert(node_id, data.to_dict())
+
+    def _get_result(self, node_id: str) -> Any:
+        """Read execution result from DB."""
+        result = self._results_table.get(node_id)
+        return result.get("value") if result else None
+
+    def _set_result(self, node_id: str, value: Any) -> None:
+        """Write execution result to DB."""
+        self._results_table.upsert(node_id, {"node_id": node_id, "value": value})
 
     def run(self, function_name: str, inputs: dict[str, Any] | None = None) -> dict[str, Any]:
         """
@@ -265,9 +295,11 @@ class DAGRunner:
         if not input_node:
             raise ValueError(f"Function '{function_name}' not found in DAG")
 
-        # Initialize input values
-        self.node_data[input_node.id].variable_values = inputs.copy()
-        self.node_data[input_node.id].completed = True
+        # Initialize input values (DB write)
+        input_data = self._get_node_data(input_node.id)
+        input_data.variable_values = inputs.copy()
+        input_data.completed = True
+        self._set_node_data(input_node.id, input_data)
 
         # Push input values to successor nodes
         self._push_outputs(input_node.id, inputs)
@@ -288,10 +320,10 @@ class DAGRunner:
             # After delegated action completes, eagerly execute inline successors
             self._execute_inline_batch(action.node_id)
 
-        # Find and return outputs
+        # Find and return outputs (DB read)
         output_node = self._find_output_node(function_name)
         if output_node:
-            return self.node_data[output_node.id].variable_values
+            return self._get_node_data(output_node.id).variable_values
         return {}
 
     def run_main(self, inputs: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -330,40 +362,47 @@ class DAGRunner:
             if node is None:
                 continue
 
-            # Skip if already completed
-            if self.node_data[node_id].completed:
+            # Skip if already completed (DB read)
+            node_data = self._get_node_data(node_id)
+            if node_data.completed:
                 continue
 
             action_type = self._get_action_type(node)
 
             if action_type == ActionType.DELEGATED:
                 # --------------------------------------------------------------
-                # IN A REAL IMPLEMENTATION WITH A DATABASE BACKEND:
-                # This is where we write to the action queue table, e.g.:
+                # DELEGATED ACTION: Write to action queue (the DB roundtrip)
                 #
-                #   INSERT INTO action_queue (id, node_id, function_name, ...)
-                #   VALUES (...)
-                #
-                # This is the "roundtrip" we're avoiding for inline nodes.
+                # In a distributed system, another worker will:
+                #   1. SELECT ... FOR UPDATE SKIP LOCKED from action_queue
+                #   2. Read node_data for this node
+                #   3. Execute the @action
+                #   4. Write results back to node_data
+                #   5. DELETE from action_queue
                 # --------------------------------------------------------------
                 action = RunnableAction(
                     id=self.queue.next_id(),
                     node_id=node_id,
                     function_name=node.function_name,
                     action_type=ActionType.DELEGATED,
-                    input_data=self.node_data[node_id].variable_values.copy(),
+                    input_data=node_data.variable_values.copy(),
                 )
                 self.queue.add(action)
                 # Don't continue past delegated actions - they'll trigger
                 # another inline batch when they complete
             else:
-                # Execute inline node immediately (no queue roundtrip)
+                # --------------------------------------------------------------
+                # INLINE ACTION: Execute immediately (NO queue roundtrip)
+                #
+                # We still read/write node_data to DB, but we skip the
+                # action_queue entirely. This is the optimization.
+                # --------------------------------------------------------------
                 action = RunnableAction(
                     id=self.queue.next_id(),
                     node_id=node_id,
                     function_name=node.function_name,
                     action_type=ActionType.INLINE,
-                    input_data=self.node_data[node_id].variable_values.copy(),
+                    input_data=node_data.variable_values.copy(),
                 )
                 self._execute_action(action)
 
@@ -390,9 +429,10 @@ class DAGRunner:
 
         ready = []
 
-        # Handle conditional branching
+        # Handle conditional branching (DB read for condition)
         if node.ir_node and isinstance(node.ir_node, RappelIfStatement):
-            condition_result = self.node_data[node_id].variable_values.get("_condition", True)
+            node_data = self._get_node_data(node_id)
+            condition_result = node_data.variable_values.get("_condition", True)
 
             for edge in self.dag.get_outgoing_edges(node_id):
                 if edge.edge_type != EdgeType.STATE_MACHINE:
@@ -405,13 +445,14 @@ class DAGRunner:
                     continue
 
                 target_node = self.dag.nodes.get(edge.target)
-                if target_node and not self.node_data[edge.target].completed:
-                    # Check if aggregator is ready
-                    if target_node.is_aggregator:
-                        data = self.node_data[edge.target]
-                        if data.pending_inputs > 0 and len(data.collected_results) < data.pending_inputs:
-                            continue
-                    ready.append(edge.target)
+                if target_node:
+                    target_data = self._get_node_data(edge.target)
+                    if not target_data.completed:
+                        # Check if aggregator is ready
+                        if target_node.is_aggregator:
+                            if target_data.pending_inputs > 0 and len(target_data.collected_results) < target_data.pending_inputs:
+                                continue
+                        ready.append(edge.target)
         else:
             # Normal node - follow all state machine edges
             for edge in self.dag.get_outgoing_edges(node_id):
@@ -422,13 +463,13 @@ class DAGRunner:
                 if target_node is None:
                     continue
 
-                if self.node_data[edge.target].completed:
+                target_data = self._get_node_data(edge.target)
+                if target_data.completed:
                     continue
 
                 # Check if aggregator is ready
                 if target_node.is_aggregator:
-                    data = self.node_data[edge.target]
-                    if data.pending_inputs > 0 and len(data.collected_results) < data.pending_inputs:
+                    if target_data.pending_inputs > 0 and len(target_data.collected_results) < target_data.pending_inputs:
                         continue
 
                 ready.append(edge.target)
@@ -436,12 +477,13 @@ class DAGRunner:
         return ready
 
     def _reset_function_state(self, function_name: str) -> None:
-        """Reset state for all nodes in a function."""
+        """Reset state for all nodes in a function (DB writes)."""
         fn_nodes = self.dag.get_nodes_for_function(function_name)
         for node_id in fn_nodes:
-            self.node_data[node_id] = RunnableActionData(node_id=node_id)
-            if node_id in self.results:
-                del self.results[node_id]
+            # Reset node data
+            self._set_node_data(node_id, RunnableActionData(node_id=node_id))
+            # Clear any cached results
+            self._results_table.delete(node_id)
 
     def _find_input_node(self, function_name: str) -> DAGNode | None:
         """Find the input boundary node for a function."""
@@ -473,13 +515,17 @@ class DAGRunner:
                 result = self._handle_inline(node, action)
 
             action.status = ActionStatus.COMPLETED
-            self.results[node.id] = result
 
-            # Push outputs to dependent nodes
+            # Store result in DB
+            self._set_result(node.id, result)
+
+            # Push outputs to dependent nodes (DB writes)
             self._push_outputs(node.id, result)
 
-            # Mark node as completed
-            self.node_data[node.id].completed = True
+            # Mark node as completed (DB read + write)
+            node_data = self._get_node_data(node.id)
+            node_data.completed = True
+            self._set_node_data(node.id, node_data)
 
             # Note: Successor handling is done by _execute_inline_batch, not here
 
@@ -654,9 +700,11 @@ class DAGRunner:
                 break
 
         if agg_node_id:
-            # Set up aggregator to expect results
-            self.node_data[agg_node_id].pending_inputs = len(source_list)
-            self.node_data[agg_node_id].collected_results = []
+            # Set up aggregator to expect results (DB read + write)
+            agg_data = self._get_node_data(agg_node_id)
+            agg_data.pending_inputs = len(source_list)
+            agg_data.collected_results = []
+            self._set_node_data(agg_node_id, agg_data)
 
         # Queue a delegated action for each item
         for i, item in enumerate(source_list):
@@ -679,8 +727,8 @@ class DAGRunner:
         return {}
 
     def _handle_aggregator(self, node: DAGNode) -> Any:
-        """Handle aggregator node - collect spread results."""
-        data = self.node_data[node.id]
+        """Handle aggregator node - collect spread results (DB read)."""
+        data = self._get_node_data(node.id)
 
         # Check if all spread results are in
         if len(data.collected_results) < data.pending_inputs:
@@ -822,34 +870,40 @@ class DAGRunner:
 
     def _get_scope_for_node(self, node_id: str) -> dict[str, Any]:
         """
-        Get the variable scope for a node.
+        Get the variable scope for a node (DB read).
 
         Collects values from all data flow edges pointing to this node.
         """
         scope = {}
 
         # Get values from node data (pushed from predecessors)
-        if node_id in self.node_data:
-            scope.update(self.node_data[node_id].variable_values)
+        try:
+            node_data = self._get_node_data(node_id)
+            scope.update(node_data.variable_values)
+        except KeyError:
+            pass
 
         return scope
 
     def _push_outputs(self, node_id: str, outputs: Any) -> None:
         """
-        Push output values to dependent nodes.
+        Push output values to dependent nodes (DB reads + writes).
 
         Updates the node_data for nodes that depend on this one.
         """
         if not isinstance(outputs, dict):
             return
 
-        # Update this node's data
-        self.node_data[node_id].variable_values.update(outputs)
+        # Update this node's data (DB read + write)
+        node_data = self._get_node_data(node_id)
+        node_data.variable_values.update(outputs)
+        self._set_node_data(node_id, node_data)
 
         # Find data flow edges from this node
         for edge in self.dag.get_outgoing_edges(node_id):
-            target_data = self.node_data.get(edge.target)
-            if target_data is None:
+            try:
+                target_data = self._get_node_data(edge.target)
+            except KeyError:
                 continue
 
             if edge.edge_type == EdgeType.DATA_FLOW:
@@ -868,9 +922,9 @@ class DAGRunner:
                 if source_node and source_node.ir_node:
                     if isinstance(source_node.ir_node, RappelSpreadAction):
                         # Collect the result with its index
-                        action = self.results.get(node_id)
-                        if isinstance(action, dict):
-                            for var, val in action.items():
+                        result = self._get_result(node_id)
+                        if isinstance(result, dict):
+                            for var, val in result.items():
                                 if var.startswith("_"):
                                     continue
                                 # Find the spread index from recent actions
@@ -878,9 +932,12 @@ class DAGRunner:
                                 idx = len(target_data.collected_results)
                                 target_data.collected_results.append((idx, val))
 
+            # Write back the updated target data (DB write)
+            self._set_node_data(edge.target, target_data)
+
     def _queue_successors(self, node_id: str) -> None:
         """
-        Queue actions for successor nodes.
+        Queue actions for successor nodes (DB reads).
 
         Follows state machine edges to find the next nodes to execute.
         """
@@ -901,15 +958,15 @@ class DAGRunner:
             if target_node is None:
                 continue
 
-            # Skip if already completed
-            if self.node_data[edge.target].completed:
+            # Skip if already completed (DB read)
+            target_data = self._get_node_data(edge.target)
+            if target_data.completed:
                 continue
 
             # Check if target is an aggregator
             if target_node.is_aggregator:
                 # Only queue if all inputs are ready
-                data = self.node_data[edge.target]
-                if data.pending_inputs > 0 and len(data.collected_results) < data.pending_inputs:
+                if target_data.pending_inputs > 0 and len(target_data.collected_results) < target_data.pending_inputs:
                     continue
 
             # Determine action type
@@ -920,13 +977,14 @@ class DAGRunner:
                 node_id=edge.target,
                 function_name=target_node.function_name,
                 action_type=action_type,
-                input_data=self.node_data[edge.target].variable_values.copy(),
+                input_data=target_data.variable_values.copy(),
             )
             self.queue.add(action)
 
     def _queue_conditional_successors(self, node_id: str) -> None:
-        """Queue the appropriate branch for a conditional."""
-        condition_result = self.node_data[node_id].variable_values.get("_condition", True)
+        """Queue the appropriate branch for a conditional (DB reads)."""
+        node_data = self._get_node_data(node_id)
+        condition_result = node_data.variable_values.get("_condition", True)
 
         for edge in self.dag.get_outgoing_edges(node_id):
             if edge.edge_type != EdgeType.STATE_MACHINE:
@@ -944,12 +1002,13 @@ class DAGRunner:
 
             action_type = self._get_action_type(target_node)
 
+            target_data = self._get_node_data(edge.target)
             action = RunnableAction(
                 id=self.queue.next_id(),
                 node_id=edge.target,
                 function_name=target_node.function_name,
                 action_type=action_type,
-                input_data=self.node_data[edge.target].variable_values.copy(),
+                input_data=target_data.variable_values.copy(),
             )
             self.queue.add(action)
 
