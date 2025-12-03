@@ -1,0 +1,772 @@
+"""
+Rappel Parser - Converts tokens into an AST (IR nodes).
+
+Enforces:
+- No nested function definitions (fn inside fn)
+- No nested python blocks inside fn (python blocks at top level only)
+- For loop body functions are allowed (they're the loop mechanism)
+- All function calls must use kwargs (no positional args)
+- Actions are called with @action_name(kwargs) syntax
+"""
+
+from __future__ import annotations
+
+from .tokens import Token, TokenType
+from .ir import (
+    SourceLocation,
+    RappelString,
+    RappelNumber,
+    RappelBoolean,
+    RappelLiteral,
+    RappelVariable,
+    RappelListExpr,
+    RappelDictExpr,
+    RappelBinaryOp,
+    RappelUnaryOp,
+    RappelIndexAccess,
+    RappelDotAccess,
+    RappelSpread,
+    RappelCall,
+    RappelActionCall,
+    RappelExpr,
+    RappelAssignment,
+    RappelMultiAssignment,
+    RappelReturn,
+    RappelExprStatement,
+    RappelPythonBlock,
+    RappelFunctionDef,
+    RappelForLoop,
+    RappelIfStatement,
+    RappelSpreadAction,
+    RappelStatement,
+    RappelProgram,
+)
+from .lexer import RappelLexer
+
+
+class RappelSyntaxError(SyntaxError):
+    """Syntax error with source location."""
+
+    def __init__(self, message: str, location: SourceLocation | None = None):
+        if location:
+            super().__init__(f"{message} at line {location.line}, column {location.column}")
+        else:
+            super().__init__(message)
+        self.location = location
+
+
+class RappelParser:
+    """Parser for the Rappel language."""
+
+    def __init__(self, tokens: list[Token]):
+        self.tokens = tokens
+        self.pos = 0
+        self._in_function = False  # Track if we're inside fn
+
+    def parse(self) -> RappelProgram:
+        """Parse a complete program."""
+        statements = []
+
+        while not self._is_at_end():
+            # Skip newlines at top level
+            while self._check(TokenType.NEWLINE):
+                self._advance()
+                if self._is_at_end():
+                    break
+
+            if self._is_at_end():
+                break
+
+            stmt = self._parse_statement()
+            if stmt:
+                statements.append(stmt)
+
+        return RappelProgram(statements=tuple(statements))
+
+    def _parse_statement(self) -> RappelStatement | None:
+        """Parse a single statement."""
+        if self._check(TokenType.FN):
+            if self._in_function:
+                raise SyntaxError(
+                    f"Nested function definitions are not allowed. "
+                    f"Define all functions at the top level. "
+                    f"Line {self._peek().line}"
+                )
+            return self._parse_function_def()
+
+        if self._check(TokenType.PYTHON):
+            if self._in_function:
+                raise SyntaxError(
+                    f"Python blocks are not allowed inside functions. "
+                    f"Define python blocks at the top level or use regular assignments. "
+                    f"Line {self._peek().line}"
+                )
+            return self._parse_python_block()
+
+        if self._check(TokenType.FOR):
+            return self._parse_for_loop()
+
+        if self._check(TokenType.IF):
+            return self._parse_if_statement()
+
+        if self._check(TokenType.RETURN):
+            return self._parse_return()
+
+        if self._check(TokenType.SPREAD):
+            return self._parse_spread_action()
+
+        # Assignment or expression statement (may also be spread with assignment)
+        return self._parse_assignment_or_expr()
+
+    def _parse_function_def(self) -> RappelFunctionDef:
+        """Parse a function definition."""
+        loc = self._location()
+        self._consume(TokenType.FN, "Expected 'fn'")
+        name = self._consume(TokenType.IDENTIFIER, "Expected function name").value
+
+        self._consume(TokenType.LPAREN, "Expected '(' after function name")
+        inputs, outputs = self._parse_io_spec()
+        self._consume(TokenType.RPAREN, "Expected ')' after parameters")
+
+        self._consume(TokenType.COLON, "Expected ':' after function signature")
+        self._consume_newline()
+
+        # Set flag to prevent nested definitions
+        prev_in_fn = self._in_function
+        self._in_function = True
+        try:
+            body = self._parse_block()
+        finally:
+            self._in_function = prev_in_fn
+
+        return RappelFunctionDef(
+            name=name,
+            inputs=tuple(inputs),
+            outputs=tuple(outputs),
+            body=tuple(body),
+            location=loc,
+        )
+
+    def _parse_python_block(self) -> RappelPythonBlock:
+        """Parse a python block with explicit I/O."""
+        loc = self._location()
+        self._consume(TokenType.PYTHON, "Expected 'python'")
+
+        self._consume(TokenType.LPAREN, "Expected '(' after 'python'")
+        inputs, outputs = self._parse_io_spec()
+        self._consume(TokenType.RPAREN, "Expected ')' after python parameters")
+
+        self._consume(TokenType.COLON, "Expected ':' after python signature")
+        self._consume_newline()
+
+        # For python blocks, we capture the raw code
+        code_lines = self._parse_raw_block()
+        code = "\n".join(code_lines)
+
+        return RappelPythonBlock(
+            code=code,
+            inputs=tuple(inputs),
+            outputs=tuple(outputs),
+            location=loc,
+        )
+
+    def _parse_for_loop(self) -> RappelForLoop:
+        """
+        Parse a for loop with a single function call in body.
+
+        Syntax:
+            for item in items:
+                result = process_item(x=item)
+
+        The body must contain exactly one statement: an assignment with a function call.
+        """
+        loc = self._location()
+        self._consume(TokenType.FOR, "Expected 'for'")
+        loop_var = self._consume(
+            TokenType.IDENTIFIER, "Expected loop variable"
+        ).value
+        self._consume(TokenType.IN, "Expected 'in'")
+        iterable = self._parse_expression()
+
+        self._consume(TokenType.COLON, "Expected ':' after for loop header")
+        self._consume_newline()
+
+        body = self._parse_block()
+
+        # Validate: body must contain exactly one function call
+        if len(body) != 1:
+            raise RappelSyntaxError(
+                f"For loop body must contain exactly one statement, got {len(body)}",
+                loc
+            )
+
+        stmt = body[0]
+        # Must be an assignment with a function call on the right side
+        if not isinstance(stmt, RappelAssignment):
+            raise RappelSyntaxError(
+                "For loop body must be an assignment with a function call",
+                loc
+            )
+        if not isinstance(stmt.value, RappelCall):
+            raise RappelSyntaxError(
+                "For loop body assignment must have a function call on the right side",
+                loc
+            )
+
+        return RappelForLoop(
+            loop_var=loop_var,
+            iterable=iterable,
+            body=tuple(body),
+            location=loc,
+        )
+
+    def _parse_spread_action(self, target: str | None = None) -> RappelSpreadAction:
+        """
+        Parse a spread action statement.
+
+        Syntax: spread <source_list>:<item_var> -> @action(kwargs)
+        Or with assignment: <target> = spread <source_list>:<item_var> -> @action(kwargs)
+        """
+        loc = self._location()
+        self._consume(TokenType.SPREAD, "Expected 'spread'")
+
+        # Parse source_list:item_var
+        source_list = self._parse_expression()
+
+        self._consume(TokenType.COLON, "Expected ':' after source list in spread")
+
+        item_var = self._consume(
+            TokenType.IDENTIFIER, "Expected item variable name after ':'"
+        ).value
+
+        self._consume(TokenType.ARROW, "Expected '->' before action in spread")
+
+        # Parse the action call (must be @action_name(...))
+        if not self._check(TokenType.AT):
+            raise SyntaxError(
+                f"Expected action call (@action_name) after '->' in spread, "
+                f"got {self._peek().type.name} at line {self._peek().line}"
+            )
+
+        self._advance()  # consume @
+        action_name = self._consume(
+            TokenType.IDENTIFIER, "Expected action name after '@'"
+        ).value
+        self._consume(TokenType.LPAREN, "Expected '(' after action name")
+        kwargs = self._parse_kwargs_only()
+        self._consume(TokenType.RPAREN, "Expected ')'")
+
+        action = RappelActionCall(
+            action_name=action_name,
+            kwargs=tuple(kwargs),
+            location=loc,
+        )
+
+        return RappelSpreadAction(
+            source_list=source_list,
+            item_var=item_var,
+            action=action,
+            target=target,
+            location=loc,
+        )
+
+    def _parse_if_statement(self) -> RappelIfStatement:
+        """Parse an if statement."""
+        loc = self._location()
+        self._consume(TokenType.IF, "Expected 'if'")
+        condition = self._parse_expression()
+
+        self._consume(TokenType.COLON, "Expected ':' after condition")
+        self._consume_newline()
+
+        then_body = self._parse_block()
+
+        else_body = None
+        if self._check(TokenType.ELSE):
+            self._advance()
+            self._consume(TokenType.COLON, "Expected ':' after 'else'")
+            self._consume_newline()
+            else_body = self._parse_block()
+
+        return RappelIfStatement(
+            condition=condition,
+            then_body=tuple(then_body),
+            else_body=tuple(else_body) if else_body else None,
+            location=loc,
+        )
+
+    def _parse_return(self) -> RappelReturn:
+        """Parse a return statement."""
+        loc = self._location()
+        self._consume(TokenType.RETURN, "Expected 'return'")
+
+        values = []
+        if not self._check(TokenType.NEWLINE) and not self._is_at_end():
+            # Check for list return [a, b, c]
+            if self._check(TokenType.LBRACKET):
+                self._advance()
+                while not self._check(TokenType.RBRACKET):
+                    values.append(self._parse_expression())
+                    if self._check(TokenType.COMMA):
+                        self._advance()
+                self._consume(TokenType.RBRACKET, "Expected ']'")
+            else:
+                values.append(self._parse_expression())
+
+        return RappelReturn(values=tuple(values), location=loc)
+
+    def _parse_assignment_or_expr(self) -> RappelStatement:
+        """Parse an assignment or expression statement."""
+        loc = self._location()
+
+        # Check for multi-assignment: a, b, c = ...
+        if self._check(TokenType.IDENTIFIER):
+            first_id = self._advance()
+            targets = [first_id.value]
+
+            while self._check(TokenType.COMMA):
+                self._advance()
+                if self._check(TokenType.IDENTIFIER):
+                    targets.append(self._advance().value)
+                else:
+                    # Not a multi-assignment, backtrack
+                    self.pos -= len(targets) * 2 - 1
+                    break
+
+            if self._check(TokenType.ASSIGN):
+                self._advance()
+
+                # Check if RHS is a spread statement: target = spread ...
+                if self._check(TokenType.SPREAD):
+                    if len(targets) > 1:
+                        raise SyntaxError(
+                            f"Spread assignment can only have one target, "
+                            f"got {len(targets)} at line {self._peek().line}"
+                        )
+                    return self._parse_spread_action(target=targets[0])
+
+                value = self._parse_expression()
+
+                if len(targets) > 1:
+                    return RappelMultiAssignment(
+                        targets=tuple(targets), value=value, location=loc
+                    )
+                else:
+                    return RappelAssignment(
+                        target=targets[0], value=value, location=loc
+                    )
+            else:
+                # Not an assignment, backtrack and parse as expression
+                self.pos -= len(targets) * 2 - 1
+
+        # Expression statement
+        expr = self._parse_expression()
+        return RappelExprStatement(expr=expr, location=loc)
+
+    def _parse_expression(self) -> RappelExpr:
+        """Parse an expression."""
+        return self._parse_or()
+
+    def _parse_or(self) -> RappelExpr:
+        """Parse or expressions."""
+        left = self._parse_and()
+
+        while self._check(TokenType.OR):
+            op = self._advance().value
+            right = self._parse_and()
+            left = RappelBinaryOp(op=op, left=left, right=right)
+
+        return left
+
+    def _parse_and(self) -> RappelExpr:
+        """Parse and expressions."""
+        left = self._parse_not()
+
+        while self._check(TokenType.AND):
+            op = self._advance().value
+            right = self._parse_not()
+            left = RappelBinaryOp(op=op, left=left, right=right)
+
+        return left
+
+    def _parse_not(self) -> RappelExpr:
+        """Parse not expressions."""
+        if self._check(TokenType.NOT):
+            op = self._advance().value
+            operand = self._parse_not()
+            return RappelUnaryOp(op=op, operand=operand)
+
+        return self._parse_comparison()
+
+    def _parse_comparison(self) -> RappelExpr:
+        """Parse comparison expressions."""
+        left = self._parse_additive()
+
+        while self._check_any(
+            TokenType.EQ,
+            TokenType.NEQ,
+            TokenType.LT,
+            TokenType.GT,
+            TokenType.LTE,
+            TokenType.GTE,
+        ):
+            op = self._advance().value
+            right = self._parse_additive()
+            left = RappelBinaryOp(op=op, left=left, right=right)
+
+        return left
+
+    def _parse_additive(self) -> RappelExpr:
+        """Parse additive expressions (+, -)."""
+        left = self._parse_multiplicative()
+
+        while self._check_any(TokenType.PLUS, TokenType.MINUS):
+            op = self._advance().value
+            right = self._parse_multiplicative()
+            left = RappelBinaryOp(op=op, left=left, right=right)
+
+        return left
+
+    def _parse_multiplicative(self) -> RappelExpr:
+        """Parse multiplicative expressions (*, /)."""
+        left = self._parse_unary()
+
+        while self._check_any(TokenType.STAR, TokenType.SLASH):
+            op = self._advance().value
+            right = self._parse_unary()
+            left = RappelBinaryOp(op=op, left=left, right=right)
+
+        return left
+
+    def _parse_unary(self) -> RappelExpr:
+        """Parse unary expressions."""
+        if self._check(TokenType.MINUS):
+            op = self._advance().value
+            operand = self._parse_unary()
+            return RappelUnaryOp(op=op, operand=operand)
+
+        if self._check(TokenType.ELLIPSIS):
+            self._advance()
+            operand = self._parse_postfix()
+            return RappelSpread(target=operand)
+
+        return self._parse_postfix()
+
+    def _parse_postfix(self) -> RappelExpr:
+        """Parse postfix expressions (calls, index access, dot access)."""
+        expr = self._parse_primary()
+
+        while True:
+            if self._check(TokenType.LBRACKET):
+                self._advance()
+                index = self._parse_expression()
+                self._consume(TokenType.RBRACKET, "Expected ']'")
+                expr = RappelIndexAccess(target=expr, index=index)
+            elif self._check(TokenType.DOT):
+                self._advance()
+                field = self._consume(
+                    TokenType.IDENTIFIER, "Expected field name"
+                ).value
+                expr = RappelDotAccess(target=expr, field=field)
+            elif self._check(TokenType.LPAREN) and isinstance(
+                expr, RappelVariable
+            ):
+                # Function call - kwargs only
+                loc = self._location()
+                self._advance()
+                kwargs = self._parse_kwargs_only()
+                self._consume(TokenType.RPAREN, "Expected ')'")
+                expr = RappelCall(
+                    target=expr.name,
+                    kwargs=tuple(kwargs),
+                    location=loc,
+                )
+            else:
+                break
+
+        return expr
+
+    def _parse_primary(self) -> RappelExpr:
+        """Parse primary expressions."""
+        loc = self._location()
+
+        # Action call: @action_name(kwargs)
+        if self._check(TokenType.AT):
+            self._advance()
+            action_name = self._consume(
+                TokenType.IDENTIFIER, "Expected action name after '@'"
+            ).value
+            self._consume(TokenType.LPAREN, "Expected '(' after action name")
+            kwargs = self._parse_kwargs_only()
+            self._consume(TokenType.RPAREN, "Expected ')'")
+            return RappelActionCall(
+                action_name=action_name,
+                kwargs=tuple(kwargs),
+                location=loc,
+            )
+
+        # Parenthesized expression
+        if self._check(TokenType.LPAREN):
+            self._advance()
+            expr = self._parse_expression()
+            self._consume(TokenType.RPAREN, "Expected ')'")
+            return expr
+
+        # List literal
+        if self._check(TokenType.LBRACKET):
+            return self._parse_list_literal()
+
+        # Dict literal
+        if self._check(TokenType.LBRACE):
+            return self._parse_dict_literal()
+
+        # String literal
+        if self._check(TokenType.STRING):
+            value = self._advance().value
+            return RappelLiteral(RappelString(value), location=loc)
+
+        # Number literal
+        if self._check(TokenType.NUMBER):
+            value = self._advance().value
+            return RappelLiteral(RappelNumber(value), location=loc)
+
+        # Boolean literal
+        if self._check(TokenType.BOOLEAN):
+            value = self._advance().value
+            return RappelLiteral(RappelBoolean(value), location=loc)
+
+        # Identifier
+        if self._check(TokenType.IDENTIFIER):
+            name = self._advance().value
+            return RappelVariable(name=name, location=loc)
+
+        raise SyntaxError(
+            f"Unexpected token {self._peek()} at line {self._peek().line}"
+        )
+
+    def _parse_list_literal(self) -> RappelListExpr:
+        """Parse a list literal [a, b, c]."""
+        loc = self._location()
+        self._consume(TokenType.LBRACKET, "Expected '['")
+
+        items = []
+        while not self._check(TokenType.RBRACKET):
+            items.append(self._parse_expression())
+            if self._check(TokenType.COMMA):
+                self._advance()
+
+        self._consume(TokenType.RBRACKET, "Expected ']'")
+        return RappelListExpr(items=tuple(items), location=loc)
+
+    def _parse_dict_literal(self) -> RappelDictExpr:
+        """Parse a dict literal {"key": value}."""
+        loc = self._location()
+        self._consume(TokenType.LBRACE, "Expected '{'")
+
+        pairs = []
+        while not self._check(TokenType.RBRACE):
+            key = self._parse_expression()
+            self._consume(TokenType.COLON, "Expected ':' after dict key")
+            value = self._parse_expression()
+            pairs.append((key, value))
+
+            if self._check(TokenType.COMMA):
+                self._advance()
+
+        self._consume(TokenType.RBRACE, "Expected '}'")
+        return RappelDictExpr(pairs=tuple(pairs), location=loc)
+
+    def _parse_kwargs_only(self) -> list[tuple[str, RappelExpr]]:
+        """Parse kwargs-only function/action call arguments."""
+        kwargs = []
+
+        while not self._check(TokenType.RPAREN):
+            # Must be keyword argument: name=value or name: value
+            if not self._check(TokenType.IDENTIFIER):
+                raise SyntaxError(
+                    f"Expected keyword argument (name=value), got {self._peek().type.name} "
+                    f"at line {self._peek().line}. All function/action calls require kwargs."
+                )
+
+            name = self._advance().value
+
+            # Accept both = and : for kwargs
+            if self._check(TokenType.ASSIGN):
+                self._advance()
+            elif self._check(TokenType.COLON):
+                self._advance()
+            else:
+                raise SyntaxError(
+                    f"Expected '=' or ':' after argument name '{name}' "
+                    f"at line {self._peek().line}. All function/action calls require kwargs."
+                )
+
+            value = self._parse_expression()
+            kwargs.append((name, value))
+
+            if self._check(TokenType.COMMA):
+                self._advance()
+
+        return kwargs
+
+    def _parse_io_spec(self) -> tuple[list[str], list[str]]:
+        """Parse input/output specification."""
+        inputs = []
+        outputs = []
+
+        while not self._check(TokenType.RPAREN):
+            if self._check(TokenType.INPUT):
+                self._advance()
+                self._consume(TokenType.COLON, "Expected ':' after 'input'")
+                inputs = self._parse_identifier_list()
+            elif self._check(TokenType.OUTPUT):
+                self._advance()
+                self._consume(TokenType.COLON, "Expected ':' after 'output'")
+                outputs = self._parse_identifier_list()
+            elif self._check(TokenType.COMMA):
+                self._advance()
+            else:
+                break
+
+        return inputs, outputs
+
+    def _parse_identifier_list(self) -> list[str]:
+        """Parse a list of identifiers [a, b, c]."""
+        self._consume(TokenType.LBRACKET, "Expected '['")
+
+        names = []
+        while not self._check(TokenType.RBRACKET):
+            names.append(
+                self._consume(TokenType.IDENTIFIER, "Expected identifier").value
+            )
+            if self._check(TokenType.COMMA):
+                self._advance()
+
+        self._consume(TokenType.RBRACKET, "Expected ']'")
+        return names
+
+    def _parse_block(self) -> list[RappelStatement]:
+        """Parse an indented block of statements."""
+        statements = []
+
+        self._consume(TokenType.INDENT, "Expected indented block")
+
+        while not self._check(TokenType.DEDENT) and not self._is_at_end():
+            # Skip newlines
+            while self._check(TokenType.NEWLINE):
+                self._advance()
+                if self._check(TokenType.DEDENT) or self._is_at_end():
+                    break
+
+            if self._check(TokenType.DEDENT) or self._is_at_end():
+                break
+
+            stmt = self._parse_statement()
+            if stmt:
+                statements.append(stmt)
+
+        if self._check(TokenType.DEDENT):
+            self._advance()
+
+        return statements
+
+    def _parse_raw_block(self) -> list[str]:
+        """Parse raw code block for python blocks."""
+        lines = []
+
+        self._consume(TokenType.INDENT, "Expected indented block")
+
+        # For raw blocks, we need to collect all tokens until DEDENT
+        # and reconstruct the code
+        current_line = ""
+
+        while not self._check(TokenType.DEDENT) and not self._is_at_end():
+            token = self._advance()
+
+            if token.type == TokenType.NEWLINE:
+                if current_line.strip():
+                    lines.append(current_line)
+                current_line = ""
+            elif token.type == TokenType.INDENT:
+                current_line += "    "
+            elif token.type == TokenType.DEDENT:
+                self.pos -= 1  # Put it back
+                break
+            else:
+                # Reconstruct token value
+                if token.type == TokenType.STRING:
+                    current_line += f'"{token.value}"'
+                elif token.type == TokenType.IDENTIFIER:
+                    if current_line and current_line[-1] not in " \t([{,.:":
+                        current_line += " "
+                    current_line += token.value
+                elif token.type in (TokenType.NUMBER, TokenType.BOOLEAN):
+                    if current_line and current_line[-1] not in " \t([{,.:":
+                        current_line += " "
+                    current_line += str(token.value)
+                else:
+                    current_line += token.value if token.value else ""
+
+        if current_line.strip():
+            lines.append(current_line)
+
+        if self._check(TokenType.DEDENT):
+            self._advance()
+
+        return lines
+
+    def _consume(self, token_type: TokenType, message: str) -> Token:
+        """Consume a token of the expected type."""
+        if self._check(token_type):
+            return self._advance()
+        raise SyntaxError(
+            f"{message}. Got {self._peek().type.name} at line {self._peek().line}"
+        )
+
+    def _consume_newline(self) -> None:
+        """Consume a newline token if present."""
+        if self._check(TokenType.NEWLINE):
+            self._advance()
+
+    def _check(self, token_type: TokenType) -> bool:
+        """Check if current token is of given type."""
+        if self._is_at_end():
+            return token_type == TokenType.EOF
+        return self._peek().type == token_type
+
+    def _check_any(self, *token_types: TokenType) -> bool:
+        """Check if current token is any of the given types."""
+        return any(self._check(t) for t in token_types)
+
+    def _advance(self) -> Token:
+        """Advance to the next token."""
+        if not self._is_at_end():
+            self.pos += 1
+        return self.tokens[self.pos - 1]
+
+    def _peek(self) -> Token:
+        """Peek at the current token."""
+        return self.tokens[self.pos]
+
+    def _peek_next(self) -> Token | None:
+        """Peek at the next token."""
+        if self.pos + 1 < len(self.tokens):
+            return self.tokens[self.pos + 1]
+        return None
+
+    def _is_at_end(self) -> bool:
+        """Check if we've reached the end."""
+        return self._peek().type == TokenType.EOF
+
+    def _location(self) -> SourceLocation:
+        """Get current source location."""
+        token = self._peek()
+        return SourceLocation(line=token.line, column=token.column)
+
+
+def parse(source: str) -> RappelProgram:
+    """Parse source code into a Rappel program."""
+    lexer = RappelLexer(source)
+    tokens = lexer.tokenize()
+    parser = RappelParser(tokens)
+    return parser.parse()
