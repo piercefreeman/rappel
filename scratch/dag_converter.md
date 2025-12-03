@@ -16,4 +16,6 @@ Any variables needed by the function within the “for” loop should be passed 
 
 The class you build to do this should have a .visualize() which should popup some matplotlib graph of the dependencies that we have here in some tree like structure. solid lines for the state machine dependencies and dotted lines for the data flow.
 
+"spread" should be implemented as the action of interest, then a node after it acting as an aggregator. reason being is we want to allow each action to finsih in order that it finsihes and just write "action_{i}" to the results payload for the next node without us having to block to modify a list.
+
 NOTE: we should only PUSH data to the most recent trailing node that DOESN’T modify the variable. If a variable name is modified downstream, downstream nodes should rely on the modified node value
