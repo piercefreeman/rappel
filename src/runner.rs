@@ -1046,8 +1046,7 @@ impl DAGRunner {
                             arg_keys = ?args.arguments.iter().map(|a| &a.key).collect::<Vec<_>>(),
                             "parsed WorkflowArguments from response payload"
                         );
-                        args
-                            .arguments
+                        args.arguments
                             .iter()
                             .find(|arg| arg.key == "error")
                             .and_then(|arg| arg.value.as_ref())
@@ -1097,7 +1096,9 @@ impl DAGRunner {
                     );
 
                     // Look for exception handlers on this node
-                    if let Some(handler_id) = Self::get_exception_handlers_from_node(&dag, base_node_id, &exception_type) {
+                    if let Some(handler_id) =
+                        Self::get_exception_handlers_from_node(&dag, base_node_id, &exception_type)
+                    {
                         debug!(
                             node_id = %node_id,
                             handler_id = %handler_id,
@@ -1126,7 +1127,11 @@ impl DAGRunner {
                             fn_call_id = %fn_call_id,
                             "node is inside try body function, checking fn_call for handlers"
                         );
-                        if let Some(handler_id) = Self::get_exception_handlers_from_node(&dag, &fn_call_id, &exception_type) {
+                        if let Some(handler_id) = Self::get_exception_handlers_from_node(
+                            &dag,
+                            &fn_call_id,
+                            &exception_type,
+                        ) {
                             debug!(
                                 fn_call_id = %fn_call_id,
                                 handler_id = %handler_id,
@@ -1270,13 +1275,13 @@ impl DAGRunner {
     /// Example: "spread_action_1[2]" -> ("spread_action_1", Some(2))
     /// Example: "action_1" -> ("action_1", None)
     fn parse_spread_node_id(node_id: &str) -> (&str, Option<usize>) {
-        if let Some(bracket_pos) = node_id.rfind('[') {
-            if node_id.ends_with(']') {
-                let base = &node_id[..bracket_pos];
-                let idx_str = &node_id[bracket_pos + 1..node_id.len() - 1];
-                if let Ok(idx) = idx_str.parse::<usize>() {
-                    return (base, Some(idx));
-                }
+        if let Some(bracket_pos) = node_id.rfind('[')
+            && node_id.ends_with(']')
+        {
+            let base = &node_id[..bracket_pos];
+            let idx_str = &node_id[bracket_pos + 1..node_id.len() - 1];
+            if let Ok(idx) = idx_str.parse::<usize>() {
+                return (base, Some(idx));
             }
         }
         (node_id, None)
@@ -1389,9 +1394,8 @@ impl DAGRunner {
 
         // All results are in! Aggregate them.
         // spread_results is already sorted by spread_index from the DB query
-        let aggregated_result = JsonValue::Array(
-            spread_results.into_iter().map(|(_, v)| v).collect()
-        );
+        let aggregated_result =
+            JsonValue::Array(spread_results.into_iter().map(|(_, v)| v).collect());
 
         debug!(
             aggregator_id = %agg_id,
@@ -1401,7 +1405,14 @@ impl DAGRunner {
 
         // Write aggregated result to downstream nodes via DATA_FLOW edges
         if let Some(ref target) = agg_node.target {
-            Self::collect_inbox_writes_for_node(&agg_id, target, &aggregated_result, dag, instance_id, &mut batch.inbox_writes);
+            Self::collect_inbox_writes_for_node(
+                &agg_id,
+                target,
+                &aggregated_result,
+                dag,
+                instance_id,
+                &mut batch.inbox_writes,
+            );
         }
 
         // Process aggregator's successors
@@ -1439,7 +1450,8 @@ impl DAGRunner {
                 ExecutionMode::Delegated => {
                     // Read inbox and create action
                     let inbox = db.read_inbox(instance_id, &successor.node_id).await?;
-                    let result = Self::create_actions_for_node(succ_node, instance_id, &inbox, dag)?;
+                    let result =
+                        Self::create_actions_for_node(succ_node, instance_id, &inbox, dag)?;
                     batch.new_actions.extend(result.actions);
                     batch.inbox_writes.extend(result.inbox_writes);
                 }
@@ -1479,10 +1491,13 @@ impl DAGRunner {
 
     /// Check if a result represents an exception.
     fn is_exception_result(result: &JsonValue) -> Option<String> {
-        if let JsonValue::Object(obj) = result {
-            if obj.get("__exception__").and_then(|v| v.as_bool()) == Some(true) {
-                return obj.get("type").and_then(|v| v.as_str()).map(|s| s.to_string());
-            }
+        if let JsonValue::Object(obj) = result
+            && obj.get("__exception__").and_then(|v| v.as_bool()) == Some(true)
+        {
+            return obj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
         }
         None
     }
@@ -1499,9 +1514,7 @@ impl DAGRunner {
 
         // Find the fn_call node that calls this function
         for (fn_call_id, fn_call_node) in &dag.nodes {
-            if fn_call_node.is_fn_call
-                && fn_call_node.called_function.as_ref() == Some(fn_name)
-            {
+            if fn_call_node.is_fn_call && fn_call_node.called_function.as_ref() == Some(fn_name) {
                 return Some(fn_call_id.clone());
             }
         }
@@ -1538,11 +1551,7 @@ impl DAGRunner {
     ///
     /// Returns `true` if there's no guard expression, or if the expression evaluates to truthy.
     /// Returns `false` if the expression evaluates to falsy or if evaluation fails.
-    fn evaluate_guard(
-        guard_expr: Option<&ast::Expr>,
-        scope: &Scope,
-        successor_id: &str,
-    ) -> bool {
+    fn evaluate_guard(guard_expr: Option<&ast::Expr>, scope: &Scope, successor_id: &str) -> bool {
         let Some(guard) = guard_expr else {
             // No guard expression - always pass
             return true;
@@ -1603,7 +1612,9 @@ impl DAGRunner {
             );
 
             // Look for exception handlers on this node
-            if let Some(handler_id) = Self::get_exception_handlers_from_node(dag, node_id, &exception_type) {
+            if let Some(handler_id) =
+                Self::get_exception_handlers_from_node(dag, node_id, &exception_type)
+            {
                 debug!(
                     node_id = %node_id,
                     handler_id = %handler_id,
@@ -1633,7 +1644,9 @@ impl DAGRunner {
                     "node is inside try body function, checking fn_call for handlers"
                 );
                 // Look for exception handlers on the enclosing fn_call
-                if let Some(handler_id) = Self::get_exception_handlers_from_node(dag, &fn_call_id, &exception_type) {
+                if let Some(handler_id) =
+                    Self::get_exception_handlers_from_node(dag, &fn_call_id, &exception_type)
+                {
                     debug!(
                         fn_call_id = %fn_call_id,
                         handler_id = %handler_id,
@@ -1782,7 +1795,9 @@ impl DAGRunner {
                     // Merge inline scope variables (from parent inline nodes like `if`)
                     // This ensures actions inside branches have access to variables defined earlier
                     for (var_name, var_value) in inline_scope.iter() {
-                        inbox.entry(var_name.clone()).or_insert_with(|| var_value.clone());
+                        inbox
+                            .entry(var_name.clone())
+                            .or_insert_with(|| var_value.clone());
                     }
 
                     // Create actions (may be multiple for spread nodes)
@@ -1863,7 +1878,9 @@ impl DAGRunner {
 
                 // Merge inline scope variables
                 for (var_name, var_value) in inline_scope.iter() {
-                    inbox.entry(var_name.clone()).or_insert_with(|| var_value.clone());
+                    inbox
+                        .entry(var_name.clone())
+                        .or_insert_with(|| var_value.clone());
                 }
 
                 // Create actions for the handler node
@@ -2031,7 +2048,9 @@ impl DAGRunner {
                         if let Some(ref called_fn) = node.called_function {
                             // Find the input node for this function
                             let fn_input_node_id = format!("{}_input_", called_fn);
-                            if let Some(input_id) = dag.nodes.keys().find(|k| k.starts_with(&fn_input_node_id)) {
+                            if let Some(input_id) =
+                                dag.nodes.keys().find(|k| k.starts_with(&fn_input_node_id))
+                            {
                                 debug!(
                                     fn_call_node = %node_id,
                                     called_function = %called_fn,
@@ -2054,7 +2073,8 @@ impl DAGRunner {
                         // This is an action - enqueue it
                         // For initial actions, we use the initial scope as the "inbox"
                         // For spread nodes, this creates multiple actions plus inbox writes
-                        let result = Self::create_actions_for_node(node, instance_id, &scope, &dag)?;
+                        let result =
+                            Self::create_actions_for_node(node, instance_id, &scope, &dag)?;
                         debug!(
                             node_id = %node_id,
                             actions_created = result.actions.len(),

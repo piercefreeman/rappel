@@ -570,4 +570,3 @@ async fn run_shell(
         Err(anyhow!("command `{command}` failed with {status}"))
     }
 }
-

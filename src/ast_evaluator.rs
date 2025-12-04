@@ -220,9 +220,9 @@ impl ExpressionEvaluator {
         match (&obj, &index) {
             (JsonValue::Array(arr), JsonValue::Number(n)) => {
                 let i = n.as_i64().unwrap_or(0) as usize;
-                arr.get(i)
-                    .cloned()
-                    .ok_or_else(|| EvaluationError::Evaluation(format!("Index {} out of bounds", i)))
+                arr.get(i).cloned().ok_or_else(|| {
+                    EvaluationError::Evaluation(format!("Index {} out of bounds", i))
+                })
             }
             (JsonValue::Object(map), JsonValue::String(key)) => map
                 .get(key)
@@ -233,7 +233,9 @@ impl ExpressionEvaluator {
                 s.chars()
                     .nth(i)
                     .map(|c| JsonValue::String(c.to_string()))
-                    .ok_or_else(|| EvaluationError::Evaluation(format!("Index {} out of bounds", i)))
+                    .ok_or_else(|| {
+                        EvaluationError::Evaluation(format!("Index {} out of bounds", i))
+                    })
             }
             _ => Err(EvaluationError::Evaluation(
                 "Invalid index operation".to_string(),
@@ -703,11 +705,11 @@ mod tests {
     #[test]
     fn test_eval_float_literal() {
         let scope = Scope::new();
-        let expr = float_literal(3.14);
+        let expr = float_literal(1.5);
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
         assert_eq!(
             result,
-            JsonValue::Number(serde_json::Number::from_f64(3.14).unwrap())
+            JsonValue::Number(serde_json::Number::from_f64(1.5).unwrap())
         );
     }
 
@@ -1098,7 +1100,9 @@ mod tests {
     #[test]
     fn test_is_truthy_number() {
         assert!(ExpressionEvaluator::is_truthy(&JsonValue::Number(1.into())));
-        assert!(!ExpressionEvaluator::is_truthy(&JsonValue::Number(0.into())));
+        assert!(!ExpressionEvaluator::is_truthy(&JsonValue::Number(
+            0.into()
+        )));
     }
 
     #[test]
@@ -1343,7 +1347,11 @@ mod tests {
         scope.insert("y".to_string(), JsonValue::Number(3.into()));
         scope.insert("z".to_string(), JsonValue::Bool(true));
 
-        let add = binary_op(variable("x"), ast::BinaryOperator::BinaryOpAdd, variable("y"));
+        let add = binary_op(
+            variable("x"),
+            ast::BinaryOperator::BinaryOpAdd,
+            variable("y"),
+        );
         let mul = binary_op(add, ast::BinaryOperator::BinaryOpMul, int_literal(2));
         let eq = binary_op(mul, ast::BinaryOperator::BinaryOpEq, int_literal(10));
         let expr = binary_op(eq, ast::BinaryOperator::BinaryOpAnd, variable("z"));

@@ -74,7 +74,7 @@ def test_execute_action_with_kwargs() -> None:
 
     assert isinstance(result, ActionExecutionResult)
     assert result.result == 20
-    assert result.error is None
+    assert result.exception is None
 
 
 def test_execute_action_resolves_dependencies() -> None:
@@ -92,7 +92,7 @@ def test_execute_action_resolves_dependencies() -> None:
 
     assert isinstance(result, ActionExecutionResult)
     assert result.result == "3-suffix"
-    assert result.error is None
+    assert result.exception is None
 
 
 def test_execute_action_handles_error() -> None:
@@ -110,9 +110,9 @@ def test_execute_action_handles_error() -> None:
 
     assert isinstance(result, ActionExecutionResult)
     assert result.result is None
-    assert result.error is not None
-    assert "ValueError" in result.error
-    assert "intentional failure" in result.error
+    assert result.exception is not None
+    assert "ValueError" in str(type(result.exception).__name__)
+    assert "intentional failure" in str(result.exception)
 
 
 def test_execute_action_unknown_action() -> None:
@@ -127,5 +127,5 @@ def test_execute_action_unknown_action() -> None:
 
     assert isinstance(result, ActionExecutionResult)
     assert result.result is None
-    assert result.error is not None
-    assert "not registered" in result.error
+    assert result.exception is not None
+    assert "not registered" in str(result.exception)

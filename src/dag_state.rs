@@ -926,16 +926,23 @@ mod tests {
         let try_body_node_id = dag
             .nodes
             .iter()
-            .find(|(_, n)| n.node_type == "action_call" && n.action_name.as_deref() == Some("risky_action"))
+            .find(|(_, n)| {
+                n.node_type == "action_call" && n.action_name.as_deref() == Some("risky_action")
+            })
             .map(|(id, _)| id.clone());
 
-        assert!(try_body_node_id.is_some(), "Should find try body action node");
+        assert!(
+            try_body_node_id.is_some(),
+            "Should find try body action node"
+        );
 
         // Look for exception edges from the try body to handlers
         let exception_edges: Vec<_> = dag
             .edges
             .iter()
-            .filter(|e| e.source == try_body_node_id.clone().unwrap() && e.exception_types.is_some())
+            .filter(|e| {
+                e.source == try_body_node_id.clone().unwrap() && e.exception_types.is_some()
+            })
             .collect();
 
         assert_eq!(
@@ -945,12 +952,18 @@ mod tests {
         );
 
         // Should have specific handler and catch-all
-        let specific = exception_edges
-            .iter()
-            .find(|e| e.exception_types.as_ref().map(|t| !t.is_empty()).unwrap_or(false));
-        let catch_all = exception_edges
-            .iter()
-            .find(|e| e.exception_types.as_ref().map(|t| t.is_empty()).unwrap_or(false));
+        let specific = exception_edges.iter().find(|e| {
+            e.exception_types
+                .as_ref()
+                .map(|t| !t.is_empty())
+                .unwrap_or(false)
+        });
+        let catch_all = exception_edges.iter().find(|e| {
+            e.exception_types
+                .as_ref()
+                .map(|t| t.is_empty())
+                .unwrap_or(false)
+        });
 
         assert!(specific.is_some(), "Should have specific exception handler");
         assert!(catch_all.is_some(), "Should have catch-all handler");

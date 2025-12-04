@@ -449,10 +449,16 @@ impl DAGConverter {
         // Phase 2: Expand into single global DAG
         // Find the entry function - prefer "run", then "main", then first non-internal function
         // This matches the runner's logic for finding the entry point
-        let entry_fn = self.function_defs.keys()
+        let entry_fn = self
+            .function_defs
+            .keys()
             .find(|name| *name == "run")
             .or_else(|| self.function_defs.keys().find(|name| *name == "main"))
-            .or_else(|| self.function_defs.keys().find(|name| !name.starts_with("__")))
+            .or_else(|| {
+                self.function_defs
+                    .keys()
+                    .find(|name| !name.starts_with("__"))
+            })
             .or_else(|| self.function_defs.keys().next())
             .map(|s| s.as_str())
             .unwrap_or("run");
@@ -560,13 +566,18 @@ impl DAGConverter {
                     // Prevent infinite recursion
                     let call_key = format!("{}:{}", fn_name, old_id);
                     if visited_calls.contains(&call_key) {
-                        panic!("Recursive function call detected: {} -> {}", fn_name, called_fn);
+                        panic!(
+                            "Recursive function call detected: {} -> {}",
+                            fn_name, called_fn
+                        );
                     }
                     visited_calls.insert(call_key.clone());
 
                     // Collect exception edges from this fn_call node BEFORE expansion
                     // These need to be propagated to ALL expanded nodes
-                    let exception_edges: Vec<_> = unexpanded.edges.iter()
+                    let exception_edges: Vec<_> = unexpanded
+                        .edges
+                        .iter()
                         .filter(|e| e.source == *old_id && e.exception_types.is_some())
                         .cloned()
                         .collect();
@@ -600,7 +611,9 @@ impl DAGConverter {
                         if !exception_edges.is_empty() {
                             // Find all nodes that were added as part of this expansion
                             // They have IDs starting with child_prefix
-                            let expanded_node_ids: Vec<_> = target.nodes.keys()
+                            let expanded_node_ids: Vec<_> = target
+                                .nodes
+                                .keys()
                                 .filter(|id| id.starts_with(&child_prefix))
                                 .cloned()
                                 .collect();
@@ -675,8 +688,14 @@ impl DAGConverter {
             // Get remapped source and target
             let new_source = if let Some(mapped) = id_map.get(&edge.source) {
                 // If source was a fn_call, we need the LAST node of its expansion
-                if unexpanded.nodes.get(&edge.source).map(|n| n.is_fn_call).unwrap_or(false) {
-                    id_map.get(&format!("{}_last", edge.source))
+                if unexpanded
+                    .nodes
+                    .get(&edge.source)
+                    .map(|n| n.is_fn_call)
+                    .unwrap_or(false)
+                {
+                    id_map
+                        .get(&format!("{}_last", edge.source))
                         .cloned()
                         .unwrap_or_else(|| mapped.clone())
                 } else {
@@ -706,15 +725,18 @@ impl DAGConverter {
 
     /// Get topological order of nodes using state machine edges
     fn get_topo_order(&self, dag: &DAG, node_ids: &HashSet<String>) -> Vec<String> {
-        let mut in_degree: HashMap<String, usize> = node_ids.iter().map(|n| (n.clone(), 0)).collect();
-        let mut adj: HashMap<String, Vec<String>> = node_ids.iter().map(|n| (n.clone(), Vec::new())).collect();
+        let mut in_degree: HashMap<String, usize> =
+            node_ids.iter().map(|n| (n.clone(), 0)).collect();
+        let mut adj: HashMap<String, Vec<String>> =
+            node_ids.iter().map(|n| (n.clone(), Vec::new())).collect();
 
         for edge in &dag.edges {
             if edge.edge_type == EdgeType::StateMachine
                 && node_ids.contains(&edge.source)
                 && node_ids.contains(&edge.target)
             {
-                adj.get_mut(&edge.source).map(|v| v.push(edge.target.clone()));
+                adj.get_mut(&edge.source)
+                    .map(|v| v.push(edge.target.clone()));
                 in_degree.entry(edge.target.clone()).and_modify(|d| *d += 1);
             }
         }
@@ -1265,8 +1287,11 @@ impl DAGConverter {
         // We need a "branch" node that serves as the decision point.
         // This node doesn't execute anything - it just routes based on guards.
         let branch_id = self.next_id("branch");
-        let mut branch_node =
-            DAGNode::new(branch_id.clone(), "branch".to_string(), "branch".to_string());
+        let mut branch_node = DAGNode::new(
+            branch_id.clone(),
+            "branch".to_string(),
+            "branch".to_string(),
+        );
         if let Some(ref fn_name) = self.current_function {
             branch_node = branch_node.with_function_name(fn_name);
         }
@@ -1279,10 +1304,7 @@ impl DAGConverter {
         let mut else_last: Option<String> = None;
 
         // Get the guard expression for the if branch
-        let guard_expr = cond
-            .if_branch
-            .as_ref()
-            .and_then(|b| b.condition.clone());
+        let guard_expr = cond.if_branch.as_ref().and_then(|b| b.condition.clone());
 
         // Process then branch (SingleCallBody - exactly one call)
         if let Some(if_branch) = &cond.if_branch
@@ -1439,8 +1461,10 @@ impl DAGConverter {
 
         // Connect try body success path to join
         if let Some(ref try_last) = try_body_last {
-            self.dag
-                .add_edge(DAGEdge::state_machine_success(try_last.clone(), join_id.clone()));
+            self.dag.add_edge(DAGEdge::state_machine_success(
+                try_last.clone(),
+                join_id.clone(),
+            ));
         }
 
         // Convert each except handler and connect from try body with exception types
@@ -2137,7 +2161,11 @@ fn main(input: [], output: [result]):
         assert!(node_types.contains("join"), "Should have join node");
 
         // Check for guarded edges (edges with guard_expr)
-        let guarded_edges: Vec<_> = dag.edges.iter().filter(|e| e.guard_expr.is_some()).collect();
+        let guarded_edges: Vec<_> = dag
+            .edges
+            .iter()
+            .filter(|e| e.guard_expr.is_some())
+            .collect();
         assert!(
             !guarded_edges.is_empty(),
             "Should have edges with guard expressions"

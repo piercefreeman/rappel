@@ -24,8 +24,8 @@ use tonic::transport::Server;
 use tracing::{error, info};
 
 use rappel::{
-    Database, PythonWorkerConfig, PythonWorkerPool,
-    WorkerBridgeServer, WorkflowInstanceId, WorkflowVersionId, proto,
+    Database, PythonWorkerConfig, PythonWorkerPool, WorkerBridgeServer, WorkflowInstanceId,
+    WorkflowVersionId, proto,
 };
 
 const BENCHMARK_WORKFLOW_MODULE: &str = include_str!("../../tests/fixtures/benchmark_workflow.py");
@@ -296,10 +296,7 @@ async fn run_shell_with_env(
 
 /// Wait for the workflow to complete by monitoring the database.
 /// Returns action count and metrics collection.
-async fn wait_for_completion(
-    database: &Arc<Database>,
-    timeout: Duration,
-) -> Result<u64> {
+async fn wait_for_completion(database: &Arc<Database>, timeout: Duration) -> Result<u64> {
     let start = std::time::Instant::now();
     let mut last_completed = 0u64;
     let mut idle_cycles = 0usize;
@@ -312,11 +309,10 @@ async fn wait_for_completion(
         }
 
         // Check how many actions have completed
-        let completed: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM action_queue WHERE status = 'completed'",
-        )
-        .fetch_one(database.pool())
-        .await?;
+        let completed: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM action_queue WHERE status = 'completed'")
+                .fetch_one(database.pool())
+                .await?;
 
         let pending: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM action_queue WHERE status IN ('pending', 'running')",
@@ -335,7 +331,11 @@ async fn wait_for_completion(
         } else {
             idle_cycles += 1;
             if idle_cycles >= max_idle_cycles && completed > 0 {
-                info!(completed = completed, pending = pending, "No progress, stopping");
+                info!(
+                    completed = completed,
+                    pending = pending,
+                    "No progress, stopping"
+                );
                 break;
             }
         }
@@ -361,7 +361,7 @@ async fn main() -> Result<()> {
                 .add_directive("hyper=warn".parse().unwrap())
                 .add_directive("h2=warn".parse().unwrap())
                 .add_directive("tower=warn".parse().unwrap())
-                .add_directive("tonic=warn".parse().unwrap())
+                .add_directive("tonic=warn".parse().unwrap()),
         )
         .init();
 
@@ -466,10 +466,7 @@ async fn main() -> Result<()> {
     let indices: Vec<serde_json::Value> = (0..args.count)
         .map(|i| serde_json::Value::Number(i.into()))
         .collect();
-    initial_inputs.insert(
-        "indices".to_string(),
-        serde_json::Value::Array(indices),
-    );
+    initial_inputs.insert("indices".to_string(), serde_json::Value::Array(indices));
     initial_inputs.insert(
         "iterations".to_string(),
         serde_json::Value::Number(args.iterations.into()),
@@ -477,7 +474,9 @@ async fn main() -> Result<()> {
 
     // Start all instances with initial inputs
     for instance_id in &instance_ids {
-        runner.start_instance(*instance_id, initial_inputs.clone()).await?;
+        runner
+            .start_instance(*instance_id, initial_inputs.clone())
+            .await?;
     }
     info!(count = instance_ids.len(), "workflow instances started");
 
