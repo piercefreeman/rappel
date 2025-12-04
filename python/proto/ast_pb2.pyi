@@ -228,7 +228,7 @@ class SingleCallBody(google.protobuf.message.Message):
     general blocks. These types make the constraints explicit.
 
     Body constrained to at most ONE action or function call.
-    Used by: TryExcept (try_body, handlers), Conditional branches
+    Used by: TryExcept (try_body, handlers), Conditional branches, ForLoop body
 
     Can contain EITHER:
     1. A single call (action or function) with optional assignment target
@@ -313,45 +313,6 @@ class SingleCallBody(google.protobuf.message.Message):
     ) -> typing.Literal["target"] | None: ...
 
 Global___SingleCallBody: typing_extensions.TypeAlias = SingleCallBody
-
-@typing.final
-class DataBody(google.protobuf.message.Message):
-    """Body for pure data manipulation (NO action/function calls allowed).
-    Used by: ForLoop body
-
-    Example (for loop with data manipulation):
-      for i, order in enumerate(valid_orders):
-          confirmation = { "order_id": order["id"], ... }
-          confirmations = confirmations + [confirmation]
-
-    For iterating with action calls, use SpreadAction instead:
-      payments = spread valid_orders:order -> @process_payment(order_id=order["id"])
-    """
-
-    DESCRIPTOR: google.protobuf.descriptor.Descriptor
-
-    STATEMENTS_FIELD_NUMBER: builtins.int
-    SPAN_FIELD_NUMBER: builtins.int
-    @property
-    def statements(
-        self,
-    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[Global___Statement]:
-        """Must NOT contain action_call or function_call"""
-
-    @property
-    def span(self) -> Global___Span: ...
-    def __init__(
-        self,
-        *,
-        statements: collections.abc.Iterable[Global___Statement] | None = ...,
-        span: Global___Span | None = ...,
-    ) -> None: ...
-    def HasField(self, field_name: typing.Literal["span", b"span"]) -> builtins.bool: ...
-    def ClearField(
-        self, field_name: typing.Literal["span", b"span", "statements", b"statements"]
-    ) -> None: ...
-
-Global___DataBody: typing_extensions.TypeAlias = DataBody
 
 @typing.final
 class Statement(google.protobuf.message.Message):
@@ -720,8 +681,8 @@ Global___Call: typing_extensions.TypeAlias = Call
 @typing.final
 class ForLoop(google.protobuf.message.Message):
     """For loop: for i, item in enumerate(items): body
-    Body is constrained to pure data manipulation (no calls).
-    Use SpreadAction for iterating with action calls.
+    Body is constrained to at most ONE action or function call per iteration.
+    Use SpreadAction for parallel iteration over collections.
     """
 
     DESCRIPTOR: google.protobuf.descriptor.Descriptor
@@ -738,15 +699,15 @@ class ForLoop(google.protobuf.message.Message):
     @property
     def iterable(self) -> Global___Expr: ...
     @property
-    def body(self) -> Global___DataBody:
-        """Pure data body (no calls allowed)"""
+    def body(self) -> Global___SingleCallBody:
+        """Single call body (one action/fn per iteration)"""
 
     def __init__(
         self,
         *,
         loop_vars: collections.abc.Iterable[builtins.str] | None = ...,
         iterable: Global___Expr | None = ...,
-        body: Global___DataBody | None = ...,
+        body: Global___SingleCallBody | None = ...,
     ) -> None: ...
     def HasField(
         self, field_name: typing.Literal["body", b"body", "iterable", b"iterable"]

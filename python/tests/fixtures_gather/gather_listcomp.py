@@ -21,8 +21,7 @@ class GatherListCompWorkflow(Workflow):
 
     async def run(self, items: list, multiplier: int) -> list:
         # Starred list comprehension - fan out over items
-        results = await asyncio.gather(*[
-            process_item(item=item, multiplier=multiplier)
-            for item in items
-        ])
+        results = await asyncio.gather(
+            *[process_item(item=item, multiplier=multiplier) for item in items]
+        )
         return list(results)

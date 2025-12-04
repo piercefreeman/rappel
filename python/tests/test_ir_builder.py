@@ -3,13 +3,13 @@
 This module contains comprehensive tests for the Python AST to IR conversion.
 The tests are organized by category:
 - TestAsyncioSleepDetection: asyncio.sleep() -> @sleep action
-- TestAsyncioGatherDetection: asyncio.gather() -> ParallelBlock
+- TestAsyncioGatherDetection: asyncio.gather() -> ParallelBlock/SpreadAction
 - TestPolicyParsing: RetryPolicy and TimeoutPolicy extraction
 - TestForLoopConversion: for loop IR generation
 - TestConditionalConversion: if/elif/else IR generation
 - TestTryExceptConversion: try/except IR generation
 - TestActionCallExtraction: action call detection and kwargs
-- TestImplicitFunctionWrapping: multi-action body wrapping
+- TestWorkflowHelperMethods: self.method() -> FunctionCall
 """
 
 from typing import List, Optional
@@ -264,13 +264,17 @@ class TestAsyncioGatherDetection:
                     spread_found = True
                     spread = stmt.spread_action
                     # Check the loop variable
-                    assert spread.loop_var == "item", f"Expected loop_var 'item', got '{spread.loop_var}'"
+                    assert spread.loop_var == "item", (
+                        f"Expected loop_var 'item', got '{spread.loop_var}'"
+                    )
                     # Check action is process_item
                     assert spread.action.action_name == "process_item", (
                         f"Expected action 'process_item', got '{spread.action.action_name}'"
                     )
                     # Check target is set (for collecting results)
-                    assert spread.target == "results", f"Expected target 'results', got '{spread.target}'"
+                    assert spread.target == "results", (
+                        f"Expected target 'results', got '{spread.target}'"
+                    )
 
         assert spread_found, "Expected SpreadAction node from gather(*[listcomp])"
 
@@ -331,7 +335,9 @@ class TestForLoopConversion:
         assert implicit_fn is not None, "Expected implicit function for multi-action for body"
 
         # The implicit function should have multiple statements
-        assert len(implicit_fn.body.statements) >= 2, "Implicit function should have multiple statements"
+        assert len(implicit_fn.body.statements) >= 2, (
+            "Implicit function should have multiple statements"
+        )
 
 
 class TestConditionalConversion:
@@ -601,9 +607,7 @@ class TestActionCallExtraction:
         assert action is not None, "Expected compute_value action"
 
         # Should have 3 kwargs (2 from positional, 1 explicit kwarg)
-        assert len(action.kwargs) == 3, (
-            f"Expected 3 kwargs, got {len(action.kwargs)}"
-        )
+        assert len(action.kwargs) == 3, f"Expected 3 kwargs, got {len(action.kwargs)}"
 
         # Verify all parameter names are present
         kwarg_names = [kw.name for kw in action.kwargs]
@@ -619,3 +623,116 @@ class TestActionCallExtraction:
                 assert kw.value.literal.int_value == 10, "Expected y=10"
             elif kw.name == "multiplier":
                 assert kw.value.literal.int_value == 2, "Expected multiplier=2"
+
+
+class TestWorkflowHelperMethods:
+    """Test that self.method() calls are converted to FunctionCall IR nodes."""
+
+    def _find_function_call_in_assignments(
+        self, program: ir.Program, func_name: str
+    ) -> Optional[ir.FunctionCall]:
+        """Find a function call by name in assignment statements."""
+        for fn in program.functions:
+            for stmt in fn.body.statements:
+                if stmt.HasField("assignment"):
+                    if stmt.assignment.value.HasField("function_call"):
+                        fc = stmt.assignment.value.function_call
+                        if fc.name == func_name:
+                            return fc
+        return None
+
+    def test_helper_method_converted_to_function_call(self) -> None:
+        """Test: self.method() calls become FunctionCall nodes."""
+        from tests.fixtures_workflow.workflow_helper_methods import WorkflowWithHelperMethods
+
+        program = WorkflowWithHelperMethods.workflow_ir()
+
+        # Should find self.compute_multiplier as a function call
+        fc = self._find_function_call_in_assignments(program, "self.compute_multiplier")
+        assert fc is not None, "Expected self.compute_multiplier as FunctionCall"
+
+        # Should find self.format_result as a function call
+        fc2 = self._find_function_call_in_assignments(program, "self.format_result")
+        assert fc2 is not None, "Expected self.format_result as FunctionCall"
+
+    def test_helper_method_kwargs_preserved(self) -> None:
+        """Test: self.method(a=x, b=y) preserves keyword arguments."""
+        from tests.fixtures_workflow.workflow_helper_methods import WorkflowWithHelperMethods
+
+        program = WorkflowWithHelperMethods.workflow_ir()
+
+        fc = self._find_function_call_in_assignments(program, "self.compute_multiplier")
+        assert fc is not None, "Expected self.compute_multiplier"
+
+        # Check kwargs are preserved
+        kwarg_names = [kw.name for kw in fc.kwargs]
+        assert "base" in kwarg_names, "Expected 'base' kwarg"
+        assert "factor" in kwarg_names, "Expected 'factor' kwarg"
+
+        # Verify values are variable references to the input parameters
+        for kw in fc.kwargs:
+            if kw.name == "base":
+                assert kw.value.HasField("variable"), "Expected variable reference"
+                assert kw.value.variable.name == "base", "Expected reference to 'base'"
+            elif kw.name == "factor":
+                assert kw.value.HasField("variable"), "Expected variable reference"
+                assert kw.value.variable.name == "factor", "Expected reference to 'factor'"
+
+    def test_helper_method_with_variable_arg(self) -> None:
+        """Test: self.method(value=some_var) passes variable references correctly."""
+        from tests.fixtures_workflow.workflow_helper_methods import WorkflowWithHelperMethods
+
+        program = WorkflowWithHelperMethods.workflow_ir()
+
+        fc = self._find_function_call_in_assignments(program, "self.format_result")
+        assert fc is not None, "Expected self.format_result"
+
+        # Check the 'value' kwarg references 'processed' variable
+        assert len(fc.kwargs) == 1, f"Expected 1 kwarg, got {len(fc.kwargs)}"
+        assert fc.kwargs[0].name == "value", "Expected 'value' kwarg"
+        assert fc.kwargs[0].value.HasField("variable"), "Expected variable reference"
+        assert fc.kwargs[0].value.variable.name == "processed", (
+            f"Expected reference to 'processed', got '{fc.kwargs[0].value.variable.name}'"
+        )
+
+    def test_helper_method_with_positional_args(self) -> None:
+        """Test: self.method(a, b) preserves positional args in fc.args."""
+        from tests.fixtures_workflow.workflow_helper_positional import WorkflowHelperPositionalArgs
+
+        program = WorkflowHelperPositionalArgs.workflow_ir()
+
+        fc = self._find_function_call_in_assignments(program, "self.add")
+        assert fc is not None, "Expected self.add"
+
+        # Positional args should be in fc.args (not converted to kwargs)
+        assert len(fc.args) == 2, f"Expected 2 positional args, got {len(fc.args)}"
+        assert len(fc.kwargs) == 0, f"Expected 0 kwargs, got {len(fc.kwargs)}"
+
+        # First arg should be variable reference to 'value'
+        assert fc.args[0].HasField("variable"), "Expected first arg to be variable"
+        assert fc.args[0].variable.name == "value", "Expected reference to 'value'"
+
+        # Second arg should be literal 10
+        assert fc.args[1].HasField("literal"), "Expected second arg to be literal"
+        assert fc.args[1].literal.int_value == 10, "Expected literal 10"
+
+    def test_helper_method_with_mixed_args(self) -> None:
+        """Test: self.method(a, b, c=x) preserves both positional and keyword args."""
+        from tests.fixtures_workflow.workflow_helper_positional import WorkflowHelperPositionalArgs
+
+        program = WorkflowHelperPositionalArgs.workflow_ir()
+
+        fc = self._find_function_call_in_assignments(program, "self.multiply")
+        assert fc is not None, "Expected self.multiply"
+
+        # Should have 2 positional args and 1 kwarg
+        assert len(fc.args) == 2, f"Expected 2 positional args, got {len(fc.args)}"
+        assert len(fc.kwargs) == 1, f"Expected 1 kwarg, got {len(fc.kwargs)}"
+
+        # Positional args
+        assert fc.args[0].variable.name == "sum_result", "Expected reference to 'sum_result'"
+        assert fc.args[1].literal.int_value == 2, "Expected literal 2"
+
+        # Keyword arg
+        assert fc.kwargs[0].name == "z", "Expected 'z' kwarg"
+        assert fc.kwargs[0].value.literal.int_value == 3, "Expected z=3"
