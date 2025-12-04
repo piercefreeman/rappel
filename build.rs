@@ -5,6 +5,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
+        // Allow large enum variants in generated proto code
+        .type_attribute(".", "#[allow(clippy::large_enum_variant)]")
         .compile(&["proto/messages.proto", "proto/ast.proto"], &["proto"])?;
 
     Ok(())

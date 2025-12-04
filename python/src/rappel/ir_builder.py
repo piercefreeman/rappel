@@ -668,7 +668,11 @@ class IRBuilder(ast.NodeVisitor):
             if self._is_run_action_call(awaited):
                 # Extract the actual action call from run_action
                 if awaited.args:
-                    return self._extract_action_call_from_awaitable(awaited.args[0])
+                    action_call = self._extract_action_call_from_awaitable(awaited.args[0])
+                    if action_call:
+                        # Extract policies from run_action kwargs (retry, timeout)
+                        self._extract_policies_from_run_action(awaited, action_call)
+                    return action_call
             # Check for asyncio.sleep() - convert to @sleep action
             if self._is_asyncio_sleep_call(awaited):
                 return self._convert_asyncio_sleep_to_action(awaited)
@@ -682,6 +686,107 @@ class IRBuilder(ast.NodeVisitor):
         if isinstance(node.func, ast.Attribute):
             return node.func.attr == "run_action"
         return False
+
+    def _extract_policies_from_run_action(
+        self, run_action_call: ast.Call, action_call: ir.ActionCall
+    ) -> None:
+        """Extract retry and timeout policies from run_action kwargs.
+
+        Parses patterns like:
+        - self.run_action(action(), retry=RetryPolicy(attempts=3))
+        - self.run_action(action(), timeout=timedelta(seconds=30))
+        - self.run_action(action(), timeout=60)
+        """
+        for kw in run_action_call.keywords:
+            if kw.arg == "retry":
+                retry_policy = self._parse_retry_policy(kw.value)
+                if retry_policy:
+                    policy_bracket = ir.PolicyBracket()
+                    policy_bracket.retry.CopyFrom(retry_policy)
+                    action_call.policies.append(policy_bracket)
+            elif kw.arg == "timeout":
+                timeout_policy = self._parse_timeout_policy(kw.value)
+                if timeout_policy:
+                    policy_bracket = ir.PolicyBracket()
+                    policy_bracket.timeout.CopyFrom(timeout_policy)
+                    action_call.policies.append(policy_bracket)
+
+    def _parse_retry_policy(self, node: ast.expr) -> Optional[ir.RetryPolicy]:
+        """Parse a RetryPolicy(...) call into IR.
+
+        Supports:
+        - RetryPolicy(attempts=3)
+        - RetryPolicy(attempts=3, exception_types=["ValueError"])
+        - RetryPolicy(attempts=3, backoff_seconds=5)
+        """
+        if not isinstance(node, ast.Call):
+            return None
+
+        # Check if it's a RetryPolicy call
+        func_name = None
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            func_name = node.func.attr
+
+        if func_name != "RetryPolicy":
+            return None
+
+        policy = ir.RetryPolicy()
+
+        for kw in node.keywords:
+            if kw.arg == "attempts" and isinstance(kw.value, ast.Constant):
+                policy.max_retries = kw.value.value
+            elif kw.arg == "exception_types" and isinstance(kw.value, ast.List):
+                for elt in kw.value.elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        policy.exception_types.append(elt.value)
+            elif kw.arg == "backoff_seconds" and isinstance(kw.value, ast.Constant):
+                policy.backoff.seconds = int(kw.value.value)
+
+        return policy
+
+    def _parse_timeout_policy(self, node: ast.expr) -> Optional[ir.TimeoutPolicy]:
+        """Parse a timeout value into IR.
+
+        Supports:
+        - timeout=60 (int seconds)
+        - timeout=30.5 (float seconds)
+        - timeout=timedelta(seconds=30)
+        - timeout=timedelta(minutes=2)
+        """
+        policy = ir.TimeoutPolicy()
+
+        # Direct numeric value (seconds)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            policy.timeout.seconds = int(node.value)
+            return policy
+
+        # timedelta(...) call
+        if isinstance(node, ast.Call):
+            func_name = None
+            if isinstance(node.func, ast.Name):
+                func_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                func_name = node.func.attr
+
+            if func_name == "timedelta":
+                total_seconds = 0
+                for kw in node.keywords:
+                    if isinstance(kw.value, ast.Constant):
+                        val = kw.value.value
+                        if kw.arg == "seconds":
+                            total_seconds += int(val)
+                        elif kw.arg == "minutes":
+                            total_seconds += int(val) * 60
+                        elif kw.arg == "hours":
+                            total_seconds += int(val) * 3600
+                        elif kw.arg == "days":
+                            total_seconds += int(val) * 86400
+                policy.timeout.seconds = total_seconds
+                return policy
+
+        return None
 
     def _is_asyncio_sleep_call(self, node: ast.Call) -> bool:
         """Check if this is an asyncio.sleep(...) call.
