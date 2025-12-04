@@ -1015,3 +1015,524 @@ class TestUnsupportedPatternDetection:
         assert isinstance(error, UnsupportedPatternError)
         assert error.line is not None, "Error should include line number"
         assert error.line > 0, "Line number should be positive"
+
+    def test_global_statement_raises_error(self) -> None:
+        """Test: global statements raise error."""
+        import pytest
+
+        from rappel import UnsupportedPatternError, action, workflow
+        from rappel.workflow import Workflow
+
+        @action(name="global_test_action")
+        async def global_action() -> int:
+            return 1
+
+        @workflow
+        class GlobalWorkflow(Workflow):
+            async def run(self) -> int:
+                global some_var  # noqa: PLW0604
+                some_var = await global_action()
+                return some_var
+
+        with pytest.raises(UnsupportedPatternError) as exc_info:
+            GlobalWorkflow.workflow_ir()
+
+        error = exc_info.value
+        assert "Global" in error.message, "Error should mention global"
+
+    def test_nonlocal_statement_raises_error(self) -> None:
+        """Test: nonlocal statements raise error."""
+        import pytest
+
+        from rappel import UnsupportedPatternError, workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class NonlocalWorkflow(Workflow):
+            async def run(self) -> int:
+                x = 1
+
+                def inner():
+                    nonlocal x
+                    x = 2
+
+                inner()
+                return x
+
+        # The nested function def will be caught first
+        with pytest.raises(UnsupportedPatternError) as exc_info:
+            NonlocalWorkflow.workflow_ir()
+
+        error = exc_info.value
+        assert "function" in error.message.lower(), "Error should mention nested function"
+
+    def test_import_inside_run_raises_error(self) -> None:
+        """Test: import statements inside run() raise error."""
+        import pytest
+
+        from rappel import UnsupportedPatternError, workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class ImportWorkflow(Workflow):
+            async def run(self) -> int:
+                import json  # noqa: PLC0415
+
+                return len(json.dumps({}))
+
+        with pytest.raises(UnsupportedPatternError) as exc_info:
+            ImportWorkflow.workflow_ir()
+
+        error = exc_info.value
+        assert "Import" in error.message, "Error should mention import"
+
+    def test_class_def_inside_run_raises_error(self) -> None:
+        """Test: class definitions inside run() raise error."""
+        import pytest
+
+        from rappel import UnsupportedPatternError, workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class ClassDefWorkflow(Workflow):
+            async def run(self) -> int:
+                class Inner:
+                    pass
+
+                return 1
+
+        with pytest.raises(UnsupportedPatternError) as exc_info:
+            ClassDefWorkflow.workflow_ir()
+
+        error = exc_info.value
+        assert "Class" in error.message, "Error should mention class"
+
+    def test_nested_function_raises_error(self) -> None:
+        """Test: nested function definitions raise error."""
+        import pytest
+
+        from rappel import UnsupportedPatternError, workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class NestedFuncWorkflow(Workflow):
+            async def run(self) -> int:
+                def helper():
+                    return 1
+
+                return helper()
+
+        with pytest.raises(UnsupportedPatternError) as exc_info:
+            NestedFuncWorkflow.workflow_ir()
+
+        error = exc_info.value
+        assert "function" in error.message.lower(), "Error should mention function"
+
+
+class TestReturnStatements:
+    """Test return statement handling."""
+
+    def test_return_with_variable(self) -> None:
+        """Test: return with a variable reference."""
+        from rappel import action, workflow
+        from rappel.workflow import Workflow
+
+        @action(name="return_test_action")
+        async def return_action() -> int:
+            return 42
+
+        @workflow
+        class ReturnVarWorkflow(Workflow):
+            async def run(self) -> int:
+                result = await return_action()
+                return result
+
+        program = ReturnVarWorkflow.workflow_ir()
+
+        # Find the return statement
+        func = program.functions[0]
+        return_stmt = None
+        for stmt in func.body.statements:
+            if stmt.HasField("return_stmt"):
+                return_stmt = stmt.return_stmt
+                break
+
+        assert return_stmt is not None, "Should have return statement"
+        assert return_stmt.value.HasField("variable"), "Return value should be variable"
+        assert return_stmt.value.variable.name == "result", "Return should reference 'result'"
+
+    def test_return_with_literal(self) -> None:
+        """Test: return with a literal value."""
+        from rappel import workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class ReturnLiteralWorkflow(Workflow):
+            async def run(self) -> int:
+                return 42
+
+        program = ReturnLiteralWorkflow.workflow_ir()
+
+        func = program.functions[0]
+        return_stmt = None
+        for stmt in func.body.statements:
+            if stmt.HasField("return_stmt"):
+                return_stmt = stmt.return_stmt
+                break
+
+        assert return_stmt is not None, "Should have return statement"
+        assert return_stmt.value.HasField("literal"), "Return value should be literal"
+        assert return_stmt.value.literal.int_value == 42, "Return should be 42"
+
+    def test_return_without_value(self) -> None:
+        """Test: return without a value."""
+        from rappel import workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class ReturnNoneWorkflow(Workflow):
+            async def run(self) -> None:
+                return
+
+        program = ReturnNoneWorkflow.workflow_ir()
+
+        func = program.functions[0]
+        return_stmt = None
+        for stmt in func.body.statements:
+            if stmt.HasField("return_stmt"):
+                return_stmt = stmt.return_stmt
+                break
+
+        assert return_stmt is not None, "Should have return statement"
+
+
+class TestAugmentedAssignment:
+    """Test augmented assignment (+=, -=, etc.)."""
+
+    def test_plus_equals_assignment(self) -> None:
+        """Test: x += 1 is converted to x = x + 1."""
+        from rappel import action, workflow
+        from rappel.workflow import Workflow
+
+        @action(name="aug_test_action")
+        async def aug_action() -> int:
+            return 5
+
+        @workflow
+        class PlusEqualsWorkflow(Workflow):
+            async def run(self) -> int:
+                x = await aug_action()
+                x += 1
+                return x
+
+        program = PlusEqualsWorkflow.workflow_ir()
+
+        func = program.functions[0]
+        # Find the assignment with binary op
+        aug_assign = None
+        for stmt in func.body.statements:
+            if stmt.HasField("assignment"):
+                if stmt.assignment.value.HasField("binary_op"):
+                    aug_assign = stmt.assignment
+                    break
+
+        assert aug_assign is not None, "Should have augmented assignment"
+        assert aug_assign.targets == ["x"], "Target should be 'x'"
+        assert aug_assign.value.binary_op.op == ir.BinaryOperator.BINARY_OP_ADD, "Op should be ADD"
+
+
+class TestExpressionTypes:
+    """Test various expression types in IR."""
+
+    def test_list_expression(self) -> None:
+        """Test: [1, 2, 3] list literals."""
+        from rappel import workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class ListWorkflow(Workflow):
+            async def run(self) -> list[int]:
+                items = [1, 2, 3]
+                return items
+
+        program = ListWorkflow.workflow_ir()
+
+        func = program.functions[0]
+        # Find the assignment with list
+        list_assign = None
+        for stmt in func.body.statements:
+            if stmt.HasField("assignment"):
+                if stmt.assignment.value.HasField("list"):
+                    list_assign = stmt.assignment
+                    break
+
+        assert list_assign is not None, "Should have list assignment"
+        assert len(list_assign.value.list.elements) == 3, "Should have 3 elements"
+
+    def test_dict_expression(self) -> None:
+        """Test: {"key": "value"} dict literals."""
+        from rappel import workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class DictWorkflow(Workflow):
+            async def run(self) -> dict[str, int]:
+                data = {"a": 1, "b": 2}
+                return data
+
+        program = DictWorkflow.workflow_ir()
+
+        func = program.functions[0]
+        # Find the assignment with dict
+        dict_assign = None
+        for stmt in func.body.statements:
+            if stmt.HasField("assignment"):
+                if stmt.assignment.value.HasField("dict"):
+                    dict_assign = stmt.assignment
+                    break
+
+        assert dict_assign is not None, "Should have dict assignment"
+        assert len(dict_assign.value.dict.entries) == 2, "Should have 2 entries"
+
+    def test_index_expression(self) -> None:
+        """Test: items[0] index access."""
+        from rappel import workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class IndexWorkflow(Workflow):
+            async def run(self, items: list[int]) -> int:
+                first = items[0]
+                return first
+
+        program = IndexWorkflow.workflow_ir()
+
+        func = program.functions[0]
+        # Find the assignment with index
+        index_assign = None
+        for stmt in func.body.statements:
+            if stmt.HasField("assignment"):
+                if stmt.assignment.value.HasField("index"):
+                    index_assign = stmt.assignment
+                    break
+
+        assert index_assign is not None, "Should have index assignment"
+        assert index_assign.value.index.object.HasField("variable"), (
+            "Index object should be variable"
+        )
+        assert index_assign.value.index.object.variable.name == "items", (
+            "Index object should be 'items'"
+        )
+
+    def test_dot_expression(self) -> None:
+        """Test: obj.attr dot access."""
+        from rappel import workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class DotWorkflow(Workflow):
+            async def run(self, obj: dict) -> str:
+                # Use a simple attribute access pattern
+                name = obj.get
+                return str(name)
+
+        program = DotWorkflow.workflow_ir()
+        # Just verify it builds without error
+        assert program is not None
+
+    def test_unary_not_expression(self) -> None:
+        """Test: not x unary operator."""
+        from rappel import workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class UnaryNotWorkflow(Workflow):
+            async def run(self, flag: bool) -> bool:
+                result = not flag
+                return result
+
+        program = UnaryNotWorkflow.workflow_ir()
+
+        func = program.functions[0]
+        # Find the assignment with unary op
+        unary_assign = None
+        for stmt in func.body.statements:
+            if stmt.HasField("assignment"):
+                if stmt.assignment.value.HasField("unary_op"):
+                    unary_assign = stmt.assignment
+                    break
+
+        assert unary_assign is not None, "Should have unary assignment"
+        assert unary_assign.value.unary_op.op == ir.UnaryOperator.UNARY_OP_NOT, "Op should be NOT"
+
+    def test_comparison_operators(self) -> None:
+        """Test: various comparison operators."""
+        from rappel import workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class ComparisonWorkflow(Workflow):
+            async def run(self, x: int, y: int) -> list[bool]:
+                lt = x < y
+                le = x <= y
+                gt = x > y
+                ge = x >= y
+                eq = x == y
+                ne = x != y
+                return [lt, le, gt, ge, eq, ne]
+
+        program = ComparisonWorkflow.workflow_ir()
+        # Just verify it builds without error - all ops are covered
+        assert program is not None
+        func = program.functions[0]
+        # Should have several assignments with binary ops
+        binary_count = 0
+        for stmt in func.body.statements:
+            if stmt.HasField("assignment"):
+                if stmt.assignment.value.HasField("binary_op"):
+                    binary_count += 1
+        assert binary_count >= 6, "Should have 6 comparison assignments"
+
+    def test_boolean_operators(self) -> None:
+        """Test: and/or boolean operators."""
+        from rappel import workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class BooleanWorkflow(Workflow):
+            async def run(self, a: bool, b: bool) -> list[bool]:
+                and_result = a and b
+                or_result = a or b
+                return [and_result, or_result]
+
+        program = BooleanWorkflow.workflow_ir()
+        assert program is not None
+        func = program.functions[0]
+        # Should have assignments with binary ops
+        binary_count = 0
+        for stmt in func.body.statements:
+            if stmt.HasField("assignment"):
+                if stmt.assignment.value.HasField("binary_op"):
+                    binary_count += 1
+        assert binary_count >= 2, "Should have 2 boolean op assignments"
+
+    def test_arithmetic_operators(self) -> None:
+        """Test: +, -, *, / arithmetic operators."""
+        from rappel import workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class ArithmeticWorkflow(Workflow):
+            async def run(self, a: int, b: int) -> list[int]:
+                add = a + b
+                sub = a - b
+                mul = a * b
+                div = a // b
+                return [add, sub, mul, div]
+
+        program = ArithmeticWorkflow.workflow_ir()
+        assert program is not None
+
+
+class TestLiteralTypes:
+    """Test literal type handling."""
+
+    def test_string_literal(self) -> None:
+        """Test: string literals."""
+        from rappel import workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class StringWorkflow(Workflow):
+            async def run(self) -> str:
+                msg = "hello"
+                return msg
+
+        program = StringWorkflow.workflow_ir()
+
+        func = program.functions[0]
+        # Find the assignment with literal
+        str_assign = None
+        for stmt in func.body.statements:
+            if stmt.HasField("assignment"):
+                if stmt.assignment.value.HasField("literal"):
+                    str_assign = stmt.assignment
+                    break
+
+        assert str_assign is not None, "Should have string assignment"
+        assert str_assign.value.literal.string_value == "hello", "Should be 'hello'"
+
+    def test_float_literal(self) -> None:
+        """Test: float literals."""
+        from rappel import workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class FloatWorkflow(Workflow):
+            async def run(self) -> float:
+                val = 3.14
+                return val
+
+        program = FloatWorkflow.workflow_ir()
+
+        func = program.functions[0]
+        # Find the assignment with literal
+        float_assign = None
+        for stmt in func.body.statements:
+            if stmt.HasField("assignment"):
+                if stmt.assignment.value.HasField("literal"):
+                    float_assign = stmt.assignment
+                    break
+
+        assert float_assign is not None, "Should have float assignment"
+        assert abs(float_assign.value.literal.float_value - 3.14) < 0.01, "Should be 3.14"
+
+    def test_bool_literal(self) -> None:
+        """Test: bool literals."""
+        from rappel import workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class BoolWorkflow(Workflow):
+            async def run(self) -> bool:
+                val = True
+                return val
+
+        program = BoolWorkflow.workflow_ir()
+
+        func = program.functions[0]
+        # Find the assignment with literal
+        bool_assign = None
+        for stmt in func.body.statements:
+            if stmt.HasField("assignment"):
+                if stmt.assignment.value.HasField("literal"):
+                    bool_assign = stmt.assignment
+                    break
+
+        assert bool_assign is not None, "Should have bool assignment"
+        assert bool_assign.value.literal.bool_value is True, "Should be True"
+
+    def test_none_literal(self) -> None:
+        """Test: None literals."""
+        from rappel import workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class NoneWorkflow(Workflow):
+            async def run(self) -> None:
+                val = None
+                return val
+
+        program = NoneWorkflow.workflow_ir()
+
+        func = program.functions[0]
+        # Find the assignment with literal
+        none_assign = None
+        for stmt in func.body.statements:
+            if stmt.HasField("assignment"):
+                if stmt.assignment.value.HasField("literal"):
+                    none_assign = stmt.assignment
+                    break
+
+        assert none_assign is not None, "Should have None assignment"
+        assert none_assign.value.literal.is_none is True, "Should be None"
