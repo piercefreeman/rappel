@@ -440,6 +440,30 @@ impl Database {
         Ok(WorkflowInstanceId(id))
     }
 
+    /// Find instances that need to be started (running but no actions created yet)
+    pub async fn find_unstarted_instances(&self, limit: i32) -> DbResult<Vec<WorkflowInstance>> {
+        let instances = sqlx::query_as::<_, WorkflowInstance>(
+            r#"
+            SELECT i.id, i.partition_id, i.workflow_name, i.workflow_version_id,
+                   i.next_action_seq, i.input_payload, i.result_payload, i.status,
+                   i.created_at, i.completed_at
+            FROM workflow_instances i
+            WHERE i.status = 'running'
+              AND i.next_action_seq = 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM action_queue a WHERE a.instance_id = i.id
+              )
+            ORDER BY i.created_at ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(instances)
+    }
+
     /// Get a workflow instance by ID
     pub async fn get_instance(&self, id: WorkflowInstanceId) -> DbResult<WorkflowInstance> {
         let instance = sqlx::query_as::<_, WorkflowInstance>(

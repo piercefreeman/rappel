@@ -19,6 +19,10 @@ path = "src/bin/boot-rappel-singleton.rs"
 name = "benchmark"
 path = "src/bin/benchmark.rs"
 
+[[bin]]
+name = "start_workers"
+path = "src/bin/start_workers.rs"
+
 [dependencies]
 anyhow = "1"
 axum = "0.7"

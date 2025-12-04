@@ -76,11 +76,11 @@ pub async fn run_servers(config: ServerConfig) -> Result<()> {
         http_addr,
         grpc_addr,
         Arc::clone(&database_url),
-        database,
+        database.clone(),
     );
 
     let http_task = tokio::spawn(run_http_server(http_listener, http_state));
-    let grpc_task = tokio::spawn(run_grpc_server(grpc_listener, database_url));
+    let grpc_task = tokio::spawn(run_grpc_server(grpc_listener, database));
 
     tokio::select! {
         result = http_task => result??,
@@ -220,7 +220,7 @@ impl IntoResponse for HttpError {
 }
 
 async fn register_workflow_http(
-    State(_state): State<HttpState>,
+    State(state): State<HttpState>,
     Json(payload): Json<RegisterWorkflowHttpRequest>,
 ) -> Result<Json<RegisterWorkflowHttpResponse>, HttpError> {
     use base64::{Engine as _, engine::general_purpose};
@@ -240,10 +240,29 @@ async fn register_workflow_http(
     // Log the registered workflow IR
     log_workflow_ir(&registration);
 
-    // TODO: Register the workflow and create instance
-    // For now, return placeholder IDs
-    let version_id = uuid::Uuid::new_v4();
-    let instance_id = uuid::Uuid::new_v4();
+    // Register the workflow version
+    let version_id = state
+        .database
+        .upsert_workflow_version(
+            &registration.workflow_name,
+            &registration.ir_hash,
+            &registration.ir,
+            registration.concurrent,
+        )
+        .await
+        .map_err(|e| HttpError::internal(e.into()))?;
+
+    // Create an instance with initial context if provided
+    let initial_input = registration.initial_context.map(|ctx| ctx.encode_to_vec());
+    let instance_id = state
+        .database
+        .create_instance(
+            &registration.workflow_name,
+            version_id,
+            initial_input.as_deref(),
+        )
+        .await
+        .map_err(|e| HttpError::internal(e.into()))?;
 
     Ok(Json(RegisterWorkflowHttpResponse {
         workflow_version_id: version_id.to_string(),
@@ -275,24 +294,48 @@ fn log_workflow_ir(registration: &proto::WorkflowRegistration) {
 }
 
 async fn wait_for_instance_http(
-    State(_state): State<HttpState>,
+    State(state): State<HttpState>,
     Json(request): Json<WaitForInstanceHttpRequest>,
 ) -> Result<Json<WaitForInstanceHttpResponse>, HttpError> {
     use base64::{Engine as _, engine::general_purpose};
+    use crate::db::{DbError, WorkflowInstanceId};
 
-    let _interval = sanitize_interval(request.poll_interval_secs);
-    let _instance_id: uuid::Uuid = request
+    let interval = sanitize_interval(request.poll_interval_secs);
+    let instance_id: uuid::Uuid = request
         .instance_id
         .parse()
         .map_err(|_| HttpError::bad_request("invalid instance_id"))?;
 
-    // TODO: Poll for instance completion
-    // For now, return empty payload
-    let encoded = general_purpose::STANDARD.encode([]);
+    // Poll for instance completion
+    loop {
+        let result = state
+            .database
+            .get_instance(WorkflowInstanceId(instance_id))
+            .await;
 
-    Ok(Json(WaitForInstanceHttpResponse {
-        payload_b64: encoded,
-    }))
+        match result {
+            Ok(inst) if inst.status == "completed" => {
+                let payload = inst.result_payload.unwrap_or_default();
+                let encoded = general_purpose::STANDARD.encode(&payload);
+                return Ok(Json(WaitForInstanceHttpResponse {
+                    payload_b64: encoded,
+                }));
+            }
+            Ok(inst) if inst.status == "failed" => {
+                return Err(HttpError::internal(anyhow::anyhow!("workflow instance failed")));
+            }
+            Ok(_) => {
+                // Still running, wait and poll again
+                tokio::time::sleep(interval).await;
+            }
+            Err(DbError::NotFound(_)) => {
+                return Err(HttpError::not_found("instance not found"));
+            }
+            Err(e) => {
+                return Err(HttpError::internal(e.into()));
+            }
+        }
+    }
 }
 
 pub(crate) fn sanitize_interval(value: Option<f64>) -> Duration {
@@ -305,13 +348,12 @@ pub(crate) fn sanitize_interval(value: Option<f64>) -> Duration {
 // gRPC Server
 // ============================================================================
 
-async fn run_grpc_server(listener: TcpListener, database_url: Arc<String>) -> Result<()> {
+async fn run_grpc_server(listener: TcpListener, database: Database) -> Result<()> {
     use proto::workflow_service_server::WorkflowServiceServer;
 
     let incoming = TcpListenerStream::new(listener);
-    let service = WorkflowGrpcService::new(database_url);
+    let service = WorkflowGrpcService::new(database);
 
-    // TODO: Also add the worker bridge server here
     Server::builder()
         .add_service(WorkflowServiceServer::new(service))
         .serve_with_incoming(incoming)
@@ -322,13 +364,12 @@ async fn run_grpc_server(listener: TcpListener, database_url: Arc<String>) -> Re
 
 #[derive(Clone)]
 struct WorkflowGrpcService {
-    #[allow(dead_code)]
-    database_url: Arc<String>,
+    database: Database,
 }
 
 impl WorkflowGrpcService {
-    fn new(database_url: Arc<String>) -> Self {
-        Self { database_url }
+    fn new(database: Database) -> Self {
+        Self { database }
     }
 }
 
@@ -346,9 +387,29 @@ impl proto::workflow_service_server::WorkflowService for WorkflowGrpcService {
         // Log the registered workflow IR
         log_workflow_ir(&registration);
 
-        // TODO: Register the workflow and create instance
-        let version_id = uuid::Uuid::new_v4();
-        let instance_id = uuid::Uuid::new_v4();
+        // Register the workflow version
+        let version_id = self
+            .database
+            .upsert_workflow_version(
+                &registration.workflow_name,
+                &registration.ir_hash,
+                &registration.ir,
+                registration.concurrent,
+            )
+            .await
+            .map_err(|e| tonic::Status::internal(format!("database error: {e}")))?;
+
+        // Create an instance with initial context if provided
+        let initial_input = registration.initial_context.map(|ctx| ctx.encode_to_vec());
+        let instance_id = self
+            .database
+            .create_instance(
+                &registration.workflow_name,
+                version_id,
+                initial_input.as_deref(),
+            )
+            .await
+            .map_err(|e| tonic::Status::internal(format!("database error: {e}")))?;
 
         Ok(tonic::Response::new(proto::RegisterWorkflowResponse {
             workflow_version_id: version_id.to_string(),
@@ -360,17 +421,44 @@ impl proto::workflow_service_server::WorkflowService for WorkflowGrpcService {
         &self,
         request: tonic::Request<proto::WaitForInstanceRequest>,
     ) -> Result<tonic::Response<proto::WaitForInstanceResponse>, tonic::Status> {
+        use crate::db::{DbError, WorkflowInstanceId};
+
         let inner = request.into_inner();
-        let _instance_id: uuid::Uuid = inner.instance_id.parse().map_err(|err| {
+        let instance_id: uuid::Uuid = inner.instance_id.parse().map_err(|err| {
             tonic::Status::invalid_argument(format!("invalid instance_id: {err}"))
         })?;
 
-        let _interval = sanitize_interval(Some(inner.poll_interval_secs));
+        let interval = sanitize_interval(Some(inner.poll_interval_secs));
 
-        // TODO: Poll for instance completion
-        Ok(tonic::Response::new(proto::WaitForInstanceResponse {
-            payload: vec![],
-        }))
+        // Poll for instance completion
+        loop {
+            let result = self
+                .database
+                .get_instance(WorkflowInstanceId(instance_id))
+                .await;
+
+            match result {
+                Ok(inst) if inst.status == "completed" => {
+                    let payload = inst.result_payload.unwrap_or_default();
+                    return Ok(tonic::Response::new(proto::WaitForInstanceResponse {
+                        payload,
+                    }));
+                }
+                Ok(inst) if inst.status == "failed" => {
+                    return Err(tonic::Status::internal("workflow instance failed"));
+                }
+                Ok(_) => {
+                    // Still running, wait and poll again
+                    tokio::time::sleep(interval).await;
+                }
+                Err(DbError::NotFound(_)) => {
+                    return Err(tonic::Status::not_found("instance not found"));
+                }
+                Err(e) => {
+                    return Err(tonic::Status::internal(format!("database error: {e}")));
+                }
+            }
+        }
     }
 }
 

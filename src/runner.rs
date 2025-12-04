@@ -973,6 +973,11 @@ impl DAGRunner {
 
                 // Fetch and dispatch work (delegated to WorkQueueHandler)
                 _ = tokio::time::sleep(tokio::time::Duration::from_millis(self.config.poll_interval_ms)) => {
+                    // First, check for and start any unstarted instances
+                    if let Err(e) = self.start_unstarted_instances().await {
+                        error!("Failed to start unstarted instances: {}", e);
+                    }
+
                     if self.work_handler.available_slots() == 0 {
                         continue;
                     }
@@ -1933,6 +1938,73 @@ impl DAGRunner {
     /// Get count of in-flight actions.
     pub async fn in_flight_count(&self) -> usize {
         self.work_handler.in_flight_count().await
+    }
+
+    /// Poll for and start any unstarted instances.
+    ///
+    /// Finds instances that are in 'running' state but have no actions queued yet,
+    /// and starts them by parsing their input and creating the initial actions.
+    async fn start_unstarted_instances(&self) -> RunnerResult<()> {
+        let db = &self.completion_handler.db;
+        let instances = db.find_unstarted_instances(10).await?;
+
+        for instance in instances {
+            let instance_id = WorkflowInstanceId(instance.id);
+
+            // Parse initial inputs from the instance's input_payload
+            let initial_inputs: std::collections::HashMap<String, JsonValue> =
+                if let Some(payload) = &instance.input_payload {
+                    // Try to decode as protobuf WorkflowArguments
+                    match proto::WorkflowArguments::decode(&payload[..]) {
+                        Ok(args) => {
+                            args.arguments
+                                .iter()
+                                .filter_map(|arg| {
+                                    arg.value.as_ref().map(|v| {
+                                        (arg.key.clone(), proto_value_to_json(v))
+                                    })
+                                })
+                                .collect()
+                        }
+                        Err(e) => {
+                            warn!(
+                                instance_id = %instance.id,
+                                error = %e,
+                                "failed to decode input payload, using empty inputs"
+                            );
+                            std::collections::HashMap::new()
+                        }
+                    }
+                } else {
+                    std::collections::HashMap::new()
+                };
+
+            info!(
+                instance_id = %instance.id,
+                workflow = %instance.workflow_name,
+                input_keys = ?initial_inputs.keys().collect::<Vec<_>>(),
+                "starting unstarted instance"
+            );
+
+            match self.start_instance(instance_id, initial_inputs).await {
+                Ok(count) => {
+                    debug!(
+                        instance_id = %instance.id,
+                        actions_created = count,
+                        "successfully started instance"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        instance_id = %instance.id,
+                        error = %e,
+                        "failed to start instance"
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Start a workflow instance by enqueuing its initial action(s).
