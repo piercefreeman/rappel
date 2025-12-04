@@ -21,10 +21,10 @@ use tempfile::TempDir;
 use tokio::{net::TcpListener, process::Command, sync::oneshot, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
-use tracing::{Level, error, info};
+use tracing::{error, info};
 
 use rappel::{
-    ActionDispatchPayload, Database, PythonWorkerConfig, PythonWorkerPool, RoundTripMetrics,
+    Database, PythonWorkerConfig, PythonWorkerPool,
     WorkerBridgeServer, WorkflowInstanceId, WorkflowVersionId, proto,
 };
 
@@ -52,6 +52,10 @@ struct Args {
     /// Number of Python workers
     #[arg(long, default_value = "4")]
     workers: u32,
+
+    /// Number of workflow instances to run concurrently
+    #[arg(long, default_value = "1")]
+    instances: u32,
 
     /// Log interval (0 = no logging during run)
     #[arg(long, default_value = "0")]
@@ -287,178 +291,59 @@ async fn run_shell_with_env(
 }
 
 // ============================================================================
-// Action Dispatch with DAG Runner Integration
+// Benchmark Runner
 // ============================================================================
 
-/// Run the DAG runner and collect metrics from completed actions.
-///
-/// Unlike the simple dispatch loop, this uses the full DAGRunner which:
-/// 1. Fetches actions from the queue
-/// 2. Dispatches to workers
-/// 3. On completion, traverses the DAG to find and enqueue next actions
-async fn run_with_dag_runner(
-    runner: &rappel::DAGRunner,
+/// Wait for the workflow to complete by monitoring the database.
+/// Returns action count and metrics collection.
+async fn wait_for_completion(
     database: &Arc<Database>,
-    pool: &Arc<PythonWorkerPool>,
     timeout: Duration,
-) -> Result<Vec<RoundTripMetrics>> {
-    let mut completed = Vec::new();
+) -> Result<u64> {
     let start = std::time::Instant::now();
-
-    // Run the dispatch loop
+    let mut last_completed = 0u64;
     let mut idle_cycles = 0usize;
-    let max_idle_cycles = 20; // Wait longer since DAG progression takes time
+    let max_idle_cycles = 40; // 2 seconds of no progress
 
     loop {
-        // Check timeout
         if start.elapsed() > timeout {
             info!("Benchmark timeout reached");
             break;
         }
 
-        // Dispatch actions
-        let actions = database.dispatch_actions(64).await?;
+        // Check how many actions have completed
+        let completed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM action_queue WHERE status = 'completed'",
+        )
+        .fetch_one(database.pool())
+        .await?;
 
-        if actions.is_empty() {
-            idle_cycles = idle_cycles.saturating_add(1);
-            if idle_cycles >= max_idle_cycles && !completed.is_empty() {
-                // Check if there are any pending actions in the queue
-                let pending: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM action_queue WHERE status IN ('pending', 'running')",
-                )
-                .fetch_one(database.pool())
-                .await?;
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM action_queue WHERE status IN ('pending', 'running')",
+        )
+        .fetch_one(database.pool())
+        .await?;
 
-                if pending == 0 {
-                    info!("No more pending actions, benchmark complete");
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            continue;
+        if pending == 0 && completed > 0 {
+            info!(completed = completed, "All actions completed");
+            return Ok(completed as u64);
         }
 
-        idle_cycles = 0;
-
-        for action in actions {
-            let kwargs = if action.dispatch_payload.is_empty() {
-                proto::WorkflowArguments { arguments: vec![] }
-            } else {
-                let json: serde_json::Value = serde_json::from_slice(&action.dispatch_payload)
-                    .context("failed to parse dispatch payload")?;
-                json_to_workflow_args(&json)
-            };
-
-            let payload = ActionDispatchPayload {
-                action_id: action.id.to_string(),
-                instance_id: action.instance_id.to_string(),
-                sequence: action.action_seq as u32,
-                action_name: action.action_name.clone(),
-                module_name: action.module_name.clone(),
-                kwargs,
-                timeout_seconds: action.timeout_seconds as u32,
-                max_retries: action.max_retries as u32,
-                attempt_number: action.attempt_number as u32,
-                dispatch_token: action.delivery_token,
-            };
-
-            let worker = pool.next_worker();
-            let metrics = worker
-                .send_action(payload)
-                .await
-                .map_err(|e| anyhow!("worker send failed: {}", e))?;
-
-            // Process the completion through the runner to trigger DAG progression
-            let completion_result = runner
-                .process_action_completion(
-                    rappel::ActionId(action.id),
-                    WorkflowInstanceId(action.instance_id),
-                    action.node_id.clone(),
-                    metrics.success,
-                    metrics.response_payload.clone(),
-                    metrics.error_message.clone(),
-                    action.delivery_token,
-                )
-                .await;
-
-            if let Err(e) = completion_result {
-                error!("Failed to process completion: {}", e);
+        if completed as u64 > last_completed {
+            last_completed = completed as u64;
+            idle_cycles = 0;
+        } else {
+            idle_cycles += 1;
+            if idle_cycles >= max_idle_cycles && completed > 0 {
+                info!(completed = completed, pending = pending, "No progress, stopping");
+                break;
             }
-
-            completed.push(metrics);
         }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    Ok(completed)
-}
-
-fn json_to_workflow_args(json: &serde_json::Value) -> proto::WorkflowArguments {
-    match json {
-        serde_json::Value::Object(obj) => {
-            let arguments = obj
-                .iter()
-                .map(|(k, v)| proto::WorkflowArgument {
-                    key: k.clone(),
-                    value: Some(json_to_workflow_value(v)),
-                })
-                .collect();
-            proto::WorkflowArguments { arguments }
-        }
-        _ => proto::WorkflowArguments { arguments: vec![] },
-    }
-}
-
-fn json_to_workflow_value(value: &serde_json::Value) -> proto::WorkflowArgumentValue {
-    let kind = match value {
-        serde_json::Value::Null => {
-            proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                kind: Some(proto::primitive_workflow_argument::Kind::NullValue(0)),
-            })
-        }
-        serde_json::Value::Bool(b) => {
-            proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                kind: Some(proto::primitive_workflow_argument::Kind::BoolValue(*b)),
-            })
-        }
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                    kind: Some(proto::primitive_workflow_argument::Kind::IntValue(i)),
-                })
-            } else if let Some(f) = n.as_f64() {
-                proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                    kind: Some(proto::primitive_workflow_argument::Kind::DoubleValue(f)),
-                })
-            } else {
-                proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                    kind: Some(proto::primitive_workflow_argument::Kind::DoubleValue(0.0)),
-                })
-            }
-        }
-        serde_json::Value::String(s) => {
-            proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                kind: Some(proto::primitive_workflow_argument::Kind::StringValue(
-                    s.clone(),
-                )),
-            })
-        }
-        serde_json::Value::Array(arr) => {
-            let items = arr.iter().map(json_to_workflow_value).collect();
-            proto::workflow_argument_value::Kind::ListValue(proto::WorkflowListArgument { items })
-        }
-        serde_json::Value::Object(obj) => {
-            let entries = obj
-                .iter()
-                .map(|(k, v)| proto::WorkflowArgument {
-                    key: k.clone(),
-                    value: Some(json_to_workflow_value(v)),
-                })
-                .collect();
-            proto::workflow_argument_value::Kind::DictValue(proto::WorkflowDictArgument { entries })
-        }
-    };
-
-    proto::WorkflowArgumentValue { kind: Some(kind) }
+    Ok(last_completed)
 }
 
 // ============================================================================
@@ -469,10 +354,16 @@ fn json_to_workflow_value(value: &serde_json::Value) -> proto::WorkflowArgumentV
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize logging
-    if args.log_interval > 0 {
-        tracing_subscriber::fmt().with_max_level(Level::INFO).init();
-    }
+    // Initialize logging - respects RUST_LOG env var for filtering
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("hyper=warn".parse().unwrap())
+                .add_directive("h2=warn".parse().unwrap())
+                .add_directive("tower=warn".parse().unwrap())
+                .add_directive("tonic=warn".parse().unwrap())
+        )
+        .init();
 
     // Connect to database
     let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| {
@@ -497,7 +388,7 @@ async fn main() -> Result<()> {
     let python_env = setup_python_env(grpc_addr, args.count, args.iterations).await?;
     info!("workflow registered");
 
-    // Find the workflow version and instance
+    // Find the workflow version
     let versions = database.list_workflow_versions().await?;
     let version = versions
         .iter()
@@ -505,7 +396,8 @@ async fn main() -> Result<()> {
         .context("benchmark workflow not found")?;
     let version_id = WorkflowVersionId(version.id);
 
-    let instances: Vec<rappel::WorkflowInstance> = sqlx::query_as(
+    // Get the initial instance (created during registration)
+    let initial_instances: Vec<rappel::WorkflowInstance> = sqlx::query_as(
         "SELECT id, partition_id, workflow_name, workflow_version_id, \
          next_action_seq, input_payload, result_payload, status, \
          created_at, completed_at \
@@ -515,10 +407,20 @@ async fn main() -> Result<()> {
     .fetch_all(database.pool())
     .await?;
 
-    let instance_id = instances
+    let first_instance_id = initial_instances
         .first()
         .map(|i| WorkflowInstanceId(i.id))
         .context("no instance found")?;
+
+    // Create additional instances if requested
+    let mut instance_ids = vec![first_instance_id];
+    for _ in 1..args.instances {
+        let instance_id = database
+            .create_instance("benchmarkfanoutworkflow", version_id, None)
+            .await?;
+        instance_ids.push(instance_id);
+    }
+    info!(count = instance_ids.len(), "workflow instances created");
 
     // Start worker pool
     let worker_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -573,46 +475,44 @@ async fn main() -> Result<()> {
         serde_json::Value::Number(args.iterations.into()),
     );
 
-    // Start the instance with initial inputs
-    runner.start_instance(instance_id, initial_inputs).await?;
-    info!(%instance_id, "workflow instance started");
+    // Start all instances with initial inputs
+    for instance_id in &instance_ids {
+        runner.start_instance(*instance_id, initial_inputs.clone()).await?;
+    }
+    info!(count = instance_ids.len(), "workflow instances started");
 
-    // Run the benchmark with DAG runner integration
+    // Run the DAGRunner in a background task - this is the unified code path
+    // that handles dispatch, completion processing, and DAG traversal
+    let runner = Arc::new(runner);
+    let runner_clone = Arc::clone(&runner);
+    let runner_handle = tokio::spawn(async move {
+        if let Err(e) = runner_clone.run().await {
+            error!("Runner failed: {}", e);
+        }
+    });
+
+    // Wait for completion by monitoring the database
     let timeout = Duration::from_secs(args.timeout);
     let start = Instant::now();
-    let metrics = run_with_dag_runner(&runner, &database, &worker_pool, timeout).await?;
+    let total = wait_for_completion(&database, timeout).await?;
     let elapsed = start.elapsed();
 
+    // Shutdown the runner
+    runner.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(5), runner_handle).await;
+
     // Calculate statistics
-    let total = metrics.len() as u64;
     let elapsed_s = elapsed.as_secs_f64();
     let throughput = total as f64 / elapsed_s;
-
-    let mut round_trips: Vec<f64> = metrics
-        .iter()
-        .map(|m| m.round_trip.as_secs_f64() * 1000.0)
-        .collect();
-    round_trips.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-    let avg_round_trip_ms = if round_trips.is_empty() {
-        0.0
-    } else {
-        round_trips.iter().sum::<f64>() / round_trips.len() as f64
-    };
-
-    let p95_round_trip_ms = if round_trips.is_empty() {
-        0.0
-    } else {
-        let idx = (round_trips.len() as f64 * 0.95) as usize;
-        round_trips[idx.min(round_trips.len() - 1)]
-    };
 
     let output = BenchmarkOutput {
         total,
         elapsed_s,
         throughput,
-        avg_round_trip_ms,
-        p95_round_trip_ms,
+        // Round-trip metrics not available in this unified path
+        // (would need to add instrumentation to the runner)
+        avg_round_trip_ms: 0.0,
+        p95_round_trip_ms: 0.0,
     };
 
     // Output results
@@ -623,12 +523,23 @@ async fn main() -> Result<()> {
         println!("Actions executed: {}", output.total);
         println!("Elapsed time: {:.2}s", output.elapsed_s);
         println!("Throughput: {:.2} actions/sec", output.throughput);
-        println!("Avg round-trip: {:.2}ms", output.avg_round_trip_ms);
-        println!("P95 round-trip: {:.2}ms", output.p95_round_trip_ms);
     }
 
     // Cleanup
     let _ = grpc_shutdown.send(());
+
+    // Shutdown worker pool - need to unwrap the Arc
+    match Arc::try_unwrap(worker_pool) {
+        Ok(pool) => {
+            if let Err(e) = pool.shutdown().await {
+                error!("Failed to shutdown worker pool: {}", e);
+            }
+        }
+        Err(_) => {
+            error!("Worker pool still has references, cannot shut down cleanly");
+        }
+    }
+
     worker_bridge.shutdown().await;
     drop(python_env);
 

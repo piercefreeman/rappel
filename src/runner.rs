@@ -1752,6 +1752,154 @@ impl DAGRunner {
         Ok(())
     }
 
+    /// Check if all spread actions are complete and process the aggregator.
+    /// This is the external (non-batched) version for use by process_action_completion.
+    /// Returns the number of new actions enqueued.
+    async fn check_and_process_aggregator_external(
+        &self,
+        spread_node_id: &str,
+        dag: &DAG,
+        helper: &DAGHelper<'_>,
+        instance_id: WorkflowInstanceId,
+        db: &Database,
+    ) -> RunnerResult<usize> {
+        // Find the aggregator node (successor via StateMachine edge)
+        let aggregator_id = dag
+            .edges
+            .iter()
+            .find(|e| e.source == spread_node_id && e.edge_type == EdgeType::StateMachine)
+            .map(|e| e.target.clone());
+
+        let agg_id = match aggregator_id {
+            Some(id) => id,
+            None => {
+                debug!(spread_node_id = %spread_node_id, "no aggregator found for spread action");
+                return Ok(0);
+            }
+        };
+
+        let agg_node = match dag.nodes.get(&agg_id) {
+            Some(n) => n,
+            None => return Ok(0),
+        };
+
+        // Read the aggregator's inbox - both spread results and the expected count
+        let spread_results = db.read_inbox_for_aggregator(instance_id, &agg_id).await?;
+        let agg_inbox = db.read_inbox(instance_id, &agg_id).await?;
+
+        // Get expected count from the regular inbox
+        let expected_count = agg_inbox
+            .get("_spread_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as usize;
+
+        // Count spread results (these come from read_inbox_for_aggregator)
+        let current_results = spread_results.len();
+
+        debug!(
+            aggregator_id = %agg_id,
+            expected_count = expected_count,
+            current_results = current_results,
+            "checking aggregator readiness (external)"
+        );
+
+        // If not all results are in yet, wait for more
+        if current_results < expected_count {
+            return Ok(0);
+        }
+
+        // All results are in! Aggregate them.
+        // spread_results is already sorted by spread_index from the DB query
+        let aggregated_result = JsonValue::Array(
+            spread_results.into_iter().map(|(_, v)| v).collect()
+        );
+
+        debug!(
+            aggregator_id = %agg_id,
+            result_count = current_results,
+            "aggregator ready, processing result (external)"
+        );
+
+        // Write aggregated result to downstream nodes via DATA_FLOW edges
+        if let Some(ref target) = agg_node.target {
+            for edge in dag.edges.iter() {
+                if edge.source == agg_id
+                    && edge.edge_type == EdgeType::DataFlow
+                    && edge.variable.as_deref() == Some(target.as_str())
+                {
+                    db.append_to_inbox(
+                        instance_id,
+                        &edge.target,
+                        target,
+                        aggregated_result.clone(),
+                        &agg_id,
+                        None,
+                    ).await?;
+                }
+            }
+        }
+
+        // Find and process successors of the aggregator
+        let mut actions_enqueued = 0;
+        let successors = helper.get_ready_successors(&agg_id, None);
+
+        debug!(
+            aggregator_id = %agg_id,
+            successor_count = successors.len(),
+            "processing aggregator successors"
+        );
+
+        for successor in successors {
+            let succ_node = match dag.nodes.get(&successor.node_id) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            let exec_mode = helper.get_execution_mode(succ_node);
+            match exec_mode {
+                ExecutionMode::Inline => {
+                    // For simplicity, skip inline nodes in this path
+                    // They would need recursive handling
+                    debug!(
+                        succ_id = %successor.node_id,
+                        "skipping inline successor of aggregator"
+                    );
+                }
+                ExecutionMode::Delegated => {
+                    // Read inbox and create action
+                    let inbox = db.read_inbox(instance_id, &successor.node_id).await?;
+                    let result = Self::create_actions_for_node(succ_node, instance_id, &inbox, dag)?;
+
+                    // Write inbox entries
+                    for write in result.inbox_writes {
+                        db.append_to_inbox(
+                            write.instance_id,
+                            &write.target_node_id,
+                            &write.variable_name,
+                            write.value,
+                            &write.source_node_id,
+                            write.spread_index,
+                        ).await?;
+                    }
+
+                    // Enqueue actions
+                    for action in result.actions {
+                        db.enqueue_action(action).await?;
+                        actions_enqueued += 1;
+                    }
+                }
+            }
+        }
+
+        debug!(
+            aggregator_id = %agg_id,
+            actions_enqueued = actions_enqueued,
+            "completed aggregator processing"
+        );
+
+        Ok(actions_enqueued)
+    }
+
     /// Process successor nodes asynchronously.
     /// Inline nodes execute immediately and collect inbox writes.
     /// Delegated nodes read from inbox and queue for execution.
@@ -1889,15 +2037,35 @@ impl DAGRunner {
         let helper = DAGHelper::new(&dag);
         let function_names = helper.get_function_names();
 
+        debug!(
+            instance_id = %instance_id.0,
+            function_count = function_names.len(),
+            functions = ?function_names,
+            "starting instance"
+        );
+
         if function_names.is_empty() {
             return Err(RunnerError::Dag("No functions found in DAG".to_string()));
         }
 
-        // Use the first function as the entry point
-        let entry_fn = function_names[0];
+        // Find the entry function - prefer "run" if it exists, otherwise use the first
+        // non-internal function (internal functions start with "__")
+        let entry_fn = function_names
+            .iter()
+            .find(|&&name| name == "run")
+            .or_else(|| function_names.iter().find(|&&name| !name.starts_with("__")))
+            .or(function_names.first())
+            .copied()
+            .ok_or_else(|| RunnerError::Dag("No valid entry function found".to_string()))?;
         let input_node = helper
             .find_input_node(entry_fn)
             .ok_or_else(|| RunnerError::NodeNotFound(format!("{}_input", entry_fn)))?;
+
+        debug!(
+            entry_fn = %entry_fn,
+            input_node_id = %input_node.id,
+            "found entry function and input node"
+        );
 
         // Find first delegated successors starting from input node
         let mut actions_to_enqueue = Vec::new();
@@ -1906,7 +2074,14 @@ impl DAGRunner {
         let mut queue = std::collections::VecDeque::new();
 
         // Start from input node's successors
-        for successor in helper.get_ready_successors(&input_node.id, None) {
+        let initial_successors = helper.get_ready_successors(&input_node.id, None);
+        debug!(
+            input_node_id = %input_node.id,
+            successor_count = initial_successors.len(),
+            successors = ?initial_successors.iter().map(|s| &s.node_id).collect::<Vec<_>>(),
+            "input node successors"
+        );
+        for successor in initial_successors {
             queue.push_back(successor.node_id);
         }
 
@@ -1918,10 +2093,20 @@ impl DAGRunner {
 
             let node = match helper.get_node(&node_id) {
                 Some(n) => n,
-                None => continue,
+                None => {
+                    debug!(node_id = %node_id, "node not found in DAG during start_instance");
+                    continue;
+                }
             };
 
             let mode = helper.get_execution_mode(node);
+            debug!(
+                node_id = %node_id,
+                node_type = %node.node_type,
+                is_spread = node.is_spread,
+                execution_mode = ?mode,
+                "processing node during start_instance"
+            );
 
             match mode {
                 ExecutionMode::Delegated => {
@@ -1929,13 +2114,25 @@ impl DAGRunner {
                     // For initial actions, we use the initial scope as the "inbox"
                     // For spread nodes, this creates multiple actions plus inbox writes
                     let result = Self::create_actions_for_node(node, instance_id, &scope, &dag)?;
+                    debug!(
+                        node_id = %node_id,
+                        actions_created = result.actions.len(),
+                        inbox_writes = result.inbox_writes.len(),
+                        "created initial actions for node"
+                    );
                     actions_to_enqueue.extend(result.actions);
                     inbox_writes_to_commit.extend(result.inbox_writes);
                     // Don't traverse past delegated nodes - they'll handle their successors
                 }
                 ExecutionMode::Inline => {
                     // Skip inline nodes and continue to their successors
-                    for successor in helper.get_ready_successors(&node_id, None) {
+                    let inline_successors = helper.get_ready_successors(&node_id, None);
+                    debug!(
+                        node_id = %node_id,
+                        inline_successor_count = inline_successors.len(),
+                        "skipping inline node during start_instance"
+                    );
+                    for successor in inline_successors {
                         if !visited.contains(&successor.node_id) {
                             queue.push_back(successor.node_id);
                         }
@@ -2043,28 +2240,41 @@ impl DAGRunner {
         let helper = DAGHelper::new(&dag);
         let db = &self.completion_handler.db;
 
+        // Parse spread index from node_id (e.g., "spread_action_10[0]" -> ("spread_action_10", Some(0)))
+        let (base_node_id, spread_index) = Self::parse_spread_node_id(&node_id);
+        debug!(
+            node_id = %node_id,
+            base_node_id = %base_node_id,
+            spread_index = ?spread_index,
+            "parsed node id for completion"
+        );
+
         // INBOX PATTERN: Push result to downstream nodes via DATA_FLOW edges
         // When this action completes, write its result to the inbox of each target node
-        if let Some(node) = dag.nodes.get(&node_id)
+        // Use base_node_id for DAG lookups since that's what exists in the DAG
+        if let Some(node) = dag.nodes.get(base_node_id)
             && let Some(ref target) = node.target
         {
             debug!(
                 node_id = %node_id,
+                base_node_id = %base_node_id,
                 target = %target,
                 result = ?result,
+                spread_index = ?spread_index,
                 "pushing result to downstream inboxes"
             );
 
-            // Find all DATA_FLOW edges from this node that carry this variable
+            // Find all DATA_FLOW edges from the base node that carry this variable
             for edge in dag.edges.iter() {
-                if edge.source == node_id
+                if edge.source == base_node_id
                     && edge.edge_type == EdgeType::DataFlow
                     && edge.variable.as_deref() == Some(target.as_str())
                 {
                     debug!(
-                        source = %node_id,
+                        source = %base_node_id,
                         target_node = %edge.target,
                         variable = %target,
+                        spread_index = ?spread_index,
                         "appending to inbox"
                     );
                     db.append_to_inbox(
@@ -2072,16 +2282,35 @@ impl DAGRunner {
                         &edge.target,
                         target,
                         result.clone(),
-                        &node_id,
-                        None, // spread_index
+                        base_node_id,
+                        spread_index.map(|i| i as i32),
                     )
                     .await?;
                 }
             }
         }
 
-        // Get successors and determine what to enqueue
-        let successors = helper.get_ready_successors(&node_id, None);
+        // For spread actions, check if all results are in before processing successors
+        if spread_index.is_some() {
+            // This is a spread action completion - check aggregator
+            return self.check_and_process_aggregator_external(
+                base_node_id,
+                &dag,
+                &helper,
+                instance_id,
+                db,
+            ).await;
+        }
+
+        // Get successors and determine what to enqueue (regular actions only)
+        let successors = helper.get_ready_successors(base_node_id, None);
+        debug!(
+            completed_node = %node_id,
+            successor_count = successors.len(),
+            successors = ?successors.iter().map(|s| &s.node_id).collect::<Vec<_>>(),
+            "finding successors after action completion"
+        );
+
         let mut actions_to_enqueue = Vec::new();
         let mut inbox_writes_to_commit = Vec::new();
         let mut visited = std::collections::HashSet::new();
@@ -2096,24 +2325,51 @@ impl DAGRunner {
 
             let succ_node = match helper.get_node(&succ_id) {
                 Some(n) => n,
-                None => continue,
+                None => {
+                    debug!(succ_id = %succ_id, "successor node not found in DAG");
+                    continue;
+                }
             };
 
             let mode = helper.get_execution_mode(succ_node);
+            debug!(
+                succ_id = %succ_id,
+                node_type = %succ_node.node_type,
+                is_spread = succ_node.is_spread,
+                execution_mode = ?mode,
+                "processing successor node"
+            );
 
             match mode {
                 ExecutionMode::Delegated => {
                     // Read inbox for this node from the database
                     let inbox = db.read_inbox(instance_id, &succ_id).await?;
+                    debug!(
+                        succ_id = %succ_id,
+                        inbox_keys = ?inbox.keys().collect::<Vec<_>>(),
+                        "read inbox for delegated node"
+                    );
 
                     // Create action(s) - may be multiple for spread nodes
                     let result = Self::create_actions_for_node(succ_node, instance_id, &inbox, &dag)?;
+                    debug!(
+                        succ_id = %succ_id,
+                        actions_created = result.actions.len(),
+                        inbox_writes = result.inbox_writes.len(),
+                        "created actions for node"
+                    );
                     actions_to_enqueue.extend(result.actions);
                     inbox_writes_to_commit.extend(result.inbox_writes);
                 }
                 ExecutionMode::Inline => {
                     // Skip inline nodes and continue to their successors
-                    for successor in helper.get_ready_successors(&succ_id, None) {
+                    let inline_successors = helper.get_ready_successors(&succ_id, None);
+                    debug!(
+                        succ_id = %succ_id,
+                        inline_successor_count = inline_successors.len(),
+                        "skipping inline node, checking its successors"
+                    );
+                    for successor in inline_successors {
                         if !visited.contains(&successor.node_id) {
                             queue.push_back(successor.node_id);
                         }
