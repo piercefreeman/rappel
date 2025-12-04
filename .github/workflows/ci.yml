@@ -107,9 +107,6 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Install nightly toolchain for branch coverage
-        run: rustup toolchain install nightly --component llvm-tools-preview
-
       - name: Run tests with coverage
         env:
           DATABASE_URL: postgresql://mountaineer:mountaineer@localhost:5432/mountaineer_daemons
@@ -167,9 +164,6 @@ jobs:
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
-
-      - name: Install nightly toolchain for branch coverage
-        run: rustup toolchain install nightly --component llvm-tools-preview
 
       - name: Python tests with coverage
         run: make python-coverage

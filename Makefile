@@ -49,16 +49,11 @@ rust-lint-verify:
 	cargo clippy --all-targets --all-features -- -D warnings
 
 # Coverage targets
-# Note: Rust --branch flag requires nightly toolchain. We detect if nightly is available
-# and add --branch automatically. Install nightly with: rustup toolchain install nightly --component llvm-tools-preview
-RUST_HAS_NIGHTLY := $(shell rustup run nightly rustc --version 2>/dev/null && echo 1 || echo 0)
-RUST_BRANCH_FLAG := $(if $(filter 1,$(RUST_HAS_NIGHTLY)),--branch,)
-
 coverage: python-coverage rust-coverage
 
 python-coverage:
 	cd python && uv run pytest tests --cov=rappel --cov-report=term-missing --cov-report=xml:coverage.xml --cov-report=html:htmlcov
 
 rust-coverage:
-	cargo $(if $(filter 1,$(RUST_HAS_NIGHTLY)),+nightly,) llvm-cov $(RUST_BRANCH_FLAG) --lcov --output-path target/rust-coverage.lcov
-	cargo $(if $(filter 1,$(RUST_HAS_NIGHTLY)),+nightly,) llvm-cov $(RUST_BRANCH_FLAG) --html --output-dir target/rust-htmlcov
+	cargo llvm-cov --lcov --output-path target/rust-coverage.lcov
+	cargo llvm-cov --html --output-dir target/rust-htmlcov
