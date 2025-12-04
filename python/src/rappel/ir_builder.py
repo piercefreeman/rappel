@@ -485,36 +485,37 @@ class IRBuilder(ast.NodeVisitor):
             )
 
     def _visit_assign(self, node: ast.Assign) -> Optional[ir.Statement]:
-        """Convert assignment to IR."""
-        stmt = ir.Statement(span=_make_span(node))
+        """Convert assignment to IR.
 
-        # Check for asyncio.gather() - convert to parallel block
+        All assignments with targets use the Assignment statement type.
+        This provides uniform unpacking support for:
+        - Action calls: a, b = @get_pair()
+        - Parallel blocks: a, b = parallel: @x() @y()
+        - Regular expressions: a, b = some_list
+        """
+        stmt = ir.Statement(span=_make_span(node))
+        targets = self._get_assign_targets(node.targets)
+
+        # Check for asyncio.gather() - convert to parallel expression
         if isinstance(node.value, ast.Await) and isinstance(node.value.value, ast.Call):
             gather_call = node.value.value
             if self._is_asyncio_gather_call(gather_call):
-                target = self._get_assign_target(node.targets)
-                return self._convert_asyncio_gather_to_parallel_block(gather_call, target)
+                parallel_expr = self._convert_asyncio_gather_to_parallel_expr(gather_call)
+                if parallel_expr:
+                    value = ir.Expr(parallel_expr=parallel_expr, span=_make_span(node))
+                    assign = ir.Assignment(targets=targets, value=value)
+                    stmt.assignment.CopyFrom(assign)
+                    return stmt
 
-        # Check if this is an action call
+        # Check if this is an action call - wrap in Assignment for uniform unpacking
         action_call = self._extract_action_call(node.value)
         if action_call:
-            # Get target variable name
-            target = self._get_assign_target(node.targets)
-            if target:
-                action_call.target = target
-            stmt.action_call.CopyFrom(action_call)
+            value = ir.Expr(action_call=action_call, span=_make_span(node))
+            assign = ir.Assignment(targets=targets, value=value)
+            stmt.assignment.CopyFrom(assign)
             return stmt
 
-        # Regular assignment
-        targets: List[str] = []
-        for t in node.targets:
-            if isinstance(t, ast.Name):
-                targets.append(t.id)
-            elif isinstance(t, ast.Tuple):
-                for elt in t.elts:
-                    if isinstance(elt, ast.Name):
-                        targets.append(elt.id)
-
+        # Regular assignment (variables, literals, expressions)
         value_expr = _expr_to_ir(node.value)
         if value_expr:
             assign = ir.Assignment(targets=targets, value=value_expr)
@@ -524,16 +525,22 @@ class IRBuilder(ast.NodeVisitor):
         return None
 
     def _visit_expr_stmt(self, node: ast.Expr) -> Optional[ir.Statement]:
-        """Convert expression statement to IR."""
+        """Convert expression statement to IR (side effect only, no assignment)."""
         stmt = ir.Statement(span=_make_span(node))
 
-        # Check for asyncio.gather() - convert to parallel block (no assignment target)
+        # Check for asyncio.gather() - convert to parallel block statement (side effect)
         if isinstance(node.value, ast.Await) and isinstance(node.value.value, ast.Call):
             gather_call = node.value.value
             if self._is_asyncio_gather_call(gather_call):
-                return self._convert_asyncio_gather_to_parallel_block(gather_call, target=None)
+                parallel_expr = self._convert_asyncio_gather_to_parallel_expr(gather_call)
+                if parallel_expr:
+                    # Side effect only - use ParallelBlock statement
+                    parallel = ir.ParallelBlock()
+                    parallel.calls.extend(parallel_expr.calls)
+                    stmt.parallel_block.CopyFrom(parallel)
+                    return stmt
 
-        # Check if this is an action call
+        # Check if this is an action call (side effect only)
         action_call = self._extract_action_call(node.value)
         if action_call:
             stmt.action_call.CopyFrom(action_call)
@@ -785,6 +792,12 @@ class IRBuilder(ast.NodeVisitor):
         for stmt in stmts:
             if stmt.HasField("action_call"):
                 count += 1
+            elif stmt.HasField("assignment"):
+                # Check if assignment value is an action call or function call
+                if stmt.assignment.value.HasField("action_call"):
+                    count += 1
+                elif stmt.assignment.value.HasField("function_call"):
+                    count += 1
             elif stmt.HasField("expr_stmt"):
                 # Check if expression is a function call
                 if stmt.expr_stmt.expr.HasField("function_call"):
@@ -1105,36 +1118,36 @@ class IRBuilder(ast.NodeVisitor):
                 return imported.module == "asyncio" and imported.original_name == "gather"
         return False
 
-    def _convert_asyncio_gather_to_parallel_block(
-        self, node: ast.Call, target: Optional[str] = None
-    ) -> Optional[ir.Statement]:
-        """Convert asyncio.gather(...) to ParallelBlock or SpreadAction IR.
+    def _convert_asyncio_gather_to_parallel_expr(self, node: ast.Call) -> Optional[ir.ParallelExpr]:
+        """Convert asyncio.gather(...) to ParallelExpr IR.
 
-        Handles two patterns:
+        Handles the static gather pattern: asyncio.gather(a(), b(), c())
+        Returns a ParallelExpr that can be used in an Assignment for unpacking.
 
-        1. Static gather: asyncio.gather(a(), b(), c())
-           -> ParallelBlock with explicit calls
-
-        2. Dynamic spread: asyncio.gather(*[action(x) for x in items])
-           -> SpreadAction for parallel iteration over collection
-
-        Raises UnsupportedPatternError for:
-        - Spreading a variable: asyncio.gather(*tasks)
-        - Any non-list-comprehension starred expression
+        For dynamic spread (asyncio.gather(*[...])), raises UnsupportedPatternError
+        with guidance to use spread syntax.
 
         Args:
             node: The asyncio.gather() Call node
-            target: Optional variable name for the result (e.g., "results" or None)
 
         Returns:
-            An IR Statement containing ParallelBlock or SpreadAction, or None if fails.
+            A ParallelExpr, or None if conversion fails.
         """
-        # Check for starred expressions
+        # Check for starred expressions - spread pattern
         if len(node.args) == 1 and isinstance(node.args[0], ast.Starred):
             starred = node.args[0]
             # Only list comprehensions are supported
             if isinstance(starred.value, ast.ListComp):
-                return self._convert_gather_listcomp_to_spread(starred.value, target, node)
+                # TODO: Convert to SpreadExpr when we add full spread support
+                # For now, raise an error with guidance
+                line = getattr(node, "lineno", None)
+                col = getattr(node, "col_offset", None)
+                raise UnsupportedPatternError(
+                    "Spread pattern in asyncio.gather() requires spread syntax",
+                    RECOMMENDATIONS["gather_variable_spread"],
+                    line=line,
+                    col=col,
+                )
             else:
                 # Spreading a variable or other expression is not supported
                 line = getattr(node, "lineno", None)
@@ -1155,11 +1168,8 @@ class IRBuilder(ast.NodeVisitor):
                         col=col,
                     )
 
-        # Standard case: gather(a(), b(), c()) -> ParallelBlock
-        parallel = ir.ParallelBlock()
-
-        if target:
-            parallel.target = target
+        # Standard case: gather(a(), b(), c()) -> ParallelExpr
+        parallel = ir.ParallelExpr()
 
         # Each argument to gather() should be an action call
         for arg in node.args:
@@ -1167,64 +1177,11 @@ class IRBuilder(ast.NodeVisitor):
             if call:
                 parallel.calls.append(call)
 
-        # Only create the statement if we have calls
+        # Only return if we have calls
         if not parallel.calls:
             return None
 
-        stmt = ir.Statement(span=_make_span(node))
-        stmt.parallel_block.CopyFrom(parallel)
-        return stmt
-
-    def _convert_gather_listcomp_to_spread(
-        self, listcomp: ast.ListComp, target: Optional[str], node: ast.Call
-    ) -> Optional[ir.Statement]:
-        """Convert gather(*[action(x) for x in items]) to SpreadAction IR.
-
-        Python:
-            results = await asyncio.gather(*[
-                process_item(item=item, multiplier=multiplier)
-                for item in items
-            ])
-
-        Becomes IR equivalent of:
-            spread items:item -> results = @process_item(item=item, multiplier=multiplier)
-        """
-        # Extract the action call from the list comprehension's element expression
-        if not isinstance(listcomp.elt, ast.Call):
-            return None
-
-        action_call = self._extract_action_call_from_call(listcomp.elt)
-        if not action_call:
-            return None
-
-        # We only support simple list comprehensions with one generator
-        if len(listcomp.generators) != 1:
-            return None
-
-        gen = listcomp.generators[0]
-
-        # Get the loop variable
-        if not isinstance(gen.target, ast.Name):
-            return None
-        loop_var = gen.target.id
-
-        # Get the iterable expression
-        iterable = _expr_to_ir(gen.iter)
-        if not iterable:
-            return None
-
-        # Build the SpreadAction
-        spread = ir.SpreadAction(
-            loop_var=loop_var,
-            collection=iterable,
-            action=action_call,
-        )
-        if target:
-            spread.target = target
-
-        stmt = ir.Statement(span=_make_span(node))
-        stmt.spread_action.CopyFrom(spread)
-        return stmt
+        return parallel
 
     def _convert_gather_arg_to_call(self, node: ast.expr) -> Optional[ir.Call]:
         """Convert a gather argument to an IR Call.
@@ -1345,10 +1302,22 @@ class IRBuilder(ast.NodeVisitor):
         return None
 
     def _get_assign_target(self, targets: List[ast.expr]) -> Optional[str]:
-        """Get the target variable name from assignment targets."""
+        """Get the target variable name from assignment targets (single target only)."""
         if targets and isinstance(targets[0], ast.Name):
             return targets[0].id
         return None
+
+    def _get_assign_targets(self, targets: List[ast.expr]) -> List[str]:
+        """Get all target variable names from assignment targets (including tuple unpacking)."""
+        result: List[str] = []
+        for t in targets:
+            if isinstance(t, ast.Name):
+                result.append(t.id)
+            elif isinstance(t, ast.Tuple):
+                for elt in t.elts:
+                    if isinstance(elt, ast.Name):
+                        result.append(elt.id)
+        return result
 
 
 def _make_span(node: ast.AST) -> ir.Span:

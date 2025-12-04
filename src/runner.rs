@@ -1214,27 +1214,77 @@ impl DAGRunner {
 
         // INBOX PATTERN: Collect inbox writes for downstream nodes via DATA_FLOW edges
         // For spread actions, use the base node ID to look up the node, but include spread_index
-        if let Some(node) = dag.nodes.get(base_node_id)
-            && let Some(ref target) = node.target
-        {
-            debug!(
-                node_id = %node_id,
-                base_node_id = %base_node_id,
-                spread_index = ?spread_index,
-                target = %target,
-                result = ?result,
-                "collecting inbox writes for downstream nodes"
-            );
+        // For parallel blocks with tuple unpacking, unpack array results into multiple targets
+        if let Some(node) = dag.nodes.get(base_node_id) {
+            // Check if we have multiple targets for tuple unpacking
+            if let Some(ref targets) = node.targets
+                && targets.len() > 1
+            {
+                // Tuple unpacking: result should be an array, unpack to targets
+                debug!(
+                    node_id = %node_id,
+                    base_node_id = %base_node_id,
+                    spread_index = ?spread_index,
+                    targets = ?targets,
+                    result = ?result,
+                    "collecting inbox writes for multiple targets (tuple unpacking)"
+                );
 
-            Self::collect_inbox_writes_for_node_with_spread(
-                base_node_id,
-                target,
-                &result,
-                &dag,
-                instance_id,
-                spread_index,
-                &mut batch.inbox_writes,
-            );
+                if let JsonValue::Array(ref arr) = result {
+                    // Unpack each array element to its corresponding target
+                    for (i, target) in targets.iter().enumerate() {
+                        let value = arr.get(i).cloned().unwrap_or(JsonValue::Null);
+                        Self::collect_inbox_writes_for_node_with_spread(
+                            base_node_id,
+                            target,
+                            &value,
+                            &dag,
+                            instance_id,
+                            spread_index,
+                            &mut batch.inbox_writes,
+                        );
+                    }
+                } else {
+                    // Result is not an array, broadcast to all targets (fallback)
+                    warn!(
+                        node_id = %node_id,
+                        targets = ?targets,
+                        "expected array result for tuple unpacking but got: {:?}",
+                        result
+                    );
+                    for target in targets {
+                        Self::collect_inbox_writes_for_node_with_spread(
+                            base_node_id,
+                            target,
+                            &result,
+                            &dag,
+                            instance_id,
+                            spread_index,
+                            &mut batch.inbox_writes,
+                        );
+                    }
+                }
+            } else if let Some(ref target) = node.target {
+                // Single target: write result directly
+                debug!(
+                    node_id = %node_id,
+                    base_node_id = %base_node_id,
+                    spread_index = ?spread_index,
+                    target = %target,
+                    result = ?result,
+                    "collecting inbox writes for downstream nodes"
+                );
+
+                Self::collect_inbox_writes_for_node_with_spread(
+                    base_node_id,
+                    target,
+                    &result,
+                    &dag,
+                    instance_id,
+                    spread_index,
+                    &mut batch.inbox_writes,
+                );
+            }
         }
 
         // Process successors - inline nodes use in-memory scope, delegated read from inbox
@@ -1956,16 +2006,15 @@ impl DAGRunner {
                 if let Some(payload) = &instance.input_payload {
                     // Try to decode as protobuf WorkflowArguments
                     match proto::WorkflowArguments::decode(&payload[..]) {
-                        Ok(args) => {
-                            args.arguments
-                                .iter()
-                                .filter_map(|arg| {
-                                    arg.value.as_ref().map(|v| {
-                                        (arg.key.clone(), proto_value_to_json(v))
-                                    })
-                                })
-                                .collect()
-                        }
+                        Ok(args) => args
+                            .arguments
+                            .iter()
+                            .filter_map(|arg| {
+                                arg.value
+                                    .as_ref()
+                                    .map(|v| (arg.key.clone(), proto_value_to_json(v)))
+                            })
+                            .collect(),
                         Err(e) => {
                             warn!(
                                 instance_id = %instance.id,

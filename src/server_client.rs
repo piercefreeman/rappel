@@ -297,8 +297,8 @@ async fn wait_for_instance_http(
     State(state): State<HttpState>,
     Json(request): Json<WaitForInstanceHttpRequest>,
 ) -> Result<Json<WaitForInstanceHttpResponse>, HttpError> {
-    use base64::{Engine as _, engine::general_purpose};
     use crate::db::{DbError, WorkflowInstanceId};
+    use base64::{Engine as _, engine::general_purpose};
 
     let interval = sanitize_interval(request.poll_interval_secs);
     let instance_id: uuid::Uuid = request
@@ -322,7 +322,9 @@ async fn wait_for_instance_http(
                 }));
             }
             Ok(inst) if inst.status == "failed" => {
-                return Err(HttpError::internal(anyhow::anyhow!("workflow instance failed")));
+                return Err(HttpError::internal(anyhow::anyhow!(
+                    "workflow instance failed"
+                )));
             }
             Ok(_) => {
                 // Still running, wait and poll again

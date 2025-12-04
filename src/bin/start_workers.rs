@@ -68,8 +68,12 @@ async fn main() -> Result<()> {
 
     // Create worker pool
     let worker_pool = Arc::new(
-        PythonWorkerPool::new(worker_config, config.worker_count, Arc::clone(&worker_bridge))
-            .await?,
+        PythonWorkerPool::new(
+            worker_config,
+            config.worker_count,
+            Arc::clone(&worker_bridge),
+        )
+        .await?,
     );
     info!(
         worker_count = config.worker_count,

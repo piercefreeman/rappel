@@ -88,10 +88,15 @@ class TestPolicyParsing:
         """Find an action call by name, searching in all contexts."""
         for fn in program.functions:
             for stmt in fn.body.statements:
-                # Direct action call
+                # Direct action call (statement form)
                 if stmt.HasField("action_call"):
                     if stmt.action_call.action_name == action_name:
                         return stmt.action_call
+                # Action call in assignment (expression form)
+                elif stmt.HasField("assignment"):
+                    if stmt.assignment.value.HasField("action_call"):
+                        if stmt.assignment.value.action_call.action_name == action_name:
+                            return stmt.assignment.value.action_call
                 # Action in try body
                 elif stmt.HasField("try_except"):
                     te = stmt.try_except
@@ -148,25 +153,52 @@ class TestPolicyParsing:
 class TestAsyncioGatherDetection:
     """Test that asyncio.gather is detected and converted to parallel blocks."""
 
-    def _find_parallel_block(self, program: ir.Program) -> ir.ParallelBlock | None:
-        """Find a parallel block in the program."""
+    def _find_parallel_expr(self, program: ir.Program) -> tuple[ir.ParallelExpr, list[str]] | None:
+        """Find the first parallel expression in the program.
+
+        Returns tuple of (ParallelExpr, targets) where targets are the assignment variables.
+        """
         for fn in program.functions:
             for stmt in fn.body.statements:
+                # Check for parallel block statement (side effect only)
                 if stmt.HasField("parallel_block"):
-                    return stmt.parallel_block
+                    parallel = ir.ParallelExpr()
+                    parallel.calls.extend(stmt.parallel_block.calls)
+                    return (parallel, [])
+                # Check for assignment with parallel expression
+                if stmt.HasField("assignment"):
+                    if stmt.assignment.value.HasField("parallel_expr"):
+                        return (
+                            stmt.assignment.value.parallel_expr,
+                            list(stmt.assignment.targets),
+                        )
         return None
 
-    def _find_all_parallel_blocks(self, program: ir.Program) -> List[ir.ParallelBlock]:
-        """Find all parallel blocks in the program."""
-        blocks = []
+    def _find_all_parallel_exprs(
+        self, program: ir.Program
+    ) -> list[tuple[ir.ParallelExpr, list[str]]]:
+        """Find all parallel expressions in the program."""
+        results: list[tuple[ir.ParallelExpr, list[str]]] = []
         for fn in program.functions:
             for stmt in fn.body.statements:
                 if stmt.HasField("parallel_block"):
-                    blocks.append(stmt.parallel_block)
-        return blocks
+                    parallel = ir.ParallelExpr()
+                    parallel.calls.extend(stmt.parallel_block.calls)
+                    results.append((parallel, []))
+                if stmt.HasField("assignment"):
+                    if stmt.assignment.value.HasField("parallel_expr"):
+                        results.append(
+                            (
+                                stmt.assignment.value.parallel_expr,
+                                list(stmt.assignment.targets),
+                            )
+                        )
+        return results
 
-    def _get_action_names_from_parallel(self, block: ir.ParallelBlock) -> List[str]:
-        """Extract action names from a parallel block."""
+    def _get_action_names_from_parallel(
+        self, block: ir.ParallelExpr | ir.ParallelBlock
+    ) -> list[str]:
+        """Extract action names from a parallel block/expr."""
         names = []
         for call in block.calls:
             if call.HasField("action"):
@@ -179,8 +211,12 @@ class TestAsyncioGatherDetection:
 
         program = GatherSimpleWorkflow.workflow_ir()
 
-        parallel = self._find_parallel_block(program)
-        assert parallel is not None, "Expected parallel block from asyncio.gather"
+        result = self._find_parallel_expr(program)
+        assert result is not None, "Expected parallel expression from asyncio.gather"
+        parallel, targets = result
+
+        # Check targets for tuple unpacking
+        assert targets == ["a", "b"], f"Expected targets ['a', 'b'], got {targets}"
 
         action_names = self._get_action_names_from_parallel(parallel)
         assert len(action_names) == 2, f"Expected 2 actions in parallel, got {len(action_names)}"
@@ -193,8 +229,9 @@ class TestAsyncioGatherDetection:
 
         program = GatherWithArgsWorkflow.workflow_ir()
 
-        parallel = self._find_parallel_block(program)
-        assert parallel is not None, "Expected parallel block from asyncio.gather"
+        result = self._find_parallel_expr(program)
+        assert result is not None, "Expected parallel expression from asyncio.gather"
+        parallel, _targets = result
 
         action_names = self._get_action_names_from_parallel(parallel)
         assert "compute_square" in action_names, "Expected compute_square in parallel"
@@ -214,11 +251,12 @@ class TestAsyncioGatherDetection:
 
         program = GatherToVariableWorkflow.workflow_ir()
 
-        parallel = self._find_parallel_block(program)
-        assert parallel is not None, "Expected parallel block from asyncio.gather"
+        result = self._find_parallel_expr(program)
+        assert result is not None, "Expected parallel expression from asyncio.gather"
+        parallel, targets = result
 
-        # Check target variable is set
-        assert parallel.target == "results", f"Expected target 'results', got '{parallel.target}'"
+        # Check target variable is set (single target in list)
+        assert targets == ["results"], f"Expected targets ['results'], got {targets}"
 
         action_names = self._get_action_names_from_parallel(parallel)
         assert len(action_names) == 3, f"Expected 3 actions, got {len(action_names)}"
@@ -229,54 +267,84 @@ class TestAsyncioGatherDetection:
 
         program = GatherNestedWorkflow.workflow_ir()
 
-        # Should have a parallel block for the gather
-        parallel = self._find_parallel_block(program)
-        assert parallel is not None, "Expected parallel block from asyncio.gather"
+        # Should have a parallel expression for the gather
+        result = self._find_parallel_expr(program)
+        assert result is not None, "Expected parallel expression from asyncio.gather"
+        parallel, _targets = result
 
         action_names = self._get_action_names_from_parallel(parallel)
         assert "fetch_a" in action_names, "Expected fetch_a in parallel"
         assert "fetch_b" in action_names, "Expected fetch_b in parallel"
 
         # Should also have the combine action after the parallel block
+        # Now it's in an assignment with action expression
         combine_found = False
         for fn in program.functions:
             for stmt in fn.body.statements:
-                if stmt.HasField("action_call"):
-                    if stmt.action_call.action_name == "combine":
-                        combine_found = True
+                if stmt.HasField("assignment"):
+                    if stmt.assignment.value.HasField("action_call"):
+                        if stmt.assignment.value.action_call.action_name == "combine":
+                            combine_found = True
         assert combine_found, "Expected combine action after parallel block"
 
     def test_gather_starred_list_comprehension(self) -> None:
         """Test: await asyncio.gather(*[action(x) for x in items])
 
-        This common pattern should produce a SpreadAction IR node that represents
-        parallel execution over a collection.
+        This pattern is not currently supported and should raise UnsupportedPatternError.
+        Users should use explicit spread syntax instead.
         """
+        import pytest
+
+        from rappel.ir_builder import UnsupportedPatternError
         from tests.fixtures_gather.gather_listcomp import GatherListCompWorkflow
 
-        program = GatherListCompWorkflow.workflow_ir()
+        # This pattern should raise an error guiding users to use spread syntax
+        with pytest.raises(UnsupportedPatternError):
+            GatherListCompWorkflow.workflow_ir()
 
-        # Should produce a SpreadAction node for parallel iteration
-        spread_found = False
+    def test_gather_tuple_unpacking(self) -> None:
+        """Test: a, b = await asyncio.gather(action1(), action2())
+
+        This tests tuple unpacking with asyncio.gather where results
+        are unpacked into multiple variables.
+        """
+        from tests.fixtures_gather.gather_tuple_unpack import GatherTupleUnpackWorkflow
+
+        program = GatherTupleUnpackWorkflow.workflow_ir()
+
+        result = self._find_parallel_expr(program)
+        assert result is not None, "Expected parallel expression from asyncio.gather"
+        parallel, targets = result
+
+        # Check that we have multiple targets for unpacking
+        assert targets == [
+            "factorial_value",
+            "fib_value",
+        ], f"Expected targets ['factorial_value', 'fib_value'], got {targets}"
+
+        action_names = self._get_action_names_from_parallel(parallel)
+        assert "compute_factorial" in action_names, "Expected compute_factorial in parallel"
+        assert "compute_fibonacci" in action_names, "Expected compute_fibonacci in parallel"
+
+        # Should also have the summarize_math action that uses the unpacked values
+        summarize_found = False
         for fn in program.functions:
             for stmt in fn.body.statements:
-                if stmt.HasField("spread_action"):
-                    spread_found = True
-                    spread = stmt.spread_action
-                    # Check the loop variable
-                    assert spread.loop_var == "item", (
-                        f"Expected loop_var 'item', got '{spread.loop_var}'"
-                    )
-                    # Check action is process_item
-                    assert spread.action.action_name == "process_item", (
-                        f"Expected action 'process_item', got '{spread.action.action_name}'"
-                    )
-                    # Check target is set (for collecting results)
-                    assert spread.target == "results", (
-                        f"Expected target 'results', got '{spread.target}'"
-                    )
-
-        assert spread_found, "Expected SpreadAction node from gather(*[listcomp])"
+                if stmt.HasField("assignment"):
+                    if stmt.assignment.value.HasField("action_call"):
+                        if stmt.assignment.value.action_call.action_name == "summarize_math":
+                            summarize_found = True
+                            # Verify the action uses the unpacked variables as kwargs
+                            kwargs = {
+                                kw.name: kw for kw in stmt.assignment.value.action_call.kwargs
+                            }
+                            assert "factorial_value" in kwargs, (
+                                "summarize_math should use factorial_value kwarg"
+                            )
+                            assert "fib_value" in kwargs, (
+                                "summarize_math should use fib_value kwarg"
+                            )
+        assert summarize_found, "Expected summarize_math action using unpacked values"
 
 
 class TestForLoopConversion:
@@ -471,22 +539,47 @@ class TestTryExceptConversion:
 class TestActionCallExtraction:
     """Test action call detection and argument handling."""
 
-    def _find_action_call(self, program: ir.Program, name: str) -> ir.ActionCall | None:
-        """Find an action call by name."""
+    def _find_action_call(
+        self, program: ir.Program, name: str
+    ) -> tuple[ir.ActionCall, list[str]] | None:
+        """Find an action call by name.
+
+        Returns tuple of (ActionCall, targets) where targets are assignment variables.
+        """
         for fn in program.functions:
             for stmt in fn.body.statements:
+                # Check for side-effect only action statement
                 if stmt.HasField("action_call"):
                     if stmt.action_call.action_name == name:
-                        return stmt.action_call
+                        return (stmt.action_call, [])
+                # Check for assignment with action expression
+                if stmt.HasField("assignment"):
+                    if stmt.assignment.value.HasField("action_call"):
+                        if stmt.assignment.value.action_call.action_name == name:
+                            return (
+                                stmt.assignment.value.action_call,
+                                list(stmt.assignment.targets),
+                            )
         return None
 
-    def _find_all_action_calls(self, program: ir.Program) -> List[ir.ActionCall]:
-        """Find all action calls in the program."""
-        calls = []
+    def _find_all_action_calls(self, program: ir.Program) -> list[tuple[ir.ActionCall, list[str]]]:
+        """Find all action calls in the program.
+
+        Returns list of (ActionCall, targets) tuples.
+        """
+        calls: list[tuple[ir.ActionCall, list[str]]] = []
         for fn in program.functions:
             for stmt in fn.body.statements:
                 if stmt.HasField("action_call"):
-                    calls.append(stmt.action_call)
+                    calls.append((stmt.action_call, []))
+                if stmt.HasField("assignment"):
+                    if stmt.assignment.value.HasField("action_call"):
+                        calls.append(
+                            (
+                                stmt.assignment.value.action_call,
+                                list(stmt.assignment.targets),
+                            )
+                        )
         return calls
 
     def test_action_with_kwargs(self) -> None:
@@ -495,8 +588,9 @@ class TestActionCallExtraction:
 
         program = ActionKwargsWorkflow.workflow_ir()
 
-        action = self._find_action_call(program, "greet_person")
-        assert action is not None, "Expected greet_person action"
+        result = self._find_action_call(program, "greet_person")
+        assert result is not None, "Expected greet_person action"
+        action, _targets = result
 
         # Check kwargs
         kwarg_names = [kw.name for kw in action.kwargs]
@@ -513,8 +607,9 @@ class TestActionCallExtraction:
 
         program = ActionPositionalArgsWorkflow.workflow_ir()
 
-        action = self._find_action_call(program, "add_numbers")
-        assert action is not None, "Expected add_numbers action"
+        result = self._find_action_call(program, "add_numbers")
+        assert result is not None, "Expected add_numbers action"
+        action, _targets = result
 
         # The IR builder should have 2 kwargs (from positional args)
         # They get converted using the action's signature
@@ -542,8 +637,9 @@ class TestActionCallExtraction:
 
         program = ActionVariableArgsWorkflow.workflow_ir()
 
-        action = self._find_action_call(program, "multiply_by")
-        assert action is not None, "Expected multiply_by action"
+        result = self._find_action_call(program, "multiply_by")
+        assert result is not None, "Expected multiply_by action"
+        action, _targets = result
 
         # Check that kwargs reference variables
         for kw in action.kwargs:
@@ -562,12 +658,12 @@ class TestActionCallExtraction:
 
         # Find log_event calls - should exist without target
         calls = self._find_all_action_calls(program)
-        log_calls = [c for c in calls if c.action_name == "log_event"]
+        log_calls = [(c, t) for c, t in calls if c.action_name == "log_event"]
 
         assert len(log_calls) >= 1, "Expected at least one log_event call"
 
-        # At least one should have no target (side effect only)
-        has_no_target = any(not c.target for c in log_calls)
+        # At least one should have no target (side effect only = empty targets list)
+        has_no_target = any(len(targets) == 0 for _call, targets in log_calls)
         assert has_no_target, "Expected log_event call without target assignment"
 
     def test_action_target_variable_captured(self) -> None:
@@ -576,11 +672,12 @@ class TestActionCallExtraction:
 
         program = ActionKwargsWorkflow.workflow_ir()
 
-        action = self._find_action_call(program, "greet_person")
-        assert action is not None, "Expected greet_person action"
+        result = self._find_action_call(program, "greet_person")
+        assert result is not None, "Expected greet_person action"
+        _action, targets = result
 
         # Should have target
-        assert action.target == "result", f"Expected target 'result', got '{action.target}'"
+        assert targets == ["result"], f"Expected targets ['result'], got {targets}"
 
     def test_action_module_name_set(self) -> None:
         """Test: Action has module_name set for worker dispatch."""
@@ -588,8 +685,9 @@ class TestActionCallExtraction:
 
         program = ActionKwargsWorkflow.workflow_ir()
 
-        action = self._find_action_call(program, "greet_person")
-        assert action is not None, "Expected greet_person action"
+        result = self._find_action_call(program, "greet_person")
+        assert result is not None, "Expected greet_person action"
+        action, _targets = result
 
         # Should have module name
         assert action.module_name, "Expected module_name to be set"
@@ -603,8 +701,9 @@ class TestActionCallExtraction:
 
         program = ActionMixedArgsWorkflow.workflow_ir()
 
-        action = self._find_action_call(program, "compute_value")
-        assert action is not None, "Expected compute_value action"
+        result = self._find_action_call(program, "compute_value")
+        assert result is not None, "Expected compute_value action"
+        action, _targets = result
 
         # Should have 3 kwargs (2 from positional, 1 explicit kwarg)
         assert len(action.kwargs) == 3, f"Expected 3 kwargs, got {len(action.kwargs)}"

@@ -98,20 +98,14 @@ impl IrPrinter {
         format!("{} = {}", targets, value)
     }
 
-    /// Print an action call.
+    /// Print an action call (statement form - no target).
     fn print_action_call(&mut self, action: &ast::ActionCall) -> String {
         let kwargs = self.print_kwargs(&action.kwargs);
         let policies = self.print_policies(&action.policies);
-
-        let call = format!("@{}({}){}", action.action_name, kwargs, policies);
-
-        match &action.target {
-            Some(target) if !target.is_empty() => format!("{} = {}", target, call),
-            _ => call,
-        }
+        format!("@{}({}){}", action.action_name, kwargs, policies)
     }
 
-    /// Print a spread action.
+    /// Print a spread action (statement form - no target).
     fn print_spread_action(&mut self, spread: &ast::SpreadAction) -> String {
         let collection = spread
             .collection
@@ -128,20 +122,12 @@ impl IrPrinter {
             })
             .unwrap_or_default();
 
-        let spread_part = format!("spread {}:{} -> {}", collection, spread.loop_var, action);
-
-        match &spread.target {
-            Some(target) if !target.is_empty() => format!("{} = {}", target, spread_part),
-            _ => spread_part,
-        }
+        format!("spread {}:{} -> {}", collection, spread.loop_var, action)
     }
 
-    /// Print a parallel block.
+    /// Print a parallel block (statement form - no target).
     fn print_parallel_block(&mut self, parallel: &ast::ParallelBlock) -> String {
-        let header = match &parallel.target {
-            Some(target) if !target.is_empty() => format!("{} = parallel:", target),
-            _ => "parallel:".to_string(),
-        };
+        let header = "parallel:".to_string();
 
         self.indent_level += 1;
         let mut call_lines = Vec::new();
@@ -348,8 +334,55 @@ impl IrPrinter {
                 let policies = self.print_policies(&action.policies);
                 format!("@{}({}){}", action.action_name, kwargs, policies)
             }
+            Some(ast::expr::Kind::ParallelExpr(parallel)) => self.print_parallel_expr(parallel),
+            Some(ast::expr::Kind::SpreadExpr(spread)) => self.print_spread_expr(spread),
             None => String::new(),
         }
+    }
+
+    /// Print a parallel expression.
+    fn print_parallel_expr(&mut self, parallel: &ast::ParallelExpr) -> String {
+        let mut calls_str = Vec::new();
+        for call in &parallel.calls {
+            if let Some(kind) = &call.kind {
+                match kind {
+                    ast::call::Kind::Action(action) => {
+                        let kwargs = self.print_kwargs(&action.kwargs);
+                        let policies = self.print_policies(&action.policies);
+                        calls_str.push(format!("@{}({}){}", action.action_name, kwargs, policies));
+                    }
+                    ast::call::Kind::Function(func) => {
+                        let args = func
+                            .args
+                            .iter()
+                            .map(|a| self.print_expr(a))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        calls_str.push(format!("{}({})", func.name, args));
+                    }
+                }
+            }
+        }
+        format!("parallel:\n    {}", calls_str.join("\n    "))
+    }
+
+    /// Print a spread expression.
+    fn print_spread_expr(&mut self, spread: &ast::SpreadExpr) -> String {
+        let collection = spread
+            .collection
+            .as_ref()
+            .map(|c| self.print_expr(c))
+            .unwrap_or_default();
+        let action = spread
+            .action
+            .as_ref()
+            .map(|a| {
+                let kwargs = self.print_kwargs(&a.kwargs);
+                let policies = self.print_policies(&a.policies);
+                format!("@{}({}){}", a.action_name, kwargs, policies)
+            })
+            .unwrap_or_default();
+        format!("spread {}:{} -> {}", collection, spread.loop_var, action)
     }
 
     /// Print a literal value.

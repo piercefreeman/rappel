@@ -343,9 +343,12 @@ impl<'source> Parser<'source> {
             Token::Spread => Some(ast::statement::Kind::SpreadAction(
                 self.parse_spread_action()?,
             )),
-            Token::Parallel => Some(ast::statement::Kind::ParallelBlock(
-                self.parse_parallel_block(None)?,
-            )),
+            Token::Parallel => {
+                self.advance(); // Consume 'parallel'
+                Some(ast::statement::Kind::ParallelBlock(
+                    self.parse_parallel_block()?,
+                ))
+            }
             Token::Ident(_) => self.parse_assignment_or_expr()?,
             Token::At => Some(ast::statement::Kind::ActionCall(self.parse_action_call()?)),
             _ => return Err(self.error(format!("unexpected token in statement: {}", self.peek()))),
@@ -375,19 +378,38 @@ impl<'source> Parser<'source> {
         if self.check(&Token::Eq) {
             self.advance();
 
-            // Check for parallel block: x = parallel: ...
+            // Check for parallel block: a, b = parallel: ... -> Assignment with ParallelExpr
             if self.check(&Token::Parallel) {
                 self.advance();
-                return Ok(Some(ast::statement::Kind::ParallelBlock(
-                    self.parse_parallel_block(Some(targets.remove(0)))?,
-                )));
+                let parallel = self.parse_parallel_block()?;
+                let parallel_expr = ast::Expr {
+                    kind: Some(ast::expr::Kind::ParallelExpr(ast::ParallelExpr {
+                        calls: parallel.calls,
+                    })),
+                    span: None,
+                };
+                return Ok(Some(ast::statement::Kind::Assignment(ast::Assignment {
+                    targets,
+                    value: Some(parallel_expr),
+                })));
             }
 
-            // Check for spread action: x = spread collection:var -> @action(...)
+            // Check for spread action: results = spread collection:var -> @action(...)
+            // -> Assignment with SpreadExpr
             if self.check(&Token::Spread) {
-                let mut spread = self.parse_spread_action()?;
-                spread.target = Some(targets.remove(0));
-                return Ok(Some(ast::statement::Kind::SpreadAction(spread)));
+                let spread = self.parse_spread_action()?;
+                let spread_expr = ast::Expr {
+                    kind: Some(ast::expr::Kind::SpreadExpr(Box::new(ast::SpreadExpr {
+                        collection: spread.collection.map(Box::new),
+                        loop_var: spread.loop_var,
+                        action: spread.action,
+                    }))),
+                    span: None,
+                };
+                return Ok(Some(ast::statement::Kind::Assignment(ast::Assignment {
+                    targets,
+                    value: Some(spread_expr),
+                })));
             }
 
             let value = self.parse_expr()?;
@@ -615,17 +637,13 @@ impl<'source> Parser<'source> {
         let action = self.parse_action_call()?;
 
         Ok(ast::SpreadAction {
-            target: None, // Will be set by parent if assigned
             collection: Some(collection),
             loop_var,
             action: Some(action),
         })
     }
 
-    fn parse_parallel_block(
-        &mut self,
-        target: Option<String>,
-    ) -> Result<ast::ParallelBlock, ParseError> {
+    fn parse_parallel_block(&mut self) -> Result<ast::ParallelBlock, ParseError> {
         self.expect(&Token::Colon)?;
         self.expect(&Token::Indent)?;
 
@@ -652,7 +670,7 @@ impl<'source> Parser<'source> {
 
         self.expect(&Token::Dedent)?;
 
-        Ok(ast::ParallelBlock { target, calls })
+        Ok(ast::ParallelBlock { calls })
     }
 
     fn parse_action_call(&mut self) -> Result<ast::ActionCall, ParseError> {
@@ -669,7 +687,6 @@ impl<'source> Parser<'source> {
         }
 
         Ok(ast::ActionCall {
-            target: None,
             action_name,
             kwargs,
             policies,
@@ -1510,11 +1527,38 @@ mod tests {
         let func = &program.functions[0];
         let body = func.body.as_ref().unwrap();
 
-        if let Some(ast::statement::Kind::ParallelBlock(parallel)) = &body.statements[0].kind {
-            assert_eq!(parallel.target, Some("results".to_string()));
-            assert_eq!(parallel.calls.len(), 3);
+        // With the new design, "results = parallel:" is an Assignment with ParallelExpr
+        if let Some(ast::statement::Kind::Assignment(assign)) = &body.statements[0].kind {
+            assert_eq!(assign.targets, vec!["results".to_string()]);
+            if let Some(ast::expr::Kind::ParallelExpr(parallel)) =
+                assign.value.as_ref().and_then(|v| v.kind.as_ref())
+            {
+                assert_eq!(parallel.calls.len(), 3);
+            } else {
+                panic!("expected parallel expression");
+            }
         } else {
-            panic!("expected parallel block");
+            panic!("expected assignment");
+        }
+    }
+
+    #[test]
+    fn test_parse_parallel_block_statement() {
+        // A parallel block without assignment (side-effect only)
+        let source = r#"fn notify_all(input: [ids], output: []):
+    parallel:
+        @notify(id=1)
+        @notify(id=2)
+    return"#;
+
+        let program = parse(source).unwrap();
+        let func = &program.functions[0];
+        let body = func.body.as_ref().unwrap();
+
+        if let Some(ast::statement::Kind::ParallelBlock(parallel)) = &body.statements[0].kind {
+            assert_eq!(parallel.calls.len(), 2);
+        } else {
+            panic!("expected parallel block statement");
         }
     }
 

@@ -471,17 +471,19 @@ Global___Assignment: typing_extensions.TypeAlias = Assignment
 
 @typing.final
 class ActionCall(google.protobuf.message.Message):
-    """Action call: result = @action(kwargs) [retry_policy] [timeout]"""
+    """Action call: @action(kwargs) [retry_policy] [timeout]
+    Can be used as:
+    - Statement (side effect only): @notify(user=x)
+    - Expression in Assignment (with binding): result = @fetch(id=x)
+    - Expression in Assignment (with unpacking): a, b = @get_pair()
+    """
 
     DESCRIPTOR: google.protobuf.descriptor.Descriptor
 
-    TARGET_FIELD_NUMBER: builtins.int
     ACTION_NAME_FIELD_NUMBER: builtins.int
     KWARGS_FIELD_NUMBER: builtins.int
     POLICIES_FIELD_NUMBER: builtins.int
     MODULE_NAME_FIELD_NUMBER: builtins.int
-    target: builtins.str
-    """Variable to assign result (optional)"""
     action_name: builtins.str
     module_name: builtins.str
     """Python module containing the action"""
@@ -498,7 +500,6 @@ class ActionCall(google.protobuf.message.Message):
     def __init__(
         self,
         *,
-        target: builtins.str | None = ...,
         action_name: builtins.str = ...,
         kwargs: collections.abc.Iterable[Global___Kwarg] | None = ...,
         policies: collections.abc.Iterable[Global___PolicyBracket] | None = ...,
@@ -506,24 +507,13 @@ class ActionCall(google.protobuf.message.Message):
     ) -> None: ...
     def HasField(
         self,
-        field_name: typing.Literal[
-            "_module_name",
-            b"_module_name",
-            "_target",
-            b"_target",
-            "module_name",
-            b"module_name",
-            "target",
-            b"target",
-        ],
+        field_name: typing.Literal["_module_name", b"_module_name", "module_name", b"module_name"],
     ) -> builtins.bool: ...
     def ClearField(
         self,
         field_name: typing.Literal[
             "_module_name",
             b"_module_name",
-            "_target",
-            b"_target",
             "action_name",
             b"action_name",
             "kwargs",
@@ -532,33 +522,25 @@ class ActionCall(google.protobuf.message.Message):
             b"module_name",
             "policies",
             b"policies",
-            "target",
-            b"target",
         ],
     ) -> None: ...
-    @typing.overload
     def WhichOneof(
         self, oneof_group: typing.Literal["_module_name", b"_module_name"]
     ) -> typing.Literal["module_name"] | None: ...
-    @typing.overload
-    def WhichOneof(
-        self, oneof_group: typing.Literal["_target", b"_target"]
-    ) -> typing.Literal["target"] | None: ...
 
 Global___ActionCall: typing_extensions.TypeAlias = ActionCall
 
 @typing.final
 class SpreadAction(google.protobuf.message.Message):
-    """Spread action: spread items:item -> @action(item=item)"""
+    """Spread action statement (side effect only, no result capture)
+    For result capture, use Assignment with SpreadExpr
+    """
 
     DESCRIPTOR: google.protobuf.descriptor.Descriptor
 
-    TARGET_FIELD_NUMBER: builtins.int
     COLLECTION_FIELD_NUMBER: builtins.int
     LOOP_VAR_FIELD_NUMBER: builtins.int
     ACTION_FIELD_NUMBER: builtins.int
-    target: builtins.str
-    """Variable to collect results"""
     loop_var: builtins.str
     """Variable name for each item"""
     @property
@@ -572,55 +554,31 @@ class SpreadAction(google.protobuf.message.Message):
     def __init__(
         self,
         *,
-        target: builtins.str | None = ...,
         collection: Global___Expr | None = ...,
         loop_var: builtins.str = ...,
         action: Global___ActionCall | None = ...,
     ) -> None: ...
     def HasField(
-        self,
-        field_name: typing.Literal[
-            "_target",
-            b"_target",
-            "action",
-            b"action",
-            "collection",
-            b"collection",
-            "target",
-            b"target",
-        ],
+        self, field_name: typing.Literal["action", b"action", "collection", b"collection"]
     ) -> builtins.bool: ...
     def ClearField(
         self,
         field_name: typing.Literal[
-            "_target",
-            b"_target",
-            "action",
-            b"action",
-            "collection",
-            b"collection",
-            "loop_var",
-            b"loop_var",
-            "target",
-            b"target",
+            "action", b"action", "collection", b"collection", "loop_var", b"loop_var"
         ],
     ) -> None: ...
-    def WhichOneof(
-        self, oneof_group: typing.Literal["_target", b"_target"]
-    ) -> typing.Literal["target"] | None: ...
 
 Global___SpreadAction: typing_extensions.TypeAlias = SpreadAction
 
 @typing.final
 class ParallelBlock(google.protobuf.message.Message):
-    """Parallel block: results = parallel: @a() @b() @c()"""
+    """Parallel block statement (side effect only, no result capture)
+    For result capture, use Assignment with ParallelExpr
+    """
 
     DESCRIPTOR: google.protobuf.descriptor.Descriptor
 
-    TARGET_FIELD_NUMBER: builtins.int
     CALLS_FIELD_NUMBER: builtins.int
-    target: builtins.str
-    """Variable to collect results"""
     @property
     def calls(
         self,
@@ -630,19 +588,9 @@ class ParallelBlock(google.protobuf.message.Message):
     def __init__(
         self,
         *,
-        target: builtins.str | None = ...,
         calls: collections.abc.Iterable[Global___Call] | None = ...,
     ) -> None: ...
-    def HasField(
-        self, field_name: typing.Literal["_target", b"_target", "target", b"target"]
-    ) -> builtins.bool: ...
-    def ClearField(
-        self,
-        field_name: typing.Literal["_target", b"_target", "calls", b"calls", "target", b"target"],
-    ) -> None: ...
-    def WhichOneof(
-        self, oneof_group: typing.Literal["_target", b"_target"]
-    ) -> typing.Literal["target"] | None: ...
+    def ClearField(self, field_name: typing.Literal["calls", b"calls"]) -> None: ...
 
 Global___ParallelBlock: typing_extensions.TypeAlias = ParallelBlock
 
@@ -1003,6 +951,8 @@ class Expr(google.protobuf.message.Message):
     DOT_FIELD_NUMBER: builtins.int
     FUNCTION_CALL_FIELD_NUMBER: builtins.int
     ACTION_CALL_FIELD_NUMBER: builtins.int
+    PARALLEL_EXPR_FIELD_NUMBER: builtins.int
+    SPREAD_EXPR_FIELD_NUMBER: builtins.int
     SPAN_FIELD_NUMBER: builtins.int
     @property
     def literal(self) -> Global___Literal: ...
@@ -1025,6 +975,14 @@ class Expr(google.protobuf.message.Message):
     @property
     def action_call(self) -> Global___ActionCall: ...
     @property
+    def parallel_expr(self) -> Global___ParallelExpr:
+        """Parallel block as expression"""
+
+    @property
+    def spread_expr(self) -> Global___SpreadExpr:
+        """Spread action as expression"""
+
+    @property
     def span(self) -> Global___Span: ...
     def __init__(
         self,
@@ -1039,6 +997,8 @@ class Expr(google.protobuf.message.Message):
         dot: Global___DotAccess | None = ...,
         function_call: Global___FunctionCall | None = ...,
         action_call: Global___ActionCall | None = ...,
+        parallel_expr: Global___ParallelExpr | None = ...,
+        spread_expr: Global___SpreadExpr | None = ...,
         span: Global___Span | None = ...,
     ) -> None: ...
     def HasField(
@@ -1062,8 +1022,12 @@ class Expr(google.protobuf.message.Message):
             b"list",
             "literal",
             b"literal",
+            "parallel_expr",
+            b"parallel_expr",
             "span",
             b"span",
+            "spread_expr",
+            b"spread_expr",
             "unary_op",
             b"unary_op",
             "variable",
@@ -1091,8 +1055,12 @@ class Expr(google.protobuf.message.Message):
             b"list",
             "literal",
             b"literal",
+            "parallel_expr",
+            b"parallel_expr",
             "span",
             b"span",
+            "spread_expr",
+            b"spread_expr",
             "unary_op",
             b"unary_op",
             "variable",
@@ -1113,6 +1081,8 @@ class Expr(google.protobuf.message.Message):
             "dot",
             "function_call",
             "action_call",
+            "parallel_expr",
+            "spread_expr",
         ]
         | None
     ): ...
@@ -1434,6 +1404,70 @@ class Kwarg(google.protobuf.message.Message):
     ) -> None: ...
 
 Global___Kwarg: typing_extensions.TypeAlias = Kwarg
+
+@typing.final
+class ParallelExpr(google.protobuf.message.Message):
+    """Parallel expression: concurrent execution of multiple calls, returns list
+    Used in assignments: a, b = parallel: @x() @y()
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    CALLS_FIELD_NUMBER: builtins.int
+    @property
+    def calls(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[Global___Call]:
+        """Actions or function calls to run in parallel"""
+
+    def __init__(
+        self,
+        *,
+        calls: collections.abc.Iterable[Global___Call] | None = ...,
+    ) -> None: ...
+    def ClearField(self, field_name: typing.Literal["calls", b"calls"]) -> None: ...
+
+Global___ParallelExpr: typing_extensions.TypeAlias = ParallelExpr
+
+@typing.final
+class SpreadExpr(google.protobuf.message.Message):
+    """Spread expression: parallel execution over a collection, returns list
+    Used in assignments: results = spread items:item -> @action(item=item)
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    COLLECTION_FIELD_NUMBER: builtins.int
+    LOOP_VAR_FIELD_NUMBER: builtins.int
+    ACTION_FIELD_NUMBER: builtins.int
+    loop_var: builtins.str
+    """Variable name for each item"""
+    @property
+    def collection(self) -> Global___Expr:
+        """The collection to iterate"""
+
+    @property
+    def action(self) -> Global___ActionCall:
+        """The action to call per item"""
+
+    def __init__(
+        self,
+        *,
+        collection: Global___Expr | None = ...,
+        loop_var: builtins.str = ...,
+        action: Global___ActionCall | None = ...,
+    ) -> None: ...
+    def HasField(
+        self, field_name: typing.Literal["action", b"action", "collection", b"collection"]
+    ) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing.Literal[
+            "action", b"action", "collection", b"collection", "loop_var", b"loop_var"
+        ],
+    ) -> None: ...
+
+Global___SpreadExpr: typing_extensions.TypeAlias = SpreadExpr
 
 @typing.final
 class PolicyBracket(google.protobuf.message.Message):

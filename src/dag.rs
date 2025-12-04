@@ -68,7 +68,10 @@ pub struct DAGNode {
     /// Keyword arguments for action calls (name -> literal value or variable reference like "$var")
     pub kwargs: Option<HashMap<String, String>>,
     /// Target variable name where the action result should be stored (for action_call nodes)
+    /// For backwards compatibility, this is the first target. Use `targets` for all targets.
     pub target: Option<String>,
+    /// All target variable names for tuple unpacking (e.g., ["a", "b"] for "a, b = @action()")
+    pub targets: Option<Vec<String>>,
     /// Whether this is a spread action (parallel iteration over a collection)
     pub is_spread: bool,
     /// Loop variable name for spread actions (e.g., "item" in "spread items:item -> @action()")
@@ -101,6 +104,7 @@ impl DAGNode {
             action_name: None,
             module_name: None,
             target: None,
+            targets: None,
             is_spread: false,
             spread_loop_var: None,
             spread_collection: None,
@@ -114,9 +118,19 @@ impl DAGNode {
         self
     }
 
-    /// Builder method to set target variable
+    /// Builder method to set target variable (single target, backwards compat)
     pub fn with_target(mut self, target: &str) -> Self {
         self.target = Some(target.to_string());
+        self.targets = Some(vec![target.to_string()]);
+        self
+    }
+
+    /// Builder method to set multiple targets for tuple unpacking
+    pub fn with_targets(mut self, targets: &[String]) -> Self {
+        if let Some(first) = targets.first() {
+            self.target = Some(first.clone());
+        }
+        self.targets = Some(targets.to_vec());
         self
     }
 
@@ -845,12 +859,17 @@ impl DAGConverter {
         match kind {
             ast::statement::Kind::Assignment(assign) => self.convert_assignment(assign),
             ast::statement::Kind::ActionCall(action) => {
-                // Use target from protobuf ActionCall message if present
-                let target = action.target.as_deref();
-                self.convert_action_call(action, target)
+                // Side-effect only action statement (no target)
+                self.convert_action_call_with_targets(action, &[])
             }
-            ast::statement::Kind::SpreadAction(spread) => self.convert_spread_action(spread),
-            ast::statement::Kind::ParallelBlock(parallel) => self.convert_parallel_block(parallel),
+            ast::statement::Kind::SpreadAction(spread) => {
+                // Side-effect only spread statement (no target)
+                self.convert_spread_action(spread)
+            }
+            ast::statement::Kind::ParallelBlock(parallel) => {
+                // Side-effect only parallel statement (no target)
+                self.convert_parallel_block(parallel)
+            }
             ast::statement::Kind::ForLoop(for_loop) => self.convert_for_loop(for_loop),
             ast::statement::Kind::Conditional(cond) => self.convert_conditional(cond),
             ast::statement::Kind::TryExcept(try_except) => self.convert_try_except(try_except),
@@ -869,7 +888,12 @@ impl DAGConverter {
             let target = body.target.as_deref();
 
             return match &call.kind {
-                Some(ast::call::Kind::Action(action)) => self.convert_action_call(action, target),
+                Some(ast::call::Kind::Action(action)) => {
+                    // SingleCallBody still uses a single optional target
+                    let targets: Vec<String> =
+                        target.map(|t| vec![t.to_string()]).unwrap_or_default();
+                    self.convert_action_call_with_targets(action, &targets)
+                }
                 Some(ast::call::Kind::Function(func)) => {
                     if let Some(t) = target {
                         self.convert_fn_call_assignment(t, &[t.to_string()], func)
@@ -906,22 +930,34 @@ impl DAGConverter {
             None => return vec![],
         };
 
-        let target = assign.targets.first().map(|s| s.as_str()).unwrap_or("_");
+        let targets = &assign.targets;
 
         // Check if RHS is a function call
         if let Some(ast::expr::Kind::FunctionCall(call)) = &value.kind {
-            return self.convert_fn_call_assignment(target, &assign.targets, call);
+            let target = targets.first().map(|s| s.as_str()).unwrap_or("_");
+            return self.convert_fn_call_assignment(target, targets, call);
         }
 
         // Check if RHS is an action call
         if let Some(ast::expr::Kind::ActionCall(action)) = &value.kind {
-            return self.convert_action_call(action, Some(target));
+            return self.convert_action_call_with_targets(action, targets);
+        }
+
+        // Check if RHS is a parallel expression
+        if let Some(ast::expr::Kind::ParallelExpr(parallel)) = &value.kind {
+            return self.convert_parallel_expr(parallel, targets);
+        }
+
+        // Check if RHS is a spread expression
+        if let Some(ast::expr::Kind::SpreadExpr(spread)) = &value.kind {
+            return self.convert_spread_expr(spread, targets);
         }
 
         // Regular assignment
         let node_id = self.next_id("assign");
-        let label = if assign.targets.len() > 1 {
-            format!("{} = ...", assign.targets.join(", "))
+        let target = targets.first().map(|s| s.as_str()).unwrap_or("_");
+        let label = if targets.len() > 1 {
+            format!("{} = ...", targets.join(", "))
         } else {
             format!("{} = ...", target)
         };
@@ -933,7 +969,7 @@ impl DAGConverter {
         self.dag.add_node(node);
 
         // Track variable definitions
-        for t in &assign.targets {
+        for t in targets {
             self.track_var_definition(t, &node_id);
         }
 
@@ -970,16 +1006,24 @@ impl DAGConverter {
     }
 
     /// Convert an action call
-    fn convert_action_call(
+    /// Convert an action call with multiple targets for tuple unpacking support.
+    /// If targets is empty, it's a side-effect only action.
+    /// If targets has one element, it's a simple assignment.
+    /// If targets has multiple elements, the action result will be unpacked.
+    fn convert_action_call_with_targets(
         &mut self,
         action: &ast::ActionCall,
-        target: Option<&str>,
+        targets: &[String],
     ) -> Vec<String> {
         let node_id = self.next_id("action");
-        let label = if let Some(t) = target {
-            format!("@{}() -> {}", action.action_name, t)
-        } else {
+
+        // Build label showing all targets
+        let label = if targets.is_empty() {
             format!("@{}()", action.action_name)
+        } else if targets.len() == 1 {
+            format!("@{}() -> {}", action.action_name, targets[0])
+        } else {
+            format!("@{}() -> ({})", action.action_name, targets.join(", "))
         };
 
         // Extract kwargs as string representations
@@ -988,19 +1032,22 @@ impl DAGConverter {
         let mut node = DAGNode::new(node_id.clone(), "action_call".to_string(), label)
             .with_action(&action.action_name, action.module_name.as_deref())
             .with_kwargs(kwargs);
-        if let Some(t) = target {
-            tracing::debug!(node_id = %node_id, target = %t, "setting action target");
-            node = node.with_target(t);
+
+        // Set targets for unpacking (store all targets)
+        if !targets.is_empty() {
+            node = node.with_targets(targets);
+            tracing::debug!(node_id = %node_id, targets = ?targets, "setting action targets");
         } else {
-            tracing::debug!(node_id = %node_id, "no target for action");
+            tracing::debug!(node_id = %node_id, "no targets for action");
         }
+
         if let Some(ref fn_name) = self.current_function {
             node = node.with_function_name(fn_name);
         }
         self.dag.add_node(node);
 
-        // Track variable definition if target is specified
-        if let Some(t) = target {
+        // Track variable definitions for all targets
+        for t in targets {
             self.track_var_definition(t, &node_id);
         }
 
@@ -1070,8 +1117,94 @@ impl DAGConverter {
         }
     }
 
-    /// Convert a spread action
+    /// Convert a spread action statement (side-effect only, no targets)
     fn convert_spread_action(&mut self, spread: &ast::SpreadAction) -> Vec<String> {
+        self.convert_spread_action_with_targets(spread, &[])
+    }
+
+    /// Convert a spread expression with targets
+    fn convert_spread_expr(&mut self, spread: &ast::SpreadExpr, targets: &[String]) -> Vec<String> {
+        // SpreadExpr has the same structure as SpreadAction
+        let action = spread.action.as_ref().unwrap();
+
+        // Create a temporary SpreadAction-like structure for the common implementation
+        let action_id = self.next_id("spread_action");
+        let action_label = format!(
+            "@{}() [spread over {}]",
+            action.action_name, spread.loop_var
+        );
+
+        // Extract kwargs
+        let kwargs = self.extract_kwargs(&action.kwargs);
+
+        // Get the collection expression as a string
+        let collection_str = spread
+            .collection
+            .as_ref()
+            .map(|c| self.expr_to_string(c))
+            .unwrap_or_default();
+
+        // Use internal variable name for spread results flowing to aggregator
+        let spread_result_var = "_spread_result".to_string();
+
+        let mut action_node =
+            DAGNode::new(action_id.clone(), "action_call".to_string(), action_label)
+                .with_action(&action.action_name, action.module_name.as_deref())
+                .with_kwargs(kwargs)
+                .with_spread(&spread.loop_var, &collection_str)
+                .with_target(&spread_result_var);
+        if let Some(ref fn_name) = self.current_function {
+            action_node = action_node.with_function_name(fn_name);
+        }
+        self.dag.add_node(action_node);
+
+        // Create aggregator node
+        let agg_id = self.next_id("aggregator");
+        let target_label = if !targets.is_empty() {
+            if targets.len() == 1 {
+                format!("aggregate -> {}", targets[0])
+            } else {
+                format!("aggregate -> ({})", targets.join(", "))
+            }
+        } else {
+            "aggregate".to_string()
+        };
+
+        let mut agg_node = DAGNode::new(agg_id.clone(), "aggregator".to_string(), target_label)
+            .with_aggregator(&action_id);
+        if !targets.is_empty() {
+            agg_node = agg_node.with_targets(targets);
+        }
+        if let Some(ref fn_name) = self.current_function {
+            agg_node = agg_node.with_function_name(fn_name);
+        }
+        self.dag.add_node(agg_node);
+
+        // Connect action to aggregator via state machine edge
+        self.dag
+            .add_edge(DAGEdge::state_machine(action_id.clone(), agg_id.clone()));
+
+        // Add DATA_FLOW edge from spread action to aggregator for results
+        self.dag.add_edge(DAGEdge::data_flow(
+            action_id.clone(),
+            agg_id.clone(),
+            &spread_result_var,
+        ));
+
+        // Track variable definitions for all targets
+        for t in targets {
+            self.track_var_definition(t, &agg_id);
+        }
+
+        vec![action_id, agg_id]
+    }
+
+    /// Convert a spread action with targets (common implementation)
+    fn convert_spread_action_with_targets(
+        &mut self,
+        spread: &ast::SpreadAction,
+        targets: &[String],
+    ) -> Vec<String> {
         let action = spread.action.as_ref().unwrap();
 
         // Create spread action node
@@ -1107,17 +1240,20 @@ impl DAGConverter {
 
         // Create aggregator node
         let agg_id = self.next_id("aggregator");
-        let target_label = if let Some(ref t) = spread.target {
-            format!("aggregate -> {}", t)
+        let target_label = if !targets.is_empty() {
+            if targets.len() == 1 {
+                format!("aggregate -> {}", targets[0])
+            } else {
+                format!("aggregate -> ({})", targets.join(", "))
+            }
         } else {
             "aggregate".to_string()
         };
 
         let mut agg_node = DAGNode::new(agg_id.clone(), "aggregator".to_string(), target_label)
             .with_aggregator(&action_id);
-        // Set the aggregator's target to the spread's target variable
-        if let Some(ref t) = spread.target {
-            agg_node = agg_node.with_target(t);
+        if !targets.is_empty() {
+            agg_node = agg_node.with_targets(targets);
         }
         if let Some(ref fn_name) = self.current_function {
             agg_node = agg_node.with_function_name(fn_name);
@@ -1135,16 +1271,34 @@ impl DAGConverter {
             &spread_result_var,
         ));
 
-        // Track variable definition at aggregator
-        if let Some(ref t) = spread.target {
+        // Track variable definitions at aggregator
+        for t in targets {
             self.track_var_definition(t, &agg_id);
         }
 
         vec![action_id, agg_id]
     }
 
-    /// Convert a parallel block
+    /// Convert a parallel block statement (side-effect only, no targets)
     fn convert_parallel_block(&mut self, parallel: &ast::ParallelBlock) -> Vec<String> {
+        self.convert_parallel_block_with_targets(&parallel.calls, &[])
+    }
+
+    /// Convert a parallel expression with targets for tuple unpacking
+    fn convert_parallel_expr(
+        &mut self,
+        parallel: &ast::ParallelExpr,
+        targets: &[String],
+    ) -> Vec<String> {
+        self.convert_parallel_block_with_targets(&parallel.calls, targets)
+    }
+
+    /// Convert a parallel block with targets (common implementation)
+    fn convert_parallel_block_with_targets(
+        &mut self,
+        calls: &[ast::Call],
+        targets: &[String],
+    ) -> Vec<String> {
         let mut result_nodes = Vec::new();
 
         // Create parallel entry node
@@ -1162,15 +1316,27 @@ impl DAGConverter {
 
         // Create a node for each call
         let mut call_node_ids = Vec::new();
-        for (i, call) in parallel.calls.iter().enumerate() {
+        for (i, call) in calls.iter().enumerate() {
+            // Assign a target to each parallel call based on index
+            // If we have targets ["a", "b"] and calls [action1, action2],
+            // then action1 produces "a" and action2 produces "b"
+            let call_target = targets.get(i).cloned();
+
             let (call_id, call_node) = match &call.kind {
                 Some(ast::call::Kind::Action(action)) => {
                     let id = self.next_id("parallel_action");
-                    let label = format!("@{}() [{}]", action.action_name, i);
+                    let label = if let Some(ref t) = call_target {
+                        format!("@{}() [{}] -> {}", action.action_name, i, t)
+                    } else {
+                        format!("@{}() [{}]", action.action_name, i)
+                    };
                     let kwargs = self.extract_kwargs(&action.kwargs);
                     let mut node = DAGNode::new(id.clone(), "action_call".to_string(), label)
                         .with_action(&action.action_name, action.module_name.as_deref())
                         .with_kwargs(kwargs);
+                    if let Some(ref t) = call_target {
+                        node = node.with_target(t);
+                    }
                     if let Some(ref fn_name) = self.current_function {
                         node = node.with_function_name(fn_name);
                     }
@@ -1178,9 +1344,16 @@ impl DAGConverter {
                 }
                 Some(ast::call::Kind::Function(func)) => {
                     let id = self.next_id("parallel_fn_call");
-                    let label = format!("{}() [{}]", func.name, i);
+                    let label = if let Some(ref t) = call_target {
+                        format!("{}() [{}] -> {}", func.name, i, t)
+                    } else {
+                        format!("{}() [{}]", func.name, i)
+                    };
                     let mut node = DAGNode::new(id.clone(), "fn_call".to_string(), label)
                         .with_fn_call(&func.name);
+                    if let Some(ref t) = call_target {
+                        node = node.with_target(t);
+                    }
                     if let Some(ref fn_name) = self.current_function {
                         node = node.with_function_name(fn_name);
                     }
@@ -1190,6 +1363,12 @@ impl DAGConverter {
             };
 
             self.dag.add_node(call_node);
+
+            // Track variable definition for each call's target
+            if let Some(ref t) = call_target {
+                self.track_var_definition(t, &call_id);
+            }
+
             call_node_ids.push(call_id.clone());
             result_nodes.push(call_id.clone());
 
@@ -1201,16 +1380,23 @@ impl DAGConverter {
             ));
         }
 
-        // Create aggregator node
+        // Create aggregator node (still needed for control flow even without targets)
         let agg_id = self.next_id("parallel_aggregator");
-        let target_label = if let Some(ref t) = parallel.target {
-            format!("parallel_aggregate -> {}", t)
+        let target_label = if !targets.is_empty() {
+            if targets.len() == 1 {
+                format!("parallel_aggregate -> {}", targets[0])
+            } else {
+                format!("parallel_aggregate -> ({})", targets.join(", "))
+            }
         } else {
             "parallel_aggregate".to_string()
         };
 
         let mut agg_node = DAGNode::new(agg_id.clone(), "aggregator".to_string(), target_label)
             .with_aggregator(&parallel_id);
+        if !targets.is_empty() {
+            agg_node = agg_node.with_targets(targets);
+        }
         if let Some(ref fn_name) = self.current_function {
             agg_node = agg_node.with_function_name(fn_name);
         }
@@ -1221,11 +1407,6 @@ impl DAGConverter {
         for call_id in call_node_ids {
             self.dag
                 .add_edge(DAGEdge::state_machine(call_id, agg_id.clone()));
-        }
-
-        // Track variable definition at aggregator
-        if let Some(ref t) = parallel.target {
-            self.track_var_definition(t, &agg_id);
         }
 
         result_nodes
@@ -1524,7 +1705,8 @@ impl DAGConverter {
         };
 
         if let Some(ast::expr::Kind::ActionCall(action)) = &expr.kind {
-            return self.convert_action_call(action, None);
+            // Side-effect only action in expression statement
+            return self.convert_action_call_with_targets(action, &[]);
         }
 
         let node_id = self.next_id("expr");
@@ -1978,6 +2160,70 @@ fn main(input: [], output: [result]):
         let node_types: HashSet<_> = dag.nodes.values().map(|n| n.node_type.as_str()).collect();
         assert!(node_types.contains("parallel"));
         assert!(node_types.contains("aggregator"));
+    }
+
+    #[test]
+    fn test_dag_parallel_tuple_unpacking() {
+        // Test parallel block with tuple unpacking: a, b = parallel: ...
+        let source = r#"fn compute(input: [n], output: [summary]):
+    factorial_value, fib_value = parallel:
+        @compute_factorial(n=n)
+        @compute_fibonacci(n=n)
+    summary = @summarize(factorial=factorial_value, fib=fib_value)
+    return summary"#;
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        // The aggregator node should have the targets for unpacking
+        let aggregator_node = dag
+            .nodes
+            .values()
+            .find(|n| n.node_type == "aggregator")
+            .expect("Should have aggregator node");
+
+        // Aggregator node should have both targets for tuple unpacking
+        assert!(
+            aggregator_node.targets.is_some(),
+            "Aggregator node should have targets for unpacking"
+        );
+        let targets = aggregator_node.targets.as_ref().unwrap();
+        assert_eq!(
+            targets.len(),
+            2,
+            "Should have 2 targets for tuple unpacking"
+        );
+        assert!(targets.contains(&"factorial_value".to_string()));
+        assert!(targets.contains(&"fib_value".to_string()));
+
+        // First target should be set for backwards compatibility
+        assert_eq!(
+            aggregator_node.target,
+            Some("factorial_value".to_string()),
+            "First target should be set for backwards compat"
+        );
+
+        // Check DATA_FLOW edges exist for both unpacked variables
+        let data_flow_edges: Vec<_> = dag
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::DataFlow)
+            .collect();
+
+        let factorial_edge = data_flow_edges
+            .iter()
+            .find(|e| e.variable.as_deref() == Some("factorial_value"));
+        let fib_edge = data_flow_edges
+            .iter()
+            .find(|e| e.variable.as_deref() == Some("fib_value"));
+
+        assert!(
+            factorial_edge.is_some(),
+            "Should have DATA_FLOW edge for factorial_value"
+        );
+        assert!(
+            fib_edge.is_some(),
+            "Should have DATA_FLOW edge for fib_value"
+        );
     }
 
     #[test]
