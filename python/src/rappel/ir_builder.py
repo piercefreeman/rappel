@@ -249,6 +249,13 @@ class IRBuilder(ast.NodeVisitor):
         """Convert assignment to IR."""
         stmt = ir.Statement(span=_make_span(node))
 
+        # Check for asyncio.gather() - convert to parallel block
+        if isinstance(node.value, ast.Await) and isinstance(node.value.value, ast.Call):
+            gather_call = node.value.value
+            if self._is_asyncio_gather_call(gather_call):
+                target = self._get_assign_target(node.targets)
+                return self._convert_asyncio_gather_to_parallel_block(gather_call, target)
+
         # Check if this is an action call
         action_call = self._extract_action_call(node.value)
         if action_call:
@@ -280,6 +287,12 @@ class IRBuilder(ast.NodeVisitor):
     def _visit_expr_stmt(self, node: ast.Expr) -> Optional[ir.Statement]:
         """Convert expression statement to IR."""
         stmt = ir.Statement(span=_make_span(node))
+
+        # Check for asyncio.gather() - convert to parallel block (no assignment target)
+        if isinstance(node.value, ast.Await) and isinstance(node.value.value, ast.Call):
+            gather_call = node.value.value
+            if self._is_asyncio_gather_call(gather_call):
+                return self._convert_asyncio_gather_to_parallel_block(gather_call, target=None)
 
         # Check if this is an action call
         action_call = self._extract_action_call(node.value)
@@ -833,6 +846,186 @@ class IRBuilder(ast.NodeVisitor):
 
         return action_call
 
+    def _is_asyncio_gather_call(self, node: ast.Call) -> bool:
+        """Check if this is an asyncio.gather(...) call.
+
+        Supports both patterns:
+        - import asyncio; asyncio.gather(a(), b())
+        - from asyncio import gather; gather(a(), b())
+        - from asyncio import gather as g; g(a(), b())
+        """
+        if isinstance(node.func, ast.Attribute):
+            # asyncio.gather(...) pattern
+            if node.func.attr == "gather" and isinstance(node.func.value, ast.Name):
+                return node.func.value.id == "asyncio"
+        elif isinstance(node.func, ast.Name):
+            # gather(...) pattern - check if it's imported from asyncio
+            func_name = node.func.id
+            if func_name in self._imported_names:
+                imported = self._imported_names[func_name]
+                return imported.module == "asyncio" and imported.original_name == "gather"
+        return False
+
+    def _convert_asyncio_gather_to_parallel_block(
+        self, node: ast.Call, target: Optional[str] = None
+    ) -> Optional[ir.Statement]:
+        """Convert asyncio.gather(...) to ParallelBlock or SpreadAction IR.
+
+        Handles two patterns:
+
+        1. Static gather: asyncio.gather(a(), b(), c())
+           -> ParallelBlock with explicit calls
+
+        2. Dynamic spread: asyncio.gather(*[action(x) for x in items])
+           -> SpreadAction for parallel iteration over collection
+
+        Args:
+            node: The asyncio.gather() Call node
+            target: Optional variable name for the result (e.g., "results" or None)
+
+        Returns:
+            An IR Statement containing ParallelBlock or SpreadAction, or None if fails.
+        """
+        # Check for starred list comprehension pattern: gather(*[action(x) for x in items])
+        if len(node.args) == 1 and isinstance(node.args[0], ast.Starred):
+            starred = node.args[0]
+            if isinstance(starred.value, ast.ListComp):
+                return self._convert_gather_listcomp_to_spread(starred.value, target, node)
+
+        # Standard case: gather(a(), b(), c()) -> ParallelBlock
+        parallel = ir.ParallelBlock()
+
+        if target:
+            parallel.target = target
+
+        # Each argument to gather() should be an action call
+        for arg in node.args:
+            call = self._convert_gather_arg_to_call(arg)
+            if call:
+                parallel.calls.append(call)
+
+        # Only create the statement if we have calls
+        if not parallel.calls:
+            return None
+
+        stmt = ir.Statement(span=_make_span(node))
+        stmt.parallel_block.CopyFrom(parallel)
+        return stmt
+
+    def _convert_gather_listcomp_to_spread(
+        self, listcomp: ast.ListComp, target: Optional[str], node: ast.Call
+    ) -> Optional[ir.Statement]:
+        """Convert gather(*[action(x) for x in items]) to SpreadAction IR.
+
+        Python:
+            results = await asyncio.gather(*[
+                process_item(item=item, multiplier=multiplier)
+                for item in items
+            ])
+
+        Becomes IR equivalent of:
+            spread items:item -> results = @process_item(item=item, multiplier=multiplier)
+        """
+        # Extract the action call from the list comprehension's element expression
+        if not isinstance(listcomp.elt, ast.Call):
+            return None
+
+        action_call = self._extract_action_call_from_call(listcomp.elt)
+        if not action_call:
+            return None
+
+        # We only support simple list comprehensions with one generator
+        if len(listcomp.generators) != 1:
+            return None
+
+        gen = listcomp.generators[0]
+
+        # Get the loop variable
+        if not isinstance(gen.target, ast.Name):
+            return None
+        loop_var = gen.target.id
+
+        # Get the iterable expression
+        iterable = _expr_to_ir(gen.iter)
+        if not iterable:
+            return None
+
+        # Build the SpreadAction
+        spread = ir.SpreadAction(
+            loop_var=loop_var,
+            collection=iterable,
+            action=action_call,
+        )
+        if target:
+            spread.target = target
+
+        stmt = ir.Statement(span=_make_span(node))
+        stmt.spread_action.CopyFrom(spread)
+        return stmt
+
+    def _convert_gather_arg_to_call(self, node: ast.expr) -> Optional[ir.Call]:
+        """Convert a gather argument to an IR Call.
+
+        Handles both action calls and regular function calls.
+        """
+        if not isinstance(node, ast.Call):
+            return None
+
+        # Try to extract as an action call first
+        action_call = self._extract_action_call_from_call(node)
+        if action_call:
+            call = ir.Call()
+            call.action.CopyFrom(action_call)
+            return call
+
+        # Fall back to regular function call
+        func_call = self._convert_to_function_call(node)
+        if func_call:
+            call = ir.Call()
+            call.function.CopyFrom(func_call)
+            return call
+
+        return None
+
+    def _convert_to_function_call(self, node: ast.Call) -> Optional[ir.FunctionCall]:
+        """Convert an AST Call to IR FunctionCall."""
+        func_name = self._get_func_name(node.func)
+        if not func_name:
+            return None
+
+        fn_call = ir.FunctionCall(name=func_name)
+
+        # Add positional args
+        for arg in node.args:
+            expr = _expr_to_ir(arg)
+            if expr:
+                fn_call.args.append(expr)
+
+        # Add keyword args
+        for kw in node.keywords:
+            if kw.arg:
+                expr = _expr_to_ir(kw.value)
+                if expr:
+                    fn_call.kwargs.append(ir.Kwarg(name=kw.arg, value=expr))
+
+        return fn_call
+
+    def _get_func_name(self, node: ast.expr) -> Optional[str]:
+        """Get function name from a func node."""
+        if isinstance(node, ast.Name):
+            return node.id
+        elif isinstance(node, ast.Attribute):
+            # Handle chained attributes like obj.method
+            parts = []
+            current = node
+            while isinstance(current, ast.Attribute):
+                parts.append(current.attr)
+                current = current.value
+            if isinstance(current, ast.Name):
+                parts.append(current.id)
+            return ".".join(reversed(parts))
+        return None
+
     def _extract_action_call_from_awaitable(self, node: ast.expr) -> Optional[ir.ActionCall]:
         """Extract action call from an awaitable expression."""
         if isinstance(node, ast.Call):
@@ -840,7 +1033,11 @@ class IRBuilder(ast.NodeVisitor):
         return None
 
     def _extract_action_call_from_call(self, node: ast.Call) -> Optional[ir.ActionCall]:
-        """Extract action call info from a Call node."""
+        """Extract action call info from a Call node.
+
+        Converts positional arguments to keyword arguments using the action's
+        signature introspection. This ensures all arguments are named in the IR.
+        """
         action_name = self._get_action_name(node.func)
         if not action_name:
             return None
@@ -855,7 +1052,18 @@ class IRBuilder(ast.NodeVisitor):
         if action_def.module_name:
             action_call.module_name = action_def.module_name
 
-        # Add kwargs
+        # Get parameter names from signature for positional arg conversion
+        param_names = list(action_def.signature.parameters.keys())
+
+        # Convert positional args to kwargs using signature introspection
+        for i, arg in enumerate(node.args):
+            if i < len(param_names):
+                expr = _expr_to_ir(arg)
+                if expr:
+                    kwarg = ir.Kwarg(name=param_names[i], value=expr)
+                    action_call.kwargs.append(kwarg)
+
+        # Add explicit kwargs
         for kw in node.keywords:
             if kw.arg:
                 expr = _expr_to_ir(kw.value)
