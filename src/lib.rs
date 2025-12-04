@@ -24,6 +24,7 @@ pub mod config;
 pub mod dag;
 pub mod dag_state;
 pub mod db;
+pub mod ir_printer;
 pub mod lexer;
 pub mod messages;
 pub mod parser;

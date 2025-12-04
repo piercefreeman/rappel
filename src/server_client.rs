@@ -22,7 +22,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tracing::{error, info};
 
-use crate::{db::Database, messages::proto};
+use crate::{db::Database, ir_printer, messages::ast as ir_ast, messages::proto};
 
 /// Service name for health checks
 pub const SERVICE_NAME: &str = "rappel";
@@ -234,8 +234,11 @@ async fn register_workflow_http(
         .map_err(|_| HttpError::bad_request("invalid base64 payload"))?;
 
     // Decode the registration
-    let _registration = proto::WorkflowRegistration::decode(&bytes[..])
+    let registration = proto::WorkflowRegistration::decode(&bytes[..])
         .map_err(|e| HttpError::bad_request(format!("invalid registration: {e}")))?;
+
+    // Log the registered workflow IR
+    log_workflow_ir(&registration);
 
     // TODO: Register the workflow and create instance
     // For now, return placeholder IDs
@@ -246,6 +249,29 @@ async fn register_workflow_http(
         workflow_version_id: version_id.to_string(),
         workflow_instance_id: instance_id.to_string(),
     }))
+}
+
+/// Log a registered workflow's IR in a pretty-printed format
+fn log_workflow_ir(registration: &proto::WorkflowRegistration) {
+    // Try to decode the IR from the registration
+    match ir_ast::Program::decode(&registration.ir[..]) {
+        Ok(program) => {
+            let ir_str = ir_printer::print_program(&program);
+            info!(
+                workflow_name = %registration.workflow_name,
+                ir_hash = %registration.ir_hash,
+                "Registered workflow IR:\n{}",
+                ir_str
+            );
+        }
+        Err(e) => {
+            error!(
+                workflow_name = %registration.workflow_name,
+                error = %e,
+                "Failed to decode workflow IR"
+            );
+        }
+    }
 }
 
 async fn wait_for_instance_http(
@@ -313,9 +339,12 @@ impl proto::workflow_service_server::WorkflowService for WorkflowGrpcService {
         request: tonic::Request<proto::RegisterWorkflowRequest>,
     ) -> Result<tonic::Response<proto::RegisterWorkflowResponse>, tonic::Status> {
         let inner = request.into_inner();
-        let _registration = inner
+        let registration = inner
             .registration
             .ok_or_else(|| tonic::Status::invalid_argument("registration missing"))?;
+
+        // Log the registered workflow IR
+        log_workflow_ir(&registration);
 
         // TODO: Register the workflow and create instance
         let version_id = uuid::Uuid::new_v4();

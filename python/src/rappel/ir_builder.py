@@ -23,7 +23,7 @@ UnsupportedPatternError with clear recommendations for how to rewrite the code.
 import ast
 import inspect
 import textwrap
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from proto import ast_pb2 as ir
@@ -108,8 +108,7 @@ RECOMMENDATIONS = {
         "        return {k: v for k, v in items}"
     ),
     "set_comprehension": (
-        "Set comprehensions are not supported in workflow code.\n"
-        "Use an @action to build sets."
+        "Set comprehensions are not supported in workflow code.\nUse an @action to build sets."
     ),
     "generator": (
         "Generator expressions are not supported in workflow code.\n"
@@ -120,8 +119,7 @@ RECOMMENDATIONS = {
         "Use separate assignment statements instead."
     ),
     "match": (
-        "Match statements are not supported in workflow code.\n"
-        "Use if/elif/else chains instead."
+        "Match statements are not supported in workflow code.\nUse if/elif/else chains instead."
     ),
     "gather_variable_spread": (
         "Spreading a variable in asyncio.gather() is not supported because it requires "

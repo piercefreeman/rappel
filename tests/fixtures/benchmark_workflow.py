@@ -200,234 +200,25 @@ class BenchmarkFanOutWorkflow(Workflow):
     """
     Simple fan-out/fan-in benchmark.
 
-    Spawns `width` parallel hash chains, then aggregates results.
+    Spawns parallel hash chains based on provided seeds, then aggregates results.
+    Uses list comprehension pattern for parallel execution.
+
+    Args:
+        seeds: List of seed strings for hash chains (e.g., ["bench_0", "bench_1", ...])
+        hash_iterations: Number of hash iterations per chain
     """
 
     async def run(
         self,
-        width: int = 10,
+        seeds: list,
         hash_iterations: int = 1000,
     ) -> str:
-        # Fan-out: spawn parallel hash computations
-        tasks = []
-        for i in range(width):
-            tasks.append(hash_chain(seed=f"bench_{i}", iterations=hash_iterations))
-
-        # Execute in parallel
-        results = await asyncio.gather(*tasks)
+        # Fan-out: spawn parallel hash computations using list comprehension
+        results = await asyncio.gather(*[
+            hash_chain(seed=seed, iterations=hash_iterations)
+            for seed in seeds
+        ])
 
         # Fan-in: aggregate results
         final = await aggregate_hashes(list(results))
         return final
-
-
-@workflow
-class BenchmarkMixedWorkflow(Workflow):
-    """
-    Mixed workload benchmark with different computation types.
-
-    Tests heterogeneous parallel execution where actions have
-    different CPU profiles (hash-bound, memory-bound, etc.)
-    """
-
-    async def run(
-        self,
-        hash_count: int = 5,
-        hash_iterations: int = 500,
-        prime_limit: int = 10000,
-        matrix_size: int = 50,
-        fib_n: int = 100,
-        string_rounds: int = 20,
-    ) -> dict[str, Any]:
-        # Layer 1: Fan-out different computation types
-
-        # Hash chains (CPU bound, predictable)
-        hash_tasks = []
-        for i in range(hash_count):
-            hash_tasks.append(hash_chain(seed=f"mixed_{i}", iterations=hash_iterations))
-
-        # Prime counting (CPU + memory)
-        prime_task = prime_sieve(limit=prime_limit)
-
-        # Matrix multiply (CPU intensive, O(n^3))
-        matrix_task = matrix_multiply(size=matrix_size, seed=42)
-
-        # Fibonacci (recursion + memoization)
-        fib_task = fibonacci_memo(n=fib_n)
-
-        # String processing (allocation heavy)
-        string_task = string_processing(
-            text="benchmark_test_string_for_processing",
-            rounds=string_rounds,
-        )
-
-        # Execute all in parallel
-        hash_results, prime_count, matrix_sum, fib_result, string_result = await asyncio.gather(
-            asyncio.gather(*hash_tasks),
-            prime_task,
-            matrix_task,
-            fib_task,
-            string_task,
-        )
-
-        # Layer 2: Fan-in aggregation
-        hash_aggregate = await aggregate_hashes(list(hash_results))
-        prime_stats = await aggregate_counts([prime_count])
-
-        # Final summary
-        result = await final_summary(
-            hash_result=hash_aggregate,
-            prime_stats=prime_stats,
-            matrix_checksum=matrix_sum,
-            fib_value=fib_result,
-            string_result=string_result,
-        )
-        return result
-
-
-@workflow
-class BenchmarkNestedFanOutWorkflow(Workflow):
-    """
-    Nested fan-out/fan-in benchmark for testing deep parallelism.
-
-    Creates a tree of parallel computations:
-    - Level 0: Spawn N branches
-    - Level 1: Each branch spawns M sub-computations
-    - Results aggregate up the tree
-    """
-
-    async def run(
-        self,
-        branches: int = 4,
-        sub_branches: int = 4,
-        hash_iterations: int = 500,
-        prime_limit: int = 5000,
-    ) -> dict[str, Any]:
-        # Level 1: Create branch tasks
-        branch_results = []
-
-        for branch_id in range(branches):
-            # Each branch does parallel work
-            # Sub-fan-out: hash chains
-            hash_tasks = []
-            for sub_id in range(sub_branches):
-                hash_tasks.append(
-                    hash_chain(
-                        seed=f"branch_{branch_id}_sub_{sub_id}",
-                        iterations=hash_iterations,
-                    )
-                )
-
-            # Sub-fan-out: prime counts with different limits
-            prime_tasks = []
-            for sub_id in range(sub_branches):
-                limit = prime_limit + (sub_id * 1000)
-                prime_tasks.append(prime_sieve(limit=limit))
-
-            # Execute this branch's parallel work
-            hash_results, prime_results = await asyncio.gather(
-                asyncio.gather(*hash_tasks),
-                asyncio.gather(*prime_tasks),
-            )
-
-            # Aggregate this branch
-            branch_hash = await aggregate_hashes(list(hash_results))
-            branch_primes = await aggregate_counts(list(prime_results))
-
-            branch_results.append({
-                "branch_id": branch_id,
-                "hash": branch_hash,
-                "primes": branch_primes,
-            })
-
-        # Final aggregation across all branches
-        all_hashes = [b["hash"] for b in branch_results]
-        final_hash = await aggregate_hashes(all_hashes)
-
-        total_primes = sum(b["primes"]["sum"] for b in branch_results)
-
-        return {
-            "branches": branches,
-            "sub_branches": sub_branches,
-            "total_actions": branches * sub_branches * 2 + branches * 2 + 1,
-            "final_hash": final_hash,
-            "total_primes_found": total_primes,
-            "branch_details": branch_results,
-        }
-
-
-@workflow
-class BenchmarkStressTestWorkflow(Workflow):
-    """
-    Maximum stress test workflow.
-
-    Designed to saturate all available CPU cores with:
-    - High fan-out width
-    - CPU-intensive computations per action
-    - Multiple aggregation layers
-    - Mixed computation types
-    """
-
-    async def run(
-        self,
-        parallelism: int = 16,
-        intensity: int = 2,  # Multiplier for computation depth
-    ) -> dict[str, Any]:
-        # Scale parameters based on intensity
-        hash_iters = 1000 * intensity
-        prime_limit = 10000 * intensity
-        matrix_size = 30 + (10 * intensity)
-        fib_n = 50 + (25 * intensity)
-        string_rounds = 10 * intensity
-
-        # Wave 1: Pure hash chains (predictable CPU load)
-        wave1_tasks = []
-        for i in range(parallelism):
-            wave1_tasks.append(
-                hash_chain(seed=f"stress_wave1_{i}", iterations=hash_iters)
-            )
-        wave1_results = await asyncio.gather(*wave1_tasks)
-        wave1_hash = await aggregate_hashes(list(wave1_results))
-
-        # Wave 2: Mixed compute (heterogeneous load)
-        wave2_primes = []
-        wave2_matrices = []
-        for i in range(parallelism // 2):
-            wave2_primes.append(prime_sieve(limit=prime_limit + i * 500))
-            wave2_matrices.append(matrix_multiply(size=matrix_size, seed=i))
-
-        prime_results, matrix_results = await asyncio.gather(
-            asyncio.gather(*wave2_primes),
-            asyncio.gather(*wave2_matrices),
-        )
-
-        prime_stats = await aggregate_counts(list(prime_results))
-        matrix_checksum = sum(matrix_results) & 0xFFFFFFFF
-
-        # Wave 3: Memory-intensive operations
-        wave3_tasks = []
-        for i in range(parallelism // 4):
-            wave3_tasks.append(fibonacci_memo(n=fib_n + i * 10))
-            wave3_tasks.append(
-                string_processing(
-                    text=f"stress_test_string_{i}" * 10,
-                    rounds=string_rounds,
-                )
-            )
-        wave3_results = await asyncio.gather(*wave3_tasks)
-
-        # Separate fib and string results
-        fib_results = [r for r in wave3_results if isinstance(r, int)]
-        string_results = [r for r in wave3_results if isinstance(r, str)]
-
-        fib_sum = sum(fib_results) if fib_results else 0
-        string_sample = string_results[0] if string_results else ""
-
-        # Final aggregation
-        return await final_summary(
-            hash_result=wave1_hash,
-            prime_stats=prime_stats,
-            matrix_checksum=matrix_checksum,
-            fib_value=fib_sum,
-            string_result=string_sample,
-        )

@@ -782,9 +782,7 @@ class TestUnsupportedPatternDetection:
 
         error = exc_info.value
         assert "F-string" in error.message, "Error should mention f-strings"
-        assert "@action" in error.recommendation, (
-            "Recommendation should suggest using @action"
-        )
+        assert "@action" in error.recommendation, "Recommendation should suggest using @action"
 
     def test_while_loop_raises_error(self) -> None:
         """Test: while loops raise error with recommendation."""
@@ -811,9 +809,7 @@ class TestUnsupportedPatternDetection:
 
         error = exc_info.value
         assert "While" in error.message, "Error should mention while loops"
-        assert "for loop" in error.recommendation.lower(), (
-            "Recommendation should suggest for loop"
-        )
+        assert "for loop" in error.recommendation.lower(), "Recommendation should suggest for loop"
 
     def test_with_statement_raises_error(self) -> None:
         """Test: with statements raise error with recommendation."""
@@ -833,9 +829,7 @@ class TestUnsupportedPatternDetection:
 
         error = exc_info.value
         assert "with" in error.message.lower(), "Error should mention with statements"
-        assert "@action" in error.recommendation, (
-            "Recommendation should suggest using @action"
-        )
+        assert "@action" in error.recommendation, "Recommendation should suggest using @action"
 
     def test_lambda_raises_error(self) -> None:
         """Test: lambda expressions raise error with recommendation."""
@@ -855,9 +849,7 @@ class TestUnsupportedPatternDetection:
 
         error = exc_info.value
         assert "Lambda" in error.message, "Error should mention lambda"
-        assert "@action" in error.recommendation, (
-            "Recommendation should suggest using @action"
-        )
+        assert "@action" in error.recommendation, "Recommendation should suggest using @action"
 
     def test_list_comprehension_outside_gather_raises_error(self) -> None:
         """Test: list comprehensions outside gather context raise error."""
@@ -876,9 +868,7 @@ class TestUnsupportedPatternDetection:
             ListCompWorkflow.workflow_ir()
 
         error = exc_info.value
-        assert "List comprehension" in error.message, (
-            "Error should mention list comprehensions"
-        )
+        assert "List comprehension" in error.message, "Error should mention list comprehensions"
         assert "asyncio.gather" in error.recommendation, (
             "Recommendation should mention gather context"
         )
@@ -901,9 +891,7 @@ class TestUnsupportedPatternDetection:
 
         error = exc_info.value
         assert "del" in error.message.lower(), "Error should mention del"
-        assert "@action" in error.recommendation, (
-            "Recommendation should suggest using @action"
-        )
+        assert "@action" in error.recommendation, "Recommendation should suggest using @action"
 
     def test_error_includes_line_number(self) -> None:
         """Test: errors include line number for debugging."""
