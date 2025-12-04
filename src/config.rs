@@ -1,164 +1,133 @@
-use std::{
-    env,
-    net::SocketAddr,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+//! Configuration loading from environment variables.
+//!
+//! Uses the following environment variables:
+//! - `DATABASE_URL`: PostgreSQL connection string (required)
+//! - `RAPPEL_HTTP_ADDR`: HTTP server bind address (default: 127.0.0.1:24117)
+//! - `RAPPEL_GRPC_ADDR`: gRPC server bind address (default: HTTP port + 1)
+//! - `RAPPEL_WORKER_COUNT`: Number of Python workers (default: num_cpus)
+//! - `RAPPEL_MAX_CONCURRENT`: Max concurrent action dispatches (default: 32)
+//! - `RAPPEL_POLL_INTERVAL_MS`: Dispatcher poll interval (default: 100)
+//! - `RAPPEL_BATCH_SIZE`: Actions to dispatch per poll (default: 100)
 
-use anyhow::{Context, Result, anyhow};
-use dotenvy::from_path_iter;
-use tracing::info;
+use std::{env, net::SocketAddr, str::FromStr};
 
-const DOTENV_FILENAME: &str = ".env";
-const HTTP_ADDR_ENV: &str = "CARABINER_HTTP_ADDR";
-const GRPC_ADDR_ENV: &str = "CARABINER_GRPC_ADDR";
-const WORKER_COUNT_ENV: &str = "CARABINER_WORKER_COUNT";
-const WORKER_MAX_CONCURRENT_ENV: &str = "CARABINER_MAX_CONCURRENT";
-const WORKER_USER_MODULE_ENV: &str = "CARABINER_USER_MODULE";
-const WORKER_POLL_INTERVAL_ENV: &str = "CARABINER_POLL_INTERVAL_MS";
-const WORKER_BATCH_SIZE_ENV: &str = "CARABINER_BATCH_SIZE";
+use anyhow::{Context, Result};
 
+/// Server configuration
 #[derive(Debug, Clone)]
-pub struct AppConfig {
+pub struct Config {
+    /// PostgreSQL connection URL
     pub database_url: String,
-    pub http_addr: Option<SocketAddr>,
-    pub grpc_addr: Option<SocketAddr>,
-    pub worker: WorkerRuntimeConfig,
-}
 
-#[derive(Debug, Clone)]
-pub struct WorkerRuntimeConfig {
+    /// HTTP server bind address
+    pub http_addr: SocketAddr,
+
+    /// gRPC server bind address (for worker bridge)
+    pub grpc_addr: SocketAddr,
+
+    /// Number of Python worker processes
     pub worker_count: usize,
+
+    /// Maximum concurrent action dispatches
     pub max_concurrent: usize,
-    pub user_module: Option<String>,
-    pub poll_interval: Duration,
-    pub batch_size: i64,
+
+    /// Dispatcher poll interval in milliseconds
+    pub poll_interval_ms: u64,
+
+    /// Number of actions to dispatch per poll cycle
+    pub batch_size: i32,
 }
 
-impl AppConfig {
-    pub fn load() -> Result<Self> {
-        if let Some(path) = hydrate_env_from_files()? {
-            info!(env_file = %path.display(), "loaded configuration from env file");
-        }
-        let database_url = env::var("DATABASE_URL")
-            .context("DATABASE_URL missing; set it in the environment or .env file")?;
-        let http_addr = parse_socket_addr_from_env(HTTP_ADDR_ENV)?;
-        let grpc_addr = parse_socket_addr_from_env(GRPC_ADDR_ENV)?;
-        let worker = WorkerRuntimeConfig::load()?;
+impl Config {
+    /// Load configuration from environment variables
+    ///
+    /// Loads `.env` file if present, then reads from environment.
+    pub fn from_env() -> Result<Self> {
+        // Load .env file if it exists
+        dotenvy::dotenv().ok();
+
+        let database_url =
+            env::var("DATABASE_URL").context("DATABASE_URL environment variable is required")?;
+
+        let http_addr =
+            env::var("RAPPEL_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:24117".to_string());
+        let http_addr =
+            SocketAddr::from_str(&http_addr).context("invalid RAPPEL_HTTP_ADDR format")?;
+
+        let grpc_addr = match env::var("RAPPEL_GRPC_ADDR") {
+            Ok(s) => SocketAddr::from_str(&s).context("invalid RAPPEL_GRPC_ADDR format")?,
+            Err(_) => {
+                let mut addr = http_addr;
+                addr.set_port(http_addr.port() + 1);
+                addr
+            }
+        };
+
+        let worker_count = env::var("RAPPEL_WORKER_COUNT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(num_cpus::get);
+
+        let max_concurrent = env::var("RAPPEL_MAX_CONCURRENT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32);
+
+        let poll_interval_ms = env::var("RAPPEL_POLL_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+
+        let batch_size = env::var("RAPPEL_BATCH_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+
         Ok(Self {
             database_url,
             http_addr,
             grpc_addr,
-            worker,
-        })
-    }
-}
-
-fn hydrate_env_from_files() -> Result<Option<PathBuf>> {
-    let mut current = env::current_dir().context("failed to resolve current directory")?;
-    loop {
-        let candidate = current.join(DOTENV_FILENAME);
-        if candidate.is_file() {
-            load_env_file(&candidate)?;
-            return Ok(Some(candidate));
-        }
-        if !current.pop() {
-            break;
-        }
-    }
-    Ok(None)
-}
-
-fn load_env_file(path: &Path) -> Result<()> {
-    for entry in from_path_iter(path)? {
-        let (key, value) = entry?;
-        if env::var_os(&key).is_some() {
-            continue;
-        }
-        // SAFETY: set_var is unsafe because callers must avoid concurrent mutations.
-        // Configuration loading happens during startup before any worker threads spawn.
-        unsafe {
-            env::set_var(&key, &value);
-        }
-    }
-    Ok(())
-}
-
-fn parse_socket_addr_from_env(key: &str) -> Result<Option<SocketAddr>> {
-    let value = match env::var(key) {
-        Ok(raw) => raw,
-        Err(_) => return Ok(None),
-    };
-    let addr = value
-        .parse::<SocketAddr>()
-        .with_context(|| format!("{key} must be a valid socket address, e.g. 0.0.0.0:1234"))?;
-    Ok(Some(addr))
-}
-
-impl WorkerRuntimeConfig {
-    fn load() -> Result<Self> {
-        let worker_count = match env::var(WORKER_COUNT_ENV) {
-            Ok(raw) => {
-                let parsed = raw
-                    .parse::<usize>()
-                    .with_context(|| format!("{WORKER_COUNT_ENV} must be a positive integer"))?;
-                if parsed == 0 {
-                    return Err(anyhow!(
-                        "{WORKER_COUNT_ENV} must be greater than zero when provided"
-                    ));
-                }
-                parsed
-            }
-            Err(_) => num_cpus::get().max(1),
-        };
-        let max_concurrent = match env::var(WORKER_MAX_CONCURRENT_ENV) {
-            Ok(raw) => {
-                let parsed = raw.parse::<usize>().with_context(|| {
-                    format!("{WORKER_MAX_CONCURRENT_ENV} must be a positive integer")
-                })?;
-                if parsed == 0 {
-                    return Err(anyhow!(
-                        "{WORKER_MAX_CONCURRENT_ENV} must be greater than zero when provided"
-                    ));
-                }
-                parsed
-            }
-            Err(_) => 32,
-        };
-        let poll_interval_ms = match env::var(WORKER_POLL_INTERVAL_ENV) {
-            Ok(raw) => {
-                let parsed = raw.parse::<u64>().with_context(|| {
-                    format!("{WORKER_POLL_INTERVAL_ENV} must be a positive integer in milliseconds")
-                })?;
-                if parsed == 0 {
-                    return Err(anyhow!(
-                        "{WORKER_POLL_INTERVAL_ENV} must be greater than zero when provided"
-                    ));
-                }
-                parsed
-            }
-            Err(_) => 100,
-        };
-        let batch_size = match env::var(WORKER_BATCH_SIZE_ENV) {
-            Ok(raw) => {
-                let parsed = raw.parse::<i64>().with_context(|| {
-                    format!("{WORKER_BATCH_SIZE_ENV} must be a positive integer")
-                })?;
-                if parsed <= 0 {
-                    return Err(anyhow!(
-                        "{WORKER_BATCH_SIZE_ENV} must be greater than zero when provided"
-                    ));
-                }
-                parsed
-            }
-            Err(_) => 100,
-        };
-        Ok(Self {
             worker_count,
             max_concurrent,
-            user_module: env::var(WORKER_USER_MODULE_ENV).ok(),
-            poll_interval: Duration::from_millis(poll_interval_ms),
+            poll_interval_ms,
             batch_size,
         })
+    }
+
+    /// Create a test configuration with defaults
+    #[cfg(test)]
+    pub fn test_config(database_url: &str) -> Self {
+        Self {
+            database_url: database_url.to_string(),
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            grpc_addr: "127.0.0.1:0".parse().unwrap(),
+            worker_count: 2,
+            max_concurrent: 10,
+            poll_interval_ms: 50,
+            batch_size: 10,
+        }
+    }
+}
+
+/// Get the database URL from environment
+pub fn database_url() -> Result<String> {
+    dotenvy::dotenv().ok();
+    env::var("DATABASE_URL").context("DATABASE_URL environment variable is required")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_grpc_port() {
+        // When GRPC addr not set, it should be HTTP port + 1
+        let http_addr: SocketAddr = "127.0.0.1:24117".parse().unwrap();
+        let expected_grpc: SocketAddr = "127.0.0.1:24118".parse().unwrap();
+
+        let mut grpc_addr = http_addr;
+        grpc_addr.set_port(http_addr.port() + 1);
+
+        assert_eq!(grpc_addr, expected_grpc);
     }
 }

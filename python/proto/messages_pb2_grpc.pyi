@@ -28,6 +28,84 @@ class _ServicerContext(grpc.ServicerContext, grpc.aio.ServicerContext):  # type:
 
 GRPC_GENERATED_VERSION: str
 GRPC_VERSION: str
+_WorkerBridgeAttachType = typing_extensions.TypeVar(
+    "_WorkerBridgeAttachType",
+    grpc.StreamStreamMultiCallable[
+        messages_pb2.Envelope,
+        messages_pb2.Envelope,
+    ],
+    grpc.aio.StreamStreamMultiCallable[
+        messages_pb2.Envelope,
+        messages_pb2.Envelope,
+    ],
+    default=grpc.StreamStreamMultiCallable[
+        messages_pb2.Envelope,
+        messages_pb2.Envelope,
+    ],
+)
+
+class WorkerBridgeStub(typing.Generic[_WorkerBridgeAttachType]):
+    """=============================================================================
+    gRPC Service Definitions
+    =============================================================================
+
+    Bidirectional streaming service for worker communication.
+    Workers connect and maintain a persistent stream for action dispatch/results.
+    """
+
+    @typing.overload
+    def __init__(
+        self: WorkerBridgeStub[
+            grpc.StreamStreamMultiCallable[
+                messages_pb2.Envelope,
+                messages_pb2.Envelope,
+            ],
+        ],
+        channel: grpc.Channel,
+    ) -> None: ...
+    @typing.overload
+    def __init__(
+        self: WorkerBridgeStub[
+            grpc.aio.StreamStreamMultiCallable[
+                messages_pb2.Envelope,
+                messages_pb2.Envelope,
+            ],
+        ],
+        channel: grpc.aio.Channel,
+    ) -> None: ...
+
+    Attach: _WorkerBridgeAttachType
+
+WorkerBridgeAsyncStub: typing_extensions.TypeAlias = WorkerBridgeStub[
+    grpc.aio.StreamStreamMultiCallable[
+        messages_pb2.Envelope,
+        messages_pb2.Envelope,
+    ],
+]
+
+class WorkerBridgeServicer(metaclass=abc.ABCMeta):
+    """=============================================================================
+    gRPC Service Definitions
+    =============================================================================
+
+    Bidirectional streaming service for worker communication.
+    Workers connect and maintain a persistent stream for action dispatch/results.
+    """
+
+    @abc.abstractmethod
+    def Attach(
+        self,
+        request_iterator: _MaybeAsyncIterator[messages_pb2.Envelope],
+        context: _ServicerContext,
+    ) -> typing.Union[
+        collections.abc.Iterator[messages_pb2.Envelope],
+        collections.abc.AsyncIterator[messages_pb2.Envelope],
+    ]: ...
+
+def add_WorkerBridgeServicer_to_server(
+    servicer: WorkerBridgeServicer, server: typing.Union[grpc.Server, grpc.aio.Server]
+) -> None: ...
+
 _WorkflowServiceRegisterWorkflowType = typing_extensions.TypeVar(
     "_WorkflowServiceRegisterWorkflowType",
     grpc.UnaryUnaryMultiCallable[
@@ -63,6 +141,8 @@ _WorkflowServiceWaitForInstanceType = typing_extensions.TypeVar(
 class WorkflowServiceStub(
     typing.Generic[_WorkflowServiceRegisterWorkflowType, _WorkflowServiceWaitForInstanceType]
 ):
+    """Workflow management service for client operations."""
+
     @typing.overload
     def __init__(
         self: WorkflowServiceStub[
@@ -108,6 +188,8 @@ WorkflowServiceAsyncStub: typing_extensions.TypeAlias = WorkflowServiceStub[
 ]
 
 class WorkflowServiceServicer(metaclass=abc.ABCMeta):
+    """Workflow management service for client operations."""
+
     @abc.abstractmethod
     def RegisterWorkflow(
         self,
@@ -129,66 +211,4 @@ class WorkflowServiceServicer(metaclass=abc.ABCMeta):
 
 def add_WorkflowServiceServicer_to_server(
     servicer: WorkflowServiceServicer, server: typing.Union[grpc.Server, grpc.aio.Server]
-) -> None: ...
-
-_WorkerBridgeAttachType = typing_extensions.TypeVar(
-    "_WorkerBridgeAttachType",
-    grpc.StreamStreamMultiCallable[
-        messages_pb2.Envelope,
-        messages_pb2.Envelope,
-    ],
-    grpc.aio.StreamStreamMultiCallable[
-        messages_pb2.Envelope,
-        messages_pb2.Envelope,
-    ],
-    default=grpc.StreamStreamMultiCallable[
-        messages_pb2.Envelope,
-        messages_pb2.Envelope,
-    ],
-)
-
-class WorkerBridgeStub(typing.Generic[_WorkerBridgeAttachType]):
-    @typing.overload
-    def __init__(
-        self: WorkerBridgeStub[
-            grpc.StreamStreamMultiCallable[
-                messages_pb2.Envelope,
-                messages_pb2.Envelope,
-            ],
-        ],
-        channel: grpc.Channel,
-    ) -> None: ...
-    @typing.overload
-    def __init__(
-        self: WorkerBridgeStub[
-            grpc.aio.StreamStreamMultiCallable[
-                messages_pb2.Envelope,
-                messages_pb2.Envelope,
-            ],
-        ],
-        channel: grpc.aio.Channel,
-    ) -> None: ...
-
-    Attach: _WorkerBridgeAttachType
-
-WorkerBridgeAsyncStub: typing_extensions.TypeAlias = WorkerBridgeStub[
-    grpc.aio.StreamStreamMultiCallable[
-        messages_pb2.Envelope,
-        messages_pb2.Envelope,
-    ],
-]
-
-class WorkerBridgeServicer(metaclass=abc.ABCMeta):
-    @abc.abstractmethod
-    def Attach(
-        self,
-        request_iterator: _MaybeAsyncIterator[messages_pb2.Envelope],
-        context: _ServicerContext,
-    ) -> typing.Union[
-        collections.abc.Iterator[messages_pb2.Envelope],
-        collections.abc.AsyncIterator[messages_pb2.Envelope],
-    ]: ...
-
-def add_WorkerBridgeServicer_to_server(
-    servicer: WorkerBridgeServicer, server: typing.Union[grpc.Server, grpc.aio.Server]
 ) -> None: ...

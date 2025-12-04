@@ -71,25 +71,25 @@ async def _handle_dispatch(
     await _send_ack(outgoing, envelope)
     dispatch = pb2.ActionDispatch()
     dispatch.ParseFromString(envelope.payload)
-    if dispatch.dispatch is None:
-        raise RuntimeError("action dispatch missing workflow payload")
     timeout_seconds = dispatch.timeout_seconds if dispatch.HasField("timeout_seconds") else 0
 
     worker_start = time.perf_counter_ns()
     success = True
-    action_name = "unknown"
-    execution: workflow_runtime.NodeExecutionResult | None = None
+    action_name = dispatch.action_name
+    execution: workflow_runtime.ActionExecutionResult | None = None
     try:
-        node = dispatch.dispatch.node
-        if node is not None and node.action:
-            action_name = node.action
         if timeout_seconds > 0:
             execution = await asyncio.wait_for(
-                workflow_runtime.execute_node(dispatch.dispatch), timeout=timeout_seconds
+                workflow_runtime.execute_action(dispatch), timeout=timeout_seconds
             )
         else:
-            execution = await workflow_runtime.execute_node(dispatch.dispatch)
-        response_payload = serialize_result_payload(execution.result)
+            execution = await workflow_runtime.execute_action(dispatch)
+
+        if execution.exception:
+            success = False
+            response_payload = serialize_error_payload(action_name, execution.exception)
+        else:
+            response_payload = serialize_result_payload(execution.result)
     except asyncio.TimeoutError:
         success = False
         error = TimeoutError(f"action {action_name} timed out after {timeout_seconds} seconds")
@@ -120,8 +120,6 @@ async def _handle_dispatch(
     response.payload.CopyFrom(response_payload)
     if dispatch.dispatch_token:
         response.dispatch_token = dispatch.dispatch_token
-    if execution is not None and execution.control is not None:
-        response.control.CopyFrom(execution.control)
     response_envelope = pb2.Envelope(
         delivery_id=envelope.delivery_id,
         partition_id=envelope.partition_id,
