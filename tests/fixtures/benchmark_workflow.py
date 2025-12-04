@@ -191,6 +191,73 @@ async def final_summary(
 
 
 # =============================================================================
+# Additional Actions for Complex Workflow
+# =============================================================================
+
+
+@action
+async def compute_hash_for_index(index: int, iterations: int) -> str:
+    """Compute a hash chain for a given index."""
+    seed = ("benchmark_seed_" + str(index)).encode()
+    result = seed
+    for _ in range(iterations):
+        result = hashlib.sha256(result).digest()
+    return result.hex()
+
+
+@action
+async def analyze_hash(hash_value: str) -> dict[str, Any]:
+    """Analyze a hash and return statistics."""
+    # Count leading zeros (simple analysis)
+    leading_zeros = 0
+    for c in hash_value:
+        if c == "0":
+            leading_zeros += 1
+        else:
+            break
+
+    # Compute numeric value of first 8 chars
+    prefix_value = int(hash_value[:8], 16)
+
+    return {
+        "hash": hash_value,
+        "leading_zeros": leading_zeros,
+        "prefix_value": prefix_value,
+        "is_special": leading_zeros >= 2,
+    }
+
+
+@action
+async def process_special_hash(analysis: dict[str, Any]) -> str:
+    """Process a hash that was marked as special."""
+    return "SPECIAL:" + analysis["hash"][:16]
+
+
+@action
+async def process_normal_hash(analysis: dict[str, Any]) -> str:
+    """Process a hash that was not special."""
+    return "NORMAL:" + analysis["hash"][:16]
+
+
+@action
+async def combine_results(results: list[str]) -> dict[str, Any]:
+    """Combine all processed results into a final summary."""
+    special_count = sum(1 for r in results if r.startswith("SPECIAL:"))
+    normal_count = sum(1 for r in results if r.startswith("NORMAL:"))
+
+    # Create a combined hash of all results
+    combined = "".join(results)
+    final_hash = hashlib.sha256(combined.encode()).hexdigest()
+
+    return {
+        "total_processed": len(results),
+        "special_count": special_count,
+        "normal_count": normal_count,
+        "final_hash": final_hash,
+    }
+
+
+# =============================================================================
 # Benchmark Workflows
 # =============================================================================
 
@@ -198,27 +265,43 @@ async def final_summary(
 @workflow
 class BenchmarkFanOutWorkflow(Workflow):
     """
-    Simple fan-out/fan-in benchmark.
+    Fan-out/fan-in benchmark with conditional processing.
 
-    Spawns parallel hash chains based on provided seeds, then aggregates results.
-    Uses list comprehension pattern for parallel execution.
+    This workflow demonstrates:
+    1. Spread over a range (parallel fan-out)
+    2. Sequential processing with conditional branching
+    3. Final aggregation (fan-in)
 
     Args:
-        seeds: List of seed strings for hash chains (e.g., ["bench_0", "bench_1", ...])
-        hash_iterations: Number of hash iterations per chain
+        count: Number of parallel hash computations
+        iterations: Number of hash iterations per computation
     """
 
     async def run(
         self,
-        seeds: list,
-        hash_iterations: int = 1000,
-    ) -> str:
-        # Fan-out: spawn parallel hash computations using list comprehension
-        results = await asyncio.gather(*[
-            hash_chain(seed=seed, iterations=hash_iterations)
-            for seed in seeds
+        indices: list[int],
+        iterations: int = 100,
+    ) -> dict[str, Any]:
+        # Fan-out: compute hashes in parallel over the range
+        hashes = await asyncio.gather(*[
+            compute_hash_for_index(index=i, iterations=iterations)
+            for i in indices
         ])
 
-        # Fan-in: aggregate results
-        final = await aggregate_hashes(list(results))
-        return final
+        # Process each hash sequentially with conditional logic
+        processed = []
+        for hash_value in hashes:
+            # Analyze the hash
+            analysis = await analyze_hash(hash_value)
+
+            # Conditional processing based on analysis
+            if analysis["is_special"]:
+                result = await process_special_hash(analysis)
+            else:
+                result = await process_normal_hash(analysis)
+
+            processed.append(result)
+
+        # Fan-in: combine all results
+        summary = await combine_results(processed)
+        return summary
