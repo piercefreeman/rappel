@@ -683,7 +683,11 @@ fn execute_inline_node(node: &DAGNode, _scope: &InlineScope) -> JsonValue {
 /// Evaluate a guard expression to determine if a branch should be taken.
 ///
 /// Returns true if the guard passes (branch should be taken), false otherwise.
-fn evaluate_guard(guard_expr: Option<&ast::Expr>, scope: &InlineScope, successor_id: &str) -> bool {
+pub fn evaluate_guard(
+    guard_expr: Option<&ast::Expr>,
+    scope: &InlineScope,
+    successor_id: &str,
+) -> bool {
     let Some(guard) = guard_expr else {
         // No guard expression - always pass
         return true;

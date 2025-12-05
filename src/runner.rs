@@ -49,7 +49,7 @@ use prost::Message;
 
 use crate::{
     ast_evaluator::{EvaluationError, ExpressionEvaluator, Scope},
-    completion::{analyze_subgraph, execute_inline_subgraph},
+    completion::{analyze_subgraph, evaluate_guard, execute_inline_subgraph},
     dag::{DAG, DAGConverter, DAGNode, EdgeType},
     dag_state::{DAGHelper, ExecutionMode},
     db::{
@@ -2379,6 +2379,16 @@ impl DAGRunner {
             "input node successors"
         );
         for successor in initial_successors {
+            // Evaluate guard if present - skip branch if guard fails
+            if let Some(ref guard) = successor.guard_expr
+                && !evaluate_guard(Some(guard), &scope, &successor.node_id)
+            {
+                debug!(
+                    successor_id = %successor.node_id,
+                    "skipping initial successor due to failed guard"
+                );
+                continue;
+            }
             queue.push_back(successor.node_id);
         }
 
@@ -2465,6 +2475,16 @@ impl DAGRunner {
                         "skipping inline node during start_instance"
                     );
                     for successor in inline_successors {
+                        // Evaluate guard if present - skip branch if guard fails
+                        if let Some(ref guard) = successor.guard_expr
+                            && !evaluate_guard(Some(guard), &scope, &successor.node_id)
+                        {
+                            debug!(
+                                successor_id = %successor.node_id,
+                                "skipping successor due to failed guard during start_instance"
+                            );
+                            continue;
+                        }
                         if !visited.contains(&successor.node_id) {
                             queue.push_back(successor.node_id);
                         }

@@ -171,7 +171,23 @@ async def step_reverse(text: str) -> str:
 async def step_add_stars(text: str) -> str:
     """Add stars around the text."""
     await asyncio.sleep(0.1)
-    return f"*** {text} ***"
+    return "*** " + text + " ***"
+
+
+@action
+async def build_chain_result(
+    original: str, step1: str, step2: str, step3: str
+) -> ChainResult:
+    """Build the chain result with formatted steps."""
+    return ChainResult(
+        original=original,
+        steps=[
+            "uppercase: " + step1,
+            "reverse: " + step2,
+            "stars: " + step3,
+        ],
+        final=step3,
+    )
 
 
 # =============================================================================
@@ -180,24 +196,36 @@ async def step_add_stars(text: str) -> str:
 
 
 @action
-async def evaluate_high(value: int) -> str:
+async def evaluate_high(value: int) -> BranchResult:
     """Handle high values (>= 75)."""
     await asyncio.sleep(0.1)
-    return f"High value detected: {value} is in the top tier!"
+    return BranchResult(
+        value=value,
+        branch_taken="high",
+        message="High value detected: " + str(value) + " is in the top tier!",
+    )
 
 
 @action
-async def evaluate_medium(value: int) -> str:
+async def evaluate_medium(value: int) -> BranchResult:
     """Handle medium values (25-74)."""
     await asyncio.sleep(0.1)
-    return f"Medium value: {value} is in the middle range."
+    return BranchResult(
+        value=value,
+        branch_taken="medium",
+        message="Medium value: " + str(value) + " is in the middle range.",
+    )
 
 
 @action
-async def evaluate_low(value: int) -> str:
+async def evaluate_low(value: int) -> BranchResult:
     """Handle low values (< 25)."""
     await asyncio.sleep(0.1)
-    return f"Low value: {value} is in the bottom tier."
+    return BranchResult(
+        value=value,
+        branch_taken="low",
+        message="Low value: " + str(value) + " is in the bottom tier.",
+    )
 
 
 # =============================================================================
@@ -318,25 +346,17 @@ class SequentialChainWorkflow(Workflow):
     """
 
     async def run(self, text: str) -> ChainResult:
-        steps = []
-
         # Step 1: Uppercase
         step1 = await step_uppercase(text)
-        steps.append(f"uppercase: {step1}")
 
         # Step 2: Reverse
         step2 = await step_reverse(step1)
-        steps.append(f"reverse: {step2}")
 
         # Step 3: Add stars
         step3 = await step_add_stars(step2)
-        steps.append(f"stars: {step3}")
 
-        return ChainResult(
-            original=text,
-            steps=steps,
-            final=step3,
-        )
+        # Build result in action (f-strings not supported in workflow)
+        return await build_chain_result(text, step1, step2, step3)
 
 
 @workflow
@@ -350,20 +370,11 @@ class ConditionalBranchWorkflow(Workflow):
 
     async def run(self, value: int) -> BranchResult:
         if value >= 75:
-            message = await evaluate_high(value)
-            branch = "high"
+            return await evaluate_high(value)
         elif value >= 25:
-            message = await evaluate_medium(value)
-            branch = "medium"
+            return await evaluate_medium(value)
         else:
-            message = await evaluate_low(value)
-            branch = "low"
-
-        return BranchResult(
-            value=value,
-            branch_taken=branch,
-            message=message,
-        )
+            return await evaluate_low(value)
 
 
 @workflow

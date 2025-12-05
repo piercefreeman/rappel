@@ -1484,6 +1484,13 @@ impl DAGConverter {
         // Get the guard expression for the if branch
         let guard_expr = cond.if_branch.as_ref().and_then(|b| b.condition.clone());
 
+        // Track all branches (if, elif*, else) for proper guard composition
+        // Each branch needs a compound guard that is:
+        // - if: guard
+        // - elif: NOT(if_guard) AND NOT(elif1_guard) AND ... AND elif_guard
+        // - else: NOT(if_guard) AND NOT(elif1_guard) AND ... AND NOT(elifN_guard)
+        let mut prior_guards: Vec<ast::Expr> = Vec::new();
+
         // Process then branch (SingleCallBody - exactly one call)
         if let Some(if_branch) = &cond.if_branch
             && let Some(body) = &if_branch.body
@@ -1493,6 +1500,31 @@ impl DAGConverter {
                 then_first = Some(node_ids[0].clone());
                 then_last = Some(node_ids.last().unwrap().clone());
                 result_nodes.extend(node_ids);
+            }
+        }
+
+        // Track if guard for elif/else composition
+        if let Some(ref guard) = guard_expr {
+            prior_guards.push(guard.clone());
+        }
+
+        // Process elif branches
+        let mut elif_branches_info: Vec<(Option<String>, Option<String>, ast::Expr)> = Vec::new();
+        for elif_branch in &cond.elif_branches {
+            if let Some(body) = &elif_branch.body {
+                let node_ids = self.convert_single_call_body(body);
+                let elif_first = node_ids.first().cloned();
+                let elif_last = node_ids.last().cloned();
+                result_nodes.extend(node_ids);
+
+                // Build compound guard: NOT(prior_guard1) AND NOT(prior_guard2) AND ... AND elif_condition
+                let elif_condition = elif_branch.condition.clone();
+                if let Some(elif_cond) = elif_condition {
+                    let compound_guard = self.build_compound_guard(&prior_guards, Some(&elif_cond));
+                    elif_branches_info.push((elif_first, elif_last, compound_guard));
+                    // Add this elif's condition to prior guards for subsequent branches
+                    prior_guards.push(elif_cond);
+                }
             }
         }
 
@@ -1535,29 +1567,31 @@ impl DAGConverter {
             }
         }
 
-        // Connect branch node to else branch with negated guard
-        if let Some(ref else_target) = else_first {
-            if let Some(ref guard) = guard_expr {
-                // Create negated guard: not (original_condition)
-                let negated_guard = ast::Expr {
-                    span: None,
-                    kind: Some(ast::expr::Kind::UnaryOp(Box::new(ast::UnaryOp {
-                        op: ast::UnaryOperator::UnaryOpNot as i32,
-                        operand: Some(Box::new(guard.clone())),
-                    }))),
-                };
+        // Connect branch node to elif branches with compound guards
+        for (elif_first, elif_last, compound_guard) in &elif_branches_info {
+            if let Some(elif_target) = elif_first {
                 self.dag.add_edge(DAGEdge::state_machine_with_guard(
                     branch_id.clone(),
-                    else_target.clone(),
-                    negated_guard,
-                ));
-            } else {
-                self.dag.add_edge(DAGEdge::state_machine_with_condition(
-                    branch_id.clone(),
-                    else_target.clone(),
-                    "else",
+                    elif_target.clone(),
+                    compound_guard.clone(),
                 ));
             }
+            // Connect elif end to join
+            if let Some(elif_end) = elif_last {
+                self.dag
+                    .add_edge(DAGEdge::state_machine(elif_end.clone(), join_id.clone()));
+            }
+        }
+
+        // Connect branch node to else branch with compound negated guard
+        if let Some(ref else_target) = else_first {
+            // Else guard is: NOT(if_guard) AND NOT(elif1_guard) AND ... AND NOT(elifN_guard)
+            let else_guard = self.build_compound_guard(&prior_guards, None);
+            self.dag.add_edge(DAGEdge::state_machine_with_guard(
+                branch_id.clone(),
+                else_target.clone(),
+                else_guard,
+            ));
         }
 
         // Handle missing branches - connect directly to join
@@ -1571,20 +1605,12 @@ impl DAGConverter {
             }
         }
         if else_first.is_none() && cond.else_branch.is_some() {
-            if let Some(ref guard) = guard_expr {
-                let negated_guard = ast::Expr {
-                    span: None,
-                    kind: Some(ast::expr::Kind::UnaryOp(Box::new(ast::UnaryOp {
-                        op: ast::UnaryOperator::UnaryOpNot as i32,
-                        operand: Some(Box::new(guard.clone())),
-                    }))),
-                };
-                self.dag.add_edge(DAGEdge::state_machine_with_guard(
-                    branch_id.clone(),
-                    join_id.clone(),
-                    negated_guard,
-                ));
-            }
+            let else_guard = self.build_compound_guard(&prior_guards, None);
+            self.dag.add_edge(DAGEdge::state_machine_with_guard(
+                branch_id.clone(),
+                join_id.clone(),
+                else_guard,
+            ));
         }
 
         // Connect branch ends to join
@@ -1597,6 +1623,60 @@ impl DAGConverter {
         }
 
         result_nodes
+    }
+
+    /// Build a compound guard expression from prior guards and an optional current condition.
+    ///
+    /// For elif branches: NOT(prior1) AND NOT(prior2) AND ... AND current_condition
+    /// For else branches: NOT(prior1) AND NOT(prior2) AND ... (no current condition)
+    fn build_compound_guard(
+        &self,
+        prior_guards: &[ast::Expr],
+        current_condition: Option<&ast::Expr>,
+    ) -> ast::Expr {
+        // Start with negated prior guards
+        let mut parts: Vec<ast::Expr> = prior_guards
+            .iter()
+            .map(|guard| ast::Expr {
+                span: None,
+                kind: Some(ast::expr::Kind::UnaryOp(Box::new(ast::UnaryOp {
+                    op: ast::UnaryOperator::UnaryOpNot as i32,
+                    operand: Some(Box::new(guard.clone())),
+                }))),
+            })
+            .collect();
+
+        // Add the current condition if provided (for elif, not for else)
+        if let Some(cond) = current_condition {
+            parts.push(cond.clone());
+        }
+
+        // Combine with AND operators
+        if parts.is_empty() {
+            // Shouldn't happen, but return a true literal as fallback
+            ast::Expr {
+                span: None,
+                kind: Some(ast::expr::Kind::Literal(ast::Literal {
+                    value: Some(ast::literal::Value::BoolValue(true)),
+                })),
+            }
+        } else if parts.len() == 1 {
+            parts.remove(0)
+        } else {
+            // Build left-associative AND chain: ((a AND b) AND c) AND d
+            let mut result = parts.remove(0);
+            for part in parts {
+                result = ast::Expr {
+                    span: None,
+                    kind: Some(ast::expr::Kind::BinaryOp(Box::new(ast::BinaryOp {
+                        left: Some(Box::new(result)),
+                        op: ast::BinaryOperator::BinaryOpAnd as i32,
+                        right: Some(Box::new(part)),
+                    }))),
+                };
+            }
+            result
+        }
     }
 
     /// Convert a try/except block
