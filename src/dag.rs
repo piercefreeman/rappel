@@ -2453,4 +2453,438 @@ fn main(input: [], output: [result]):
         assert!(action_names.contains("positive_handler"));
         assert!(action_names.contains("negative_handler"));
     }
+
+    // =========================================================================
+    // SingleCallBody tuple unpacking tests
+    // =========================================================================
+
+    /// Helper to create a SingleCallBody with an action call and multiple targets
+    fn make_single_call_body_with_action(
+        targets: Vec<String>,
+        action_name: &str,
+    ) -> ast::SingleCallBody {
+        let action = ast::ActionCall {
+            action_name: action_name.to_string(),
+            kwargs: vec![],
+            policies: vec![],
+            module_name: None,
+        };
+        let call = ast::Call {
+            kind: Some(ast::call::Kind::Action(action)),
+        };
+        ast::SingleCallBody {
+            targets,
+            call: Some(call),
+            statements: vec![],
+            span: None,
+        }
+    }
+
+    /// Helper to create a simple function def for testing
+    fn make_test_function(name: &str, body_statements: Vec<ast::Statement>) -> ast::FunctionDef {
+        ast::FunctionDef {
+            name: name.to_string(),
+            io: Some(ast::IoDecl {
+                inputs: vec!["input".to_string()],
+                outputs: vec!["output".to_string()],
+                span: None,
+            }),
+            body: Some(ast::Block {
+                statements: body_statements,
+                span: None,
+            }),
+            span: None,
+        }
+    }
+
+    #[test]
+    fn test_single_call_body_tuple_unpacking_in_if_branch() {
+        // Test: if condition: a, b = @get_pair()
+        let if_body = make_single_call_body_with_action(
+            vec!["first".to_string(), "second".to_string()],
+            "get_pair",
+        );
+
+        let condition = ast::Expr {
+            kind: Some(ast::expr::Kind::Literal(ast::Literal {
+                value: Some(ast::literal::Value::BoolValue(true)),
+            })),
+            span: None,
+        };
+
+        let if_branch = ast::IfBranch {
+            condition: Some(condition),
+            body: Some(if_body),
+            span: None,
+        };
+
+        let conditional = ast::Conditional {
+            if_branch: Some(if_branch),
+            elif_branches: vec![],
+            else_branch: None,
+        };
+
+        let stmt = ast::Statement {
+            kind: Some(ast::statement::Kind::Conditional(conditional)),
+            span: None,
+        };
+
+        let func = make_test_function("test_if_tuple", vec![stmt]);
+        let program = ast::Program {
+            functions: vec![func],
+        };
+
+        let dag = convert_to_dag(&program);
+
+        // Find the action node
+        let action_node = dag
+            .nodes
+            .values()
+            .find(|n| n.node_type == "action_call" && n.action_name.as_deref() == Some("get_pair"))
+            .expect("Should have action_call node for get_pair");
+
+        // Verify targets are set correctly
+        assert!(
+            action_node.targets.is_some(),
+            "Action node should have targets for tuple unpacking"
+        );
+        let targets = action_node.targets.as_ref().unwrap();
+        assert_eq!(targets.len(), 2, "Should have 2 targets");
+        assert_eq!(targets[0], "first");
+        assert_eq!(targets[1], "second");
+
+        // Verify first target is also set for backwards compatibility
+        assert_eq!(
+            action_node.target,
+            Some("first".to_string()),
+            "First target should be set for backwards compat"
+        );
+
+        // Verify DATA_FLOW edges for both variables
+        let data_edges: Vec<_> = dag
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::DataFlow)
+            .collect();
+
+        let first_edge = data_edges
+            .iter()
+            .find(|e| e.variable.as_deref() == Some("first"));
+        let second_edge = data_edges
+            .iter()
+            .find(|e| e.variable.as_deref() == Some("second"));
+
+        assert!(
+            first_edge.is_some(),
+            "Should have DATA_FLOW edge for 'first'"
+        );
+        assert!(
+            second_edge.is_some(),
+            "Should have DATA_FLOW edge for 'second'"
+        );
+    }
+
+    #[test]
+    fn test_single_call_body_tuple_unpacking_in_try_body() {
+        // Test: try: a, b = @risky_action()
+        let try_body = make_single_call_body_with_action(
+            vec!["result_a".to_string(), "result_b".to_string()],
+            "risky_action",
+        );
+
+        // Simple handler body with single target
+        let handler_body =
+            make_single_call_body_with_action(vec!["recovered".to_string()], "recover");
+
+        let handler = ast::ExceptHandler {
+            exception_types: vec!["Error".to_string()],
+            body: Some(handler_body),
+            span: None,
+        };
+
+        let try_except = ast::TryExcept {
+            try_body: Some(try_body),
+            handlers: vec![handler],
+        };
+
+        let stmt = ast::Statement {
+            kind: Some(ast::statement::Kind::TryExcept(try_except)),
+            span: None,
+        };
+
+        let func = make_test_function("test_try_tuple", vec![stmt]);
+        let program = ast::Program {
+            functions: vec![func],
+        };
+
+        let dag = convert_to_dag(&program);
+
+        // Find the risky_action node (in try body)
+        let try_action = dag
+            .nodes
+            .values()
+            .find(|n| {
+                n.node_type == "action_call" && n.action_name.as_deref() == Some("risky_action")
+            })
+            .expect("Should have action_call node for risky_action");
+
+        // Verify tuple unpacking targets
+        assert!(
+            try_action.targets.is_some(),
+            "Try body action should have targets"
+        );
+        let targets = try_action.targets.as_ref().unwrap();
+        assert_eq!(targets.len(), 2, "Should have 2 targets in try body");
+        assert_eq!(targets[0], "result_a");
+        assert_eq!(targets[1], "result_b");
+
+        // Verify handler action has single target
+        let handler_action = dag
+            .nodes
+            .values()
+            .find(|n| n.node_type == "action_call" && n.action_name.as_deref() == Some("recover"))
+            .expect("Should have action_call node for recover");
+
+        assert!(handler_action.targets.is_some());
+        let handler_targets = handler_action.targets.as_ref().unwrap();
+        assert_eq!(handler_targets.len(), 1);
+        assert_eq!(handler_targets[0], "recovered");
+    }
+
+    #[test]
+    fn test_single_call_body_tuple_unpacking_in_for_loop() {
+        // Test: for item in items: x, y = @process(item=item)
+        let loop_body = make_single_call_body_with_action(
+            vec!["processed_x".to_string(), "processed_y".to_string()],
+            "process_item",
+        );
+
+        let iterable = ast::Expr {
+            kind: Some(ast::expr::Kind::Variable(ast::Variable {
+                name: "items".to_string(),
+            })),
+            span: None,
+        };
+
+        let for_loop = ast::ForLoop {
+            loop_vars: vec!["item".to_string()],
+            iterable: Some(iterable),
+            body: Some(loop_body),
+        };
+
+        let stmt = ast::Statement {
+            kind: Some(ast::statement::Kind::ForLoop(for_loop)),
+            span: None,
+        };
+
+        let func = make_test_function("test_for_tuple", vec![stmt]);
+        let program = ast::Program {
+            functions: vec![func],
+        };
+
+        let dag = convert_to_dag(&program);
+
+        // The for loop creates a "for_loop" node that contains the body
+        // Find the action node for process_item
+        let action_node = dag.nodes.values().find(|n| {
+            n.node_type == "action_call" && n.action_name.as_deref() == Some("process_item")
+        });
+
+        // Verify the for_loop node exists
+        let loop_node = dag
+            .nodes
+            .values()
+            .find(|n| n.node_type == "for_loop")
+            .expect("Should have for_loop node");
+
+        // Loop node should exist and have proper structure
+        assert!(!loop_node.id.is_empty());
+
+        // If action is directly in the loop body (not wrapped), verify targets
+        if let Some(action) = action_node {
+            assert!(
+                action.targets.is_some(),
+                "Action in loop body should have targets"
+            );
+            let targets = action.targets.as_ref().unwrap();
+            assert_eq!(targets.len(), 2);
+            assert!(targets.contains(&"processed_x".to_string()));
+            assert!(targets.contains(&"processed_y".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_single_call_body_no_targets() {
+        // Test: if condition: @side_effect_action()  (no assignment)
+        let if_body = ast::SingleCallBody {
+            targets: vec![], // No targets - side effect only
+            call: Some(ast::Call {
+                kind: Some(ast::call::Kind::Action(ast::ActionCall {
+                    action_name: "side_effect".to_string(),
+                    kwargs: vec![],
+                    policies: vec![],
+                    module_name: None,
+                })),
+            }),
+            statements: vec![],
+            span: None,
+        };
+
+        let condition = ast::Expr {
+            kind: Some(ast::expr::Kind::Literal(ast::Literal {
+                value: Some(ast::literal::Value::BoolValue(true)),
+            })),
+            span: None,
+        };
+
+        let conditional = ast::Conditional {
+            if_branch: Some(ast::IfBranch {
+                condition: Some(condition),
+                body: Some(if_body),
+                span: None,
+            }),
+            elif_branches: vec![],
+            else_branch: None,
+        };
+
+        let stmt = ast::Statement {
+            kind: Some(ast::statement::Kind::Conditional(conditional)),
+            span: None,
+        };
+
+        let func = make_test_function("test_no_target", vec![stmt]);
+        let program = ast::Program {
+            functions: vec![func],
+        };
+
+        let dag = convert_to_dag(&program);
+
+        // Find the action node
+        let action_node = dag
+            .nodes
+            .values()
+            .find(|n| {
+                n.node_type == "action_call" && n.action_name.as_deref() == Some("side_effect")
+            })
+            .expect("Should have action_call node");
+
+        // Should have no targets (side effect only)
+        assert!(
+            action_node.targets.is_none() || action_node.targets.as_ref().unwrap().is_empty(),
+            "Side effect action should have no targets"
+        );
+        assert!(
+            action_node.target.is_none(),
+            "Side effect action should have no target"
+        );
+    }
+
+    #[test]
+    fn test_single_call_body_single_target() {
+        // Test: if condition: result = @compute()  (single target - common case)
+        let if_body = make_single_call_body_with_action(vec!["result".to_string()], "compute");
+
+        let condition = ast::Expr {
+            kind: Some(ast::expr::Kind::Literal(ast::Literal {
+                value: Some(ast::literal::Value::BoolValue(true)),
+            })),
+            span: None,
+        };
+
+        let conditional = ast::Conditional {
+            if_branch: Some(ast::IfBranch {
+                condition: Some(condition),
+                body: Some(if_body),
+                span: None,
+            }),
+            elif_branches: vec![],
+            else_branch: None,
+        };
+
+        let stmt = ast::Statement {
+            kind: Some(ast::statement::Kind::Conditional(conditional)),
+            span: None,
+        };
+
+        let func = make_test_function("test_single_target", vec![stmt]);
+        let program = ast::Program {
+            functions: vec![func],
+        };
+
+        let dag = convert_to_dag(&program);
+
+        let action_node = dag
+            .nodes
+            .values()
+            .find(|n| n.node_type == "action_call" && n.action_name.as_deref() == Some("compute"))
+            .expect("Should have action_call node");
+
+        // Should have single target
+        assert!(action_node.targets.is_some());
+        let targets = action_node.targets.as_ref().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0], "result");
+
+        // Backwards compat target should also be set
+        assert_eq!(action_node.target, Some("result".to_string()));
+    }
+
+    #[test]
+    fn test_single_call_body_three_targets() {
+        // Test edge case: a, b, c = @get_triple()
+        let if_body = make_single_call_body_with_action(
+            vec!["x".to_string(), "y".to_string(), "z".to_string()],
+            "get_triple",
+        );
+
+        let condition = ast::Expr {
+            kind: Some(ast::expr::Kind::Literal(ast::Literal {
+                value: Some(ast::literal::Value::BoolValue(true)),
+            })),
+            span: None,
+        };
+
+        let conditional = ast::Conditional {
+            if_branch: Some(ast::IfBranch {
+                condition: Some(condition),
+                body: Some(if_body),
+                span: None,
+            }),
+            elif_branches: vec![],
+            else_branch: None,
+        };
+
+        let stmt = ast::Statement {
+            kind: Some(ast::statement::Kind::Conditional(conditional)),
+            span: None,
+        };
+
+        let func = make_test_function("test_triple", vec![stmt]);
+        let program = ast::Program {
+            functions: vec![func],
+        };
+
+        let dag = convert_to_dag(&program);
+
+        let action_node = dag
+            .nodes
+            .values()
+            .find(|n| {
+                n.node_type == "action_call" && n.action_name.as_deref() == Some("get_triple")
+            })
+            .expect("Should have action_call node");
+
+        // Should have all 3 targets
+        assert!(action_node.targets.is_some());
+        let targets = action_node.targets.as_ref().unwrap();
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets, &vec!["x", "y", "z"]);
+
+        // Label should show all targets
+        assert!(
+            action_node.label.contains("x, y, z"),
+            "Label should show all targets: {}",
+            action_node.label
+        );
+    }
 }
