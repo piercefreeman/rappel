@@ -6,12 +6,15 @@
 
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet, VecDeque};
+use tracing::{debug, warn};
 
 use uuid::Uuid;
 
+use crate::ast_evaluator::ExpressionEvaluator;
 use crate::dag::{DAG, DAGNode, EdgeType};
 use crate::dag_state::DAGHelper;
 use crate::db::{ActionId, WorkflowInstanceId};
+use crate::parser::ast;
 
 // ============================================================================
 // Subgraph Analysis Types
@@ -412,6 +415,11 @@ pub enum CompletionError {
 /// 3. Builds readiness increments for frontier nodes
 /// 4. Determines if any frontier is the workflow output
 ///
+/// The subgraph provides the maximum possible reachable nodes. This function
+/// does a BFS traversal, evaluating guard expressions to determine which
+/// branches are actually taken. Only nodes reachable via passing guards
+/// are executed and have their frontiers processed.
+///
 /// Returns a CompletionPlan ready to be executed as a single transaction.
 pub fn execute_inline_subgraph(
     completed_node_id: &str,
@@ -422,6 +430,7 @@ pub fn execute_inline_subgraph(
     instance_id: WorkflowInstanceId,
 ) -> Result<CompletionPlan, CompletionError> {
     let mut plan = CompletionPlan::new(completed_node_id.to_string());
+    let helper = DAGHelper::new(dag);
 
     // Initialize inline scope with completed node's result
     let mut inline_scope: InlineScope = HashMap::new();
@@ -438,31 +447,100 @@ pub fn execute_inline_subgraph(
         }
     }
 
-    // Execute inline nodes in order, accumulating results
-    for node_id in &subgraph.inline_nodes {
-        let node = dag.nodes.get(node_id).ok_or_else(|| {
-            CompletionError::NodeNotFound(node_id.clone())
-        })?;
+    // BFS traversal with guard evaluation
+    // Track which nodes we've visited and which inline nodes we've executed
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut executed_inline: Vec<String> = Vec::new();
+    let mut reachable_frontiers: HashSet<String> = HashSet::new();
 
-        // Merge this node's inbox from DB
-        let mut node_scope = inline_scope.clone();
-        if let Some(node_inbox) = existing_inbox.get(node_id) {
+    // Queue holds (node_id, is_from_completed_node)
+    // Start with successors of the completed node
+    let mut queue: VecDeque<(String, bool)> = VecDeque::new();
+    for successor in helper.get_ready_successors(completed_node_id, None) {
+        // Evaluate guard if present
+        if let Some(ref guard) = successor.guard_expr {
+            if !evaluate_guard(Some(guard), &inline_scope, &successor.node_id) {
+                continue; // Guard failed, don't traverse this branch
+            }
+        }
+        queue.push_back((successor.node_id, true));
+    }
+
+    while let Some((node_id, _is_direct)) = queue.pop_front() {
+        if visited.contains(&node_id) {
+            continue;
+        }
+        visited.insert(node_id.clone());
+
+        // Only process nodes that are in the subgraph
+        if !subgraph.all_node_ids.contains(&node_id) {
+            continue;
+        }
+
+        let node = match dag.nodes.get(&node_id) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        // Merge this node's inbox from DB into scope
+        if let Some(node_inbox) = existing_inbox.get(&node_id) {
             for (var, val) in node_inbox {
-                node_scope.entry(var.clone()).or_insert_with(|| val.clone());
+                inline_scope.entry(var.clone()).or_insert_with(|| val.clone());
             }
         }
 
-        // Execute the inline node
-        let result = execute_inline_node(node, &node_scope);
+        // Check if this is a frontier node
+        let is_frontier = subgraph.frontier_nodes.iter().any(|f| f.node_id == node_id);
 
-        // Store result in scope for downstream nodes
-        if let Some(ref target) = node.target {
-            inline_scope.insert(target.clone(), result);
+        if is_frontier {
+            // Mark as reachable frontier - we'll process it after BFS
+            reachable_frontiers.insert(node_id.clone());
+            // Don't traverse past frontier nodes
+        } else {
+            // This is an inline node - execute it
+            let result = execute_inline_node(node, &inline_scope);
+            if let Some(ref target) = node.target {
+                inline_scope.insert(target.clone(), result);
+            }
+            executed_inline.push(node_id.clone());
+
+            // Continue to successors, evaluating guards
+            for successor in helper.get_ready_successors(&node_id, None) {
+                if visited.contains(&successor.node_id) {
+                    continue;
+                }
+
+                // Evaluate guard if present
+                if let Some(ref guard) = successor.guard_expr {
+                    if !evaluate_guard(Some(guard), &inline_scope, &successor.node_id) {
+                        debug!(
+                            node_id = %node_id,
+                            successor_id = %successor.node_id,
+                            "guard failed, skipping branch"
+                        );
+                        continue;
+                    }
+                }
+
+                queue.push_back((successor.node_id, false));
+            }
         }
     }
 
-    // Process frontier nodes - collect inbox writes and readiness increments
+    debug!(
+        completed_node_id = %completed_node_id,
+        executed_inline_count = executed_inline.len(),
+        reachable_frontiers_count = reachable_frontiers.len(),
+        reachable_frontiers = ?reachable_frontiers,
+        "BFS traversal complete"
+    );
+
+    // Process only the reachable frontier nodes
     for frontier in &subgraph.frontier_nodes {
+        // Skip frontiers that weren't reachable via passing guards
+        if !reachable_frontiers.contains(&frontier.node_id) {
+            continue;
+        }
         let frontier_node = match dag.nodes.get(&frontier.node_id) {
             Some(n) => n,
             None => continue,
@@ -479,7 +557,7 @@ pub fn execute_inline_subgraph(
 
         // Find which node in our path is the direct predecessor of this frontier
         let predecessor_id = find_direct_predecessor_in_path(
-            &subgraph.inline_nodes,
+            &executed_inline,
             &frontier.node_id,
             completed_node_id,
             dag,
@@ -525,12 +603,64 @@ pub fn execute_inline_subgraph(
                     });
                 }
                 FrontierCategory::Output => {
-                    // Workflow complete - get result from scope
-                    let result_value = inline_scope
-                        .values()
-                        .next()
+                    // Workflow complete - get result
+                    // Return nodes typically don't have DataFlow edges - they get their value
+                    // from the result being propagated through the inline scope.
+                    //
+                    // Priority for finding the result:
+                    // 1. DataFlow edges to this node (if any exist)
+                    // 2. Existing inbox for this node
+                    // 3. The inline scope (propagated result from completed node)
+                    let mut output_inbox = existing_inbox
+                        .get(&frontier.node_id)
                         .cloned()
-                        .unwrap_or(JsonValue::Null);
+                        .unwrap_or_default();
+
+                    // Try to merge via DataFlow edges (might not find anything for return nodes)
+                    merge_data_flow_into_inbox(
+                        &frontier.node_id,
+                        &inline_scope,
+                        dag,
+                        &mut output_inbox,
+                    );
+
+                    // If we found nothing via DataFlow, use the inline scope directly
+                    // This handles return statements that reference variables in scope
+                    let result_value = if !output_inbox.is_empty() {
+                        // Found via DataFlow or existing inbox
+                        output_inbox
+                            .get("result")
+                            .or_else(|| output_inbox.values().next())
+                            .cloned()
+                            .unwrap_or(JsonValue::Null)
+                    } else {
+                        // No DataFlow edges - get result from inline scope
+                        // Try "result" first (common convention from action target),
+                        // then the node's target variable, then first available value
+                        inline_scope
+                            .get("result")
+                            .or_else(|| {
+                                // Try to find by the completed node's target variable
+                                if let Some(completed) = dag.nodes.get(completed_node_id) {
+                                    if let Some(ref target) = completed.target {
+                                        inline_scope.get(target)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            })
+                            .or_else(|| inline_scope.values().next())
+                            .cloned()
+                            .unwrap_or(JsonValue::Null)
+                    };
+
+                    debug!(
+                        output_node_id = %frontier.node_id,
+                        result_value = ?result_value,
+                        "determined workflow result"
+                    );
 
                     plan.instance_completion = Some(InstanceCompletion {
                         instance_id,
@@ -556,6 +686,45 @@ fn execute_inline_node(node: &DAGNode, _scope: &InlineScope) -> JsonValue {
         "join" => JsonValue::Null,
         "aggregator" => JsonValue::Array(vec![]),
         _ => JsonValue::Null,
+    }
+}
+
+/// Evaluate a guard expression to determine if a branch should be taken.
+///
+/// Returns true if the guard passes (branch should be taken), false otherwise.
+fn evaluate_guard(guard_expr: Option<&ast::Expr>, scope: &InlineScope, successor_id: &str) -> bool {
+    let Some(guard) = guard_expr else {
+        // No guard expression - always pass
+        return true;
+    };
+
+    match ExpressionEvaluator::evaluate(guard, scope) {
+        Ok(val) => {
+            let is_true = match &val {
+                JsonValue::Bool(b) => *b,
+                JsonValue::Null => false,
+                JsonValue::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+                JsonValue::String(s) => !s.is_empty(),
+                JsonValue::Array(a) => !a.is_empty(),
+                JsonValue::Object(o) => !o.is_empty(),
+            };
+            debug!(
+                successor_id = %successor_id,
+                guard_expr = ?guard,
+                result = ?val,
+                is_true = is_true,
+                "evaluated guard expression"
+            );
+            is_true
+        }
+        Err(e) => {
+            warn!(
+                successor_id = %successor_id,
+                error = %e,
+                "failed to evaluate guard expression, assuming false"
+            );
+            false
+        }
     }
 }
 
@@ -595,12 +764,35 @@ fn merge_data_flow_into_inbox(
     dag: &DAG,
     inbox: &mut HashMap<String, JsonValue>,
 ) {
-    for edge in &dag.edges {
-        if edge.target == target_node_id && edge.edge_type == EdgeType::DataFlow {
-            if let Some(ref var_name) = edge.variable {
-                if let Some(value) = inline_scope.get(var_name) {
-                    inbox.insert(var_name.clone(), value.clone());
-                }
+    // Find all DataFlow edges to this target
+    let df_edges: Vec<_> = dag.edges.iter()
+        .filter(|e| e.target == target_node_id && e.edge_type == EdgeType::DataFlow)
+        .collect();
+
+    debug!(
+        target_node_id = %target_node_id,
+        dataflow_edges_count = df_edges.len(),
+        dataflow_edges = ?df_edges.iter().map(|e| (&e.source, &e.variable)).collect::<Vec<_>>(),
+        inline_scope_keys = ?inline_scope.keys().collect::<Vec<_>>(),
+        "merging data flow edges"
+    );
+
+    for edge in df_edges {
+        if let Some(ref var_name) = edge.variable {
+            if let Some(value) = inline_scope.get(var_name) {
+                debug!(
+                    target_node_id = %target_node_id,
+                    var_name = %var_name,
+                    value = ?value,
+                    "matched dataflow edge with scope"
+                );
+                inbox.insert(var_name.clone(), value.clone());
+            } else {
+                debug!(
+                    target_node_id = %target_node_id,
+                    var_name = %var_name,
+                    "dataflow edge variable not in scope"
+                );
             }
         }
     }

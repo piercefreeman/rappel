@@ -625,6 +625,7 @@ pub struct WorkQueueHandler {
     worker_pool: Arc<PythonWorkerPool>,
     slot_tracker: Arc<WorkerSlotTracker>,
     in_flight: Arc<Mutex<InFlightTracker>>,
+    dag_cache: Arc<DAGCache>,
 }
 
 impl WorkQueueHandler {
@@ -633,12 +634,14 @@ impl WorkQueueHandler {
         worker_pool: Arc<PythonWorkerPool>,
         slot_tracker: Arc<WorkerSlotTracker>,
         in_flight: Arc<Mutex<InFlightTracker>>,
+        dag_cache: Arc<DAGCache>,
     ) -> Self {
         Self {
             db,
             worker_pool,
             slot_tracker,
             in_flight,
+            dag_cache,
         }
     }
 
@@ -647,9 +650,12 @@ impl WorkQueueHandler {
         self.slot_tracker.available_slots()
     }
 
-    /// Fetch and dispatch a batch of actions to workers.
+    /// Fetch and dispatch a batch of runnable nodes (actions and barriers).
     ///
-    /// Returns immediately after dispatching. Completions are sent to the provided channel.
+    /// - Actions are dispatched to Python workers
+    /// - Barriers are processed inline using the unified readiness model
+    ///
+    /// Returns immediately after dispatching. Action completions are sent to the provided channel.
     pub async fn fetch_and_dispatch(
         &self,
         batch_size: usize,
@@ -661,14 +667,111 @@ impl WorkQueueHandler {
         }
 
         let limit = available.min(batch_size);
-        let actions = self.db.dispatch_actions(limit as i32).await?;
-        let dispatched = actions.len();
+        let nodes = self.db.dispatch_runnable_nodes(limit as i32).await?;
+        let dispatched = nodes.len();
 
-        for action in actions {
-            self.dispatch_action(action, completion_tx.clone()).await?;
+        for node in nodes {
+            match node.node_type.as_str() {
+                "barrier" => {
+                    // Process barriers inline using unified readiness model
+                    self.process_barrier(node).await?;
+                }
+                _ => {
+                    // Dispatch actions to workers
+                    self.dispatch_action(node, completion_tx.clone()).await?;
+                }
+            }
         }
 
         Ok(dispatched)
+    }
+
+    /// Process a barrier (aggregator) that has become ready.
+    ///
+    /// Barriers are processed inline by the runner, not dispatched to workers.
+    /// The barrier's inbox is guaranteed to be fully populated because all
+    /// predecessors completed and wrote their data before the barrier was enqueued.
+    async fn process_barrier(&self, barrier: QueuedAction) -> RunnerResult<()> {
+        let instance_id = WorkflowInstanceId(barrier.instance_id);
+        let node_id = match barrier.node_id.as_deref() {
+            Some(id) => id,
+            None => {
+                warn!(barrier_id = %barrier.id, "Barrier missing node_id");
+                return Ok(());
+            }
+        };
+
+        debug!(
+            barrier_id = %barrier.id,
+            node_id = %node_id,
+            instance_id = %instance_id.0,
+            "processing barrier"
+        );
+
+        // Get DAG
+        let dag = match self.dag_cache.get_dag_for_instance(instance_id).await? {
+            Some(dag) => dag,
+            None => {
+                warn!(instance_id = %instance_id.0, "DAG not found for barrier processing");
+                return Ok(());
+            }
+        };
+
+        let helper = DAGHelper::new(&dag);
+
+        // Read aggregated results from inbox
+        let spread_results = self.db.read_inbox_for_aggregator(instance_id, node_id).await?;
+
+        // Aggregate results (already sorted by spread_index)
+        let aggregated = JsonValue::Array(
+            spread_results.into_iter().map(|(_, v)| v).collect()
+        );
+
+        debug!(
+            barrier_id = %node_id,
+            result_count = aggregated.as_array().map(|a| a.len()).unwrap_or(0),
+            "aggregated barrier results"
+        );
+
+        // Analyze subgraph from barrier
+        let subgraph = analyze_subgraph(node_id, &dag, &helper);
+
+        // Batch fetch inbox for all nodes in subgraph
+        let existing_inbox = self.db
+            .batch_read_inbox(instance_id, &subgraph.all_node_ids)
+            .await?;
+
+        // Execute inline subgraph and build completion plan
+        let mut plan = execute_inline_subgraph(
+            node_id,
+            aggregated,
+            &subgraph,
+            &existing_inbox,
+            &dag,
+            instance_id,
+        )
+        .map_err(|e| RunnerError::Dag(e.to_string()))?;
+
+        // Fill in barrier completion details
+        plan = plan.with_action_completion(
+            ActionId(barrier.id),
+            barrier.delivery_token,
+            true, // barriers always succeed
+            Vec::new(),
+            None,
+        );
+
+        // Execute completion plan in single atomic transaction
+        let result = self.db.execute_completion_plan(instance_id, plan).await?;
+
+        info!(
+            barrier_id = %node_id,
+            newly_ready_nodes = ?result.newly_ready_nodes,
+            workflow_completed = result.workflow_completed,
+            "processed barrier"
+        );
+
+        Ok(())
     }
 
     /// Dispatch a single action to a worker.
@@ -925,14 +1028,15 @@ impl DAGRunner {
         ));
         let in_flight = Arc::new(Mutex::new(InFlightTracker::new()));
 
+        let dag_cache = Arc::new(DAGCache::new(Arc::clone(&db)));
         let work_handler = Arc::new(WorkQueueHandler::new(
             Arc::clone(&db),
             worker_pool,
             slot_tracker,
             in_flight,
+            Arc::clone(&dag_cache),
         ));
-        let completion_handler = WorkCompletionHandler::new(Arc::clone(&db));
-        let dag_cache = Arc::new(DAGCache::new(db));
+        let completion_handler = WorkCompletionHandler::new(db);
 
         Self {
             config,
@@ -960,24 +1064,38 @@ impl DAGRunner {
                     break;
                 }
 
-                // Process completions
+                // Process completions using unified readiness model
                 Some((in_flight, metrics)) = completion_rx.recv() => {
-                    // Spawn tokio task for parallel processing
                     let handler = self.completion_handler.clone();
                     let dag_cache = Arc::clone(&self.dag_cache);
                     let instance_contexts = Arc::clone(&self.instance_contexts);
                     let instance_id = in_flight.action.instance_id;
 
                     tokio::spawn(async move {
-                        if let Err(e) = Self::process_completion_task(
-                            handler,
-                            dag_cache,
-                            instance_contexts,
-                            in_flight,
-                            metrics,
-                            WorkflowInstanceId(instance_id),
-                        ).await {
-                            error!("Completion processing failed: {}", e);
+                        // Use unified completion path for successful actions
+                        // Fall back to old path for failures (which handles exception routing)
+                        if metrics.success {
+                            if let Err(e) = Self::process_completion_unified(
+                                &handler.db,
+                                &dag_cache,
+                                &in_flight,
+                                &metrics,
+                                WorkflowInstanceId(instance_id),
+                            ).await {
+                                error!("Unified completion processing failed: {}", e);
+                            }
+                        } else {
+                            // Failed actions use old path for exception handling
+                            if let Err(e) = Self::process_completion_task(
+                                handler,
+                                dag_cache,
+                                instance_contexts,
+                                in_flight,
+                                metrics,
+                                WorkflowInstanceId(instance_id),
+                            ).await {
+                                error!("Completion processing failed: {}", e);
+                            }
                         }
                     });
                 }
@@ -1028,7 +1146,6 @@ impl DAGRunner {
     ///
     /// Every frontier node gets readiness tracking. A node is only enqueued
     /// when `completed_count == required_count`.
-    #[allow(dead_code)]
     async fn process_completion_unified(
         db: &Database,
         dag_cache: &DAGCache,
