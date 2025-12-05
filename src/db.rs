@@ -967,6 +967,112 @@ impl Database {
 
         Ok(())
     }
+
+    /// Count completed actions for a set of node IDs within an instance.
+    /// Used for parallel block synchronization.
+    pub async fn count_completed_actions_for_nodes(
+        &self,
+        instance_id: WorkflowInstanceId,
+        node_ids: &[&str],
+    ) -> DbResult<usize> {
+        let count: (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*)
+            FROM action_queue
+            WHERE instance_id = $1
+              AND node_id = ANY($2)
+              AND status = 'completed'
+            "#,
+        )
+        .bind(instance_id.0)
+        .bind(node_ids)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count.0 as usize)
+    }
+
+    /// Atomically increment and return a parallel aggregator counter.
+    /// Uses INSERT ON CONFLICT to safely handle concurrent increments.
+    /// Returns the new count after incrementing.
+    pub async fn increment_parallel_aggregator_count(
+        &self,
+        instance_id: WorkflowInstanceId,
+        aggregator_node_id: &str,
+    ) -> DbResult<i64> {
+        // Use dedicated parallel_counters table with unique constraint
+        // This ensures atomic increment even with concurrent calls
+        let row = sqlx::query(
+            r#"
+            INSERT INTO parallel_counters (instance_id, aggregator_node_id, count)
+            VALUES ($1, $2, 1)
+            ON CONFLICT (instance_id, aggregator_node_id)
+            DO UPDATE SET count = parallel_counters.count + 1
+            RETURNING count
+            "#,
+        )
+        .bind(instance_id.0)
+        .bind(aggregator_node_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let count: i32 = row.get(0);
+        Ok(count as i64)
+    }
+
+    /// Atomically write inbox entries and increment the parallel aggregator counter.
+    /// This ensures that when the counter reaches the expected value, all inbox writes
+    /// from all parallel actions are visible to the aggregator.
+    ///
+    /// Returns the new count after incrementing.
+    pub async fn write_inbox_and_increment_parallel_counter(
+        &self,
+        instance_id: WorkflowInstanceId,
+        aggregator_node_id: &str,
+        inbox_writes: &[(String, String, serde_json::Value, String, Option<i32>)], // (target_node_id, variable_name, value, source_node_id, spread_index)
+    ) -> DbResult<i64> {
+        let mut tx = self.pool.begin().await?;
+
+        // Write all inbox entries within the transaction
+        for (target_node_id, variable_name, value, source_node_id, spread_index) in inbox_writes {
+            sqlx::query(
+                r#"
+                INSERT INTO node_inputs (instance_id, target_node_id, variable_name, value, source_node_id, spread_index)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                "#,
+            )
+            .bind(instance_id.0)
+            .bind(target_node_id)
+            .bind(variable_name)
+            .bind(value)
+            .bind(source_node_id)
+            .bind(spread_index)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Increment the counter within the same transaction
+        let row = sqlx::query(
+            r#"
+            INSERT INTO parallel_counters (instance_id, aggregator_node_id, count)
+            VALUES ($1, $2, 1)
+            ON CONFLICT (instance_id, aggregator_node_id)
+            DO UPDATE SET count = parallel_counters.count + 1
+            RETURNING count
+            "#,
+        )
+        .bind(instance_id.0)
+        .bind(aggregator_node_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let count: i32 = row.get(0);
+
+        // Commit the transaction - inbox writes and counter increment are now atomic
+        tx.commit().await?;
+
+        Ok(count as i64)
+    }
 }
 
 #[cfg(test)]

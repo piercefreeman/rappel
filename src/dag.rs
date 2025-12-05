@@ -1760,7 +1760,7 @@ impl DAGConverter {
 
         let mut edges_to_add = Vec::new();
 
-        // For each variable modification, connect to subsequent nodes that might use it
+        // For each variable modification, connect to nodes that USE the variable
         for (var_name, modifications) in &self.var_modifications {
             for (i, mod_node) in modifications.iter().enumerate() {
                 if !fn_node_ids.contains(mod_node) {
@@ -1774,6 +1774,7 @@ impl DAGConverter {
                 let mod_pos = order.iter().position(|n| n == mod_node);
 
                 // Find nodes that come after this modification but before the next
+                // AND actually use this variable in their kwargs
                 for (pos, node_id) in order.iter().enumerate() {
                     if let Some(mp) = mod_pos {
                         if pos <= mp {
@@ -1793,10 +1794,9 @@ impl DAGConverter {
                         continue;
                     }
 
-                    // Add data flow edge (simplified - in full implementation we'd check if node uses var)
-                    // For now, we only connect to the immediate next node
-                    if let Some(mp) = mod_pos {
-                        if pos == mp + 1 {
+                    // Check if this node uses the variable in its kwargs
+                    if let Some(node) = self.dag.nodes.get(node_id) {
+                        if self.node_uses_variable(node, var_name) {
                             edges_to_add.push((
                                 var_name.clone(),
                                 mod_node.clone(),
@@ -1812,6 +1812,20 @@ impl DAGConverter {
             self.dag
                 .add_edge(DAGEdge::data_flow(source, target, &var_name));
         }
+    }
+
+    /// Check if a node uses a variable (references it in kwargs)
+    fn node_uses_variable(&self, node: &DAGNode, var_name: &str) -> bool {
+        // Check kwargs for variable references
+        if let Some(ref kwargs) = node.kwargs {
+            for value in kwargs.values() {
+                // Check for $var_name pattern
+                if value == &format!("${}", var_name) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Get nodes in topological (execution) order for a subset of nodes
@@ -2499,7 +2513,7 @@ fn main(input: [], output: [result]):
 
     #[test]
     fn test_single_call_body_tuple_unpacking_in_if_branch() {
-        // Test: if condition: a, b = @get_pair()
+        // Test: if condition: a, b = @get_pair() followed by @use_pair(a=first, b=second)
         let if_body = make_single_call_body_with_action(
             vec!["first".to_string(), "second".to_string()],
             "get_pair",
@@ -2529,7 +2543,43 @@ fn main(input: [], output: [result]):
             span: None,
         };
 
-        let func = make_test_function("test_if_tuple", vec![stmt]);
+        // Add a downstream action that uses the unpacked variables
+        let mut use_kwargs = std::collections::HashMap::new();
+        use_kwargs.insert("a".to_string(), "$first".to_string());
+        use_kwargs.insert("b".to_string(), "$second".to_string());
+
+        let use_action = ast::ActionCall {
+            action_name: "use_pair".to_string(),
+            kwargs: vec![
+                ast::Kwarg {
+                    name: "a".to_string(),
+                    value: Some(ast::Expr {
+                        kind: Some(ast::expr::Kind::Variable(ast::Variable {
+                            name: "first".to_string(),
+                        })),
+                        span: None,
+                    }),
+                },
+                ast::Kwarg {
+                    name: "b".to_string(),
+                    value: Some(ast::Expr {
+                        kind: Some(ast::expr::Kind::Variable(ast::Variable {
+                            name: "second".to_string(),
+                        })),
+                        span: None,
+                    }),
+                },
+            ],
+            policies: vec![],
+            module_name: None,
+        };
+
+        let use_stmt = ast::Statement {
+            kind: Some(ast::statement::Kind::ActionCall(use_action)),
+            span: None,
+        };
+
+        let func = make_test_function("test_if_tuple", vec![stmt, use_stmt]);
         let program = ast::Program {
             functions: vec![func],
         };
@@ -2560,7 +2610,13 @@ fn main(input: [], output: [result]):
             "First target should be set for backwards compat"
         );
 
-        // Verify DATA_FLOW edges for both variables
+        // Verify DATA_FLOW edges for both variables (to the use_pair action)
+        let use_pair_node = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("use_pair"))
+            .expect("Should have use_pair action");
+
         let data_edges: Vec<_> = dag
             .edges
             .iter()
@@ -2569,18 +2625,18 @@ fn main(input: [], output: [result]):
 
         let first_edge = data_edges
             .iter()
-            .find(|e| e.variable.as_deref() == Some("first"));
+            .find(|e| e.variable.as_deref() == Some("first") && e.target == use_pair_node.id);
         let second_edge = data_edges
             .iter()
-            .find(|e| e.variable.as_deref() == Some("second"));
+            .find(|e| e.variable.as_deref() == Some("second") && e.target == use_pair_node.id);
 
         assert!(
             first_edge.is_some(),
-            "Should have DATA_FLOW edge for 'first'"
+            "Should have DATA_FLOW edge for 'first' to use_pair"
         );
         assert!(
             second_edge.is_some(),
-            "Should have DATA_FLOW edge for 'second'"
+            "Should have DATA_FLOW edge for 'second' to use_pair"
         );
     }
 
@@ -2885,6 +2941,364 @@ fn main(input: [], output: [result]):
             action_node.label.contains("x, y, z"),
             "Label should show all targets: {}",
             action_node.label
+        );
+    }
+
+    #[test]
+    fn test_dag_parallel_input_flows_to_downstream() {
+        // Test that input variable flows through parallel block to downstream action
+        // This reproduces the bug where summarize_math gets TypeError because
+        // the input_number variable is not in its inbox
+        let source = r#"fn compute(input: [n], output: [summary]):
+    factorial_value, fib_value = parallel:
+        @compute_factorial(n=n)
+        @compute_fibonacci(n=n)
+    summary = @summarize(input_number=n, factorial=factorial_value, fib=fib_value)
+    return summary"#;
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        // Find the summarize action node
+        let summarize_node = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("summarize"))
+            .expect("Should have summarize action node");
+
+        // Check kwargs include input_number
+        let kwargs = summarize_node.kwargs.as_ref().expect("Should have kwargs");
+        assert_eq!(
+            kwargs.get("input_number").map(|v| v.as_str()),
+            Some("$n"),
+            "input_number kwarg should reference n"
+        );
+
+        // Print DataFlow edges for debugging
+        println!("\nDataFlow edges:");
+        for edge in dag
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::DataFlow)
+        {
+            println!(
+                "  {} --[{}]--> {}",
+                edge.source,
+                edge.variable.as_deref().unwrap_or("?"),
+                edge.target
+            );
+        }
+
+        // Check that input 'n' flows to summarize action
+        let input_to_summarize = dag
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::DataFlow)
+            .find(|e| e.variable.as_deref() == Some("n") && e.target == summarize_node.id);
+
+        assert!(
+            input_to_summarize.is_some(),
+            "Should have DATA_FLOW edge for input 'n' to summarize action"
+        );
+    }
+
+    #[test]
+    fn test_dag_parallel_data_flow_to_summarize() {
+        // Test that data flows correctly from parallel actions to downstream action
+        let source = r#"fn compute(input: [n], output: [summary]):
+    factorial_value, fib_value = parallel:
+        @compute_factorial(n=n)
+        @compute_fibonacci(n=n)
+    summary = @summarize(factorial=factorial_value, fib=fib_value)
+    return summary"#;
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        // Find the summarize action node
+        let summarize_node = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("summarize"))
+            .expect("Should have summarize action node");
+
+        println!("Summarize node id: {}", summarize_node.id);
+        println!("Summarize node kwargs: {:?}", summarize_node.kwargs);
+
+        // Check the kwargs - they should reference the variables
+        let kwargs = summarize_node.kwargs.as_ref().expect("Should have kwargs");
+        assert!(
+            kwargs.get("factorial").map(|v| v.as_str()) == Some("$factorial_value"),
+            "factorial kwarg should reference factorial_value"
+        );
+        assert!(
+            kwargs.get("fib").map(|v| v.as_str()) == Some("$fib_value"),
+            "fib kwarg should reference fib_value"
+        );
+
+        // Print all data flow edges for debugging
+        println!("\nDataFlow edges:");
+        for edge in dag
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::DataFlow)
+        {
+            println!(
+                "  {} --[{}]--> {}",
+                edge.source,
+                edge.variable.as_deref().unwrap_or("?"),
+                edge.target
+            );
+        }
+
+        // Check that there are DATA_FLOW edges from the parallel action nodes to summarize
+        let factorial_to_summarize = dag
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::DataFlow)
+            .find(|e| {
+                e.variable.as_deref() == Some("factorial_value") && e.target == summarize_node.id
+            });
+
+        let fib_to_summarize = dag
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::DataFlow)
+            .find(|e| e.variable.as_deref() == Some("fib_value") && e.target == summarize_node.id);
+
+        assert!(
+            factorial_to_summarize.is_some(),
+            "Should have DATA_FLOW edge from factorial_value definition to summarize"
+        );
+        assert!(
+            fib_to_summarize.is_some(),
+            "Should have DATA_FLOW edge from fib_value definition to summarize"
+        );
+    }
+
+    #[test]
+    fn test_dag_parallel_structure_for_aggregator() {
+        // Test to visualize the full DAG structure for parallel workflow
+        // This helps debug the aggregator synchronization issue
+        let source = r#"fn compute(input: [n], output: [summary]):
+    factorial_value, fib_value = parallel:
+        @compute_factorial(n=n)
+        @compute_fibonacci(n=n)
+    summary = @summarize(factorial=factorial_value, fib=fib_value)
+    return summary"#;
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        println!("\n=== DAG NODES ===");
+        for (id, node) in dag.nodes.iter() {
+            println!(
+                "  {} (type={}, action={:?}, target={:?}, targets={:?}, is_aggregator={}, aggregates_from={:?})",
+                id,
+                node.node_type,
+                node.action_name,
+                node.target,
+                node.targets,
+                node.is_aggregator,
+                node.aggregates_from
+            );
+        }
+
+        println!("\n=== STATE MACHINE EDGES ===");
+        for edge in dag
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::StateMachine)
+        {
+            println!("  {} --> {}", edge.source, edge.target);
+        }
+
+        println!("\n=== DATA FLOW EDGES ===");
+        for edge in dag
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::DataFlow)
+        {
+            println!(
+                "  {} --[{}]--> {}",
+                edge.source,
+                edge.variable.as_deref().unwrap_or("?"),
+                edge.target
+            );
+        }
+
+        // Find the parallel entry node, parallel actions, aggregator, and summarize action
+        let _parallel_entry = dag
+            .nodes
+            .values()
+            .find(|n| n.node_type == "parallel")
+            .expect("Should have parallel entry node");
+
+        let aggregator = dag
+            .nodes
+            .values()
+            .find(|n| n.is_aggregator)
+            .expect("Should have aggregator node");
+
+        let summarize = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("summarize"))
+            .expect("Should have summarize action");
+
+        // Get state machine successors of parallel_action_3 (compute_factorial)
+        let factorial_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("compute_factorial"))
+            .expect("Should have compute_factorial action");
+
+        println!("\n=== FACTORIAL ACTION STATE MACHINE SUCCESSORS ===");
+        for edge in dag
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::StateMachine && e.source == factorial_action.id)
+        {
+            println!("  {} --> {}", edge.source, edge.target);
+        }
+
+        // The key assertion: parallel actions should have aggregator as their SM successor
+        let factorial_sm_successors: Vec<_> = dag
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::StateMachine && e.source == factorial_action.id)
+            .map(|e| e.target.clone())
+            .collect();
+
+        println!("\nFactorial SM successors: {:?}", factorial_sm_successors);
+        println!("Aggregator ID: {}", aggregator.id);
+
+        assert!(
+            factorial_sm_successors.contains(&aggregator.id),
+            "Parallel action should have aggregator as StateMachine successor"
+        );
+
+        // The aggregator should have summarize as its SM successor
+        let aggregator_sm_successors: Vec<_> = dag
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::StateMachine && e.source == aggregator.id)
+            .map(|e| e.target.clone())
+            .collect();
+
+        println!("Aggregator SM successors: {:?}", aggregator_sm_successors);
+        println!("Summarize ID: {}", summarize.id);
+
+        assert!(
+            aggregator_sm_successors.contains(&summarize.id),
+            "Aggregator should have summarize action as StateMachine successor"
+        );
+    }
+
+    #[test]
+    fn test_parallel_math_from_protobuf() {
+        // Test that loads the actual parallel_math.pb protobuf file and verifies
+        // that DataFlow edges exist from the input node to summarize_math action.
+        use prost::Message;
+        use std::fs;
+
+        let pb_path = "/tmp/parallel_math.pb";
+        if !std::path::Path::new(pb_path).exists() {
+            // Skip test if the file doesn't exist (CI environments)
+            eprintln!(
+                "Skipping test_parallel_math_from_protobuf: {} not found",
+                pb_path
+            );
+            return;
+        }
+
+        let data = fs::read(pb_path).expect("Failed to read parallel_math.pb");
+        let program = crate::ast::Program::decode(&data[..]).expect("Failed to decode protobuf");
+
+        // Convert to DAG
+        let dag = convert_to_dag(&program);
+
+        // Print the DAG structure for debugging
+        println!("\n=== NODES ===");
+        for (id, node) in &dag.nodes {
+            println!(
+                "  {} (type={}, action={:?}, target={:?}, targets={:?}, kwargs={:?})",
+                id, node.node_type, node.action_name, node.target, node.targets, node.kwargs
+            );
+        }
+
+        println!("\n=== DATA FLOW EDGES ===");
+        for edge in dag
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::DataFlow)
+        {
+            println!(
+                "  {} --[{}]--> {}",
+                edge.source,
+                edge.variable.as_deref().unwrap_or("?"),
+                edge.target
+            );
+        }
+
+        println!("\n=== STATE MACHINE EDGES ===");
+        for edge in dag
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::StateMachine)
+        {
+            println!(
+                "  {} --({:?})--> {}",
+                edge.source, edge.condition, edge.target
+            );
+        }
+
+        // Find the input node
+        let input_node = dag
+            .nodes
+            .values()
+            .find(|n| n.node_type == "input")
+            .expect("Should have input node");
+
+        println!("\nInput node id: {}", input_node.id);
+        println!("Input node io_vars: {:?}", input_node.io_vars);
+
+        // Find the summarize action node
+        let summarize_node = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("summarize_math"))
+            .expect("Should have summarize_math action node");
+
+        println!("Summarize node id: {}", summarize_node.id);
+        println!("Summarize node kwargs: {:?}", summarize_node.kwargs);
+
+        // Check that there's a DataFlow edge from input to summarize for 'number'
+        let input_to_summarize_edges: Vec<_> = dag
+            .edges
+            .iter()
+            .filter(|e| {
+                e.edge_type == EdgeType::DataFlow
+                    && e.source == input_node.id
+                    && e.target == summarize_node.id
+            })
+            .collect();
+
+        println!("\nDataFlow edges from input to summarize:");
+        for edge in &input_to_summarize_edges {
+            println!(
+                "  {} --[{}]--> {}",
+                edge.source,
+                edge.variable.as_deref().unwrap_or("?"),
+                edge.target
+            );
+        }
+
+        // This is the key assertion - there should be a DataFlow edge for 'number'
+        let number_edge = input_to_summarize_edges
+            .iter()
+            .find(|e| e.variable.as_deref() == Some("number"));
+
+        assert!(
+            number_edge.is_some(),
+            "Should have DataFlow edge for 'number' from input to summarize_math"
         );
     }
 }

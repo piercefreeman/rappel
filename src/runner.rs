@@ -1516,6 +1516,178 @@ impl DAGRunner {
         Ok(())
     }
 
+    /// Check if all parallel actions are complete and process the aggregator if ready.
+    ///
+    /// For parallel blocks like:
+    ///   a, b = parallel:
+    ///     @action1()
+    ///     @action2()
+    ///
+    /// The aggregator collects control flow from both actions. This function:
+    /// 1. Counts expected parallel actions from the parallel entry node
+    /// 2. Atomically writes inbox entries and increments counter in one transaction
+    /// 3. When all complete, processes the aggregator's successors
+    #[allow(clippy::too_many_arguments)]
+    async fn check_and_process_parallel_aggregator(
+        _completed_node_id: &str,
+        agg_node: &DAGNode,
+        dag: &DAG,
+        helper: &DAGHelper<'_>,
+        inline_scope: &mut Scope,
+        batch: &mut CompletionBatch,
+        instance_id: WorkflowInstanceId,
+        db: &Database,
+    ) -> RunnerResult<()> {
+        let agg_id = &agg_node.id;
+
+        // Get the parallel entry node this aggregator is collecting from
+        let parallel_entry_id = match &agg_node.aggregates_from {
+            Some(id) => id,
+            None => return Ok(()), // Not a valid aggregator
+        };
+
+        // Find all parallel action node IDs (successors of the parallel entry node)
+        let parallel_action_ids: Vec<String> = dag
+            .edges
+            .iter()
+            .filter(|e| e.source == *parallel_entry_id && e.edge_type == EdgeType::StateMachine)
+            .map(|e| e.target.clone())
+            .collect();
+
+        let expected_count = parallel_action_ids.len();
+
+        // Collect inbox writes that need to be committed atomically with the counter
+        // These are writes from the current parallel action completion
+        let inbox_writes_for_tx: Vec<(String, String, JsonValue, String, Option<i32>)> = batch
+            .inbox_writes
+            .drain(..)
+            .map(|w| {
+                (
+                    w.target_node_id,
+                    w.variable_name,
+                    w.value,
+                    w.source_node_id,
+                    w.spread_index,
+                )
+            })
+            .collect();
+
+        // Atomically write inbox entries and increment counter in one transaction
+        // This ensures that when the counter reaches expected_count, all inbox writes
+        // from all parallel actions are visible
+        let completed_count = db
+            .write_inbox_and_increment_parallel_counter(instance_id, agg_id, &inbox_writes_for_tx)
+            .await? as usize;
+
+        debug!(
+            aggregator_id = %agg_id,
+            expected_count = expected_count,
+            completed_count = completed_count,
+            parallel_action_ids = ?parallel_action_ids,
+            inbox_writes_committed = inbox_writes_for_tx.len(),
+            "checking parallel aggregator readiness"
+        );
+
+        // If not all parallel actions are complete, wait for more
+        if completed_count < expected_count {
+            return Ok(());
+        }
+
+        debug!(
+            aggregator_id = %agg_id,
+            "parallel aggregator ready, processing successors"
+        );
+
+        // All parallel actions complete! Process aggregator's successors.
+        // For parallel blocks with tuple unpacking, the data has already been
+        // written to downstream nodes via DataFlow edges from each parallel action.
+        // The aggregator's role is just control flow synchronization.
+
+        // Find and process successors of the aggregator
+        let successors = helper.get_ready_successors(agg_id, None);
+        for successor in successors {
+            let succ_node = match dag.nodes.get(&successor.node_id) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            let exec_mode = helper.get_execution_mode(succ_node);
+            match exec_mode {
+                ExecutionMode::Inline => {
+                    // Check for output/return node (workflow completion)
+                    if succ_node.is_output || succ_node.node_type == "return" {
+                        // Get result from inline scope or inbox
+                        let result = inline_scope
+                            .values()
+                            .next()
+                            .cloned()
+                            .unwrap_or(JsonValue::Null);
+
+                        let mut result_map = HashMap::new();
+                        result_map.insert("result".to_string(), result);
+                        let result_payload = Self::serialize_workflow_result(&result_map);
+
+                        batch.instance_completion = Some(InstanceCompletion {
+                            instance_id,
+                            result_payload,
+                        });
+                        continue;
+                    }
+
+                    // Execute inline and continue
+                    let inline_result = Self::execute_inline_node(succ_node, inline_scope)?;
+                    if let Some(ref target) = succ_node.target {
+                        inline_scope.insert(target.clone(), inline_result.clone());
+                        Self::collect_inbox_writes_for_node(
+                            &successor.node_id,
+                            target,
+                            &inline_result,
+                            dag,
+                            instance_id,
+                            &mut batch.inbox_writes,
+                        );
+                    }
+                }
+                ExecutionMode::Delegated => {
+                    // Read inbox from DB - all parallel action inbox writes are already
+                    // committed atomically with the counter increment
+                    let mut inbox = db.read_inbox(instance_id, &successor.node_id).await?;
+
+                    // Merge pending inbox writes from current batch
+                    for pending_write in &batch.inbox_writes {
+                        if pending_write.target_node_id == successor.node_id {
+                            inbox.insert(
+                                pending_write.variable_name.clone(),
+                                pending_write.value.clone(),
+                            );
+                        }
+                    }
+
+                    // Merge inline scope
+                    for (var_name, var_value) in inline_scope.iter() {
+                        inbox
+                            .entry(var_name.clone())
+                            .or_insert_with(|| var_value.clone());
+                    }
+
+                    debug!(
+                        successor_node_id = %successor.node_id,
+                        inbox = ?inbox.keys().collect::<Vec<_>>(),
+                        "creating action for parallel aggregator successor"
+                    );
+
+                    // Create action
+                    let result =
+                        Self::create_actions_for_node(succ_node, instance_id, &inbox, dag)?;
+                    batch.new_actions.extend(result.actions);
+                    batch.inbox_writes.extend(result.inbox_writes);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Process successor nodes asynchronously.
     /// Inline nodes execute immediately and collect inbox writes.
     /// Delegated nodes read from inbox and queue for execution.
@@ -1766,6 +1938,25 @@ impl DAGRunner {
                 Some(n) => n,
                 None => continue,
             };
+
+            // Skip aggregator nodes during normal successor processing.
+            // Parallel aggregators need all predecessors to complete before processing.
+            // Instead, check if all predecessors are complete and process if ready.
+            if succ_node.is_aggregator {
+                // Check if all parallel actions feeding this aggregator are complete
+                Self::check_and_process_parallel_aggregator(
+                    &current_node_id,
+                    succ_node,
+                    dag,
+                    helper,
+                    inline_scope,
+                    batch,
+                    instance_id,
+                    db,
+                )
+                .await?;
+                continue;
+            }
 
             let exec_mode = helper.get_execution_mode(succ_node);
             match exec_mode {
@@ -2125,6 +2316,27 @@ impl DAGRunner {
         let mut inbox_writes_to_commit = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let mut queue = std::collections::VecDeque::new();
+
+        // Collect inbox writes for input variables to downstream nodes via DataFlow edges.
+        // This ensures that actions which reference input variables (like summarize_math
+        // using input_number=n) receive those values in their inbox, even if they're not
+        // immediate successors of the input node.
+        for (var_name, value) in &scope {
+            Self::collect_inbox_writes_for_node(
+                &input_node.id,
+                var_name,
+                value,
+                &dag,
+                instance_id,
+                &mut inbox_writes_to_commit,
+            );
+        }
+        debug!(
+            input_node_id = %input_node.id,
+            inbox_writes = inbox_writes_to_commit.len(),
+            variables = ?scope.keys().collect::<Vec<_>>(),
+            "collected inbox writes for input variables"
+        );
 
         // Start from input node's successors
         let initial_successors = helper.get_ready_successors(&input_node.id, None);
@@ -2787,5 +2999,178 @@ mod tests {
             error_message: None,
         });
         assert!(!batch.is_empty());
+    }
+
+    #[test]
+    fn test_build_action_payload_resolves_variables() {
+        use crate::dag::DAGNode;
+
+        // Create a node with kwargs that reference variables
+        let mut kwargs = HashMap::new();
+        kwargs.insert("input_number".to_string(), "$number".to_string());
+        kwargs.insert(
+            "factorial_value".to_string(),
+            "$factorial_value".to_string(),
+        );
+        kwargs.insert("fibonacci_value".to_string(), "$fib_value".to_string());
+
+        let node = DAGNode::new(
+            "action_6".to_string(),
+            "action_call".to_string(),
+            "@summarize_math()".to_string(),
+        )
+        .with_kwargs(kwargs);
+
+        // Create inbox with the expected variables
+        let mut inbox: HashMap<String, JsonValue> = HashMap::new();
+        inbox.insert("number".to_string(), JsonValue::Number(5.into()));
+        inbox.insert("factorial_value".to_string(), JsonValue::Number(120.into()));
+        inbox.insert("fib_value".to_string(), JsonValue::Number(5.into()));
+
+        // Build payload
+        let payload = DAGRunner::build_action_payload_from_inbox(&node, &inbox).unwrap();
+        let payload_json: JsonValue = serde_json::from_slice(&payload).unwrap();
+
+        // Verify all kwargs are resolved correctly
+        let obj = payload_json.as_object().expect("payload should be object");
+        assert_eq!(obj.get("input_number"), Some(&JsonValue::Number(5.into())));
+        assert_eq!(
+            obj.get("factorial_value"),
+            Some(&JsonValue::Number(120.into()))
+        );
+        assert_eq!(
+            obj.get("fibonacci_value"),
+            Some(&JsonValue::Number(5.into()))
+        );
+    }
+
+    #[test]
+    fn test_build_action_payload_missing_variable_returns_null() {
+        use crate::dag::DAGNode;
+
+        // Create a node with kwargs that reference variables
+        let mut kwargs = HashMap::new();
+        kwargs.insert("input_number".to_string(), "$number".to_string());
+        kwargs.insert(
+            "factorial_value".to_string(),
+            "$factorial_value".to_string(),
+        );
+        kwargs.insert("fibonacci_value".to_string(), "$fib_value".to_string());
+
+        let node = DAGNode::new(
+            "action_6".to_string(),
+            "action_call".to_string(),
+            "@summarize_math()".to_string(),
+        )
+        .with_kwargs(kwargs);
+
+        // Create inbox MISSING some variables - this simulates the bug
+        let mut inbox: HashMap<String, JsonValue> = HashMap::new();
+        inbox.insert("factorial_value".to_string(), JsonValue::Number(120.into()));
+        // fib_value and number are MISSING
+
+        // Build payload
+        let payload = DAGRunner::build_action_payload_from_inbox(&node, &inbox).unwrap();
+        let payload_json: JsonValue = serde_json::from_slice(&payload).unwrap();
+
+        // Missing variables should resolve to null (which will cause TypeError in Python!)
+        let obj = payload_json.as_object().expect("payload should be object");
+        assert_eq!(
+            obj.get("input_number"),
+            Some(&JsonValue::Null),
+            "missing variable should be null"
+        );
+        assert_eq!(
+            obj.get("factorial_value"),
+            Some(&JsonValue::Number(120.into()))
+        );
+        assert_eq!(
+            obj.get("fibonacci_value"),
+            Some(&JsonValue::Null),
+            "missing variable should be null"
+        );
+    }
+
+    #[test]
+    fn test_collect_inbox_writes_for_input_variables() {
+        use crate::dag::{DAG, DAGEdge, DAGNode};
+
+        // This test reproduces the bug where input variables don't flow to downstream
+        // nodes via DataFlow edges during workflow start.
+        //
+        // Workflow structure:
+        //   run_input_1 (input node, declares variable 'n')
+        //       |
+        //       v (StateMachine edge)
+        //   parallel_2 (parallel block)
+        //       |
+        //       v (StateMachine edge)
+        //   action_3 (compute_factorial, uses n)
+        //   action_4 (compute_fibonacci, uses n)
+        //       |
+        //       v (StateMachine edge from aggregator)
+        //   action_5 (summarize_math, uses n AND factorial_value AND fib_value)
+        //
+        // DataFlow edges:
+        //   run_input_1 --[n]--> action_3
+        //   run_input_1 --[n]--> action_4
+        //   run_input_1 --[n]--> action_5  <-- This is the one that's broken!
+        //   action_3 --[factorial_value]--> action_5
+        //   action_4 --[fib_value]--> action_5
+
+        let mut dag = DAG {
+            nodes: HashMap::new(),
+            edges: Vec::new(),
+            entry_node: Some("run_input_1".to_string()),
+        };
+
+        // Add input node
+        let input_node = DAGNode::new(
+            "run_input_1".to_string(),
+            "input".to_string(),
+            "".to_string(),
+        )
+        .with_input(vec!["n".to_string()])
+        .with_function_name("run");
+        dag.nodes.insert("run_input_1".to_string(), input_node);
+
+        // Add action nodes
+        let action_5 = DAGNode::new(
+            "action_5".to_string(),
+            "action_call".to_string(),
+            "@summarize_math()".to_string(),
+        );
+        dag.nodes.insert("action_5".to_string(), action_5);
+
+        // Add DataFlow edge from input node to downstream action for variable 'n'
+        dag.edges.push(DAGEdge::data_flow(
+            "run_input_1".to_string(),
+            "action_5".to_string(),
+            "n",
+        ));
+
+        // Test: collect_inbox_writes_for_node should produce inbox write for action_5
+        let instance_id = WorkflowInstanceId(Uuid::new_v4());
+        let mut inbox_writes = Vec::new();
+
+        DAGRunner::collect_inbox_writes_for_node(
+            "run_input_1",
+            "n",
+            &JsonValue::Number(42.into()),
+            &dag,
+            instance_id,
+            &mut inbox_writes,
+        );
+
+        // Verify an inbox write was created for action_5
+        assert_eq!(
+            inbox_writes.len(),
+            1,
+            "Should create inbox write for downstream action"
+        );
+        assert_eq!(inbox_writes[0].target_node_id, "action_5");
+        assert_eq!(inbox_writes[0].variable_name, "n");
+        assert_eq!(inbox_writes[0].value, JsonValue::Number(42.into()));
+        assert_eq!(inbox_writes[0].source_node_id, "run_input_1");
     }
 }
