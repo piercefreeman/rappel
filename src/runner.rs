@@ -49,7 +49,7 @@ use prost::Message;
 
 use crate::{
     ast_evaluator::{EvaluationError, ExpressionEvaluator, Scope},
-    completion::{analyze_subgraph, execute_inline_subgraph},
+    completion::{analyze_subgraph, evaluate_guard, execute_inline_subgraph},
     dag::{DAG, DAGConverter, DAGNode, EdgeType},
     dag_state::{DAGHelper, ExecutionMode},
     db::{
@@ -719,7 +719,7 @@ impl WorkQueueHandler {
 
         let helper = DAGHelper::new(&dag);
 
-        // Read aggregated results from inbox
+        // Read aggregated results from inbox (for spread actions with spread_index)
         let spread_results = self
             .db
             .read_inbox_for_aggregator(instance_id, node_id)
@@ -728,9 +728,13 @@ impl WorkQueueHandler {
         // Aggregate results (already sorted by spread_index)
         let aggregated = JsonValue::Array(spread_results.into_iter().map(|(_, v)| v).collect());
 
+        // Also read named variables from the barrier's inbox (for parallel blocks)
+        let barrier_inbox = self.db.read_inbox(instance_id, node_id).await?;
+
         debug!(
             barrier_id = %node_id,
             result_count = aggregated.as_array().map(|a| a.len()).unwrap_or(0),
+            named_vars = ?barrier_inbox.keys().collect::<Vec<_>>(),
             "aggregated barrier results"
         );
 
@@ -738,10 +742,19 @@ impl WorkQueueHandler {
         let subgraph = analyze_subgraph(node_id, &dag, &helper);
 
         // Batch fetch inbox for all nodes in subgraph
-        let existing_inbox = self
+        let mut existing_inbox = self
             .db
             .batch_read_inbox(instance_id, &subgraph.all_node_ids)
             .await?;
+
+        // Merge barrier's named variables into the existing inbox so they're available
+        // to successors. This is how parallel block results flow to downstream nodes.
+        if !barrier_inbox.is_empty() {
+            existing_inbox
+                .entry(node_id.to_string())
+                .or_default()
+                .extend(barrier_inbox.clone());
+        }
 
         // Execute inline subgraph and build completion plan
         let mut plan = execute_inline_subgraph(
@@ -751,6 +764,7 @@ impl WorkQueueHandler {
             &existing_inbox,
             &dag,
             instance_id,
+            None, // barriers are not spread actions
         )
         .map_err(|e| RunnerError::Dag(e.to_string()))?;
 
@@ -1172,7 +1186,7 @@ impl DAGRunner {
         };
 
         // Parse spread index if present
-        let (base_node_id, _spread_index) = Self::parse_spread_node_id(node_id);
+        let (base_node_id, spread_index) = Self::parse_spread_node_id(node_id);
 
         // Parse result from response payload
         let result: JsonValue = if metrics.response_payload.is_empty() {
@@ -1217,6 +1231,7 @@ impl DAGRunner {
             &existing_inbox,
             &dag,
             instance_id,
+            spread_index,
         )
         .map_err(|e| RunnerError::Dag(e.to_string()))?;
 
@@ -1305,6 +1320,7 @@ impl DAGRunner {
             &existing_inbox,
             &dag,
             instance_id,
+            None, // barriers are not spread actions
         )
         .map_err(|e| RunnerError::Dag(e.to_string()))?;
 
@@ -2379,6 +2395,16 @@ impl DAGRunner {
             "input node successors"
         );
         for successor in initial_successors {
+            // Evaluate guard if present - skip branch if guard fails
+            if let Some(ref guard) = successor.guard_expr
+                && !evaluate_guard(Some(guard), &scope, &successor.node_id)
+            {
+                debug!(
+                    successor_id = %successor.node_id,
+                    "skipping initial successor due to failed guard"
+                );
+                continue;
+            }
             queue.push_back(successor.node_id);
         }
 
@@ -2465,6 +2491,16 @@ impl DAGRunner {
                         "skipping inline node during start_instance"
                     );
                     for successor in inline_successors {
+                        // Evaluate guard if present - skip branch if guard fails
+                        if let Some(ref guard) = successor.guard_expr
+                            && !evaluate_guard(Some(guard), &scope, &successor.node_id)
+                        {
+                            debug!(
+                                successor_id = %successor.node_id,
+                                "skipping successor due to failed guard during start_instance"
+                            );
+                            continue;
+                        }
                         if !visited.contains(&successor.node_id) {
                             queue.push_back(successor.node_id);
                         }
@@ -2544,17 +2580,14 @@ impl DAGRunner {
         node: &DAGNode,
         instance_id: WorkflowInstanceId,
         inbox: &std::collections::HashMap<String, JsonValue>,
-        dag: &DAG,
+        _dag: &DAG,
     ) -> RunnerResult<NodeActionResult> {
         let actions = Self::create_actions_for_spread_node(node, instance_id, inbox)?;
         let spread_count = actions.len();
 
-        // Find the aggregator node that follows this spread action
-        let aggregator_id = dag
-            .edges
-            .iter()
-            .find(|e| e.source == node.id && e.edge_type == EdgeType::StateMachine)
-            .map(|e| e.target.clone());
+        // Use the aggregates_to field to find the aggregator node
+        // This is set during DAG conversion and propagated during function expansion
+        let aggregator_id = node.aggregates_to.clone();
 
         // Return readiness init info so caller can initialize node_readiness
         let readiness_init = aggregator_id.clone().map(|agg_id| ReadinessInit {

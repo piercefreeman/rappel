@@ -26,6 +26,8 @@ const EXCEPTION_CUSTOM_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_exception_custom.py");
 const EXCEPTION_WITH_SUCCESS_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_exception_with_success.py");
+const IMMEDIATE_CONDITIONAL_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/immediate_conditional_workflow.py");
 
 /// Registration script that imports and runs the workflow.
 /// This triggers the workflow decorator which registers the IR via gRPC.
@@ -476,6 +478,406 @@ async fn exception_with_success_workflow_registers() -> Result<()> {
     // Execute all actions via the DAGRunner
     harness.dispatch_all().await?;
     info!("workflow completed");
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Immediate Conditional Workflow Tests
+// =============================================================================
+
+fn make_immediate_conditional_register_script(value: i32) -> String {
+    format!(
+        r#"
+import asyncio
+import os
+
+from immediate_conditional_workflow import ImmediateConditionalWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ImmediateConditionalWorkflow()
+    result = await wf.run(value={value})
+    print(f"Registration result: {{result}}")
+
+asyncio.run(main())
+"#
+    )
+}
+
+/// Test that immediate conditional workflows execute correctly with the "high" branch.
+///
+/// This tests the conditional execution where guards depend on input values directly.
+/// With value=100, 100>=75 so result should be "high:100".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn immediate_conditional_workflow_high_branch() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let register_script = make_immediate_conditional_register_script(100);
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "immediate_conditional_workflow.py",
+                IMMEDIATE_CONDITIONAL_WORKFLOW_MODULE,
+            ),
+            ("register.py", register_script.leak()),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "immediateconditionalworkflow",
+        user_module: "immediate_conditional_workflow",
+        inputs: &[("value", "100")],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result: value=100 -> 100>=75 -> evaluate_high -> "high:100"
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("high:100".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test that immediate conditional workflows execute correctly with the "medium" branch.
+///
+/// With value=50, 50>=25 but 50<75 so result should be "medium:50".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn immediate_conditional_workflow_medium_branch() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let register_script = make_immediate_conditional_register_script(50);
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "immediate_conditional_workflow.py",
+                IMMEDIATE_CONDITIONAL_WORKFLOW_MODULE,
+            ),
+            ("register.py", register_script.leak()),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "immediateconditionalworkflow",
+        user_module: "immediate_conditional_workflow",
+        inputs: &[("value", "50")],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result: value=50 -> 50>=25 -> evaluate_medium -> "medium:50"
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("medium:50".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test that immediate conditional workflows execute correctly with the "low" branch.
+///
+/// With value=10, 10<25 so result should be "low:10".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn immediate_conditional_workflow_low_branch() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let register_script = make_immediate_conditional_register_script(10);
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "immediate_conditional_workflow.py",
+                IMMEDIATE_CONDITIONAL_WORKFLOW_MODULE,
+            ),
+            ("register.py", register_script.leak()),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "immediateconditionalworkflow",
+        user_module: "immediate_conditional_workflow",
+        inputs: &[("value", "10")],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result: value=10 -> 10<25 -> evaluate_low -> "low:10"
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("low:10".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Loop Workflow Test
+// =============================================================================
+
+const LOOP_WORKFLOW_MODULE: &str = include_str!("fixtures/loop_workflow.py");
+
+const REGISTER_LOOP_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from loop_workflow import LoopWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = LoopWorkflow()
+    result = await wf.run(items=["apple", "banana", "cherry"])
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that loop workflows execute correctly with for loop iteration.
+///
+/// This tests the for loop pattern: for item in items -> process_item -> join_results
+/// With items=["apple", "banana", "cherry"], result should be "APPLE,BANANA,CHERRY".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn loop_workflow_executes_all_iterations() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("loop_workflow.py", LOOP_WORKFLOW_MODULE),
+            ("register.py", REGISTER_LOOP_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "loopworkflow",
+        user_module: "loop_workflow",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result: ["apple", "banana", "cherry"] -> ["APPLE", "BANANA", "CHERRY"] -> "APPLE,BANANA,CHERRY"
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("APPLE,BANANA,CHERRY".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Parallel Workflow Test
+// =============================================================================
+
+const PARALLEL_WORKFLOW_MODULE: &str = include_str!("fixtures/parallel_workflow.py");
+
+const REGISTER_PARALLEL_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from parallel_workflow import ParallelWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ParallelWorkflow()
+    result = await wf.run(value=5)
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that parallel workflows execute correctly with asyncio.gather.
+///
+/// This tests the parallel fan-out/fan-in pattern:
+/// value=5 -> gather(compute_double(5), compute_square(5)) -> combine_results
+/// doubled=10, squared=25 -> "doubled:10,squared:25"
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn parallel_workflow_executes_concurrent_actions() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("parallel_workflow.py", PARALLEL_WORKFLOW_MODULE),
+            ("register.py", REGISTER_PARALLEL_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "parallelworkflow",
+        user_module: "parallel_workflow",
+        inputs: &[], // Use default value from Python registration
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result: value=5 -> doubled=10, squared=25 -> "doubled:10,squared:25"
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("doubled:10,squared:25".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Additional Conditional Workflow Tests (medium, low branches)
+// =============================================================================
+
+/// Test that conditional workflows execute correctly with the "medium" tier branch.
+///
+/// With tier="medium", score=50, and 50>=25 but 50<75 so result should be "good:50".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn conditional_workflow_medium_branch() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let register_script = make_conditional_register_script("medium");
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("conditional_workflow.py", CONDITIONAL_WORKFLOW_MODULE),
+            ("register.py", register_script.leak()),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "conditionalworkflow",
+        user_module: "conditional_workflow",
+        inputs: &[("tier", "medium")],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result: tier="medium" -> score=50 -> evaluate_medium -> "good:50"
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("good:50".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test that conditional workflows execute correctly with the "low" tier branch.
+///
+/// With tier="low", score=10, and 10<25 so result should be "needs_work:10".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn conditional_workflow_low_branch() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let register_script = make_conditional_register_script("low");
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("conditional_workflow.py", CONDITIONAL_WORKFLOW_MODULE),
+            ("register.py", register_script.leak()),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "conditionalworkflow",
+        user_module: "conditional_workflow",
+        inputs: &[("tier", "low")],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result: tier="low" -> score=10 -> evaluate_low -> "needs_work:10"
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("needs_work:10".to_string()),
+        "unexpected workflow result"
+    );
 
     harness.shutdown().await?;
     Ok(())

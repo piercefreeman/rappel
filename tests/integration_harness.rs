@@ -266,12 +266,19 @@ impl IntegrationHarness {
         .fetch_all(database.pool())
         .await?;
 
-        let instance_id = instances
+        let instance = instances
             .first()
-            .map(|i| WorkflowInstanceId(i.id))
             .with_context(|| "no instance found after registration")?;
+        let instance_id = WorkflowInstanceId(instance.id);
 
         info!(%instance_id, "found workflow instance");
+
+        // Parse the stored input_payload from registration (contains initial context)
+        let stored_inputs = if let Some(payload) = &instance.input_payload {
+            parse_input_payload(payload)?
+        } else {
+            HashMap::new()
+        };
 
         // Start worker pool
         let worker_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -304,7 +311,12 @@ impl IntegrationHarness {
         ));
 
         // Start the workflow instance using the DAGRunner
-        let initial_inputs = build_initial_inputs(config.inputs);
+        // Merge stored inputs from Python registration with harness-provided inputs
+        // (harness inputs override stored inputs if there's a conflict)
+        let mut initial_inputs = stored_inputs;
+        for (k, v) in build_initial_inputs(config.inputs) {
+            initial_inputs.insert(k, v);
+        }
         runner
             .start_instance(instance_id, initial_inputs)
             .await
@@ -439,6 +451,93 @@ fn build_initial_inputs(pairs: &[(&str, &str)]) -> HashMap<String, JsonValue> {
         .iter()
         .map(|(k, v)| ((*k).to_string(), JsonValue::String((*v).to_string())))
         .collect()
+}
+
+/// Convert a protobuf WorkflowArgumentValue to a JSON Value.
+fn proto_value_to_json(value: &proto::WorkflowArgumentValue) -> JsonValue {
+    use proto::primitive_workflow_argument::Kind as PrimitiveKind;
+    use proto::workflow_argument_value::Kind;
+
+    match &value.kind {
+        Some(Kind::Primitive(p)) => match &p.kind {
+            Some(PrimitiveKind::IntValue(i)) => JsonValue::Number((*i).into()),
+            Some(PrimitiveKind::DoubleValue(f)) => serde_json::Number::from_f64(*f)
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null),
+            Some(PrimitiveKind::StringValue(s)) => JsonValue::String(s.clone()),
+            Some(PrimitiveKind::BoolValue(b)) => JsonValue::Bool(*b),
+            Some(PrimitiveKind::NullValue(_)) => JsonValue::Null,
+            None => JsonValue::Null,
+        },
+        Some(Kind::ListValue(list)) => {
+            let items: Vec<JsonValue> = list.items.iter().map(proto_value_to_json).collect();
+            JsonValue::Array(items)
+        }
+        Some(Kind::DictValue(dict)) => {
+            let entries: serde_json::Map<String, JsonValue> = dict
+                .entries
+                .iter()
+                .filter_map(|arg| {
+                    arg.value
+                        .as_ref()
+                        .map(|v| (arg.key.clone(), proto_value_to_json(v)))
+                })
+                .collect();
+            JsonValue::Object(entries)
+        }
+        Some(Kind::TupleValue(tuple)) => {
+            let items: Vec<JsonValue> = tuple.items.iter().map(proto_value_to_json).collect();
+            JsonValue::Array(items)
+        }
+        Some(Kind::Basemodel(model)) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "__class__".to_string(),
+                JsonValue::String(model.name.clone()),
+            );
+            obj.insert(
+                "__module__".to_string(),
+                JsonValue::String(model.module.clone()),
+            );
+            if let Some(data_dict) = &model.data {
+                for entry in &data_dict.entries {
+                    if let Some(v) = &entry.value {
+                        obj.insert(entry.key.clone(), proto_value_to_json(v));
+                    }
+                }
+            }
+            JsonValue::Object(obj)
+        }
+        Some(Kind::Exception(exc)) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("__exception__".to_string(), JsonValue::Bool(true));
+            obj.insert("type".to_string(), JsonValue::String(exc.r#type.clone()));
+            obj.insert("module".to_string(), JsonValue::String(exc.module.clone()));
+            obj.insert(
+                "message".to_string(),
+                JsonValue::String(exc.message.clone()),
+            );
+            JsonValue::Object(obj)
+        }
+        None => JsonValue::Null,
+    }
+}
+
+/// Parse stored input_payload (protobuf WorkflowArguments) to HashMap.
+fn parse_input_payload(payload: &[u8]) -> Result<HashMap<String, JsonValue>> {
+    if payload.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let arguments = proto::WorkflowArguments::decode(payload)
+        .map_err(|err| anyhow::anyhow!("decode workflow arguments: {err}"))?;
+
+    let mut result = HashMap::new();
+    for arg in arguments.arguments {
+        if let Some(value) = arg.value {
+            result.insert(arg.key, proto_value_to_json(&value));
+        }
+    }
+    Ok(result)
 }
 
 /// Clean up the database before each test.

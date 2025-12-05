@@ -78,6 +78,8 @@ pub struct DAGNode {
     pub spread_loop_var: Option<String>,
     /// Collection variable being spread over (e.g., "items" in "spread items:item -> @action()")
     pub spread_collection: Option<String>,
+    /// Node ID of the aggregator that collects results from this spread action
+    pub aggregates_to: Option<String>,
     /// Guard expression for conditional nodes (if/elif). Evaluated at runtime to determine branch.
     pub guard_expr: Option<ast::Expr>,
 }
@@ -108,6 +110,7 @@ impl DAGNode {
             is_spread: false,
             spread_loop_var: None,
             spread_collection: None,
+            aggregates_to: None,
             guard_expr: None,
         }
     }
@@ -193,6 +196,12 @@ impl DAGNode {
         self.is_spread = true;
         self.spread_loop_var = Some(loop_var.to_string());
         self.spread_collection = Some(collection.to_string());
+        self
+    }
+
+    /// Builder method to set aggregator node ID for spread actions
+    pub fn with_aggregates_to(mut self, aggregator_id: &str) -> Self {
+        self.aggregates_to = Some(aggregator_id.to_string());
         self
     }
 }
@@ -617,6 +626,33 @@ impl DAGConverter {
                         // Store the last node for later edge rewiring
                         // We'll need special handling for edges FROM this fn_call
                         id_map.insert(format!("{}_last", old_id), child_last.clone());
+
+                        // Propagate spread attributes from fn_call to expanded action nodes
+                        // This implements for loop semantics: the fn_call is marked as spread,
+                        // and all action_call nodes inside need to inherit that for iteration
+                        if node.is_spread {
+                            // Find all action nodes that were added as part of this expansion
+                            let expanded_action_ids: Vec<_> = target
+                                .nodes
+                                .keys()
+                                .filter(|id| id.starts_with(&child_prefix))
+                                .cloned()
+                                .collect();
+
+                            for action_id in expanded_action_ids {
+                                if let Some(action_node) = target.nodes.get_mut(&action_id) {
+                                    if action_node.node_type == "action_call" {
+                                        action_node.is_spread = true;
+                                        action_node.spread_loop_var =
+                                            node.spread_loop_var.clone();
+                                        action_node.spread_collection =
+                                            node.spread_collection.clone();
+                                        action_node.aggregates_to =
+                                            node.aggregates_to.clone();
+                                    }
+                                }
+                            }
+                        }
 
                         // Propagate exception edges to ALL expanded nodes
                         // This implements the try/except context handling:
@@ -1144,19 +1180,22 @@ impl DAGConverter {
         // Use internal variable name for spread results flowing to aggregator
         let spread_result_var = "_spread_result".to_string();
 
+        // Create aggregator ID first so we can link the action to it
+        let agg_id = self.next_id("aggregator");
+
         let mut action_node =
             DAGNode::new(action_id.clone(), "action_call".to_string(), action_label)
                 .with_action(&action.action_name, action.module_name.as_deref())
                 .with_kwargs(kwargs)
                 .with_spread(&spread.loop_var, &collection_str)
-                .with_target(&spread_result_var);
+                .with_target(&spread_result_var)
+                .with_aggregates_to(&agg_id);
         if let Some(ref fn_name) = self.current_function {
             action_node = action_node.with_function_name(fn_name);
         }
         self.dag.add_node(action_node);
 
         // Create aggregator node
-        let agg_id = self.next_id("aggregator");
         let target_label = if !targets.is_empty() {
             if targets.len() == 1 {
                 format!("aggregate -> {}", targets[0])
@@ -1224,19 +1263,22 @@ impl DAGConverter {
         // Use internal variable name for spread results flowing to aggregator
         let spread_result_var = "_spread_result".to_string();
 
+        // Create aggregator ID first so we can link the action to it
+        let agg_id = self.next_id("aggregator");
+
         let mut action_node =
             DAGNode::new(action_id.clone(), "action_call".to_string(), action_label)
                 .with_action(&action.action_name, action.module_name.as_deref())
                 .with_kwargs(kwargs)
                 .with_spread(&spread.loop_var, &collection_str)
-                .with_target(&spread_result_var); // Set target so results flow to aggregator
+                .with_target(&spread_result_var) // Set target so results flow to aggregator
+                .with_aggregates_to(&agg_id);
         if let Some(ref fn_name) = self.current_function {
             action_node = action_node.with_function_name(fn_name);
         }
         self.dag.add_node(action_node);
 
         // Create aggregator node
-        let agg_id = self.next_id("aggregator");
         let target_label = if !targets.is_empty() {
             if targets.len() == 1 {
                 format!("aggregate -> {}", targets[0])
@@ -1409,11 +1451,26 @@ impl DAGConverter {
         result_nodes
     }
 
-    /// Convert a for loop
+    /// Convert a for loop.
+    ///
+    /// For loops create:
+    /// 1. A for_loop node (loop head)
+    /// 2. Optional body nodes (action_call or fn_call) for the loop iteration
+    /// 3. An aggregator node to collect results
+    ///
+    /// The structure is: for_loop -> body_action/fn_call -> aggregator -> ...
     fn convert_for_loop(&mut self, for_loop: &ast::ForLoop) -> Vec<String> {
         let loop_id = self.next_id("for_loop");
         let loop_vars_str = for_loop.loop_vars.join(", ");
-        let label = format!("for {} in ...", loop_vars_str);
+
+        // Get the iterable expression as a string for spread-like behavior
+        let collection_str = for_loop
+            .iterable
+            .as_ref()
+            .map(|c| self.expr_to_string(c))
+            .unwrap_or_default();
+
+        let label = format!("for {} in {}", loop_vars_str, collection_str);
 
         let mut loop_node = DAGNode::new(loop_id.clone(), "for_loop".to_string(), label)
             .with_loop_head(for_loop.loop_vars.clone());
@@ -1422,28 +1479,186 @@ impl DAGConverter {
         }
         self.dag.add_node(loop_node);
 
-        // Track loop variables
+        // Track loop variables as defined by the for_loop node
         for loop_var in &for_loop.loop_vars {
             self.track_var_definition(loop_var, &loop_id);
         }
 
-        // Track output variables from the loop body (SingleCallBody)
+        let mut result_nodes = vec![loop_id.clone()];
+
+        // Convert the loop body (SingleCallBody)
         if let Some(body) = &for_loop.body {
-            // If there's a call with targets, track them
-            for target in &body.targets {
-                self.track_var_definition(target, &loop_id);
-            }
-            // Also check pure data statements for assignments
-            for stmt in &body.statements {
-                if let Some(ast::statement::Kind::Assignment(assign)) = &stmt.kind {
-                    for target in &assign.targets {
-                        self.track_var_definition(target, &loop_id);
+            // Handle function call in body (e.g., synthetic __for_body_X__)
+            if let Some(call) = &body.call {
+                if let Some(ast::call::Kind::Function(func)) = &call.kind {
+                    // Create fn_call node for the body function
+                    let fn_call_id = self.next_id("for_body_call");
+                    let fn_label = format!("{}()", func.name);
+                    let kwargs = self.extract_kwargs(&func.kwargs);
+
+                    // Use the loop variable as the spread variable for iteration
+                    let loop_var = if for_loop.loop_vars.len() == 1 {
+                        for_loop.loop_vars[0].clone()
+                    } else {
+                        "__loop_item".to_string()
+                    };
+
+                    // Create aggregator ID first so we can link the fn_call to it
+                    let agg_id = self.next_id("for_aggregator");
+
+                    let mut fn_node =
+                        DAGNode::new(fn_call_id.clone(), "fn_call".to_string(), fn_label)
+                            .with_fn_call(&func.name)
+                            .with_kwargs(kwargs)
+                            .with_spread(&loop_var, &collection_str)
+                            .with_aggregates_to(&agg_id);
+                    if let Some(ref current_fn) = self.current_function {
+                        fn_node = fn_node.with_function_name(current_fn);
+                    }
+                    // Preserve body targets on the fn_call node (for tuple unpacking)
+                    // while also setting the internal target for spread result flow
+                    if !body.targets.is_empty() {
+                        fn_node = fn_node.with_targets(&body.targets);
+                    } else {
+                        fn_node = fn_node.with_target("_for_loop_result");
+                    }
+                    self.dag.add_node(fn_node);
+
+                    // Connect for_loop -> fn_call
+                    self.dag
+                        .add_edge(DAGEdge::state_machine(loop_id.clone(), fn_call_id.clone()));
+
+                    // Create aggregator node
+                    let agg_label = if !body.targets.is_empty() {
+                        format!("collect -> {}", body.targets.join(", "))
+                    } else {
+                        "collect".to_string()
+                    };
+                    let mut agg_node =
+                        DAGNode::new(agg_id.clone(), "aggregator".to_string(), agg_label)
+                            .with_aggregator(&fn_call_id);
+                    if !body.targets.is_empty() {
+                        agg_node = agg_node.with_targets(&body.targets);
+                    }
+                    if let Some(ref current_fn) = self.current_function {
+                        agg_node = agg_node.with_function_name(current_fn);
+                    }
+                    self.dag.add_node(agg_node);
+
+                    // Connect fn_call -> aggregator
+                    self.dag
+                        .add_edge(DAGEdge::state_machine(fn_call_id.clone(), agg_id.clone()));
+
+                    // Add DATA_FLOW edge for results using the first target or internal variable
+                    let flow_var = body
+                        .targets
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "_for_loop_result".to_string());
+                    self.dag.add_edge(DAGEdge::data_flow(
+                        fn_call_id.clone(),
+                        agg_id.clone(),
+                        &flow_var,
+                    ));
+
+                    // Track targets at aggregator
+                    for target in &body.targets {
+                        self.track_var_definition(target, &agg_id);
+                    }
+
+                    result_nodes.push(fn_call_id);
+                    result_nodes.push(agg_id);
+                } else if let Some(ast::call::Kind::Action(action)) = &call.kind {
+                    // Direct action call in body (no function wrapper)
+                    let action_id = self.next_id("for_action");
+                    let action_label = format!("@{}()", action.action_name);
+                    let kwargs = self.extract_kwargs(&action.kwargs);
+
+                    let loop_var = if for_loop.loop_vars.len() == 1 {
+                        for_loop.loop_vars[0].clone()
+                    } else {
+                        "__loop_item".to_string()
+                    };
+
+                    // Create aggregator ID first so we can link the action to it
+                    let agg_id = self.next_id("for_aggregator");
+
+                    let mut action_node =
+                        DAGNode::new(action_id.clone(), "action_call".to_string(), action_label)
+                            .with_action(&action.action_name, action.module_name.as_deref())
+                            .with_kwargs(kwargs)
+                            .with_spread(&loop_var, &collection_str)
+                            .with_aggregates_to(&agg_id);
+                    if let Some(ref current_fn) = self.current_function {
+                        action_node = action_node.with_function_name(current_fn);
+                    }
+                    // Preserve body targets on the action node (for tuple unpacking)
+                    // while also setting the internal target for spread result flow
+                    if !body.targets.is_empty() {
+                        action_node = action_node.with_targets(&body.targets);
+                    } else {
+                        action_node = action_node.with_target("_for_loop_result");
+                    }
+                    self.dag.add_node(action_node);
+
+                    // Connect for_loop -> action
+                    self.dag
+                        .add_edge(DAGEdge::state_machine(loop_id.clone(), action_id.clone()));
+
+                    // Create aggregator node
+                    let agg_label = if !body.targets.is_empty() {
+                        format!("collect -> {}", body.targets.join(", "))
+                    } else {
+                        "collect".to_string()
+                    };
+                    let mut agg_node =
+                        DAGNode::new(agg_id.clone(), "aggregator".to_string(), agg_label)
+                            .with_aggregator(&action_id);
+                    if !body.targets.is_empty() {
+                        agg_node = agg_node.with_targets(&body.targets);
+                    }
+                    if let Some(ref current_fn) = self.current_function {
+                        agg_node = agg_node.with_function_name(current_fn);
+                    }
+                    self.dag.add_node(agg_node);
+
+                    // Connect action -> aggregator
+                    self.dag
+                        .add_edge(DAGEdge::state_machine(action_id.clone(), agg_id.clone()));
+
+                    // Add DATA_FLOW edge for results using the first target or internal variable
+                    let flow_var = body
+                        .targets
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "_for_loop_result".to_string());
+                    self.dag.add_edge(DAGEdge::data_flow(
+                        action_id.clone(),
+                        agg_id.clone(),
+                        &flow_var,
+                    ));
+
+                    // Track targets at aggregator
+                    for target in &body.targets {
+                        self.track_var_definition(target, &agg_id);
+                    }
+
+                    result_nodes.push(action_id);
+                    result_nodes.push(agg_id);
+                }
+            } else {
+                // Pure data body (no call) - track assignments
+                for stmt in &body.statements {
+                    if let Some(ast::statement::Kind::Assignment(assign)) = &stmt.kind {
+                        for target in &assign.targets {
+                            self.track_var_definition(target, &loop_id);
+                        }
                     }
                 }
             }
         }
 
-        vec![loop_id]
+        result_nodes
     }
 
     /// Convert a conditional (if/elif/else)
@@ -1484,6 +1699,13 @@ impl DAGConverter {
         // Get the guard expression for the if branch
         let guard_expr = cond.if_branch.as_ref().and_then(|b| b.condition.clone());
 
+        // Track all branches (if, elif*, else) for proper guard composition
+        // Each branch needs a compound guard that is:
+        // - if: guard
+        // - elif: NOT(if_guard) AND NOT(elif1_guard) AND ... AND elif_guard
+        // - else: NOT(if_guard) AND NOT(elif1_guard) AND ... AND NOT(elifN_guard)
+        let mut prior_guards: Vec<ast::Expr> = Vec::new();
+
         // Process then branch (SingleCallBody - exactly one call)
         if let Some(if_branch) = &cond.if_branch
             && let Some(body) = &if_branch.body
@@ -1493,6 +1715,31 @@ impl DAGConverter {
                 then_first = Some(node_ids[0].clone());
                 then_last = Some(node_ids.last().unwrap().clone());
                 result_nodes.extend(node_ids);
+            }
+        }
+
+        // Track if guard for elif/else composition
+        if let Some(ref guard) = guard_expr {
+            prior_guards.push(guard.clone());
+        }
+
+        // Process elif branches
+        let mut elif_branches_info: Vec<(Option<String>, Option<String>, ast::Expr)> = Vec::new();
+        for elif_branch in &cond.elif_branches {
+            if let Some(body) = &elif_branch.body {
+                let node_ids = self.convert_single_call_body(body);
+                let elif_first = node_ids.first().cloned();
+                let elif_last = node_ids.last().cloned();
+                result_nodes.extend(node_ids);
+
+                // Build compound guard: NOT(prior_guard1) AND NOT(prior_guard2) AND ... AND elif_condition
+                let elif_condition = elif_branch.condition.clone();
+                if let Some(elif_cond) = elif_condition {
+                    let compound_guard = self.build_compound_guard(&prior_guards, Some(&elif_cond));
+                    elif_branches_info.push((elif_first, elif_last, compound_guard));
+                    // Add this elif's condition to prior guards for subsequent branches
+                    prior_guards.push(elif_cond);
+                }
             }
         }
 
@@ -1535,29 +1782,31 @@ impl DAGConverter {
             }
         }
 
-        // Connect branch node to else branch with negated guard
-        if let Some(ref else_target) = else_first {
-            if let Some(ref guard) = guard_expr {
-                // Create negated guard: not (original_condition)
-                let negated_guard = ast::Expr {
-                    span: None,
-                    kind: Some(ast::expr::Kind::UnaryOp(Box::new(ast::UnaryOp {
-                        op: ast::UnaryOperator::UnaryOpNot as i32,
-                        operand: Some(Box::new(guard.clone())),
-                    }))),
-                };
+        // Connect branch node to elif branches with compound guards
+        for (elif_first, elif_last, compound_guard) in &elif_branches_info {
+            if let Some(elif_target) = elif_first {
                 self.dag.add_edge(DAGEdge::state_machine_with_guard(
                     branch_id.clone(),
-                    else_target.clone(),
-                    negated_guard,
-                ));
-            } else {
-                self.dag.add_edge(DAGEdge::state_machine_with_condition(
-                    branch_id.clone(),
-                    else_target.clone(),
-                    "else",
+                    elif_target.clone(),
+                    compound_guard.clone(),
                 ));
             }
+            // Connect elif end to join
+            if let Some(elif_end) = elif_last {
+                self.dag
+                    .add_edge(DAGEdge::state_machine(elif_end.clone(), join_id.clone()));
+            }
+        }
+
+        // Connect branch node to else branch with compound negated guard
+        if let Some(ref else_target) = else_first {
+            // Else guard is: NOT(if_guard) AND NOT(elif1_guard) AND ... AND NOT(elifN_guard)
+            let else_guard = self.build_compound_guard(&prior_guards, None);
+            self.dag.add_edge(DAGEdge::state_machine_with_guard(
+                branch_id.clone(),
+                else_target.clone(),
+                else_guard,
+            ));
         }
 
         // Handle missing branches - connect directly to join
@@ -1571,20 +1820,12 @@ impl DAGConverter {
             }
         }
         if else_first.is_none() && cond.else_branch.is_some() {
-            if let Some(ref guard) = guard_expr {
-                let negated_guard = ast::Expr {
-                    span: None,
-                    kind: Some(ast::expr::Kind::UnaryOp(Box::new(ast::UnaryOp {
-                        op: ast::UnaryOperator::UnaryOpNot as i32,
-                        operand: Some(Box::new(guard.clone())),
-                    }))),
-                };
-                self.dag.add_edge(DAGEdge::state_machine_with_guard(
-                    branch_id.clone(),
-                    join_id.clone(),
-                    negated_guard,
-                ));
-            }
+            let else_guard = self.build_compound_guard(&prior_guards, None);
+            self.dag.add_edge(DAGEdge::state_machine_with_guard(
+                branch_id.clone(),
+                join_id.clone(),
+                else_guard,
+            ));
         }
 
         // Connect branch ends to join
@@ -1597,6 +1838,60 @@ impl DAGConverter {
         }
 
         result_nodes
+    }
+
+    /// Build a compound guard expression from prior guards and an optional current condition.
+    ///
+    /// For elif branches: NOT(prior1) AND NOT(prior2) AND ... AND current_condition
+    /// For else branches: NOT(prior1) AND NOT(prior2) AND ... (no current condition)
+    fn build_compound_guard(
+        &self,
+        prior_guards: &[ast::Expr],
+        current_condition: Option<&ast::Expr>,
+    ) -> ast::Expr {
+        // Start with negated prior guards
+        let mut parts: Vec<ast::Expr> = prior_guards
+            .iter()
+            .map(|guard| ast::Expr {
+                span: None,
+                kind: Some(ast::expr::Kind::UnaryOp(Box::new(ast::UnaryOp {
+                    op: ast::UnaryOperator::UnaryOpNot as i32,
+                    operand: Some(Box::new(guard.clone())),
+                }))),
+            })
+            .collect();
+
+        // Add the current condition if provided (for elif, not for else)
+        if let Some(cond) = current_condition {
+            parts.push(cond.clone());
+        }
+
+        // Combine with AND operators
+        if parts.is_empty() {
+            // Shouldn't happen, but return a true literal as fallback
+            ast::Expr {
+                span: None,
+                kind: Some(ast::expr::Kind::Literal(ast::Literal {
+                    value: Some(ast::literal::Value::BoolValue(true)),
+                })),
+            }
+        } else if parts.len() == 1 {
+            parts.remove(0)
+        } else {
+            // Build left-associative AND chain: ((a AND b) AND c) AND d
+            let mut result = parts.remove(0);
+            for part in parts {
+                result = ast::Expr {
+                    span: None,
+                    kind: Some(ast::expr::Kind::BinaryOp(Box::new(ast::BinaryOp {
+                        left: Some(Box::new(result)),
+                        op: ast::BinaryOperator::BinaryOpAnd as i32,
+                        right: Some(Box::new(part)),
+                    }))),
+                };
+            }
+            result
+        }
     }
 
     /// Convert a try/except block

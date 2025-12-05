@@ -245,6 +245,8 @@ fn categorize_node(node: &DAGNode) -> NodeCategory {
     }
 
     // Everything else is inline: assignments, expressions, control flow, fn_call
+    // Note: for_loop nodes without action bodies are inline (pure data manipulation)
+    // For loops WITH action bodies are converted to action_call + aggregator during DAG conversion
     NodeCategory::Inline
 }
 
@@ -420,6 +422,7 @@ pub fn execute_inline_subgraph(
     existing_inbox: &HashMap<String, HashMap<String, JsonValue>>,
     dag: &DAG,
     instance_id: WorkflowInstanceId,
+    spread_index: Option<usize>,
 ) -> Result<CompletionPlan, CompletionError> {
     let mut plan = CompletionPlan::new(completed_node_id.to_string());
     let helper = DAGHelper::new(dag);
@@ -429,7 +432,37 @@ pub fn execute_inline_subgraph(
     if let Some(node) = dag.nodes.get(completed_node_id)
         && let Some(ref target) = node.target
     {
-        inline_scope.insert(target.clone(), completed_result.clone());
+        // For aggregator nodes with multiple targets (parallel blocks with tuple unpacking),
+        // don't insert the aggregated array as the result. For parallel blocks, the named
+        // variables from the inbox (written by individual parallel actions) are the
+        // authoritative source. They will be merged in later from existing_inbox.
+        //
+        // For spread/for-loop aggregators (single target), the aggregated array IS the result
+        // and should be used.
+        let is_parallel_aggregator = node.node_type == "aggregator"
+            && node.targets.as_ref().is_some_and(|t| t.len() > 1);
+
+        if !is_parallel_aggregator {
+            inline_scope.insert(target.clone(), completed_result.clone());
+        }
+    }
+
+    // If this is a spread action, write the result to the aggregator with spread_index
+    if let Some(spread_idx) = spread_index {
+        if let Some(node) = dag.nodes.get(completed_node_id) {
+            if let Some(ref aggregator_id) = node.aggregates_to {
+                // Write result to aggregator with spread_index
+                let var_name = node.target.clone().unwrap_or_else(|| "_for_loop_result".to_string());
+                plan.inbox_writes.push(InboxWrite {
+                    instance_id,
+                    target_node_id: aggregator_id.clone(),
+                    variable_name: var_name,
+                    value: completed_result.clone(),
+                    source_node_id: completed_node_id.to_string(),
+                    spread_index: Some(spread_idx as i32),
+                });
+            }
+        }
     }
 
     // Merge existing inbox data for the completed node
@@ -584,6 +617,23 @@ pub fn execute_inline_subgraph(
                     });
                 }
                 FrontierCategory::Barrier => {
+                    // For parallel blocks, write the completed node's result to the barrier's inbox
+                    // so it can be passed to successor nodes when the barrier fires.
+                    // This is different from spread actions which use spread_index.
+                    if let Some(completed_node) = dag.nodes.get(completed_node_id) {
+                        if let Some(ref target) = completed_node.target {
+                            // Write this parallel action's result to the barrier's inbox
+                            plan.inbox_writes.push(InboxWrite {
+                                instance_id,
+                                target_node_id: frontier.node_id.clone(),
+                                variable_name: target.clone(),
+                                value: completed_result.clone(),
+                                source_node_id: completed_node_id.to_string(),
+                                spread_index: None,
+                            });
+                        }
+                    }
+
                     plan.readiness_increments.push(ReadinessIncrement {
                         node_id: frontier.node_id.clone(),
                         required_count: frontier.required_count,
@@ -683,7 +733,11 @@ fn execute_inline_node(node: &DAGNode, _scope: &InlineScope) -> JsonValue {
 /// Evaluate a guard expression to determine if a branch should be taken.
 ///
 /// Returns true if the guard passes (branch should be taken), false otherwise.
-fn evaluate_guard(guard_expr: Option<&ast::Expr>, scope: &InlineScope, successor_id: &str) -> bool {
+pub fn evaluate_guard(
+    guard_expr: Option<&ast::Expr>,
+    scope: &InlineScope,
+    successor_id: &str,
+) -> bool {
     let Some(guard) = guard_expr else {
         // No guard expression - always pass
         return true;
@@ -1073,6 +1127,7 @@ fn workflow(input: [x], output: [result]):
             &existing_inbox,
             &dag,
             instance_id,
+            None, // no spread index
         )
         .expect("Should succeed");
 
