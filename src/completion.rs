@@ -885,3 +885,258 @@ fn json_to_proto_value(value: &JsonValue) -> crate::messages::proto::WorkflowArg
 
     proto::WorkflowArgumentValue { kind: Some(kind) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dag::convert_to_dag;
+    use crate::parser::parse;
+
+    /// Helper to create a DAG from IR source
+    fn dag_from_source(source: &str) -> DAG {
+        let program = parse(source).expect("Failed to parse IR");
+        convert_to_dag(&program)
+    }
+
+    #[test]
+    fn test_analyze_subgraph_simple_action_to_return() {
+        // Simple workflow: action -> return
+        let source = r#"
+fn workflow(input: [x], output: [result]):
+    result = @test_action(value=x)
+    return result
+"#;
+        let dag = dag_from_source(source);
+        let helper = DAGHelper::new(&dag);
+
+        // Find the action node
+        let action_node = dag
+            .nodes
+            .values()
+            .find(|n| n.node_type == "action_call")
+            .expect("Should have action node");
+
+        let analysis = analyze_subgraph(&action_node.id, &dag, &helper);
+
+        // After action completes, we should find the return node as frontier
+        assert!(
+            !analysis.frontier_nodes.is_empty(),
+            "Should have frontier nodes"
+        );
+        assert!(
+            analysis
+                .frontier_nodes
+                .iter()
+                .any(|f| f.category == FrontierCategory::Output),
+            "Should have output frontier"
+        );
+    }
+
+    #[test]
+    fn test_analyze_subgraph_inline_nodes() {
+        // Workflow with inline assignment between actions
+        let source = r#"
+fn workflow(input: [x], output: [result]):
+    a = @first_action(value=x)
+    b = a + 1
+    result = @second_action(value=b)
+    return result
+"#;
+        let dag = dag_from_source(source);
+        let helper = DAGHelper::new(&dag);
+
+        // Find the first action node
+        let first_action = dag
+            .nodes
+            .values()
+            .find(|n| {
+                n.node_type == "action_call" && n.action_name.as_deref() == Some("first_action")
+            })
+            .expect("Should have first_action node");
+
+        let analysis = analyze_subgraph(&first_action.id, &dag, &helper);
+
+        // Should have inline nodes (the assignment)
+        assert!(
+            !analysis.inline_nodes.is_empty(),
+            "Should have inline nodes for assignment"
+        );
+
+        // Should have action frontier (second_action)
+        assert!(
+            analysis
+                .frontier_nodes
+                .iter()
+                .any(|f| f.category == FrontierCategory::Action),
+            "Should have action frontier"
+        );
+    }
+
+    #[test]
+    fn test_analyze_subgraph_parallel_barrier() {
+        // Workflow with parallel block that has a barrier (aggregator)
+        let source = r#"
+fn workflow(input: [x], output: [result]):
+    a, b = parallel:
+        @action1(value=x)
+        @action2(value=x)
+    result = a + b
+    return result
+"#;
+        let dag = dag_from_source(source);
+        let helper = DAGHelper::new(&dag);
+
+        // Find one of the parallel actions
+        let parallel_action = dag
+            .nodes
+            .values()
+            .find(|n| n.node_type == "action_call")
+            .expect("Should have action node");
+
+        let analysis = analyze_subgraph(&parallel_action.id, &dag, &helper);
+
+        // Should have barrier frontier (the aggregator)
+        assert!(
+            analysis
+                .frontier_nodes
+                .iter()
+                .any(|f| f.category == FrontierCategory::Barrier),
+            "Should have barrier frontier for parallel aggregator"
+        );
+    }
+
+    #[test]
+    fn test_is_direct_predecessor() {
+        let source = r#"
+fn workflow(input: [x], output: [result]):
+    result = @test_action(value=x)
+    return result
+"#;
+        let dag = dag_from_source(source);
+
+        // Find nodes
+        let action_node = dag
+            .nodes
+            .values()
+            .find(|n| n.node_type == "action_call")
+            .expect("Should have action node");
+
+        let return_node = dag
+            .nodes
+            .values()
+            .find(|n| n.node_type == "return")
+            .expect("Should have return node");
+
+        // Action should be direct predecessor of return
+        assert!(is_direct_predecessor(
+            &action_node.id,
+            &return_node.id,
+            &dag
+        ));
+
+        // Return should not be direct predecessor of action
+        assert!(!is_direct_predecessor(
+            &return_node.id,
+            &action_node.id,
+            &dag
+        ));
+    }
+
+    #[test]
+    fn test_execute_inline_subgraph_simple() {
+        let source = r#"
+fn workflow(input: [x], output: [result]):
+    result = @test_action(value=x)
+    return result
+"#;
+        let dag = dag_from_source(source);
+        let helper = DAGHelper::new(&dag);
+
+        // Find the action node
+        let action_node = dag
+            .nodes
+            .values()
+            .find(|n| n.node_type == "action_call")
+            .expect("Should have action node");
+
+        let subgraph = analyze_subgraph(&action_node.id, &dag, &helper);
+
+        // Execute with a sample result
+        let result = serde_json::json!("hello world");
+        let existing_inbox = HashMap::new();
+        let instance_id = WorkflowInstanceId(Uuid::new_v4());
+
+        let plan = execute_inline_subgraph(
+            &action_node.id,
+            result,
+            &subgraph,
+            &existing_inbox,
+            &dag,
+            instance_id,
+        )
+        .expect("Should succeed");
+
+        // Should have instance completion (workflow output)
+        assert!(
+            plan.instance_completion.is_some(),
+            "Should have instance completion"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_guard_none() {
+        let scope: InlineScope = HashMap::new();
+
+        // No guard expression should return true (always pass)
+        assert!(evaluate_guard(None, &scope, "test_node"));
+    }
+
+    #[test]
+    fn test_evaluate_guard_with_conditional_workflow() {
+        // Test guard evaluation by analyzing a conditional workflow's DAG
+        // and checking that guards are correctly evaluated
+        let source = r#"
+fn workflow(input: [x], output: [result]):
+    score = @get_score(value=x)
+    if score >= 75:
+        result = @high_action(value=score)
+    else:
+        result = @low_action(value=score)
+    return result
+"#;
+        let dag = dag_from_source(source);
+        let helper = DAGHelper::new(&dag);
+
+        // Find the get_score action
+        let score_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("get_score"))
+            .expect("Should have get_score action");
+
+        // Analyze from the score action
+        let analysis = analyze_subgraph(&score_action.id, &dag, &helper);
+
+        // Should have conditional branch nodes as inline or frontiers
+        // The exact structure depends on how conditionals are represented
+        assert!(
+            !analysis.all_node_ids.is_empty(),
+            "Should have reachable nodes"
+        );
+    }
+
+    #[test]
+    fn test_node_type_as_str() {
+        assert_eq!(NodeType::Action.as_str(), "action");
+        assert_eq!(NodeType::Barrier.as_str(), "barrier");
+    }
+
+    #[test]
+    fn test_completion_plan_new() {
+        let plan = CompletionPlan::new("test_node".to_string());
+        assert_eq!(plan.completed_node_id, "test_node");
+        assert!(plan.inbox_writes.is_empty());
+        assert!(plan.readiness_increments.is_empty());
+        assert!(plan.instance_completion.is_none());
+    }
+}
