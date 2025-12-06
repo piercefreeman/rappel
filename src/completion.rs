@@ -57,6 +57,8 @@ pub enum FrontierCategory {
     Barrier,
     /// Workflow completion (output/return node).
     Output,
+    /// For-loop controller that manages iteration state.
+    ForLoop,
 }
 
 // ============================================================================
@@ -169,6 +171,7 @@ pub struct ReadinessIncrement {
 pub enum NodeType {
     Action,
     Barrier,
+    ForLoop,
 }
 
 impl NodeType {
@@ -176,6 +179,7 @@ impl NodeType {
         match self {
             NodeType::Action => "action",
             NodeType::Barrier => "barrier",
+            NodeType::ForLoop => "for_loop",
         }
     }
 }
@@ -238,6 +242,11 @@ fn categorize_node(node: &DAGNode) -> NodeCategory {
         return NodeCategory::Barrier;
     }
 
+    // For-loop controller nodes are frontiers that manage iteration
+    if node.node_type == "for_loop" {
+        return NodeCategory::ForLoop;
+    }
+
     // Action calls (external) need worker execution
     // But fn_call nodes are internal function expansions - treat as inline
     if node.node_type == "action_call" && !node.is_fn_call {
@@ -245,8 +254,6 @@ fn categorize_node(node: &DAGNode) -> NodeCategory {
     }
 
     // Everything else is inline: assignments, expressions, control flow, fn_call
-    // Note: for_loop nodes without action bodies are inline (pure data manipulation)
-    // For loops WITH action bodies are converted to action_call + aggregator during DAG conversion
     NodeCategory::Inline
 }
 
@@ -257,13 +264,19 @@ enum NodeCategory {
     Action,
     Barrier,
     Output,
+    ForLoop,
 }
 
 /// Count the number of StateMachine predecessors for a node.
+/// Excludes loop-back edges since they don't contribute to initial readiness.
 fn count_sm_predecessors(dag: &DAG, node_id: &str) -> i32 {
     dag.edges
         .iter()
-        .filter(|e| e.target == node_id && e.edge_type == EdgeType::StateMachine)
+        .filter(|e| {
+            e.target == node_id
+                && e.edge_type == EdgeType::StateMachine
+                && !e.is_loop_back // Don't count loop-back edges
+        })
         .count() as i32
 }
 
@@ -337,6 +350,15 @@ pub fn analyze_subgraph(start_node_id: &str, dag: &DAG, helper: &DAGHelper) -> S
                     required_count,
                 });
                 // Don't traverse past output - workflow completes
+            }
+            NodeCategory::ForLoop => {
+                let required_count = count_sm_predecessors(dag, &node_id);
+                analysis.frontier_nodes.push(FrontierNode {
+                    node_id,
+                    category: FrontierCategory::ForLoop,
+                    required_count,
+                });
+                // Don't traverse past for_loop - it manages its own iteration
             }
         }
     }
@@ -727,6 +749,74 @@ pub fn execute_inline_subgraph(
                     plan.instance_completion = Some(InstanceCompletion {
                         instance_id,
                         result_payload: serialize_workflow_result(&result_value)?,
+                    });
+                }
+                FrontierCategory::ForLoop => {
+                    // For-loop controller: manage iteration state
+                    // The loop index variable is stored in the inbox as __loop_{loop_id}_i
+                    let loop_i_var = format!("__loop_{}_i", frontier.node_id);
+
+                    // Check if we're coming from a loop-back edge (iteration complete)
+                    // by looking at whether the completed node has a loop-back edge to us
+                    let is_loop_back = dag.edges.iter().any(|e| {
+                        e.source == completed_node_id
+                            && e.target == frontier.node_id
+                            && e.is_loop_back
+                    });
+
+                    // Get current loop index from inbox or initialize to 0
+                    let mut loop_inbox = existing_inbox
+                        .get(&frontier.node_id)
+                        .cloned()
+                        .unwrap_or_default();
+
+                    let current_index: i64 = if is_loop_back {
+                        // Coming from loop-back: increment the index
+                        let prev_index = loop_inbox
+                            .get(&loop_i_var)
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        prev_index + 1
+                    } else {
+                        // First entry: initialize to 0
+                        0
+                    };
+
+                    // Write the updated loop index to the for_loop's inbox
+                    plan.inbox_writes.push(InboxWrite {
+                        instance_id,
+                        target_node_id: frontier.node_id.clone(),
+                        variable_name: loop_i_var.clone(),
+                        value: JsonValue::Number(current_index.into()),
+                        source_node_id: completed_node_id.to_string(),
+                        spread_index: None,
+                    });
+
+                    // Also merge collection data into inbox
+                    merge_data_flow_into_inbox(
+                        &frontier.node_id,
+                        &inline_scope,
+                        dag,
+                        &mut loop_inbox,
+                    );
+
+                    debug!(
+                        for_loop_id = %frontier.node_id,
+                        loop_i_var = %loop_i_var,
+                        current_index = current_index,
+                        is_loop_back = is_loop_back,
+                        "for_loop frontier: updating loop index"
+                    );
+
+                    // Add readiness increment for the for_loop
+                    // When it becomes ready, the runner will evaluate its guard
+                    plan.readiness_increments.push(ReadinessIncrement {
+                        node_id: frontier.node_id.clone(),
+                        required_count: frontier.required_count,
+                        node_type: NodeType::ForLoop,
+                        module_name: None,
+                        action_name: None,
+                        dispatch_payload: None,
                     });
                 }
             }

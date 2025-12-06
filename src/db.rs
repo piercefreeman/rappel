@@ -271,6 +271,8 @@ pub struct NewAction {
     pub backoff_kind: BackoffKind,
     pub backoff_base_delay_ms: i32,
     pub node_id: Option<String>,
+    /// The type of node (e.g., "action", "for_loop", "barrier")
+    pub node_type: Option<String>,
 }
 
 /// Loop iteration state
@@ -566,9 +568,9 @@ impl Database {
             INSERT INTO action_queue (
                 instance_id, action_seq, module_name, action_name,
                 dispatch_payload, timeout_seconds, max_retries,
-                backoff_kind, backoff_base_delay_ms, node_id
+                backoff_kind, backoff_base_delay_ms, node_id, node_type
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING id
             "#,
         )
@@ -582,6 +584,7 @@ impl Database {
         .bind(action.backoff_kind.as_str())
         .bind(action.backoff_base_delay_ms)
         .bind(&action.node_id)
+        .bind(&action.node_type)
         .fetch_one(&self.pool)
         .await?;
 
@@ -1858,6 +1861,7 @@ mod tests {
                 backoff_kind: BackoffKind::Exponential,
                 backoff_base_delay_ms: 1000,
                 node_id: Some("node_1".to_string()),
+                node_type: None,
             })
             .await
             .expect("failed to enqueue action");
@@ -1911,6 +1915,7 @@ mod tests {
             backoff_kind: BackoffKind::None,
             backoff_base_delay_ms: 0,
             node_id: None,
+            node_type: None,
         })
         .await
         .unwrap();
@@ -2004,6 +2009,7 @@ mod tests {
                 backoff_kind: BackoffKind::None,
                 backoff_base_delay_ms: 0,
                 node_id: None,
+                node_type: None,
             })
             .await
             .unwrap();
@@ -2146,6 +2152,7 @@ mod tests {
                 backoff_kind: BackoffKind::None,
                 backoff_base_delay_ms: 0,
                 node_id: None,
+                node_type: None,
             })
             .await
             .unwrap();

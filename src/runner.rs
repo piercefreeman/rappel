@@ -676,6 +676,10 @@ impl WorkQueueHandler {
                     // Process barriers inline using unified readiness model
                     self.process_barrier(node).await?;
                 }
+                "for_loop" => {
+                    // Process for-loop controllers inline
+                    self.process_for_loop(node, completion_tx.clone()).await?;
+                }
                 _ => {
                     // Dispatch actions to workers
                     self.dispatch_action(node, completion_tx.clone()).await?;
@@ -785,6 +789,266 @@ impl WorkQueueHandler {
             newly_ready_nodes = ?result.newly_ready_nodes,
             workflow_completed = result.workflow_completed,
             "processed barrier"
+        );
+
+        Ok(())
+    }
+
+    /// Process a for-loop controller that has become ready.
+    ///
+    /// For-loops evaluate their guard expression to decide whether to:
+    /// - Continue: dispatch the loop body and set the loop variable
+    /// - Break: proceed to successors after the loop
+    async fn process_for_loop(
+        &self,
+        for_loop: QueuedAction,
+        _completion_tx: mpsc::Sender<(InFlightAction, RoundTripMetrics)>,
+    ) -> RunnerResult<()> {
+        use crate::completion::{
+            CompletionPlan, InboxWrite, NodeType, ReadinessIncrement,
+        };
+
+        let instance_id = WorkflowInstanceId(for_loop.instance_id);
+        let node_id = match for_loop.node_id.as_deref() {
+            Some(id) => id,
+            None => {
+                warn!(for_loop_id = %for_loop.id, "ForLoop missing node_id");
+                return Ok(());
+            }
+        };
+
+        debug!(
+            for_loop_id = %for_loop.id,
+            node_id = %node_id,
+            instance_id = %instance_id.0,
+            "processing for_loop"
+        );
+
+        // Get DAG
+        let dag = match self.dag_cache.get_dag_for_instance(instance_id).await? {
+            Some(dag) => dag,
+            None => {
+                warn!(
+                    for_loop_id = %for_loop.id,
+                    instance_id = %instance_id.0,
+                    "No DAG found for instance"
+                );
+                return Ok(());
+            }
+        };
+
+        let helper = DAGHelper::new(&dag);
+
+        // Get the for_loop node
+        let loop_node = match dag.nodes.get(node_id) {
+            Some(n) => n,
+            None => {
+                warn!(node_id = %node_id, "ForLoop node not found in DAG");
+                return Ok(());
+            }
+        };
+
+        // Read the for_loop's inbox to get the loop index and collection
+        let loop_inbox = self.db.read_inbox(instance_id, node_id).await?;
+        let loop_i_var = format!("__loop_{}_i", node_id);
+
+        // Get current loop index (should have been set by completion handler)
+        let current_index = loop_inbox
+            .get(&loop_i_var)
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as usize;
+
+        // Get collection from inbox using the loop_collection field
+        // Strip the $ prefix if present (expr_to_string adds $ for variables)
+        let collection_var = loop_node.loop_collection.clone().unwrap_or_default();
+        let collection_key = collection_var.strip_prefix('$').unwrap_or(&collection_var);
+        let collection = loop_inbox.get(collection_key);
+        let collection_len = collection
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+
+        debug!(
+            node_id = %node_id,
+            loop_i_var = %loop_i_var,
+            current_index = current_index,
+            collection_var = %collection_var,
+            collection_len = collection_len,
+            "for_loop state"
+        );
+
+        // Evaluate guard: current_index < collection_len
+        let should_continue = current_index < collection_len;
+
+        // Build completion plan
+        let mut plan = CompletionPlan::new(node_id.to_string());
+        plan = plan.with_action_completion(
+            ActionId(for_loop.id),
+            for_loop.delivery_token,
+            true, // for_loops always "succeed"
+            Vec::new(),
+            None,
+        );
+
+        if should_continue {
+            // Continue: set loop variable(s) and dispatch body
+            let loop_vars = loop_node.loop_vars.clone();
+            let collection_arr = collection.and_then(|v| v.as_array());
+
+            // Get the current item from the collection
+            let current_item = collection_arr
+                .and_then(|arr| arr.get(current_index))
+                .cloned()
+                .unwrap_or(JsonValue::Null);
+
+            // Find the body node (successor with guard)
+            let body_successors: Vec<_> = helper
+                .get_ready_successors(node_id, None)
+                .into_iter()
+                .filter(|s| s.guard_expr.is_some())
+                .collect();
+
+            if let Some(body_successor) = body_successors.first() {
+                let body_node_id = &body_successor.node_id;
+
+                // Write loop variable(s) to body's inbox
+                // Handle both single variable and tuple unpacking
+                if let Some(ref vars) = loop_vars {
+                    if vars.len() == 1 {
+                        // Single variable: item = collection[i]
+                        plan.inbox_writes.push(InboxWrite {
+                            instance_id,
+                            target_node_id: body_node_id.clone(),
+                            variable_name: vars[0].clone(),
+                            value: current_item.clone(),
+                            source_node_id: node_id.to_string(),
+                            spread_index: None,
+                        });
+                    } else if vars.len() > 1 {
+                        // Tuple unpacking: (i, item) = enumerate(collection)[i]
+                        // or (a, b) = collection[i] where collection[i] is a tuple
+                        if let Some(arr) = current_item.as_array() {
+                            for (idx, var) in vars.iter().enumerate() {
+                                let val = arr.get(idx).cloned().unwrap_or(JsonValue::Null);
+                                plan.inbox_writes.push(InboxWrite {
+                                    instance_id,
+                                    target_node_id: body_node_id.clone(),
+                                    variable_name: var.clone(),
+                                    value: val,
+                                    source_node_id: node_id.to_string(),
+                                    spread_index: None,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Write the loop index to body's inbox (for data flow back)
+                plan.inbox_writes.push(InboxWrite {
+                    instance_id,
+                    target_node_id: body_node_id.clone(),
+                    variable_name: loop_i_var.clone(),
+                    value: JsonValue::Number((current_index as i64).into()),
+                    source_node_id: node_id.to_string(),
+                    spread_index: None,
+                });
+
+                // Get body node for dispatch info
+                let body_node = dag.nodes.get(body_node_id);
+                let (module_name, action_name, dispatch_payload) = if let Some(bn) = body_node {
+                    let payload = if bn.node_type == "action_call" {
+                        // Build dispatch payload for the action
+                        let mut action_inbox: HashMap<String, JsonValue> = HashMap::new();
+                        // Add loop variable
+                        if let Some(ref vars) = loop_vars {
+                            if vars.len() == 1 {
+                                action_inbox.insert(vars[0].clone(), current_item.clone());
+                            }
+                        }
+                        action_inbox.insert(loop_i_var.clone(), JsonValue::Number((current_index as i64).into()));
+
+                        // Build kwargs-based payload
+                        if let Some(ref kwargs) = bn.kwargs {
+                            let mut payload_map = serde_json::Map::new();
+                            for (key, value_str) in kwargs {
+                                let resolved = if let Some(var_name) = value_str.strip_prefix('$') {
+                                    action_inbox.get(var_name).cloned().unwrap_or(JsonValue::Null)
+                                } else {
+                                    serde_json::from_str(value_str).unwrap_or(JsonValue::String(value_str.clone()))
+                                };
+                                payload_map.insert(key.clone(), resolved);
+                            }
+                            Some(serde_json::to_vec(&JsonValue::Object(payload_map)).unwrap_or_default())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    (bn.module_name.clone(), bn.action_name.clone(), payload)
+                } else {
+                    (None, None, None)
+                };
+
+                // Add readiness increment for body node
+                plan.readiness_increments.push(ReadinessIncrement {
+                    node_id: body_node_id.clone(),
+                    required_count: 1, // Body has one predecessor (the for_loop)
+                    node_type: if body_node.map(|n| n.node_type == "action_call").unwrap_or(false) {
+                        NodeType::Action
+                    } else {
+                        NodeType::Barrier // fn_call treated as barrier-like
+                    },
+                    module_name,
+                    action_name,
+                    dispatch_payload,
+                });
+
+                debug!(
+                    for_loop_id = %node_id,
+                    body_node_id = %body_node_id,
+                    current_index = current_index,
+                    "dispatching loop body"
+                );
+            }
+        } else {
+            // Break: proceed to successors after the loop
+            // Find successors without guards (break edges)
+            let break_successors: Vec<_> = helper
+                .get_ready_successors(node_id, None)
+                .into_iter()
+                .filter(|s| s.guard_expr.is_none())
+                .collect();
+
+            for successor in break_successors {
+                // Add readiness increment for break successors
+                plan.readiness_increments.push(ReadinessIncrement {
+                    node_id: successor.node_id.clone(),
+                    required_count: 1,
+                    node_type: NodeType::Barrier, // Break successors are inline/barrier-like
+                    module_name: None,
+                    action_name: None,
+                    dispatch_payload: None,
+                });
+
+                debug!(
+                    for_loop_id = %node_id,
+                    successor_id = %successor.node_id,
+                    "loop complete, proceeding to successor"
+                );
+            }
+        }
+
+        // Execute completion plan in single atomic transaction
+        let result = self.db.execute_completion_plan(instance_id, plan).await?;
+
+        info!(
+            for_loop_id = %node_id,
+            current_index = current_index,
+            collection_len = collection_len,
+            should_continue = should_continue,
+            newly_ready_nodes = ?result.newly_ready_nodes,
+            "processed for_loop"
         );
 
         Ok(())
@@ -2554,6 +2818,29 @@ impl DAGRunner {
         inbox: &std::collections::HashMap<String, JsonValue>,
         dag: &DAG,
     ) -> RunnerResult<NodeActionResult> {
+        // Handle for_loop nodes - they create a special action for the runner
+        if node.node_type == "for_loop" {
+            // For-loop nodes are added to the action queue so they can be dispatched
+            // to the runner for loop index management
+            let action = NewAction {
+                instance_id,
+                module_name: "".to_string(), // No module for internal nodes
+                action_name: "".to_string(), // No action name for internal nodes
+                dispatch_payload: Vec::new(), // Empty payload for control flow nodes
+                timeout_seconds: 300,
+                max_retries: 0, // No retries for control flow nodes
+                backoff_kind: BackoffKind::None,
+                backoff_base_delay_ms: 0,
+                node_id: Some(node.id.clone()),
+                node_type: Some("for_loop".to_string()),
+            };
+            return Ok(NodeActionResult {
+                actions: vec![action],
+                inbox_writes: vec![],
+                readiness_init: None,
+            });
+        }
+
         if node.node_type != "action_call" {
             return Ok(NodeActionResult::default());
         }
@@ -2645,6 +2932,7 @@ impl DAGRunner {
             backoff_kind: BackoffKind::Exponential,
             backoff_base_delay_ms: 1000,
             node_id: Some(node.id.clone()),
+            node_type: None, // Default to "action"
         }))
     }
 
@@ -2774,6 +3062,7 @@ impl DAGRunner {
                 backoff_kind: BackoffKind::Exponential,
                 backoff_base_delay_ms: 1000,
                 node_id: Some(spread_node_id),
+                node_type: None, // Default to "action"
             });
         }
 

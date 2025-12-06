@@ -2121,6 +2121,14 @@ impl DAGConverter {
             .cloned()
             .collect();
 
+        tracing::debug!(
+            function_name = %function_name,
+            fn_node_ids = ?fn_node_ids,
+            order = ?order,
+            var_modifications = ?self.var_modifications.keys().collect::<Vec<_>>(),
+            "add_data_flow_from_definitions"
+        );
+
         let mut edges_to_add = Vec::new();
 
         // For each variable modification, connect to nodes that USE the variable
@@ -2177,7 +2185,7 @@ impl DAGConverter {
         }
     }
 
-    /// Check if a node uses a variable (references it in kwargs)
+    /// Check if a node uses a variable (references it in kwargs or loop_collection)
     fn node_uses_variable(&self, node: &DAGNode, var_name: &str) -> bool {
         // Check kwargs for variable references
         if let Some(ref kwargs) = node.kwargs {
@@ -2188,18 +2196,45 @@ impl DAGConverter {
                 }
             }
         }
+
+        // Check loop_collection for for_loop nodes
+        if node.node_type == "for_loop" {
+            if let Some(ref collection) = node.loop_collection {
+                // The collection could be a variable name directly or with $ prefix
+                // (expr_to_string converts Variable to $name format)
+                let matches = collection == var_name
+                    || collection == &format!("${}", var_name)
+                    || collection.strip_prefix('$') == Some(var_name);
+                tracing::debug!(
+                    node_id = %node.id,
+                    var_name = %var_name,
+                    collection = %collection,
+                    matches = matches,
+                    "checking if for_loop uses variable"
+                );
+                if matches {
+                    return true;
+                }
+            }
+        }
+
         false
     }
 
     /// Get nodes in topological (execution) order for a subset of nodes
     fn get_execution_order_for_nodes(&self, node_ids: &HashSet<String>) -> Vec<String> {
         // Simple topological sort using state machine edges
+        // Exclude loop-back edges to avoid cycles from for-loops
         let mut in_degree: HashMap<String, usize> =
             node_ids.iter().map(|n| (n.clone(), 0)).collect();
         let mut adj: HashMap<String, Vec<String>> =
             node_ids.iter().map(|n| (n.clone(), Vec::new())).collect();
 
         for edge in self.dag.get_state_machine_edges() {
+            // Skip loop-back edges which create cycles
+            if edge.is_loop_back {
+                continue;
+            }
             if node_ids.contains(&edge.source) && node_ids.contains(&edge.target) {
                 adj.get_mut(&edge.source)
                     .map(|v| v.push(edge.target.clone()));

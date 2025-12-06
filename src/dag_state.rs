@@ -393,9 +393,13 @@ impl<'a> DAGHelper<'a> {
             return ExecutionMode::Delegated;
         }
 
+        // For-loop nodes are delegated - they need to go through the runner
+        // to properly initialize and manage the loop index
+        if node.node_type == "for_loop" {
+            return ExecutionMode::Delegated;
+        }
+
         // Everything else is inline
-        // Note: for_loop nodes without action bodies are inline (pure data manipulation)
-        // For loops WITH action bodies are converted to action_call + aggregator during DAG conversion
         ExecutionMode::Inline
     }
 
