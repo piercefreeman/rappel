@@ -627,8 +627,14 @@ class IRBuilder(ast.NodeVisitor):
         accumulator_targets = self._detect_accumulator_targets(body_stmts, in_scope_vars)
 
         # Wrap for loop body if multiple calls (use loop_vars as inputs)
+        # NOTE: For loops use spread/gather pattern - each iteration runs independently
+        # and returns a value that gets collected by the aggregator. We do NOT pass
+        # modified_vars here because the accumulator is handled by the aggregator,
+        # not by passing mutable state between iterations.
         if self._count_calls(body_stmts) > 1:
-            body_stmts = self._wrap_body_as_function(body_stmts, "for_body", node, inputs=loop_vars)
+            body_stmts = self._wrap_body_as_function(
+                body_stmts, "for_body", node, inputs=loop_vars
+            )
 
         # For loops use SingleCallBody (at most one action/function call per iteration)
         # Use spread for parallel iteration over collections.
@@ -742,6 +748,9 @@ class IRBuilder(ast.NodeVisitor):
         If any branch has multiple action calls, we wrap it into a synthetic
         function to ensure each branch has at most one call.
 
+        Out-of-scope variable modifications (like list.append()) are detected
+        and the modified variables are passed in/out of the synthetic function.
+
         Python:
             if condition:
                 a = await action_a()
@@ -772,9 +781,13 @@ class IRBuilder(ast.NodeVisitor):
             stmts = self._visit_statement(body_node)
             body_stmts.extend(stmts)
 
-        # Wrap if branch body if multiple calls
+        # Detect and wrap if branch body if multiple calls
         if self._count_calls(body_stmts) > 1:
-            body_stmts = self._wrap_body_as_function(body_stmts, "if_then", node)
+            in_scope_vars = self._collect_assigned_vars(body_stmts)
+            modified_vars = self._detect_accumulator_targets(body_stmts, in_scope_vars)
+            body_stmts = self._wrap_body_as_function(
+                body_stmts, "if_then", node, modified_vars=modified_vars
+            )
 
         if_branch = ir.IfBranch(
             condition=condition,
@@ -797,9 +810,13 @@ class IRBuilder(ast.NodeVisitor):
                         stmts = self._visit_statement(body_node)
                         elif_body.extend(stmts)
 
-                    # Wrap elif body if multiple calls
+                    # Detect and wrap elif body if multiple calls
                     if self._count_calls(elif_body) > 1:
-                        elif_body = self._wrap_body_as_function(elif_body, "if_elif", elif_node)
+                        in_scope_vars = self._collect_assigned_vars(elif_body)
+                        modified_vars = self._detect_accumulator_targets(elif_body, in_scope_vars)
+                        elif_body = self._wrap_body_as_function(
+                            elif_body, "if_elif", elif_node, modified_vars=modified_vars
+                        )
 
                     elif_branch = ir.ElifBranch(
                         condition=elif_condition,
@@ -815,9 +832,13 @@ class IRBuilder(ast.NodeVisitor):
                     stmts = self._visit_statement(else_node)
                     else_body.extend(stmts)
 
-                # Wrap else body if multiple calls
+                # Detect and wrap else body if multiple calls
                 if self._count_calls(else_body) > 1:
-                    else_body = self._wrap_body_as_function(else_body, "if_else", current.orelse[0])
+                    in_scope_vars = self._collect_assigned_vars(else_body)
+                    modified_vars = self._detect_accumulator_targets(else_body, in_scope_vars)
+                    else_body = self._wrap_body_as_function(
+                        else_body, "if_else", current.orelse[0], modified_vars=modified_vars
+                    )
 
                 else_branch = ir.ElseBranch(
                     body=self._stmts_to_single_call_body(
@@ -830,6 +851,14 @@ class IRBuilder(ast.NodeVisitor):
 
         stmt.conditional.CopyFrom(conditional)
         return stmt
+
+    def _collect_assigned_vars(self, stmts: List[ir.Statement]) -> set:
+        """Collect all variable names assigned in a list of statements."""
+        assigned = set()
+        for stmt in stmts:
+            if stmt.HasField("assignment"):
+                assigned.update(stmt.assignment.targets)
+        return assigned
 
     def _visit_try(self, node: ast.Try) -> List[ir.Statement]:
         """Convert try/except to IR with body wrapping transformation.
@@ -867,7 +896,11 @@ class IRBuilder(ast.NodeVisitor):
 
         # If multiple calls, wrap into synthetic function
         if call_count > 1:
-            try_body = self._wrap_body_as_function(try_body, "try_body", node)
+            in_scope_vars = self._collect_assigned_vars(try_body)
+            modified_vars = self._detect_accumulator_targets(try_body, in_scope_vars)
+            try_body = self._wrap_body_as_function(
+                try_body, "try_body", node, modified_vars=modified_vars
+            )
 
         # Build exception handlers (with wrapping if needed)
         handlers: List[ir.ExceptHandler] = []
@@ -890,7 +923,11 @@ class IRBuilder(ast.NodeVisitor):
             # Wrap handler if multiple calls
             handler_call_count = self._count_calls(handler_body)
             if handler_call_count > 1:
-                handler_body = self._wrap_body_as_function(handler_body, "except_handler", node)
+                in_scope_vars = self._collect_assigned_vars(handler_body)
+                modified_vars = self._detect_accumulator_targets(handler_body, in_scope_vars)
+                handler_body = self._wrap_body_as_function(
+                    handler_body, "except_handler", node, modified_vars=modified_vars
+                )
 
             except_handler = ir.ExceptHandler(
                 exception_types=exception_types,
@@ -987,24 +1024,65 @@ class IRBuilder(ast.NodeVisitor):
         prefix: str,
         node: ast.AST,
         inputs: Optional[List[str]] = None,
+        modified_vars: Optional[List[str]] = None,
     ) -> List[ir.Statement]:
         """Wrap a body with multiple calls into a synthetic function.
 
-        Returns a list containing a single function call statement.
+        Args:
+            body: The statements to wrap
+            prefix: Name prefix for the synthetic function
+            node: AST node for span information
+            inputs: Variables to pass as inputs (e.g., loop variables)
+            modified_vars: Out-of-scope variables modified in the body.
+                          These are added as inputs AND returned as outputs,
+                          enabling functional transformation of external state.
+
+        Returns a list containing a single function call statement (or assignment
+        if modified_vars are present).
         """
         fn_name = self._ctx.next_implicit_fn_name(prefix)
-        fn_inputs = inputs or []
+        fn_inputs = list(inputs or [])
+
+        # Add modified variables as inputs (they need to be passed in)
+        modified_vars = modified_vars or []
+        for var in modified_vars:
+            if var not in fn_inputs:
+                fn_inputs.append(var)
+
+        # If there are modified variables, add a return statement for them
+        wrapped_body = list(body)
+        if modified_vars:
+            # Create return statement: return (var1, var2, ...) or return var1
+            if len(modified_vars) == 1:
+                return_expr = ir.Expr(
+                    variable=ir.Variable(name=modified_vars[0]),
+                    span=_make_span(node),
+                )
+            else:
+                # Return as tuple
+                return_expr = ir.Expr(
+                    tuple=ir.TupleExpr(
+                        elements=[
+                            ir.Expr(variable=ir.Variable(name=var))
+                            for var in modified_vars
+                        ]
+                    ),
+                    span=_make_span(node),
+                )
+            return_stmt = ir.Statement(span=_make_span(node))
+            return_stmt.return_stmt.CopyFrom(ir.ReturnStmt(value=return_expr))
+            wrapped_body.append(return_stmt)
 
         # Create the synthetic function
         implicit_fn = ir.FunctionDef(
             name=fn_name,
-            io=ir.IoDecl(inputs=fn_inputs, outputs=[]),
-            body=ir.Block(statements=body),
+            io=ir.IoDecl(inputs=fn_inputs, outputs=modified_vars),
+            body=ir.Block(statements=wrapped_body),
             span=_make_span(node),
         )
         self._ctx.implicit_functions.append(implicit_fn)
 
-        # Create a function call statement
+        # Create a function call expression
         kwargs = [
             ir.Kwarg(name=var, value=ir.Expr(variable=ir.Variable(name=var))) for var in fn_inputs
         ]
@@ -1012,8 +1090,17 @@ class IRBuilder(ast.NodeVisitor):
             function_call=ir.FunctionCall(name=fn_name, kwargs=kwargs),
             span=_make_span(node),
         )
+
+        # If there are modified variables, create an assignment statement
+        # so the returned values are assigned back to the variables
         call_stmt = ir.Statement(span=_make_span(node))
-        call_stmt.expr_stmt.CopyFrom(ir.ExprStmt(expr=fn_call_expr))
+        if modified_vars:
+            # Create assignment: var1, var2 = fn(...) or var1 = fn(...)
+            assign = ir.Assignment(value=fn_call_expr)
+            assign.targets.extend(modified_vars)
+            call_stmt.assignment.CopyFrom(assign)
+        else:
+            call_stmt.expr_stmt.CopyFrom(ir.ExprStmt(expr=fn_call_expr))
 
         return [call_stmt]
 

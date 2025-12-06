@@ -536,6 +536,41 @@ class TestForLoopAccumulatorDetection:
         )
 
 
+class TestConditionalAccumulatorDetection:
+    """Test detection of accumulator patterns in conditionals."""
+
+    def _find_implicit_function(self, program: ir.Program, prefix: str) -> ir.FunctionDef | None:
+        """Find an implicit function by name prefix."""
+        for fn in program.functions:
+            if fn.name.startswith(prefix):
+                return fn
+        return None
+
+    def test_if_with_multi_action_body_and_accumulator(self) -> None:
+        """Test: Conditional with multi-action body detects modified variables."""
+        from tests.fixtures_control_flow.if_with_accumulator import IfWithAccumulatorWorkflow
+
+        program = IfWithAccumulatorWorkflow.workflow_ir()
+
+        # Should have an implicit function for the multi-action if branch
+        implicit_fn = self._find_implicit_function(program, "__if_then")
+        assert implicit_fn is not None, "Expected implicit function for multi-action if body"
+
+        # The implicit function should have 'results' as both input and output
+        assert "results" in implicit_fn.io.inputs, (
+            f"Expected 'results' in function inputs, got: {list(implicit_fn.io.inputs)}"
+        )
+        assert "results" in implicit_fn.io.outputs, (
+            f"Expected 'results' in function outputs, got: {list(implicit_fn.io.outputs)}"
+        )
+
+        # Should have a return statement
+        has_return = any(
+            stmt.HasField("return_stmt") for stmt in implicit_fn.body.statements
+        )
+        assert has_return, "Expected return statement in implicit function"
+
+
 class TestConditionalConversion:
     """Test if/elif/else conversion to IR."""
 
