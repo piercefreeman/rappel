@@ -990,6 +990,10 @@ impl WorkQueueHandler {
                     (None, None, None)
                 };
 
+                // Reset body node's readiness for this iteration
+                // This is needed because the body was already triggered in a previous iteration
+                self.db.reset_node_readiness(instance_id, body_node_id).await?;
+
                 // Add readiness increment for body node
                 plan.readiness_increments.push(ReadinessIncrement {
                     node_id: body_node_id.clone(),
@@ -2579,8 +2583,8 @@ impl DAGRunner {
             .await?
             .ok_or_else(|| RunnerError::InstanceNotFound(instance_id.0))?;
 
-        // Create initial scope from inputs
-        let scope: Scope = initial_inputs;
+        // Create initial scope from inputs (mutable for inline node execution)
+        let mut scope: Scope = initial_inputs;
 
         // Store scope for inline evaluation
         {
@@ -2747,12 +2751,31 @@ impl DAGRunner {
                     }
                 }
                 ExecutionMode::Inline => {
-                    // Skip inline nodes and continue to their successors
+                    // Execute inline nodes (e.g., assignments) and continue to their successors
+                    let inline_result = Self::execute_inline_node(node, &mut scope)?;
+                    debug!(
+                        node_id = %node_id,
+                        result = ?inline_result,
+                        "executed inline node during start_instance"
+                    );
+
+                    // Add result to scope if this node has a target
+                    if let Some(ref target) = node.target {
+                        scope.insert(target.clone(), inline_result.clone());
+                    }
+                    // Also handle multiple targets (tuple unpacking)
+                    if let Some(ref targets) = node.targets {
+                        if targets.len() == 1 {
+                            scope.insert(targets[0].clone(), inline_result.clone());
+                        }
+                        // For multiple targets, the inline_result would be an array
+                    }
+
                     let inline_successors = helper.get_ready_successors(&node_id, None);
                     debug!(
                         node_id = %node_id,
                         inline_successor_count = inline_successors.len(),
-                        "skipping inline node during start_instance"
+                        "continuing to successors after inline execution"
                     );
                     for successor in inline_successors {
                         // Evaluate guard if present - skip branch if guard fails

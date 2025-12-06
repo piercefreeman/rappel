@@ -1236,6 +1236,28 @@ impl Database {
         })
     }
 
+    /// Reset node readiness counter to 0 for loop re-triggering.
+    /// This is used when a for-loop body needs to be re-dispatched for the next iteration.
+    pub async fn reset_node_readiness(
+        &self,
+        instance_id: WorkflowInstanceId,
+        node_id: &str,
+    ) -> DbResult<()> {
+        sqlx::query(
+            r#"
+            UPDATE node_readiness
+            SET completed_count = 0, updated_at = NOW()
+            WHERE instance_id = $1 AND node_id = $2
+            "#,
+        )
+        .bind(instance_id.0)
+        .bind(node_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     /// Atomically write inbox entries and increment node readiness counter.
     /// This is for parallel blocks where multiple inbox writes need to be atomic.
     ///
@@ -1556,6 +1578,21 @@ impl Database {
             .bind(&write.value)
             .bind(&write.source_node_id)
             .bind(write.spread_index)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 2.5. Reset readiness for loop re-triggering (before increments)
+        for node_id in &plan.readiness_resets {
+            sqlx::query(
+                r#"
+                UPDATE node_readiness
+                SET completed_count = 0, updated_at = NOW()
+                WHERE instance_id = $1 AND node_id = $2
+                "#,
+            )
+            .bind(instance_id.0)
+            .bind(node_id)
             .execute(&mut *tx)
             .await?;
         }

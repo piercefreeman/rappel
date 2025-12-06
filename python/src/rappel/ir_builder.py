@@ -557,6 +557,39 @@ class IRBuilder(ast.NodeVisitor):
             stmt.action_call.CopyFrom(action_call)
             return stmt
 
+        # Convert list.append(x) to list = list + [x]
+        # This makes the mutation explicit so data flows correctly through the DAG
+        if isinstance(node.value, ast.Call):
+            call = node.value
+            if (
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr == "append"
+                and isinstance(call.func.value, ast.Name)
+                and len(call.args) == 1
+            ):
+                list_name = call.func.value.id
+                append_value = call.args[0]
+                # Create: list = list + [value]
+                list_var = ir.Expr(
+                    variable=ir.Variable(name=list_name), span=_make_span(node)
+                )
+                value_expr = _expr_to_ir(append_value)
+                if value_expr:
+                    # Create [value] as a list literal
+                    list_literal = ir.Expr(
+                        list=ir.ListExpr(elements=[value_expr]), span=_make_span(node)
+                    )
+                    # Create list + [value]
+                    concat_expr = ir.Expr(
+                        binary_op=ir.BinaryOp(
+                            op=ir.BinaryOperator.BINARY_OP_ADD, left=list_var, right=list_literal
+                        ),
+                        span=_make_span(node),
+                    )
+                    assign = ir.Assignment(targets=[list_name], value=concat_expr)
+                    stmt.assignment.CopyFrom(assign)
+                    return stmt
+
         # Regular expression
         expr = _expr_to_ir(node.value)
         if expr:
@@ -622,27 +655,19 @@ class IRBuilder(ast.NodeVisitor):
                 if s.HasField("assignment"):
                     in_scope_vars.update(s.assignment.targets)
 
-        # Detect all out-of-scope variable modifications (accumulators)
+        # Detect all out-of-scope variable modifications
         # These are variables modified in the loop body but defined outside it
-        accumulator_targets = self._detect_accumulator_targets(body_stmts, in_scope_vars)
+        modified_vars = self._detect_accumulator_targets(body_stmts, in_scope_vars)
 
-        # Wrap for loop body if multiple calls (use loop_vars as inputs)
-        # For sequential loops, modified_vars (accumulators) are passed in and returned
-        # from each iteration, enabling mutable state across iterations.
-        if self._count_calls(body_stmts) > 1:
-            body_stmts = self._wrap_body_as_function(
-                body_stmts, "for_body", node, inputs=loop_vars, modified_vars=accumulator_targets
-            )
+        # ALWAYS wrap for loop body into a synthetic function for variable isolation.
+        # Variables flow in/out explicitly through function parameters and return values.
+        body_stmts = self._wrap_body_as_function(
+            body_stmts, "for_body", node, inputs=loop_vars, modified_vars=modified_vars
+        )
 
-        # For loops use SingleCallBody (at most one action/function call per iteration)
-        # Use spread for parallel iteration over collections.
+        # Convert to SingleCallBody (now contains just the synthetic function call)
         stmt = ir.Statement(span=_make_span(node))
         single_call_body = self._stmts_to_single_call_body(body_stmts, _make_span(node))
-
-        # If we detected accumulator patterns, set them as targets on the SingleCallBody
-        # This ensures the aggregated results are stored under the correct variable names
-        if accumulator_targets and not single_call_body.targets:
-            single_call_body.targets.extend(accumulator_targets)
 
         for_loop = ir.ForLoop(
             loop_vars=loop_vars,
@@ -738,7 +763,52 @@ class IRBuilder(ast.NodeVisitor):
                     if var_name and var_name not in in_scope_vars:
                         return var_name
 
+        # Pattern 3: Self-referential assignment like x = x + [y]
+        # The target variable is used on the RHS, so it must come from outside.
+        # Note: We don't check in_scope_vars here because the assignment itself
+        # would have added the target to in_scope_vars, but it still needs its
+        # previous value from outside the loop body.
+        if stmt.HasField("assignment"):
+            assign = stmt.assignment
+            rhs_vars = self._collect_variables_from_expr(assign.value)
+            for target in assign.targets:
+                if target in rhs_vars:
+                    return target
+
         return None
+
+    def _collect_variables_from_expr(self, expr: ir.Expr) -> set:
+        """Recursively collect all variable names used in an expression."""
+        vars_found: set = set()
+
+        if expr.HasField("variable"):
+            vars_found.add(expr.variable.name)
+        elif expr.HasField("binary_op"):
+            vars_found.update(self._collect_variables_from_expr(expr.binary_op.left))
+            vars_found.update(self._collect_variables_from_expr(expr.binary_op.right))
+        elif expr.HasField("unary_op"):
+            vars_found.update(self._collect_variables_from_expr(expr.unary_op.operand))
+        elif expr.HasField("list"):
+            for elem in expr.list.elements:
+                vars_found.update(self._collect_variables_from_expr(elem))
+        elif expr.HasField("dict"):
+            for key in expr.dict.keys:
+                vars_found.update(self._collect_variables_from_expr(key))
+            for val in expr.dict.values:
+                vars_found.update(self._collect_variables_from_expr(val))
+        elif expr.HasField("index"):
+            vars_found.update(self._collect_variables_from_expr(expr.index.value))
+            vars_found.update(self._collect_variables_from_expr(expr.index.index))
+        elif expr.HasField("dot"):
+            vars_found.update(self._collect_variables_from_expr(expr.dot.value))
+        elif expr.HasField("function_call"):
+            for kwarg in expr.function_call.kwargs:
+                vars_found.update(self._collect_variables_from_expr(kwarg.value))
+        elif expr.HasField("action_call"):
+            for kwarg in expr.action_call.kwargs:
+                vars_found.update(self._collect_variables_from_expr(kwarg.value))
+
+        return vars_found
 
     def _visit_if(self, node: ast.If) -> Optional[ir.Statement]:
         """Convert if statement to IR conditional with branch wrapping.
@@ -779,13 +849,12 @@ class IRBuilder(ast.NodeVisitor):
             stmts = self._visit_statement(body_node)
             body_stmts.extend(stmts)
 
-        # Detect and wrap if branch body if multiple calls
-        if self._count_calls(body_stmts) > 1:
-            in_scope_vars = self._collect_assigned_vars(body_stmts)
-            modified_vars = self._detect_accumulator_targets(body_stmts, in_scope_vars)
-            body_stmts = self._wrap_body_as_function(
-                body_stmts, "if_then", node, modified_vars=modified_vars
-            )
+        # ALWAYS wrap if branch body for variable isolation
+        in_scope_vars = self._collect_assigned_vars(body_stmts)
+        modified_vars = self._detect_accumulator_targets(body_stmts, in_scope_vars)
+        body_stmts = self._wrap_body_as_function(
+            body_stmts, "if_then", node, modified_vars=modified_vars
+        )
 
         if_branch = ir.IfBranch(
             condition=condition,
@@ -808,13 +877,12 @@ class IRBuilder(ast.NodeVisitor):
                         stmts = self._visit_statement(body_node)
                         elif_body.extend(stmts)
 
-                    # Detect and wrap elif body if multiple calls
-                    if self._count_calls(elif_body) > 1:
-                        in_scope_vars = self._collect_assigned_vars(elif_body)
-                        modified_vars = self._detect_accumulator_targets(elif_body, in_scope_vars)
-                        elif_body = self._wrap_body_as_function(
-                            elif_body, "if_elif", elif_node, modified_vars=modified_vars
-                        )
+                    # ALWAYS wrap elif body for variable isolation
+                    in_scope_vars = self._collect_assigned_vars(elif_body)
+                    modified_vars = self._detect_accumulator_targets(elif_body, in_scope_vars)
+                    elif_body = self._wrap_body_as_function(
+                        elif_body, "if_elif", elif_node, modified_vars=modified_vars
+                    )
 
                     elif_branch = ir.ElifBranch(
                         condition=elif_condition,
@@ -830,13 +898,12 @@ class IRBuilder(ast.NodeVisitor):
                     stmts = self._visit_statement(else_node)
                     else_body.extend(stmts)
 
-                # Detect and wrap else body if multiple calls
-                if self._count_calls(else_body) > 1:
-                    in_scope_vars = self._collect_assigned_vars(else_body)
-                    modified_vars = self._detect_accumulator_targets(else_body, in_scope_vars)
-                    else_body = self._wrap_body_as_function(
-                        else_body, "if_else", current.orelse[0], modified_vars=modified_vars
-                    )
+                # ALWAYS wrap else body for variable isolation
+                in_scope_vars = self._collect_assigned_vars(else_body)
+                modified_vars = self._detect_accumulator_targets(else_body, in_scope_vars)
+                else_body = self._wrap_body_as_function(
+                    else_body, "if_else", current.orelse[0], modified_vars=modified_vars
+                )
 
                 else_branch = ir.ElseBranch(
                     body=self._stmts_to_single_call_body(
@@ -889,16 +956,12 @@ class IRBuilder(ast.NodeVisitor):
             stmts = self._visit_statement(body_node)
             try_body.extend(stmts)
 
-        # Count action calls and function calls (synthetic functions count too)
-        call_count = self._count_calls(try_body)
-
-        # If multiple calls, wrap into synthetic function
-        if call_count > 1:
-            in_scope_vars = self._collect_assigned_vars(try_body)
-            modified_vars = self._detect_accumulator_targets(try_body, in_scope_vars)
-            try_body = self._wrap_body_as_function(
-                try_body, "try_body", node, modified_vars=modified_vars
-            )
+        # ALWAYS wrap try body for variable isolation
+        in_scope_vars = self._collect_assigned_vars(try_body)
+        modified_vars = self._detect_accumulator_targets(try_body, in_scope_vars)
+        try_body = self._wrap_body_as_function(
+            try_body, "try_body", node, modified_vars=modified_vars
+        )
 
         # Build exception handlers (with wrapping if needed)
         handlers: List[ir.ExceptHandler] = []
@@ -918,14 +981,12 @@ class IRBuilder(ast.NodeVisitor):
                 stmts = self._visit_statement(handler_node)
                 handler_body.extend(stmts)
 
-            # Wrap handler if multiple calls
-            handler_call_count = self._count_calls(handler_body)
-            if handler_call_count > 1:
-                in_scope_vars = self._collect_assigned_vars(handler_body)
-                modified_vars = self._detect_accumulator_targets(handler_body, in_scope_vars)
-                handler_body = self._wrap_body_as_function(
-                    handler_body, "except_handler", node, modified_vars=modified_vars
-                )
+            # ALWAYS wrap handler body for variable isolation
+            in_scope_vars = self._collect_assigned_vars(handler_body)
+            modified_vars = self._detect_accumulator_targets(handler_body, in_scope_vars)
+            handler_body = self._wrap_body_as_function(
+                handler_body, "except_handler", node, modified_vars=modified_vars
+            )
 
             except_handler = ir.ExceptHandler(
                 exception_types=exception_types,

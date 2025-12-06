@@ -759,8 +759,9 @@ impl DAGConverter {
         let output_id = output_node.map(|n| n.id.as_str());
 
         for edge in &unexpanded.edges {
-            // Skip edges not in this function
-            if !fn_node_ids.contains(&edge.source) || !fn_node_ids.contains(&edge.target) {
+            // Skip edges where the source is not in this function
+            // (target can be outside for loop-back edges)
+            if !fn_node_ids.contains(&edge.source) {
                 continue;
             }
 
@@ -801,7 +802,9 @@ impl DAGConverter {
 
             let new_target = match id_map.get(&edge.target) {
                 Some(t) => t.clone(),
-                None => continue, // Target not mapped (shouldn't happen)
+                // Target not in id_map - it's outside the expansion (e.g., loop-back to for_loop)
+                // Keep the original target
+                None => edge.target.clone(),
             };
 
             let mut cloned_edge = edge.clone();
@@ -1010,8 +1013,10 @@ impl DAGConverter {
                         // Function call without assignment target
                         let node_id = self.next_id("fn_call");
                         let label = format!("{}()", func.name);
+                        let kwargs = self.extract_kwargs(&func.kwargs);
                         let mut node = DAGNode::new(node_id.clone(), "fn_call".to_string(), label)
-                            .with_fn_call(&func.name);
+                            .with_fn_call(&func.name)
+                            .with_kwargs(kwargs);
                         if let Some(ref fn_name) = self.current_function {
                             node = node.with_function_name(fn_name);
                         }
@@ -1099,8 +1104,13 @@ impl DAGConverter {
             format!("{}() -> {}", call.name, target)
         };
 
+        // Extract kwargs from the function call
+        let kwargs = self.extract_kwargs(&call.kwargs);
+
         let mut node =
-            DAGNode::new(node_id.clone(), "fn_call".to_string(), label).with_fn_call(&call.name);
+            DAGNode::new(node_id.clone(), "fn_call".to_string(), label)
+                .with_fn_call(&call.name)
+                .with_kwargs(kwargs);
         if let Some(ref fn_name) = self.current_function {
             node = node.with_function_name(fn_name);
         }
@@ -2133,6 +2143,11 @@ impl DAGConverter {
 
         // For each variable modification, connect to nodes that USE the variable
         for (var_name, modifications) in &self.var_modifications {
+            tracing::debug!(
+                var_name = %var_name,
+                modifications = ?modifications,
+                "processing variable modifications"
+            );
             for (i, mod_node) in modifications.iter().enumerate() {
                 if !fn_node_ids.contains(mod_node) {
                     continue;
@@ -2153,13 +2168,6 @@ impl DAGConverter {
                         }
                     }
 
-                    // Stop if we hit the next modification
-                    if let Some(next) = next_mod {
-                        if node_id == next {
-                            break;
-                        }
-                    }
-
                     // Don't add edge to the modification node itself
                     if node_id == mod_node {
                         continue;
@@ -2175,10 +2183,21 @@ impl DAGConverter {
                             ));
                         }
                     }
+
+                    // Stop after the next modification (but we still add edge to it if it uses the var)
+                    if let Some(next) = next_mod {
+                        if node_id == next {
+                            break;
+                        }
+                    }
                 }
             }
         }
 
+        tracing::debug!(
+            edges_to_add = ?edges_to_add,
+            "data flow edges being created"
+        );
         for (var_name, source, target) in edges_to_add {
             self.dag
                 .add_edge(DAGEdge::data_flow(source, target, &var_name));
@@ -2189,6 +2208,12 @@ impl DAGConverter {
     fn node_uses_variable(&self, node: &DAGNode, var_name: &str) -> bool {
         // Check kwargs for variable references
         if let Some(ref kwargs) = node.kwargs {
+            tracing::debug!(
+                node_id = %node.id,
+                var_name = %var_name,
+                kwargs = ?kwargs,
+                "checking if node uses variable in kwargs"
+            );
             for value in kwargs.values() {
                 // Check for $var_name pattern
                 if value == &format!("${}", var_name) {
@@ -2214,6 +2239,30 @@ impl DAGConverter {
                 );
                 if matches {
                     return true;
+                }
+            }
+
+            // Also check if the for_loop's body uses this variable
+            // The body is a fn_call that's a direct successor of the for_loop
+            for edge in self.dag.get_state_machine_edges() {
+                if edge.source == node.id && !edge.is_loop_back {
+                    if let Some(body_node) = self.dag.nodes.get(&edge.target) {
+                        if body_node.node_type == "fn_call" {
+                            if let Some(ref kwargs) = body_node.kwargs {
+                                for value in kwargs.values() {
+                                    if value == &format!("${}", var_name) {
+                                        tracing::debug!(
+                                            node_id = %node.id,
+                                            var_name = %var_name,
+                                            body_id = %body_node.id,
+                                            "for_loop uses variable via body"
+                                        );
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -92,6 +92,9 @@ pub struct CompletionPlan {
     /// Inbox writes for frontier nodes.
     pub inbox_writes: Vec<InboxWrite>,
 
+    /// Readiness resets for loop re-triggering.
+    pub readiness_resets: Vec<String>,
+
     /// Readiness increments for frontier nodes.
     pub readiness_increments: Vec<ReadinessIncrement>,
 
@@ -110,6 +113,7 @@ impl CompletionPlan {
             result_payload: Vec::new(),
             error_message: None,
             inbox_writes: Vec::new(),
+            readiness_resets: Vec::new(),
             readiness_increments: Vec::new(),
             instance_completion: None,
         }
@@ -232,8 +236,16 @@ pub type InlineScope = HashMap<String, JsonValue>;
 
 /// Categorize a DAG node for subgraph analysis.
 fn categorize_node(node: &DAGNode) -> NodeCategory {
-    // Output/return nodes are workflow completion points
-    if node.is_output || node.node_type == "return" {
+    // Only `is_output` nodes are workflow completion points.
+    // These are function output boundary nodes. For the entry function, this
+    // triggers workflow completion. For helper functions that have been expanded
+    // inline, these nodes should have edges to their callers (e.g., loop-back
+    // edges for for-loop bodies) so traversal continues via those edges.
+    //
+    // Note: `return` nodes (node_type == "return") are treated as inline because
+    // they just set up the return value - the actual output boundary is the
+    // `is_output` node that follows.
+    if node.is_output {
         return NodeCategory::Output;
     }
 
@@ -253,7 +265,7 @@ fn categorize_node(node: &DAGNode) -> NodeCategory {
         return NodeCategory::Action;
     }
 
-    // Everything else is inline: assignments, expressions, control flow, fn_call
+    // Everything else is inline: assignments, expressions, control flow, fn_call, return
     NodeCategory::Inline
 }
 
@@ -343,13 +355,27 @@ pub fn analyze_subgraph(start_node_id: &str, dag: &DAG, helper: &DAGHelper) -> S
                 // Don't traverse past barriers - they wait for all predecessors
             }
             NodeCategory::Output => {
-                let required_count = count_sm_predecessors(dag, &node_id);
-                analysis.frontier_nodes.push(FrontierNode {
-                    node_id,
-                    category: FrontierCategory::Output,
-                    required_count,
-                });
-                // Don't traverse past output - workflow completes
+                // Check if this output node has outgoing edges (expanded helper function output)
+                // If it does, treat it as inline and continue traversal to find loop-back edges
+                let outgoing_edges = helper.get_state_machine_successors(&node_id);
+                if !outgoing_edges.is_empty() {
+                    // This is an expanded helper function output with outgoing edges
+                    // (e.g., loop-back edge to for_loop). Treat as inline.
+                    analysis.inline_nodes.push(node_id.clone());
+                    for edge in outgoing_edges {
+                        if !visited.contains(&edge.target) {
+                            queue.push_back(edge.target.clone());
+                        }
+                    }
+                } else {
+                    // This is the workflow's final output - stop traversal
+                    let required_count = count_sm_predecessors(dag, &node_id);
+                    analysis.frontier_nodes.push(FrontierNode {
+                        node_id,
+                        category: FrontierCategory::Output,
+                        required_count,
+                    });
+                }
             }
             NodeCategory::ForLoop => {
                 let required_count = count_sm_predecessors(dag, &node_id);
@@ -503,22 +529,24 @@ pub fn execute_inline_subgraph(
     // Track which nodes we've visited and which inline nodes we've executed
     let mut visited: HashSet<String> = HashSet::new();
     let mut executed_inline: Vec<String> = Vec::new();
-    let mut reachable_frontiers: HashSet<String> = HashSet::new();
+    // Track frontiers and whether they were reached via a loop-back edge
+    let mut reachable_frontiers: HashMap<String, bool> = HashMap::new();
 
-    // Queue holds (node_id, is_from_completed_node)
+    // Queue holds (node_id, reached_via_loop_back)
     // Start with successors of the completed node
+    // Use get_state_machine_successors to include loop-back edges (needed for for-loop iteration)
     let mut queue: VecDeque<(String, bool)> = VecDeque::new();
-    for successor in helper.get_ready_successors(completed_node_id, None) {
+    for edge in helper.get_state_machine_successors(completed_node_id) {
         // Evaluate guard if present - skip branch if guard fails
-        if let Some(ref guard) = successor.guard_expr
-            && !evaluate_guard(Some(guard), &inline_scope, &successor.node_id)
+        if let Some(ref guard) = edge.guard_expr
+            && !evaluate_guard(Some(guard), &inline_scope, &edge.target)
         {
             continue;
         }
-        queue.push_back((successor.node_id, true));
+        queue.push_back((edge.target.clone(), edge.is_loop_back));
     }
 
-    while let Some((node_id, _is_direct)) = queue.pop_front() {
+    while let Some((node_id, reached_via_loop_back)) = queue.pop_front() {
         if visited.contains(&node_id) {
             continue;
         }
@@ -547,8 +575,8 @@ pub fn execute_inline_subgraph(
         let is_frontier = subgraph.frontier_nodes.iter().any(|f| f.node_id == node_id);
 
         if is_frontier {
-            // Mark as reachable frontier - we'll process it after BFS
-            reachable_frontiers.insert(node_id.clone());
+            // Mark as reachable frontier with loop-back info
+            reachable_frontiers.insert(node_id.clone(), reached_via_loop_back);
             // Don't traverse past frontier nodes
         } else {
             // This is an inline node - execute it
@@ -559,24 +587,27 @@ pub fn execute_inline_subgraph(
             executed_inline.push(node_id.clone());
 
             // Continue to successors, evaluating guards
-            for successor in helper.get_ready_successors(&node_id, None) {
-                if visited.contains(&successor.node_id) {
+            // Use get_state_machine_successors to include loop-back edges
+            for edge in helper.get_state_machine_successors(&node_id) {
+                if visited.contains(&edge.target) {
                     continue;
                 }
 
                 // Evaluate guard if present - skip branch if guard fails
-                if let Some(ref guard) = successor.guard_expr
-                    && !evaluate_guard(Some(guard), &inline_scope, &successor.node_id)
+                if let Some(ref guard) = edge.guard_expr
+                    && !evaluate_guard(Some(guard), &inline_scope, &edge.target)
                 {
                     debug!(
                         node_id = %node_id,
-                        successor_id = %successor.node_id,
+                        successor_id = %edge.target,
                         "guard failed, skipping branch"
                     );
                     continue;
                 }
 
-                queue.push_back((successor.node_id, false));
+                // Propagate loop-back status: true if we already came via loop-back OR this edge is loop-back
+                let via_loop_back = reached_via_loop_back || edge.is_loop_back;
+                queue.push_back((edge.target.clone(), via_loop_back));
             }
         }
     }
@@ -585,7 +616,7 @@ pub fn execute_inline_subgraph(
         completed_node_id = %completed_node_id,
         executed_inline_count = executed_inline.len(),
         reachable_frontiers_count = reachable_frontiers.len(),
-        reachable_frontiers = ?reachable_frontiers,
+        reachable_frontiers = ?reachable_frontiers.keys().collect::<Vec<_>>(),
         "BFS traversal complete"
     );
 
@@ -599,9 +630,10 @@ pub fn execute_inline_subgraph(
     // Process only the reachable frontier nodes
     for frontier in &subgraph.frontier_nodes {
         // Skip frontiers that weren't reachable via passing guards
-        if !reachable_frontiers.contains(&frontier.node_id) {
-            continue;
-        }
+        let reached_via_loop_back = match reachable_frontiers.get(&frontier.node_id) {
+            Some(&via_loop_back) => via_loop_back,
+            None => continue, // Not reachable
+        };
         let frontier_node = match dag.nodes.get(&frontier.node_id) {
             Some(n) => n,
             None => continue,
@@ -756,13 +788,8 @@ pub fn execute_inline_subgraph(
                     // The loop index variable is stored in the inbox as __loop_{loop_id}_i
                     let loop_i_var = format!("__loop_{}_i", frontier.node_id);
 
-                    // Check if we're coming from a loop-back edge (iteration complete)
-                    // by looking at whether the completed node has a loop-back edge to us
-                    let is_loop_back = dag.edges.iter().any(|e| {
-                        e.source == completed_node_id
-                            && e.target == frontier.node_id
-                            && e.is_loop_back
-                    });
+                    // Use the loop-back info tracked during BFS traversal
+                    let is_loop_back = reached_via_loop_back;
 
                     // Get current loop index from inbox or initialize to 0
                     let mut loop_inbox = existing_inbox
@@ -807,6 +834,11 @@ pub fn execute_inline_subgraph(
                         is_loop_back = is_loop_back,
                         "for_loop frontier: updating loop index"
                     );
+
+                    // For loop-back iterations, reset the for_loop's readiness before incrementing
+                    if is_loop_back {
+                        plan.readiness_resets.push(frontier.node_id.clone());
+                    }
 
                     // Add readiness increment for the for_loop
                     // When it becomes ready, the runner will evaluate its guard
