@@ -953,6 +953,39 @@ impl WorkQueueHandler {
                     spread_index: None,
                 });
 
+                // Write ALL variables from the for_loop's inbox to body's inbox
+                // (except the collection variable itself)
+                // This ensures variables like 'processed' flow through to the body
+                for (var_name, value) in &loop_inbox {
+                    // Skip the collection variable (e.g., 'items') - body doesn't need the whole collection
+                    if var_name == collection_key {
+                        continue;
+                    }
+                    // Skip loop variables - we already wrote them above
+                    let is_loop_var = loop_vars.as_ref().map_or(false, |vars| vars.contains(var_name));
+                    if is_loop_var {
+                        continue;
+                    }
+                    // Skip the loop index variable - we already wrote it above
+                    if var_name == &loop_i_var {
+                        continue;
+                    }
+
+                    debug!(
+                        var_name = %var_name,
+                        target = %body_node_id,
+                        "writing inbox variable to body"
+                    );
+                    plan.inbox_writes.push(InboxWrite {
+                        instance_id,
+                        target_node_id: body_node_id.clone(),
+                        variable_name: var_name.clone(),
+                        value: value.clone(),
+                        source_node_id: node_id.to_string(),
+                        spread_index: None,
+                    });
+                }
+
                 // Get body node for dispatch info
                 let body_node = dag.nodes.get(body_node_id);
                 let (module_name, action_name, dispatch_payload) = if let Some(bn) = body_node {
@@ -1025,14 +1058,64 @@ impl WorkQueueHandler {
                 .collect();
 
             for successor in break_successors {
+                // Write the loop's accumulated variables to break successor's inbox
+                // This passes variables like 'processed' that were modified during the loop
+                for (var_name, value) in &loop_inbox {
+                    // Skip the collection variable and loop index - they're not needed
+                    if var_name == collection_key || var_name == &loop_i_var {
+                        continue;
+                    }
+                    debug!(
+                        var_name = %var_name,
+                        target = %successor.node_id,
+                        "writing loop variable to break successor"
+                    );
+                    plan.inbox_writes.push(InboxWrite {
+                        instance_id,
+                        target_node_id: successor.node_id.clone(),
+                        variable_name: var_name.clone(),
+                        value: value.clone(),
+                        source_node_id: node_id.to_string(),
+                        spread_index: None,
+                    });
+                }
+
+                // Look up the successor node to determine its type and dispatch info
+                let successor_node = dag.nodes.get(&successor.node_id);
+                let (node_type, module_name, action_name, dispatch_payload) =
+                    if let Some(sn) = successor_node {
+                        if sn.node_type == "action_call" {
+                            // Build dispatch payload for the action
+                            let payload = if let Some(ref kwargs) = sn.kwargs {
+                                let mut payload_map = serde_json::Map::new();
+                                for (key, value_str) in kwargs {
+                                    let resolved = if let Some(var_name) = value_str.strip_prefix('$') {
+                                        loop_inbox.get(var_name).cloned().unwrap_or(JsonValue::Null)
+                                    } else {
+                                        serde_json::from_str(value_str).unwrap_or(JsonValue::String(value_str.clone()))
+                                    };
+                                    payload_map.insert(key.clone(), resolved);
+                                }
+                                Some(serde_json::to_vec(&JsonValue::Object(payload_map)).unwrap_or_default())
+                            } else {
+                                None
+                            };
+                            (NodeType::Action, sn.module_name.clone(), sn.action_name.clone(), payload)
+                        } else {
+                            (NodeType::Barrier, None, None, None)
+                        }
+                    } else {
+                        (NodeType::Barrier, None, None, None)
+                    };
+
                 // Add readiness increment for break successors
                 plan.readiness_increments.push(ReadinessIncrement {
                     node_id: successor.node_id.clone(),
                     required_count: 1,
-                    node_type: NodeType::Barrier, // Break successors are inline/barrier-like
-                    module_name: None,
-                    action_name: None,
-                    dispatch_payload: None,
+                    node_type,
+                    module_name,
+                    action_name,
+                    dispatch_payload,
                 });
 
                 debug!(
@@ -2470,9 +2553,26 @@ impl DAGRunner {
     }
 
     /// Execute an inline node with in-memory scope (non-durable).
-    fn execute_inline_node(node: &DAGNode, _scope: &mut Scope) -> RunnerResult<JsonValue> {
+    fn execute_inline_node(node: &DAGNode, scope: &mut Scope) -> RunnerResult<JsonValue> {
         match node.node_type.as_str() {
-            "assignment" => Ok(JsonValue::Null),
+            "assignment" => {
+                // Evaluate the assignment expression
+                if let Some(ref expr) = node.assign_expr {
+                    match ExpressionEvaluator::evaluate(expr, scope) {
+                        Ok(val) => Ok(val),
+                        Err(e) => {
+                            warn!(
+                                node_id = %node.id,
+                                error = %e,
+                                "failed to evaluate assignment expression"
+                            );
+                            Ok(JsonValue::Null)
+                        }
+                    }
+                } else {
+                    Ok(JsonValue::Null)
+                }
+            }
             "input" | "output" => Ok(JsonValue::Null),
             "return" => Ok(JsonValue::Null),
             "conditional" => Ok(JsonValue::Bool(true)),
@@ -2857,9 +2957,36 @@ impl DAGRunner {
                 node_id: Some(node.id.clone()),
                 node_type: Some("for_loop".to_string()),
             };
+
+            // Write all inbox/scope values to the for_loop's inbox
+            // These are needed for the loop to access its input variables
+            let mut inbox_writes = Vec::new();
+            for (var_name, value) in inbox {
+                // Find the source node for this variable from dataflow edges
+                let source_node_id = dag
+                    .edges
+                    .iter()
+                    .find(|e| {
+                        e.target == node.id
+                            && e.edge_type == EdgeType::DataFlow
+                            && e.variable.as_ref() == Some(var_name)
+                    })
+                    .map(|e| e.source.clone())
+                    .unwrap_or_else(|| "initial_scope".to_string());
+
+                inbox_writes.push(InboxWrite {
+                    instance_id,
+                    target_node_id: node.id.clone(),
+                    variable_name: var_name.clone(),
+                    value: value.clone(),
+                    source_node_id,
+                    spread_index: None,
+                });
+            }
+
             return Ok(NodeActionResult {
                 actions: vec![action],
-                inbox_writes: vec![],
+                inbox_writes,
                 readiness_init: None,
             });
         }
@@ -2955,7 +3082,7 @@ impl DAGRunner {
             backoff_kind: BackoffKind::Exponential,
             backoff_base_delay_ms: 1000,
             node_id: Some(node.id.clone()),
-            node_type: None, // Default to "action"
+            node_type: Some("action".to_string()),
         }))
     }
 
@@ -3085,7 +3212,7 @@ impl DAGRunner {
                 backoff_kind: BackoffKind::Exponential,
                 backoff_base_delay_ms: 1000,
                 node_id: Some(spread_node_id),
-                node_type: None, // Default to "action"
+                node_type: Some("action".to_string()),
             });
         }
 

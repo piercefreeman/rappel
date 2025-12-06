@@ -86,6 +86,8 @@ pub struct DAGNode {
     pub loop_collection: Option<String>,
     /// For loop body nodes, the ID of the for_loop node they belong to
     pub loop_body_of: Option<String>,
+    /// Expression for assignment nodes (evaluated at runtime)
+    pub assign_expr: Option<ast::Expr>,
 }
 
 impl DAGNode {
@@ -118,12 +120,19 @@ impl DAGNode {
             guard_expr: None,
             loop_collection: None,
             loop_body_of: None,
+            assign_expr: None,
         }
     }
 
     /// Builder method to set guard expression for conditional nodes
     pub fn with_guard_expr(mut self, expr: ast::Expr) -> Self {
         self.guard_expr = Some(expr);
+        self
+    }
+
+    /// Builder method to set assignment expression (for assignment nodes)
+    pub fn with_assign_expr(mut self, expr: ast::Expr) -> Self {
+        self.assign_expr = Some(expr);
         self
     }
 
@@ -1076,7 +1085,9 @@ impl DAGConverter {
             format!("{} = ...", target)
         };
 
-        let mut node = DAGNode::new(node_id.clone(), "assignment".to_string(), label);
+        let mut node = DAGNode::new(node_id.clone(), "assignment".to_string(), label)
+            .with_targets(targets)
+            .with_assign_expr(value.clone());
         if let Some(ref fn_name) = self.current_function {
             node = node.with_function_name(fn_name);
         }

@@ -517,7 +517,15 @@ pub fn execute_inline_subgraph(
     }
 
     // Merge existing inbox data for the completed node
-    if let Some(node_inbox) = existing_inbox.get(completed_node_id) {
+    let completed_inbox = existing_inbox.get(completed_node_id);
+    debug!(
+        completed_node_id = %completed_node_id,
+        has_inbox = completed_inbox.is_some(),
+        inbox_vars = ?completed_inbox.map(|i| i.keys().collect::<Vec<_>>()),
+        all_inbox_keys = ?existing_inbox.keys().collect::<Vec<_>>(),
+        "merging completed node inbox into scope"
+    );
+    if let Some(node_inbox) = completed_inbox {
         for (var, val) in node_inbox {
             inline_scope
                 .entry(var.clone())
@@ -791,19 +799,23 @@ pub fn execute_inline_subgraph(
                     // Use the loop-back info tracked during BFS traversal
                     let is_loop_back = reached_via_loop_back;
 
-                    // Get current loop index from inbox or initialize to 0
+                    // Get current loop index from inline_scope (which has the body's iteration index)
+                    // This is more reliable than reading from for_loop's inbox when concurrent
+                    // body completions might be racing.
                     let mut loop_inbox = existing_inbox
                         .get(&frontier.node_id)
                         .cloned()
                         .unwrap_or_default();
 
                     let current_index: i64 = if is_loop_back {
-                        // Coming from loop-back: increment the index
-                        let prev_index = loop_inbox
+                        // Coming from loop-back: the body's inbox contains the iteration index
+                        // that was just completed. Read from inline_scope (populated from body's
+                        // inbox) and increment by 1.
+                        let body_index = inline_scope
                             .get(&loop_i_var)
                             .and_then(|v| v.as_i64())
                             .unwrap_or(0);
-                        prev_index + 1
+                        body_index + 1
                     } else {
                         // First entry: initialize to 0
                         0
@@ -859,11 +871,28 @@ pub fn execute_inline_subgraph(
 }
 
 /// Execute a single inline node and return its result.
-fn execute_inline_node(node: &DAGNode, _scope: &InlineScope) -> JsonValue {
+fn execute_inline_node(node: &DAGNode, scope: &InlineScope) -> JsonValue {
     // Most inline nodes don't produce meaningful values themselves
     // The actual data flows through DataFlow edges from their predecessors
     match node.node_type.as_str() {
-        "assignment" => JsonValue::Null,
+        "assignment" => {
+            // Evaluate the assignment expression
+            if let Some(ref expr) = node.assign_expr {
+                match ExpressionEvaluator::evaluate(expr, scope) {
+                    Ok(val) => val,
+                    Err(e) => {
+                        tracing::warn!(
+                            node_id = %node.id,
+                            error = %e,
+                            "failed to evaluate assignment expression in completion"
+                        );
+                        JsonValue::Null
+                    }
+                }
+            } else {
+                JsonValue::Null
+            }
+        }
         "input" | "output" => JsonValue::Null,
         "return" => JsonValue::Null,
         "conditional" | "branch" => JsonValue::Bool(true),
