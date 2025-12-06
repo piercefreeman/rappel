@@ -571,6 +571,16 @@ class IRBuilder(ast.NodeVisitor):
         If the for loop body has multiple action/function calls, we wrap them
         into a synthetic function and replace the body with a single call.
 
+        For loops that modify out-of-scope variables (accumulators) are detected
+        and those variables are set as targets on the SingleCallBody. This enables
+        the runtime to properly aggregate results into those variables.
+
+        Supported accumulator patterns:
+        1. List append: results.append(value)
+        2. Dict subscript: result[key] = value
+        3. List concatenation: results = results + [value]
+        4. Counter increment: count = count + 1
+
         Python:
             for item in items:
                 a = await step_one(item)
@@ -599,11 +609,22 @@ class IRBuilder(ast.NodeVisitor):
         if not iterable:
             return []
 
+        # Collect variables defined within the loop body (in-scope)
+        in_scope_vars = set(loop_vars)
+
         # Build body statements (recursively transforms nested structures)
         body_stmts: List[ir.Statement] = []
         for body_node in node.body:
             stmts = self._visit_statement(body_node)
             body_stmts.extend(stmts)
+            # Track variables defined by assignments in this iteration
+            for s in stmts:
+                if s.HasField("assignment"):
+                    in_scope_vars.update(s.assignment.targets)
+
+        # Detect all out-of-scope variable modifications (accumulators)
+        # These are variables modified in the loop body but defined outside it
+        accumulator_targets = self._detect_accumulator_targets(body_stmts, in_scope_vars)
 
         # Wrap for loop body if multiple calls (use loop_vars as inputs)
         if self._count_calls(body_stmts) > 1:
@@ -612,13 +633,108 @@ class IRBuilder(ast.NodeVisitor):
         # For loops use SingleCallBody (at most one action/function call per iteration)
         # Use spread for parallel iteration over collections.
         stmt = ir.Statement(span=_make_span(node))
+        single_call_body = self._stmts_to_single_call_body(body_stmts, _make_span(node))
+
+        # If we detected accumulator patterns, set them as targets on the SingleCallBody
+        # This ensures the aggregated results are stored under the correct variable names
+        if accumulator_targets and not single_call_body.targets:
+            single_call_body.targets.extend(accumulator_targets)
+
         for_loop = ir.ForLoop(
             loop_vars=loop_vars,
             iterable=iterable,
-            body=self._stmts_to_single_call_body(body_stmts, _make_span(node)),
+            body=single_call_body,
         )
         stmt.for_loop.CopyFrom(for_loop)
         return [stmt]
+
+    def _detect_accumulator_targets(
+        self, stmts: List[ir.Statement], in_scope_vars: set
+    ) -> List[str]:
+        """Detect out-of-scope variable modifications in for loop body.
+
+        Scans statements for patterns that modify variables defined outside the loop.
+        Returns a list of accumulator variable names that should be set as targets.
+
+        Supported patterns:
+        1. List append: results.append(value) -> "results"
+        2. Dict subscript: result[key] = value -> "result"
+        3. List/set update methods: results.extend(...), results.add(...) -> "results"
+
+        Note: Patterns like `results = results + [x]` and `count = count + 1` create
+        new assignments which are tracked via in_scope_vars and don't need special
+        detection here - they're handled by the regular assignment target logic.
+        """
+        accumulators: List[str] = []
+        seen: set = set()
+
+        for stmt in stmts:
+            var_name = self._extract_accumulator_from_stmt(stmt, in_scope_vars)
+            if var_name and var_name not in seen:
+                accumulators.append(var_name)
+                seen.add(var_name)
+
+            # Recursively check conditionals
+            if stmt.HasField("conditional"):
+                cond = stmt.conditional
+                if cond.HasField("if_branch") and cond.if_branch.HasField("body"):
+                    for var in self._detect_accumulator_targets(
+                        list(cond.if_branch.body.statements), in_scope_vars
+                    ):
+                        if var not in seen:
+                            accumulators.append(var)
+                            seen.add(var)
+                for elif_branch in cond.elif_branches:
+                    if elif_branch.HasField("body"):
+                        for var in self._detect_accumulator_targets(
+                            list(elif_branch.body.statements), in_scope_vars
+                        ):
+                            if var not in seen:
+                                accumulators.append(var)
+                                seen.add(var)
+                if cond.HasField("else_branch") and cond.else_branch.HasField("body"):
+                    for var in self._detect_accumulator_targets(
+                        list(cond.else_branch.body.statements), in_scope_vars
+                    ):
+                        if var not in seen:
+                            accumulators.append(var)
+                            seen.add(var)
+
+        return accumulators
+
+    def _extract_accumulator_from_stmt(
+        self, stmt: ir.Statement, in_scope_vars: set
+    ) -> Optional[str]:
+        """Extract accumulator variable name from a single statement.
+
+        Returns the variable name if this statement modifies an out-of-scope variable,
+        None otherwise.
+        """
+        # Pattern 1: Method calls like list.append(), dict.update(), set.add()
+        if stmt.HasField("expr_stmt"):
+            expr = stmt.expr_stmt.expr
+            if expr.HasField("function_call"):
+                fn_name = expr.function_call.name
+                # Check for mutating method calls: x.append, x.extend, x.add, x.update, etc.
+                mutating_methods = {".append", ".extend", ".add", ".update", ".insert", ".pop", ".remove", ".clear"}
+                for method in mutating_methods:
+                    if fn_name.endswith(method):
+                        var_name = fn_name[:len(fn_name) - len(method)]
+                        # Only return if it's an out-of-scope variable
+                        if var_name and var_name not in in_scope_vars:
+                            return var_name
+
+        # Pattern 2: Subscript assignment like dict[key] = value
+        if stmt.HasField("assignment"):
+            for target in stmt.assignment.targets:
+                # Check if target is a subscript pattern (contains '[')
+                if "[" in target:
+                    # Extract base variable name (before '[')
+                    var_name = target.split("[")[0]
+                    if var_name and var_name not in in_scope_vars:
+                        return var_name
+
+        return None
 
     def _visit_if(self, node: ast.If) -> Optional[ir.Statement]:
         """Convert if statement to IR conditional with branch wrapping.

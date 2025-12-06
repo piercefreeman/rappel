@@ -949,3 +949,72 @@ async fn chain_workflow_executes_all_steps() -> Result<()> {
     harness.shutdown().await?;
     Ok(())
 }
+
+// =============================================================================
+// For-Loop Workflow Test (loop with append pattern)
+// =============================================================================
+
+const FOR_LOOP_WORKFLOW_MODULE: &str = include_str!("fixtures/for_loop_workflow.py");
+
+const REGISTER_FOR_LOOP_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from for_loop_workflow import ForLoopWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ForLoopWorkflow()
+    result = await wf.run(items=["apple", "banana", "cherry"])
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that for-loop workflows execute correctly with the loop-append pattern.
+///
+/// This tests the classic for loop pattern: for item in items -> process_item -> append
+/// With items=["apple", "banana", "cherry"], result should be "APPLE,BANANA,CHERRY".
+///
+/// This differs from the spread/gather pattern in that items are processed as a
+/// spread operation under the hood, not via parallel gather.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn for_loop_workflow_executes_all_iterations() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("for_loop_workflow.py", FOR_LOOP_WORKFLOW_MODULE),
+            ("register.py", REGISTER_FOR_LOOP_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "forloopworkflow",
+        user_module: "for_loop_workflow",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result: ["apple", "banana", "cherry"] -> ["APPLE", "BANANA", "CHERRY"] -> "APPLE,BANANA,CHERRY"
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("APPLE,BANANA,CHERRY".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}

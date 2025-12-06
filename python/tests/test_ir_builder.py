@@ -431,6 +431,111 @@ class TestForLoopConversion:
         )
 
 
+class TestForLoopAccumulatorDetection:
+    """Test detection of accumulator patterns in for loops."""
+
+    def _find_for_loop(self, program: ir.Program) -> ir.ForLoop | None:
+        """Find the first for loop in the program."""
+        for fn in program.functions:
+            for stmt in fn.body.statements:
+                if stmt.HasField("for_loop"):
+                    return stmt.for_loop
+        return None
+
+    def test_single_list_append_accumulator(self) -> None:
+        """Test: Single list.append() is detected as accumulator target."""
+        from tests.fixtures_for_loop.for_single_accumulator import ForSingleAccumulatorWorkflow
+
+        program = ForSingleAccumulatorWorkflow.workflow_ir()
+        for_loop = self._find_for_loop(program)
+        assert for_loop is not None, "Expected for_loop in IR"
+
+        # The body should have 'results' as target (from results.append())
+        assert "results" in for_loop.body.targets, (
+            f"Expected 'results' in targets, got: {list(for_loop.body.targets)}"
+        )
+
+    def test_multi_list_append_in_conditionals(self) -> None:
+        """Test: Accumulators in conditional branches are detected but don't override action targets.
+
+        When the for loop body has both an action call with targets AND conditional
+        appends, the action targets take precedence. This is because the spread pattern
+        uses the action targets to know what the action returns per-iteration.
+
+        The conditional accumulation pattern (different lists based on condition) requires
+        different handling than simple accumulation.
+        """
+        from tests.fixtures_for_loop.for_multi_accumulator import ForMultiAccumulatorWorkflow
+
+        program = ForMultiAccumulatorWorkflow.workflow_ir()
+        for_loop = self._find_for_loop(program)
+        assert for_loop is not None, "Expected for_loop in IR"
+
+        # The action call targets should be present (is_valid, processed from tuple unpacking)
+        targets = list(for_loop.body.targets)
+        assert "is_valid" in targets or "processed" in targets, (
+            f"Expected action targets in body, got: {targets}"
+        )
+
+    def test_for_with_append_original_fixture(self) -> None:
+        """Test: Original for_with_append fixture works correctly."""
+        from tests.fixtures_for_loop.for_with_append import ForWithAppendWorkflow
+
+        program = ForWithAppendWorkflow.workflow_ir()
+        for_loop = self._find_for_loop(program)
+        assert for_loop is not None, "Expected for_loop in IR"
+
+        # The body should have 'results' as target
+        assert "results" in for_loop.body.targets, (
+            f"Expected 'results' in targets, got: {list(for_loop.body.targets)}"
+        )
+
+    def test_loop_variable_not_detected_as_accumulator(self) -> None:
+        """Test: Loop variables are not incorrectly detected as accumulators."""
+        from tests.fixtures_for_loop.for_single_accumulator import ForSingleAccumulatorWorkflow
+
+        program = ForSingleAccumulatorWorkflow.workflow_ir()
+        for_loop = self._find_for_loop(program)
+        assert for_loop is not None, "Expected for_loop in IR"
+
+        # 'item' is the loop variable, should NOT be in targets
+        assert "item" not in for_loop.body.targets, (
+            f"Loop variable 'item' should not be in targets, got: {list(for_loop.body.targets)}"
+        )
+
+    def test_in_scope_variable_not_detected_as_accumulator(self) -> None:
+        """Test: Variables defined in loop body are not detected as accumulators."""
+        from tests.fixtures_for_loop.for_single_accumulator import ForSingleAccumulatorWorkflow
+
+        program = ForSingleAccumulatorWorkflow.workflow_ir()
+        for_loop = self._find_for_loop(program)
+        assert for_loop is not None, "Expected for_loop in IR"
+
+        # 'processed' is defined in the loop body, should NOT be in targets
+        assert "processed" not in for_loop.body.targets, (
+            f"In-scope variable 'processed' should not be in targets, got: {list(for_loop.body.targets)}"
+        )
+
+    def test_accumulator_with_wrapped_body(self) -> None:
+        """Test: Accumulators are detected even when body is wrapped in function."""
+        from tests.fixtures_for_loop.for_with_append import ForWithAppendWorkflow
+
+        program = ForWithAppendWorkflow.workflow_ir()
+        for_loop = self._find_for_loop(program)
+        assert for_loop is not None, "Expected for_loop in IR"
+
+        # Should have an implicit function (multi-action body)
+        has_implicit_fn = any(
+            fn.name.startswith("__for_body") for fn in program.functions
+        )
+        assert has_implicit_fn, "Expected implicit function for multi-action body"
+
+        # Even with wrapped body, 'results' should be detected
+        assert "results" in for_loop.body.targets, (
+            f"Expected 'results' in targets even with wrapped body, got: {list(for_loop.body.targets)}"
+        )
+
+
 class TestConditionalConversion:
     """Test if/elif/else conversion to IR."""
 
