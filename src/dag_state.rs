@@ -388,6 +388,8 @@ impl<'a> DAGHelper<'a> {
         }
 
         // Everything else is inline
+        // Note: for_loop nodes without action bodies are inline (pure data manipulation)
+        // For loops WITH action bodies are converted to action_call + aggregator during DAG conversion
         ExecutionMode::Inline
     }
 

@@ -49,6 +49,7 @@ use prost::Message;
 
 use crate::{
     ast_evaluator::{EvaluationError, ExpressionEvaluator, Scope},
+    completion::{analyze_subgraph, evaluate_guard, execute_inline_subgraph},
     dag::{DAG, DAGConverter, DAGNode, EdgeType},
     dag_state::{DAGHelper, ExecutionMode},
     db::{
@@ -624,6 +625,7 @@ pub struct WorkQueueHandler {
     worker_pool: Arc<PythonWorkerPool>,
     slot_tracker: Arc<WorkerSlotTracker>,
     in_flight: Arc<Mutex<InFlightTracker>>,
+    dag_cache: Arc<DAGCache>,
 }
 
 impl WorkQueueHandler {
@@ -632,12 +634,14 @@ impl WorkQueueHandler {
         worker_pool: Arc<PythonWorkerPool>,
         slot_tracker: Arc<WorkerSlotTracker>,
         in_flight: Arc<Mutex<InFlightTracker>>,
+        dag_cache: Arc<DAGCache>,
     ) -> Self {
         Self {
             db,
             worker_pool,
             slot_tracker,
             in_flight,
+            dag_cache,
         }
     }
 
@@ -646,9 +650,12 @@ impl WorkQueueHandler {
         self.slot_tracker.available_slots()
     }
 
-    /// Fetch and dispatch a batch of actions to workers.
+    /// Fetch and dispatch a batch of runnable nodes (actions and barriers).
     ///
-    /// Returns immediately after dispatching. Completions are sent to the provided channel.
+    /// - Actions are dispatched to Python workers
+    /// - Barriers are processed inline using the unified readiness model
+    ///
+    /// Returns immediately after dispatching. Action completions are sent to the provided channel.
     pub async fn fetch_and_dispatch(
         &self,
         batch_size: usize,
@@ -660,14 +667,127 @@ impl WorkQueueHandler {
         }
 
         let limit = available.min(batch_size);
-        let actions = self.db.dispatch_actions(limit as i32).await?;
-        let dispatched = actions.len();
+        let nodes = self.db.dispatch_runnable_nodes(limit as i32).await?;
+        let dispatched = nodes.len();
 
-        for action in actions {
-            self.dispatch_action(action, completion_tx.clone()).await?;
+        for node in nodes {
+            match node.node_type.as_str() {
+                "barrier" => {
+                    // Process barriers inline using unified readiness model
+                    self.process_barrier(node).await?;
+                }
+                _ => {
+                    // Dispatch actions to workers
+                    self.dispatch_action(node, completion_tx.clone()).await?;
+                }
+            }
         }
 
         Ok(dispatched)
+    }
+
+    /// Process a barrier (aggregator) that has become ready.
+    ///
+    /// Barriers are processed inline by the runner, not dispatched to workers.
+    /// The barrier's inbox is guaranteed to be fully populated because all
+    /// predecessors completed and wrote their data before the barrier was enqueued.
+    async fn process_barrier(&self, barrier: QueuedAction) -> RunnerResult<()> {
+        let instance_id = WorkflowInstanceId(barrier.instance_id);
+        let node_id = match barrier.node_id.as_deref() {
+            Some(id) => id,
+            None => {
+                warn!(barrier_id = %barrier.id, "Barrier missing node_id");
+                return Ok(());
+            }
+        };
+
+        debug!(
+            barrier_id = %barrier.id,
+            node_id = %node_id,
+            instance_id = %instance_id.0,
+            "processing barrier"
+        );
+
+        // Get DAG
+        let dag = match self.dag_cache.get_dag_for_instance(instance_id).await? {
+            Some(dag) => dag,
+            None => {
+                warn!(instance_id = %instance_id.0, "DAG not found for barrier processing");
+                return Ok(());
+            }
+        };
+
+        let helper = DAGHelper::new(&dag);
+
+        // Read aggregated results from inbox (for spread actions with spread_index)
+        let spread_results = self
+            .db
+            .read_inbox_for_aggregator(instance_id, node_id)
+            .await?;
+
+        // Aggregate results (already sorted by spread_index)
+        let aggregated = JsonValue::Array(spread_results.into_iter().map(|(_, v)| v).collect());
+
+        // Also read named variables from the barrier's inbox (for parallel blocks)
+        let barrier_inbox = self.db.read_inbox(instance_id, node_id).await?;
+
+        debug!(
+            barrier_id = %node_id,
+            result_count = aggregated.as_array().map(|a| a.len()).unwrap_or(0),
+            named_vars = ?barrier_inbox.keys().collect::<Vec<_>>(),
+            "aggregated barrier results"
+        );
+
+        // Analyze subgraph from barrier
+        let subgraph = analyze_subgraph(node_id, &dag, &helper);
+
+        // Batch fetch inbox for all nodes in subgraph
+        let mut existing_inbox = self
+            .db
+            .batch_read_inbox(instance_id, &subgraph.all_node_ids)
+            .await?;
+
+        // Merge barrier's named variables into the existing inbox so they're available
+        // to successors. This is how parallel block results flow to downstream nodes.
+        if !barrier_inbox.is_empty() {
+            existing_inbox
+                .entry(node_id.to_string())
+                .or_default()
+                .extend(barrier_inbox.clone());
+        }
+
+        // Execute inline subgraph and build completion plan
+        let mut plan = execute_inline_subgraph(
+            node_id,
+            aggregated,
+            &subgraph,
+            &existing_inbox,
+            &dag,
+            instance_id,
+            None, // barriers are not spread actions
+        )
+        .map_err(|e| RunnerError::Dag(e.to_string()))?;
+
+        // Fill in barrier completion details
+        plan = plan.with_action_completion(
+            ActionId(barrier.id),
+            barrier.delivery_token,
+            true, // barriers always succeed
+            Vec::new(),
+            None,
+        );
+
+        // Execute completion plan in single atomic transaction
+        let result = self.db.execute_completion_plan(instance_id, plan).await?;
+
+        info!(
+            barrier_id = %node_id,
+            newly_ready_nodes = ?result.newly_ready_nodes,
+            workflow_completed = result.workflow_completed,
+            "processed barrier"
+        );
+
+        Ok(())
     }
 
     /// Dispatch a single action to a worker.
@@ -842,6 +962,16 @@ pub struct InboxWrite {
 struct NodeActionResult {
     pub actions: Vec<NewAction>,
     pub inbox_writes: Vec<InboxWrite>,
+    /// If this is a spread node, the aggregator node ID and expected count
+    /// that needs readiness initialization.
+    pub readiness_init: Option<ReadinessInit>,
+}
+
+/// Info needed to initialize readiness tracking for an aggregator node.
+#[derive(Debug, Clone)]
+struct ReadinessInit {
+    pub aggregator_node_id: String,
+    pub required_count: i32,
 }
 
 /// Exception information for error handling.
@@ -914,14 +1044,15 @@ impl DAGRunner {
         ));
         let in_flight = Arc::new(Mutex::new(InFlightTracker::new()));
 
+        let dag_cache = Arc::new(DAGCache::new(Arc::clone(&db)));
         let work_handler = Arc::new(WorkQueueHandler::new(
             Arc::clone(&db),
             worker_pool,
             slot_tracker,
             in_flight,
+            Arc::clone(&dag_cache),
         ));
-        let completion_handler = WorkCompletionHandler::new(Arc::clone(&db));
-        let dag_cache = Arc::new(DAGCache::new(db));
+        let completion_handler = WorkCompletionHandler::new(db);
 
         Self {
             config,
@@ -949,30 +1080,49 @@ impl DAGRunner {
                     break;
                 }
 
-                // Process completions
+                // Process completions using unified readiness model
                 Some((in_flight, metrics)) = completion_rx.recv() => {
-                    // Spawn tokio task for parallel processing
                     let handler = self.completion_handler.clone();
                     let dag_cache = Arc::clone(&self.dag_cache);
                     let instance_contexts = Arc::clone(&self.instance_contexts);
                     let instance_id = in_flight.action.instance_id;
 
                     tokio::spawn(async move {
-                        if let Err(e) = Self::process_completion_task(
-                            handler,
-                            dag_cache,
-                            instance_contexts,
-                            in_flight,
-                            metrics,
-                            WorkflowInstanceId(instance_id),
-                        ).await {
-                            error!("Completion processing failed: {}", e);
+                        // Use unified completion path for successful actions
+                        // Fall back to old path for failures (which handles exception routing)
+                        if metrics.success {
+                            if let Err(e) = Self::process_completion_unified(
+                                &handler.db,
+                                &dag_cache,
+                                &in_flight,
+                                &metrics,
+                                WorkflowInstanceId(instance_id),
+                            ).await {
+                                error!("Unified completion processing failed: {}", e);
+                            }
+                        } else {
+                            // Failed actions use old path for exception handling
+                            if let Err(e) = Self::process_completion_task(
+                                handler,
+                                dag_cache,
+                                instance_contexts,
+                                in_flight,
+                                metrics,
+                                WorkflowInstanceId(instance_id),
+                            ).await {
+                                error!("Completion processing failed: {}", e);
+                            }
                         }
                     });
                 }
 
                 // Fetch and dispatch work (delegated to WorkQueueHandler)
                 _ = tokio::time::sleep(tokio::time::Duration::from_millis(self.config.poll_interval_ms)) => {
+                    // First, check for and start any unstarted instances
+                    if let Err(e) = self.start_unstarted_instances().await {
+                        error!("Failed to start unstarted instances: {}", e);
+                    }
+
                     if self.work_handler.available_slots() == 0 {
                         continue;
                     }
@@ -996,6 +1146,204 @@ impl DAGRunner {
         }
 
         Ok(())
+    }
+
+    // ========================================================================
+    // Unified Readiness Model - New Completion Flow
+    // ========================================================================
+
+    /// Process a completion using the unified readiness model.
+    ///
+    /// This implements the 4-step completion flow:
+    /// 1. Analyze subgraph - find inline nodes and frontier (barriers/actions)
+    /// 2. Batch fetch inbox - single query for all relevant node inboxes
+    /// 3. Execute inline subgraph - run inline nodes in memory
+    /// 4. Execute completion plan - single atomic transaction
+    ///
+    /// Every frontier node gets readiness tracking. A node is only enqueued
+    /// when `completed_count == required_count`.
+    async fn process_completion_unified(
+        db: &Database,
+        dag_cache: &DAGCache,
+        in_flight: &InFlightAction,
+        metrics: &RoundTripMetrics,
+        instance_id: WorkflowInstanceId,
+    ) -> RunnerResult<crate::completion::CompletionResult> {
+        // Get DAG for this workflow instance
+        let dag = match dag_cache.get_dag_for_instance(instance_id).await? {
+            Some(dag) => dag,
+            None => {
+                return Ok(crate::completion::CompletionResult::default());
+            }
+        };
+
+        // Get node_id from action
+        let node_id = match in_flight.action.node_id.as_deref() {
+            Some(id) => id,
+            None => {
+                return Ok(crate::completion::CompletionResult::default());
+            }
+        };
+
+        // Parse spread index if present
+        let (base_node_id, spread_index) = Self::parse_spread_node_id(node_id);
+
+        // Parse result from response payload
+        let result: JsonValue = if metrics.response_payload.is_empty() {
+            JsonValue::Null
+        } else {
+            match proto::WorkflowArguments::decode(&metrics.response_payload[..]) {
+                Ok(args) => args
+                    .arguments
+                    .iter()
+                    .find(|arg| arg.key == "result")
+                    .and_then(|arg| arg.value.as_ref())
+                    .map(proto_value_to_json)
+                    .unwrap_or(JsonValue::Null),
+                Err(_) => {
+                    serde_json::from_slice(&metrics.response_payload).unwrap_or(JsonValue::Null)
+                }
+            }
+        };
+
+        let helper = DAGHelper::new(&dag);
+
+        // Step 1: Analyze subgraph
+        let subgraph = analyze_subgraph(base_node_id, &dag, &helper);
+
+        debug!(
+            node_id = %node_id,
+            inline_nodes = subgraph.inline_nodes.len(),
+            frontier_nodes = subgraph.frontier_nodes.len(),
+            "analyzed subgraph for completion"
+        );
+
+        // Step 2: Batch fetch inbox for all nodes in subgraph
+        let existing_inbox = db
+            .batch_read_inbox(instance_id, &subgraph.all_node_ids)
+            .await?;
+
+        // Step 3: Execute inline subgraph and build completion plan
+        let mut plan = execute_inline_subgraph(
+            base_node_id,
+            result,
+            &subgraph,
+            &existing_inbox,
+            &dag,
+            instance_id,
+            spread_index,
+        )
+        .map_err(|e| RunnerError::Dag(e.to_string()))?;
+
+        // Fill in action completion details
+        plan = plan.with_action_completion(
+            ActionId(in_flight.action.id),
+            in_flight.action.delivery_token,
+            metrics.success,
+            metrics.response_payload.clone(),
+            metrics.error_message.clone(),
+        );
+
+        debug!(
+            node_id = %node_id,
+            inbox_writes = plan.inbox_writes.len(),
+            readiness_increments = plan.readiness_increments.len(),
+            has_instance_completion = plan.instance_completion.is_some(),
+            "built completion plan"
+        );
+
+        // Step 4: Execute completion plan in single atomic transaction
+        let result = db.execute_completion_plan(instance_id, plan).await?;
+
+        info!(
+            node_id = %node_id,
+            newly_ready_nodes = ?result.newly_ready_nodes,
+            workflow_completed = result.workflow_completed,
+            was_stale = result.was_stale,
+            "executed completion plan"
+        );
+
+        Ok(result)
+    }
+
+    /// Process a barrier (aggregator) that has become ready.
+    ///
+    /// Called when the polling loop picks up a barrier from the queue.
+    /// The barrier's inbox is guaranteed to be fully populated because
+    /// all predecessors completed and wrote their data before the barrier
+    /// was enqueued.
+    #[allow(dead_code)]
+    async fn process_barrier_unified(
+        db: &Database,
+        dag_cache: &DAGCache,
+        barrier: &QueuedAction,
+    ) -> RunnerResult<crate::completion::CompletionResult> {
+        let instance_id = WorkflowInstanceId(barrier.instance_id);
+        let node_id = match barrier.node_id.as_deref() {
+            Some(id) => id,
+            None => return Ok(crate::completion::CompletionResult::default()),
+        };
+
+        // Get DAG
+        let dag = match dag_cache.get_dag_for_instance(instance_id).await? {
+            Some(dag) => dag,
+            None => return Ok(crate::completion::CompletionResult::default()),
+        };
+
+        let helper = DAGHelper::new(&dag);
+
+        // Read aggregated results from inbox
+        let spread_results = db.read_inbox_for_aggregator(instance_id, node_id).await?;
+
+        // Aggregate results (already sorted by spread_index)
+        let aggregated = JsonValue::Array(spread_results.into_iter().map(|(_, v)| v).collect());
+
+        debug!(
+            barrier_id = %node_id,
+            result_count = aggregated.as_array().map(|a| a.len()).unwrap_or(0),
+            "processing ready barrier"
+        );
+
+        // Analyze subgraph from barrier
+        let subgraph = analyze_subgraph(node_id, &dag, &helper);
+
+        // Batch fetch inbox
+        let existing_inbox = db
+            .batch_read_inbox(instance_id, &subgraph.all_node_ids)
+            .await?;
+
+        // Execute inline subgraph
+        let mut plan = execute_inline_subgraph(
+            node_id,
+            aggregated,
+            &subgraph,
+            &existing_inbox,
+            &dag,
+            instance_id,
+            None, // barriers are not spread actions
+        )
+        .map_err(|e| RunnerError::Dag(e.to_string()))?;
+
+        // Fill in barrier completion details
+        plan = plan.with_action_completion(
+            ActionId(barrier.id),
+            barrier.delivery_token,
+            true, // barriers always succeed
+            Vec::new(),
+            None,
+        );
+
+        // Execute completion plan
+        let result = db.execute_completion_plan(instance_id, plan).await?;
+
+        info!(
+            barrier_id = %node_id,
+            newly_ready_nodes = ?result.newly_ready_nodes,
+            workflow_completed = result.workflow_completed,
+            "processed barrier"
+        );
+
+        Ok(result)
     }
 
     /// Process a completion in a tokio task (fully async with inbox pattern).
@@ -1166,106 +1514,9 @@ impl DAGRunner {
             return Ok(());
         }
 
-        // Get DAG for this workflow instance
-        let dag = match dag_cache.get_dag_for_instance(instance_id).await? {
-            Some(dag) => dag,
-            None => {
-                handler.write_batch(batch).await?;
-                return Ok(());
-            }
-        };
-
-        // Find the node that was executed
-        let node_id = match in_flight.action.node_id.as_deref() {
-            Some(id) => id,
-            None => {
-                handler.write_batch(batch).await?;
-                return Ok(());
-            }
-        };
-
-        // Parse result payload (protobuf WorkflowArguments -> JSON)
-        let result: JsonValue = if metrics.response_payload.is_empty() {
-            JsonValue::Null
-        } else {
-            match proto::WorkflowArguments::decode(&metrics.response_payload[..]) {
-                Ok(args) => args
-                    .arguments
-                    .iter()
-                    .find(|arg| arg.key == "result")
-                    .and_then(|arg| arg.value.as_ref())
-                    .map(proto_value_to_json)
-                    .unwrap_or(JsonValue::Null),
-                Err(_) => {
-                    serde_json::from_slice(&metrics.response_payload).unwrap_or(JsonValue::Null)
-                }
-            }
-        };
-
-        let helper = DAGHelper::new(&dag);
-
-        // Parse spread index from node_id if present (e.g., "spread_action_1[2]" -> ("spread_action_1", Some(2)))
-        let (base_node_id, spread_index) = Self::parse_spread_node_id(node_id);
-
-        // INBOX PATTERN: Collect inbox writes for downstream nodes via DATA_FLOW edges
-        // For spread actions, use the base node ID to look up the node, but include spread_index
-        if let Some(node) = dag.nodes.get(base_node_id)
-            && let Some(ref target) = node.target
-        {
-            debug!(
-                node_id = %node_id,
-                base_node_id = %base_node_id,
-                spread_index = ?spread_index,
-                target = %target,
-                result = ?result,
-                "collecting inbox writes for downstream nodes"
-            );
-
-            Self::collect_inbox_writes_for_node_with_spread(
-                base_node_id,
-                target,
-                &result,
-                &dag,
-                instance_id,
-                spread_index,
-                &mut batch.inbox_writes,
-            );
-        }
-
-        // Process successors - inline nodes use in-memory scope, delegated read from inbox
-        // For spread actions, we use base_node_id to find successors in the DAG
-        // But we DON'T process successors for individual spread completions - only the aggregator handles that
-        let mut inline_scope: Scope = HashMap::new();
-        if spread_index.is_none() {
-            // Regular action - process successors normally
-            Self::process_successors_async(
-                base_node_id,
-                &result,
-                &dag,
-                &helper,
-                &mut inline_scope,
-                &mut batch,
-                instance_id,
-                &handler.db,
-            )
-            .await?;
-        } else {
-            // For spread actions: check if all spread actions are complete
-            // If so, process the aggregator node
-            Self::check_and_process_aggregator(
-                base_node_id,
-                &dag,
-                &helper,
-                &mut batch,
-                instance_id,
-                &handler.db,
-            )
-            .await?;
-        }
-
-        // Write everything in one batch: completion, inbox writes, new actions
+        // If we get here, the action failed but no exception handler was found
+        // Just write the completion record
         handler.write_batch(batch).await?;
-
         Ok(())
     }
 
@@ -1335,94 +1586,100 @@ impl DAGRunner {
         );
     }
 
-    /// Check if all spread actions are complete and process the aggregator if ready.
+    /// Check if all parallel actions are complete and process the aggregator if ready.
     ///
-    /// This is called after each spread action completes. It:
-    /// 1. Finds the aggregator node for this spread
-    /// 2. Reads the aggregator's inbox to get _spread_count and _spread_result entries
-    /// 3. If all results are in, aggregates them and processes successors
+    /// For parallel blocks like:
+    ///   a, b = parallel:
+    ///     @action1()
+    ///     @action2()
+    ///
+    /// The aggregator collects control flow from both actions. This function:
+    /// 1. Counts expected parallel actions from the parallel entry node
+    /// 2. Atomically writes inbox entries and increments counter in one transaction
+    /// 3. When all complete, processes the aggregator's successors
     #[allow(clippy::too_many_arguments)]
-    async fn check_and_process_aggregator(
-        spread_node_id: &str,
+    async fn check_and_process_parallel_aggregator(
+        _completed_node_id: &str,
+        agg_node: &DAGNode,
         dag: &DAG,
         helper: &DAGHelper<'_>,
+        inline_scope: &mut Scope,
         batch: &mut CompletionBatch,
         instance_id: WorkflowInstanceId,
         db: &Database,
     ) -> RunnerResult<()> {
-        // Find the aggregator node (successor via StateMachine edge)
-        let aggregator_id = dag
+        let agg_id = &agg_node.id;
+
+        // Get the parallel entry node this aggregator is collecting from
+        let parallel_entry_id = match &agg_node.aggregates_from {
+            Some(id) => id,
+            None => return Ok(()), // Not a valid aggregator
+        };
+
+        // Find all parallel action node IDs (successors of the parallel entry node)
+        let parallel_action_ids: Vec<String> = dag
             .edges
             .iter()
-            .find(|e| e.source == spread_node_id && e.edge_type == EdgeType::StateMachine)
-            .map(|e| e.target.clone());
+            .filter(|e| e.source == *parallel_entry_id && e.edge_type == EdgeType::StateMachine)
+            .map(|e| e.target.clone())
+            .collect();
 
-        let agg_id = match aggregator_id {
-            Some(id) => id,
-            None => return Ok(()), // No aggregator, nothing to do
-        };
+        let expected_count = parallel_action_ids.len() as i32;
 
-        let agg_node = match dag.nodes.get(&agg_id) {
-            Some(n) => n,
-            None => return Ok(()),
-        };
+        // Collect inbox writes that need to be committed atomically with the counter
+        // These are writes from the current parallel action completion
+        let inbox_writes_for_tx: Vec<(String, String, JsonValue, String, Option<i32>)> = batch
+            .inbox_writes
+            .drain(..)
+            .map(|w| {
+                (
+                    w.target_node_id,
+                    w.variable_name,
+                    w.value,
+                    w.source_node_id,
+                    w.spread_index,
+                )
+            })
+            .collect();
 
-        // Read the aggregator's inbox - both spread results and the expected count
-        let spread_results = db.read_inbox_for_aggregator(instance_id, &agg_id).await?;
-        let agg_inbox = db.read_inbox(instance_id, &agg_id).await?;
-
-        // Get expected count from the regular inbox
-        let expected_count = agg_inbox
-            .get("_spread_count")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0) as usize;
-
-        // Count spread results (these come from read_inbox_for_aggregator)
-        let current_results = spread_results.len();
+        // Atomically write inbox entries and increment readiness counter
+        // Uses init-on-first-use pattern so we don't need separate initialization
+        let readiness = db
+            .write_inbox_batch_and_increment_readiness(
+                instance_id,
+                agg_id,
+                expected_count,
+                &inbox_writes_for_tx,
+            )
+            .await?;
 
         debug!(
             aggregator_id = %agg_id,
             expected_count = expected_count,
-            current_results = current_results,
-            "checking aggregator readiness"
+            completed_count = readiness.completed_count,
+            is_now_ready = readiness.is_now_ready,
+            parallel_action_ids = ?parallel_action_ids,
+            inbox_writes_committed = inbox_writes_for_tx.len(),
+            "checking parallel aggregator readiness"
         );
 
-        // If not all results are in yet, wait for more
-        if current_results < expected_count {
+        // If not all parallel actions are complete, wait for more
+        if !readiness.is_now_ready {
             return Ok(());
         }
 
-        // All results are in! Aggregate them.
-        // spread_results is already sorted by spread_index from the DB query
-        let aggregated_result =
-            JsonValue::Array(spread_results.into_iter().map(|(_, v)| v).collect());
-
         debug!(
             aggregator_id = %agg_id,
-            result_count = current_results,
-            "aggregator ready, processing result"
+            "parallel aggregator ready, processing successors"
         );
 
-        // Write aggregated result to downstream nodes via DATA_FLOW edges
-        if let Some(ref target) = agg_node.target {
-            Self::collect_inbox_writes_for_node(
-                &agg_id,
-                target,
-                &aggregated_result,
-                dag,
-                instance_id,
-                &mut batch.inbox_writes,
-            );
-        }
-
-        // Process aggregator's successors
-        let mut inline_scope: Scope = HashMap::new();
-        if let Some(ref target) = agg_node.target {
-            inline_scope.insert(target.clone(), aggregated_result.clone());
-        }
+        // All parallel actions complete! Process aggregator's successors.
+        // For parallel blocks with tuple unpacking, the data has already been
+        // written to downstream nodes via DataFlow edges from each parallel action.
+        // The aggregator's role is just control flow synchronization.
 
         // Find and process successors of the aggregator
-        let successors = helper.get_ready_successors(&agg_id, None);
+        let successors = helper.get_ready_successors(agg_id, None);
         for successor in successors {
             let succ_node = match dag.nodes.get(&successor.node_id) {
                 Some(n) => n,
@@ -1432,9 +1689,30 @@ impl DAGRunner {
             let exec_mode = helper.get_execution_mode(succ_node);
             match exec_mode {
                 ExecutionMode::Inline => {
-                    // Execute inline and recurse
-                    let inline_result = Self::execute_inline_node(succ_node, &mut inline_scope)?;
+                    // Check for output/return node (workflow completion)
+                    if succ_node.is_output || succ_node.node_type == "return" {
+                        // Get result from inline scope or inbox
+                        let result = inline_scope
+                            .values()
+                            .next()
+                            .cloned()
+                            .unwrap_or(JsonValue::Null);
+
+                        let mut result_map = HashMap::new();
+                        result_map.insert("result".to_string(), result);
+                        let result_payload = Self::serialize_workflow_result(&result_map);
+
+                        batch.instance_completion = Some(InstanceCompletion {
+                            instance_id,
+                            result_payload,
+                        });
+                        continue;
+                    }
+
+                    // Execute inline and continue
+                    let inline_result = Self::execute_inline_node(succ_node, inline_scope)?;
                     if let Some(ref target) = succ_node.target {
+                        inline_scope.insert(target.clone(), inline_result.clone());
                         Self::collect_inbox_writes_for_node(
                             &successor.node_id,
                             target,
@@ -1444,12 +1722,36 @@ impl DAGRunner {
                             &mut batch.inbox_writes,
                         );
                     }
-                    // Continue processing inline successors...
-                    // (simplified - in production would use full recursive processing)
                 }
                 ExecutionMode::Delegated => {
-                    // Read inbox and create action
-                    let inbox = db.read_inbox(instance_id, &successor.node_id).await?;
+                    // Read inbox from DB - all parallel action inbox writes are already
+                    // committed atomically with the counter increment
+                    let mut inbox = db.read_inbox(instance_id, &successor.node_id).await?;
+
+                    // Merge pending inbox writes from current batch
+                    for pending_write in &batch.inbox_writes {
+                        if pending_write.target_node_id == successor.node_id {
+                            inbox.insert(
+                                pending_write.variable_name.clone(),
+                                pending_write.value.clone(),
+                            );
+                        }
+                    }
+
+                    // Merge inline scope
+                    for (var_name, var_value) in inline_scope.iter() {
+                        inbox
+                            .entry(var_name.clone())
+                            .or_insert_with(|| var_value.clone());
+                    }
+
+                    debug!(
+                        successor_node_id = %successor.node_id,
+                        inbox = ?inbox.keys().collect::<Vec<_>>(),
+                        "creating action for parallel aggregator successor"
+                    );
+
+                    // Create action
                     let result =
                         Self::create_actions_for_node(succ_node, instance_id, &inbox, dag)?;
                     batch.new_actions.extend(result.actions);
@@ -1459,34 +1761,6 @@ impl DAGRunner {
         }
 
         Ok(())
-    }
-
-    /// Process successor nodes asynchronously.
-    /// Inline nodes execute immediately and collect inbox writes.
-    /// Delegated nodes read from inbox and queue for execution.
-    #[allow(clippy::too_many_arguments)]
-    async fn process_successors_async(
-        node_id: &str,
-        result: &JsonValue,
-        dag: &DAG,
-        helper: &DAGHelper<'_>,
-        inline_scope: &mut Scope,
-        batch: &mut CompletionBatch,
-        instance_id: WorkflowInstanceId,
-        db: &Database,
-    ) -> RunnerResult<()> {
-        Self::process_successors_with_condition(
-            node_id,
-            result,
-            dag,
-            helper,
-            inline_scope,
-            batch,
-            instance_id,
-            db,
-            None,
-        )
-        .await
     }
 
     /// Check if a result represents an exception.
@@ -1712,6 +1986,25 @@ impl DAGRunner {
                 None => continue,
             };
 
+            // Skip aggregator nodes during normal successor processing.
+            // Parallel aggregators need all predecessors to complete before processing.
+            // Instead, check if all predecessors are complete and process if ready.
+            if succ_node.is_aggregator {
+                // Check if all parallel actions feeding this aggregator are complete
+                Self::check_and_process_parallel_aggregator(
+                    &current_node_id,
+                    succ_node,
+                    dag,
+                    helper,
+                    inline_scope,
+                    batch,
+                    instance_id,
+                    db,
+                )
+                .await?;
+                continue;
+            }
+
             let exec_mode = helper.get_execution_mode(succ_node);
             match exec_mode {
                 ExecutionMode::Inline => {
@@ -1935,6 +2228,72 @@ impl DAGRunner {
         self.work_handler.in_flight_count().await
     }
 
+    /// Poll for and start any unstarted instances.
+    ///
+    /// Finds instances that are in 'running' state but have no actions queued yet,
+    /// and starts them by parsing their input and creating the initial actions.
+    async fn start_unstarted_instances(&self) -> RunnerResult<()> {
+        let db = &self.completion_handler.db;
+        let instances = db.find_unstarted_instances(10).await?;
+
+        for instance in instances {
+            let instance_id = WorkflowInstanceId(instance.id);
+
+            // Parse initial inputs from the instance's input_payload
+            let initial_inputs: std::collections::HashMap<String, JsonValue> =
+                if let Some(payload) = &instance.input_payload {
+                    // Try to decode as protobuf WorkflowArguments
+                    match proto::WorkflowArguments::decode(&payload[..]) {
+                        Ok(args) => args
+                            .arguments
+                            .iter()
+                            .filter_map(|arg| {
+                                arg.value
+                                    .as_ref()
+                                    .map(|v| (arg.key.clone(), proto_value_to_json(v)))
+                            })
+                            .collect(),
+                        Err(e) => {
+                            warn!(
+                                instance_id = %instance.id,
+                                error = %e,
+                                "failed to decode input payload, using empty inputs"
+                            );
+                            std::collections::HashMap::new()
+                        }
+                    }
+                } else {
+                    std::collections::HashMap::new()
+                };
+
+            info!(
+                instance_id = %instance.id,
+                workflow = %instance.workflow_name,
+                input_keys = ?initial_inputs.keys().collect::<Vec<_>>(),
+                "starting unstarted instance"
+            );
+
+            match self.start_instance(instance_id, initial_inputs).await {
+                Ok(count) => {
+                    debug!(
+                        instance_id = %instance.id,
+                        actions_created = count,
+                        "successfully started instance"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        instance_id = %instance.id,
+                        error = %e,
+                        "failed to start instance"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Start a workflow instance by enqueuing its initial action(s).
     ///
     /// This is the entry point for workflow execution. It:
@@ -2002,8 +2361,30 @@ impl DAGRunner {
         // Find first delegated successors starting from input node
         let mut actions_to_enqueue = Vec::new();
         let mut inbox_writes_to_commit = Vec::new();
+        let mut readiness_inits: Vec<ReadinessInit> = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let mut queue = std::collections::VecDeque::new();
+
+        // Collect inbox writes for input variables to downstream nodes via DataFlow edges.
+        // This ensures that actions which reference input variables (like summarize_math
+        // using input_number=n) receive those values in their inbox, even if they're not
+        // immediate successors of the input node.
+        for (var_name, value) in &scope {
+            Self::collect_inbox_writes_for_node(
+                &input_node.id,
+                var_name,
+                value,
+                &dag,
+                instance_id,
+                &mut inbox_writes_to_commit,
+            );
+        }
+        debug!(
+            input_node_id = %input_node.id,
+            inbox_writes = inbox_writes_to_commit.len(),
+            variables = ?scope.keys().collect::<Vec<_>>(),
+            "collected inbox writes for input variables"
+        );
 
         // Start from input node's successors
         let initial_successors = helper.get_ready_successors(&input_node.id, None);
@@ -2014,6 +2395,16 @@ impl DAGRunner {
             "input node successors"
         );
         for successor in initial_successors {
+            // Evaluate guard if present - skip branch if guard fails
+            if let Some(ref guard) = successor.guard_expr
+                && !evaluate_guard(Some(guard), &scope, &successor.node_id)
+            {
+                debug!(
+                    successor_id = %successor.node_id,
+                    "skipping initial successor due to failed guard"
+                );
+                continue;
+            }
             queue.push_back(successor.node_id);
         }
 
@@ -2079,10 +2470,15 @@ impl DAGRunner {
                             node_id = %node_id,
                             actions_created = result.actions.len(),
                             inbox_writes = result.inbox_writes.len(),
+                            readiness_init = ?result.readiness_init,
                             "created initial actions for node"
                         );
                         actions_to_enqueue.extend(result.actions);
                         inbox_writes_to_commit.extend(result.inbox_writes);
+                        // Collect readiness init for spread aggregators
+                        if let Some(init) = result.readiness_init {
+                            readiness_inits.push(init);
+                        }
                         // Don't traverse past delegated nodes - they'll handle their successors
                     }
                 }
@@ -2095,6 +2491,16 @@ impl DAGRunner {
                         "skipping inline node during start_instance"
                     );
                     for successor in inline_successors {
+                        // Evaluate guard if present - skip branch if guard fails
+                        if let Some(ref guard) = successor.guard_expr
+                            && !evaluate_guard(Some(guard), &scope, &successor.node_id)
+                        {
+                            debug!(
+                                successor_id = %successor.node_id,
+                                "skipping successor due to failed guard during start_instance"
+                            );
+                            continue;
+                        }
                         if !visited.contains(&successor.node_id) {
                             queue.push_back(successor.node_id);
                         }
@@ -2115,6 +2521,18 @@ impl DAGRunner {
                 write.spread_index,
             )
             .await?;
+        }
+
+        // Initialize node_readiness for spread aggregators BEFORE enqueuing actions
+        // This ensures the readiness row exists when spread actions complete
+        for init in readiness_inits {
+            debug!(
+                aggregator_node_id = %init.aggregator_node_id,
+                required_count = init.required_count,
+                "initializing node readiness for aggregator"
+            );
+            db.init_node_readiness(instance_id, &init.aggregator_node_id, init.required_count)
+                .await?;
         }
 
         // Enqueue all initial actions
@@ -2150,46 +2568,37 @@ impl DAGRunner {
             Some(action) => Ok(NodeActionResult {
                 actions: vec![action],
                 inbox_writes: vec![],
+                readiness_init: None,
             }),
             None => Ok(NodeActionResult::default()),
         }
     }
 
     /// Create actions and inbox writes for a spread node.
-    /// This writes the expected count to the aggregator's inbox.
+    /// Returns readiness init info so caller can initialize node_readiness table.
     fn create_spread_node_result(
         node: &DAGNode,
         instance_id: WorkflowInstanceId,
         inbox: &std::collections::HashMap<String, JsonValue>,
-        dag: &DAG,
+        _dag: &DAG,
     ) -> RunnerResult<NodeActionResult> {
         let actions = Self::create_actions_for_spread_node(node, instance_id, inbox)?;
         let spread_count = actions.len();
 
-        // Find the aggregator node that follows this spread action
-        let aggregator_id = dag
-            .edges
-            .iter()
-            .find(|e| e.source == node.id && e.edge_type == EdgeType::StateMachine)
-            .map(|e| e.target.clone());
+        // Use the aggregates_to field to find the aggregator node
+        // This is set during DAG conversion and propagated during function expansion
+        let aggregator_id = node.aggregates_to.clone();
 
-        let mut inbox_writes = Vec::new();
-
-        // Write the expected count to the aggregator's inbox
-        if let Some(agg_id) = aggregator_id {
-            inbox_writes.push(InboxWrite {
-                instance_id,
-                target_node_id: agg_id,
-                variable_name: "_spread_count".to_string(),
-                value: JsonValue::Number(spread_count.into()),
-                source_node_id: node.id.clone(),
-                spread_index: None,
-            });
-        }
+        // Return readiness init info so caller can initialize node_readiness
+        let readiness_init = aggregator_id.clone().map(|agg_id| ReadinessInit {
+            aggregator_node_id: agg_id,
+            required_count: spread_count as i32,
+        });
 
         Ok(NodeActionResult {
             actions,
-            inbox_writes,
+            inbox_writes: vec![],
+            readiness_init,
         })
     }
 
@@ -2430,6 +2839,7 @@ mod tests {
             timeout_retry_limit: 3,
             retry_kind: "failure".to_string(),
             node_id: Some("node_1".to_string()),
+            node_type: "action".to_string(),
         };
 
         tracker.add(action.clone(), 0);
@@ -2666,5 +3076,178 @@ mod tests {
             error_message: None,
         });
         assert!(!batch.is_empty());
+    }
+
+    #[test]
+    fn test_build_action_payload_resolves_variables() {
+        use crate::dag::DAGNode;
+
+        // Create a node with kwargs that reference variables
+        let mut kwargs = HashMap::new();
+        kwargs.insert("input_number".to_string(), "$number".to_string());
+        kwargs.insert(
+            "factorial_value".to_string(),
+            "$factorial_value".to_string(),
+        );
+        kwargs.insert("fibonacci_value".to_string(), "$fib_value".to_string());
+
+        let node = DAGNode::new(
+            "action_6".to_string(),
+            "action_call".to_string(),
+            "@summarize_math()".to_string(),
+        )
+        .with_kwargs(kwargs);
+
+        // Create inbox with the expected variables
+        let mut inbox: HashMap<String, JsonValue> = HashMap::new();
+        inbox.insert("number".to_string(), JsonValue::Number(5.into()));
+        inbox.insert("factorial_value".to_string(), JsonValue::Number(120.into()));
+        inbox.insert("fib_value".to_string(), JsonValue::Number(5.into()));
+
+        // Build payload
+        let payload = DAGRunner::build_action_payload_from_inbox(&node, &inbox).unwrap();
+        let payload_json: JsonValue = serde_json::from_slice(&payload).unwrap();
+
+        // Verify all kwargs are resolved correctly
+        let obj = payload_json.as_object().expect("payload should be object");
+        assert_eq!(obj.get("input_number"), Some(&JsonValue::Number(5.into())));
+        assert_eq!(
+            obj.get("factorial_value"),
+            Some(&JsonValue::Number(120.into()))
+        );
+        assert_eq!(
+            obj.get("fibonacci_value"),
+            Some(&JsonValue::Number(5.into()))
+        );
+    }
+
+    #[test]
+    fn test_build_action_payload_missing_variable_returns_null() {
+        use crate::dag::DAGNode;
+
+        // Create a node with kwargs that reference variables
+        let mut kwargs = HashMap::new();
+        kwargs.insert("input_number".to_string(), "$number".to_string());
+        kwargs.insert(
+            "factorial_value".to_string(),
+            "$factorial_value".to_string(),
+        );
+        kwargs.insert("fibonacci_value".to_string(), "$fib_value".to_string());
+
+        let node = DAGNode::new(
+            "action_6".to_string(),
+            "action_call".to_string(),
+            "@summarize_math()".to_string(),
+        )
+        .with_kwargs(kwargs);
+
+        // Create inbox MISSING some variables - this simulates the bug
+        let mut inbox: HashMap<String, JsonValue> = HashMap::new();
+        inbox.insert("factorial_value".to_string(), JsonValue::Number(120.into()));
+        // fib_value and number are MISSING
+
+        // Build payload
+        let payload = DAGRunner::build_action_payload_from_inbox(&node, &inbox).unwrap();
+        let payload_json: JsonValue = serde_json::from_slice(&payload).unwrap();
+
+        // Missing variables should resolve to null (which will cause TypeError in Python!)
+        let obj = payload_json.as_object().expect("payload should be object");
+        assert_eq!(
+            obj.get("input_number"),
+            Some(&JsonValue::Null),
+            "missing variable should be null"
+        );
+        assert_eq!(
+            obj.get("factorial_value"),
+            Some(&JsonValue::Number(120.into()))
+        );
+        assert_eq!(
+            obj.get("fibonacci_value"),
+            Some(&JsonValue::Null),
+            "missing variable should be null"
+        );
+    }
+
+    #[test]
+    fn test_collect_inbox_writes_for_input_variables() {
+        use crate::dag::{DAG, DAGEdge, DAGNode};
+
+        // This test reproduces the bug where input variables don't flow to downstream
+        // nodes via DataFlow edges during workflow start.
+        //
+        // Workflow structure:
+        //   run_input_1 (input node, declares variable 'n')
+        //       |
+        //       v (StateMachine edge)
+        //   parallel_2 (parallel block)
+        //       |
+        //       v (StateMachine edge)
+        //   action_3 (compute_factorial, uses n)
+        //   action_4 (compute_fibonacci, uses n)
+        //       |
+        //       v (StateMachine edge from aggregator)
+        //   action_5 (summarize_math, uses n AND factorial_value AND fib_value)
+        //
+        // DataFlow edges:
+        //   run_input_1 --[n]--> action_3
+        //   run_input_1 --[n]--> action_4
+        //   run_input_1 --[n]--> action_5  <-- This is the one that's broken!
+        //   action_3 --[factorial_value]--> action_5
+        //   action_4 --[fib_value]--> action_5
+
+        let mut dag = DAG {
+            nodes: HashMap::new(),
+            edges: Vec::new(),
+            entry_node: Some("run_input_1".to_string()),
+        };
+
+        // Add input node
+        let input_node = DAGNode::new(
+            "run_input_1".to_string(),
+            "input".to_string(),
+            "".to_string(),
+        )
+        .with_input(vec!["n".to_string()])
+        .with_function_name("run");
+        dag.nodes.insert("run_input_1".to_string(), input_node);
+
+        // Add action nodes
+        let action_5 = DAGNode::new(
+            "action_5".to_string(),
+            "action_call".to_string(),
+            "@summarize_math()".to_string(),
+        );
+        dag.nodes.insert("action_5".to_string(), action_5);
+
+        // Add DataFlow edge from input node to downstream action for variable 'n'
+        dag.edges.push(DAGEdge::data_flow(
+            "run_input_1".to_string(),
+            "action_5".to_string(),
+            "n",
+        ));
+
+        // Test: collect_inbox_writes_for_node should produce inbox write for action_5
+        let instance_id = WorkflowInstanceId(Uuid::new_v4());
+        let mut inbox_writes = Vec::new();
+
+        DAGRunner::collect_inbox_writes_for_node(
+            "run_input_1",
+            "n",
+            &JsonValue::Number(42.into()),
+            &dag,
+            instance_id,
+            &mut inbox_writes,
+        );
+
+        // Verify an inbox write was created for action_5
+        assert_eq!(
+            inbox_writes.len(),
+            1,
+            "Should create inbox write for downstream action"
+        );
+        assert_eq!(inbox_writes[0].target_node_id, "action_5");
+        assert_eq!(inbox_writes[0].variable_name, "n");
+        assert_eq!(inbox_writes[0].value, JsonValue::Number(42.into()));
+        assert_eq!(inbox_writes[0].source_node_id, "run_input_1");
     }
 }

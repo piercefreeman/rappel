@@ -91,7 +91,8 @@ async fn main() -> Result<()> {
 fn parse_port_file_arg(args: &[String]) -> Option<PathBuf> {
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {
-        if arg == "--port-file" {
+        // Support both --port-file and --output-file for compatibility
+        if arg == "--port-file" || arg == "--output-file" {
             return iter.next().map(PathBuf::from);
         }
     }

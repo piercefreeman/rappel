@@ -68,6 +68,12 @@ impl ExpressionEvaluator {
             ast::expr::Kind::ActionCall(_) => Err(EvaluationError::Evaluation(
                 "Action calls cannot be evaluated inline".to_string(),
             )),
+            ast::expr::Kind::ParallelExpr(_) => Err(EvaluationError::Evaluation(
+                "Parallel expressions cannot be evaluated inline".to_string(),
+            )),
+            ast::expr::Kind::SpreadExpr(_) => Err(EvaluationError::Evaluation(
+                "Spread expressions cannot be evaluated inline".to_string(),
+            )),
         }
     }
 

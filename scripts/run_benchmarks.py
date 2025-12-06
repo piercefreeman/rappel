@@ -149,10 +149,10 @@ def run_benchmark(args: list[str], timeout: int = 300) -> BenchmarkResult | Benc
 
 @click.command()
 @click.option("--output", "-o", type=click.Path(), required=True, help="Output JSON file path")
-@click.option("--width", default=16, help="Fan-out width (parallel actions)")
-@click.option("--hash-iterations", default=1000, help="Hash iterations per action (CPU intensity)")
-@click.option("--workers", default=4, help="Number of Python workers")
-def main(output: str, width: int, hash_iterations: int, workers: int):
+@click.option("--count", default=16, help="Number of parallel hash computations (indices 0..count)")
+@click.option("--iterations", default=1000, help="Hash iterations per action (CPU intensity)")
+@click.option("--workers-per-host", default=4, help="Number of Python workers per host")
+def main(output: str, count: int, iterations: int, workers_per_host: int):
     """Run fan-out/fan-in benchmark and output results as JSON."""
     results: dict[str, dict] = {}
 
@@ -174,12 +174,12 @@ def main(output: str, width: int, hash_iterations: int, workers: int):
     reset_database()
     results["fanout"] = run_benchmark(
         [
-            "--width",
-            str(width),
-            "--hash-iterations",
-            str(hash_iterations),
-            "--workers",
-            str(workers),
+            "--count",
+            str(count),
+            "--iterations",
+            str(iterations),
+            "--workers-per-host",
+            str(workers_per_host),
             "--log-interval",
             "0",
         ],

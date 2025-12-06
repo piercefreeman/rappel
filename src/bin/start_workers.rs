@@ -1,0 +1,156 @@
+//! Start Workers - Runs the DAG runner with Python worker pool.
+//!
+//! This binary starts the worker infrastructure:
+//! - Connects to the database
+//! - Starts the WorkerBridge gRPC server for worker connections
+//! - Spawns a pool of Python workers
+//! - Runs the DAGRunner to process workflow actions
+//!
+//! Configuration is via environment variables:
+//! - DATABASE_URL: PostgreSQL connection string (required)
+//! - CARABINER_USER_MODULE or RAPPEL_USER_MODULE: Python module to preload
+//! - CARABINER_WORKER_COUNT or RAPPEL_WORKER_COUNT: Number of workers (default: num_cpus)
+//! - RAPPEL_BATCH_SIZE: Actions per poll cycle (default: 100)
+//! - RAPPEL_POLL_INTERVAL_MS: Poll interval in ms (default: 100)
+
+use std::{env, sync::Arc};
+
+use anyhow::{Result, anyhow};
+use tokio::{select, signal};
+use tracing::info;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use rappel::{
+    Config, DAGRunner, Database, PythonWorkerConfig, PythonWorkerPool, RunnerConfig,
+    WorkerBridgeServer,
+};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize logging
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "rappel=info,start_workers=info".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    // Load configuration
+    let config = Config::from_env()?;
+
+    // Get user module from environment (support both old and new env var names)
+    let user_module = env::var("CARABINER_USER_MODULE")
+        .or_else(|_| env::var("RAPPEL_USER_MODULE"))
+        .ok();
+
+    info!(
+        worker_count = config.worker_count,
+        batch_size = config.batch_size,
+        poll_interval_ms = config.poll_interval_ms,
+        user_module = ?user_module,
+        "starting worker pool"
+    );
+
+    // Connect to database
+    let database = Arc::new(Database::connect(&config.database_url).await?);
+    info!("connected to database");
+
+    // Start worker bridge server
+    let worker_bridge = WorkerBridgeServer::start(Some(config.grpc_addr)).await?;
+    info!(addr = %worker_bridge.addr(), "worker bridge started");
+
+    // Configure Python workers
+    let mut worker_config = PythonWorkerConfig::new();
+    if let Some(module) = &user_module {
+        worker_config = worker_config.with_user_module(module);
+    }
+
+    // Create worker pool
+    let worker_pool = Arc::new(
+        PythonWorkerPool::new(
+            worker_config,
+            config.worker_count,
+            Arc::clone(&worker_bridge),
+        )
+        .await?,
+    );
+    info!(
+        worker_count = config.worker_count,
+        "python worker pool created"
+    );
+
+    // Configure and create DAG runner
+    let runner_config = RunnerConfig {
+        batch_size: config.batch_size as usize,
+        max_slots_per_worker: 10,
+        poll_interval_ms: config.poll_interval_ms,
+        timeout_check_interval_ms: 1000,
+    };
+
+    let runner = Arc::new(DAGRunner::new(
+        runner_config,
+        Arc::clone(&database),
+        Arc::clone(&worker_pool),
+    ));
+
+    info!(
+        batch_size = config.batch_size,
+        poll_interval_ms = config.poll_interval_ms,
+        "python worker pool started - waiting for shutdown signal"
+    );
+
+    // Spawn runner in background task
+    let runner_clone = Arc::clone(&runner);
+    let runner_handle = tokio::spawn(async move {
+        if let Err(e) = runner_clone.run().await {
+            tracing::error!("DAG runner error: {}", e);
+        }
+    });
+
+    // Wait for shutdown signal
+    wait_for_shutdown().await?;
+    info!("shutdown signal received - stopping workers");
+
+    // Shutdown runner
+    runner.shutdown();
+
+    // Wait for runner to finish (with timeout)
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), runner_handle).await;
+
+    // Shutdown worker pool
+    drop(runner); // Release Arc reference
+    let pool = Arc::try_unwrap(worker_pool)
+        .map_err(|_| anyhow!("worker pool still referenced during shutdown"))?;
+    pool.shutdown().await?;
+
+    // Shutdown worker bridge
+    worker_bridge.shutdown().await;
+
+    info!("shutdown complete");
+    Ok(())
+}
+
+async fn wait_for_shutdown() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal as unix_signal};
+
+        let mut terminate = unix_signal(SignalKind::terminate())?;
+        select! {
+            _ = signal::ctrl_c() => {
+                info!("Ctrl+C received");
+            }
+            _ = terminate.recv() => {
+                info!("SIGTERM received");
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        signal::ctrl_c().await?;
+        info!("Ctrl+C received");
+        Ok(())
+    }
+}
