@@ -3114,8 +3114,10 @@ impl DAGRunner {
         let mut payload_map = serde_json::Map::new();
 
         if let Some(ref kwargs) = node.kwargs {
+            let kwarg_exprs = node.kwarg_exprs.as_ref();
             for (key, value_str) in kwargs {
-                let resolved = Self::resolve_kwarg_value_from_inbox(value_str, inbox)?;
+                let expr = kwarg_exprs.and_then(|m| m.get(key));
+                let resolved = Self::resolve_kwarg_value_from_inbox(key, value_str, expr, inbox)?;
                 payload_map.insert(key.clone(), resolved);
             }
         }
@@ -3125,9 +3127,33 @@ impl DAGRunner {
 
     /// Resolve a kwarg value string to a JSON value using inbox.
     fn resolve_kwarg_value_from_inbox(
+        key: &str,
         value_str: &str,
+        expr: Option<&ast::Expr>,
         inbox: &std::collections::HashMap<String, JsonValue>,
     ) -> RunnerResult<JsonValue> {
+        if let Some(expr) = expr {
+            match ExpressionEvaluator::evaluate(expr, inbox) {
+                Ok(value) => return Ok(value),
+                Err(EvaluationError::VariableNotFound(var)) => {
+                    debug!(
+                        kwarg = %key,
+                        missing_var = %var,
+                        inbox_vars = ?inbox.keys().collect::<Vec<_>>(),
+                        "kwarg variable not found in inbox, defaulting to null"
+                    );
+                    return Ok(JsonValue::Null);
+                }
+                Err(err) => {
+                    debug!(
+                        kwarg = %key,
+                        error = ?err,
+                        "kwarg expression evaluation failed, falling back to string parsing"
+                    );
+                }
+            }
+        }
+
         // Variable reference
         if let Some(var_name) = value_str.strip_prefix('$') {
             let resolved = inbox.get(var_name).cloned().unwrap_or(JsonValue::Null);
@@ -3198,7 +3224,8 @@ impl DAGRunner {
             .ok_or_else(|| RunnerError::Dag("Spread node missing collection".to_string()))?;
 
         // Evaluate the collection expression
-        let collection = Self::resolve_kwarg_value_from_inbox(collection_str, inbox)?;
+        let collection =
+            Self::resolve_kwarg_value_from_inbox("spread_collection", collection_str, None, inbox)?;
 
         let items = match &collection {
             JsonValue::Array(arr) => arr.clone(),
@@ -3598,6 +3625,30 @@ mod tests {
             obj.get("fibonacci_value"),
             Some(&JsonValue::Number(5.into()))
         );
+    }
+
+    #[test]
+    fn test_build_action_payload_uses_kwarg_expressions() {
+        use crate::dag::convert_to_dag;
+        use crate::parser::parse;
+
+        let source = r#"fn workflow(input: [], output: [result]):
+    result = @dummy(flag=True)
+    return result"#;
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        let action_node = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("dummy"))
+            .expect("Action node not found");
+
+        let inbox: HashMap<String, JsonValue> = HashMap::new();
+        let payload = DAGRunner::build_action_payload_from_inbox(action_node, &inbox).unwrap();
+        let payload_json: JsonValue = serde_json::from_slice(&payload).unwrap();
+
+        assert_eq!(payload_json.get("flag"), Some(&JsonValue::Bool(true)));
     }
 
     #[test]

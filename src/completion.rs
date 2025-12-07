@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 
 use uuid::Uuid;
 
-use crate::ast_evaluator::ExpressionEvaluator;
+use crate::ast_evaluator::{EvaluationError, ExpressionEvaluator};
 use crate::dag::{DAG, DAGNode, EdgeType};
 use crate::dag_state::DAGHelper;
 use crate::db::{ActionId, WorkflowInstanceId};
@@ -1176,8 +1176,10 @@ fn build_action_payload(
     let mut payload_map = serde_json::Map::new();
 
     if let Some(ref kwargs) = node.kwargs {
+        let kwarg_exprs = node.kwarg_exprs.as_ref();
         for (key, value_str) in kwargs {
-            let resolved = resolve_kwarg_value(value_str, inbox);
+            let expr = kwarg_exprs.and_then(|m| m.get(key));
+            let resolved = resolve_kwarg_value(key, value_str, expr, inbox);
             payload_map.insert(key.clone(), resolved);
         }
     }
@@ -1186,7 +1188,33 @@ fn build_action_payload(
 }
 
 /// Resolve a kwarg value string to a JSON value.
-fn resolve_kwarg_value(value_str: &str, inbox: &HashMap<String, JsonValue>) -> JsonValue {
+fn resolve_kwarg_value(
+    key: &str,
+    value_str: &str,
+    expr: Option<&ast::Expr>,
+    inbox: &HashMap<String, JsonValue>,
+) -> JsonValue {
+    if let Some(expr) = expr {
+        match ExpressionEvaluator::evaluate(expr, inbox) {
+            Ok(value) => return value,
+            Err(EvaluationError::VariableNotFound(var)) => {
+                debug!(
+                    kwarg = %key,
+                    missing_var = %var,
+                    "kwarg variable not found in inbox, defaulting to null"
+                );
+                return JsonValue::Null;
+            }
+            Err(err) => {
+                debug!(
+                    kwarg = %key,
+                    error = ?err,
+                    "kwarg expression evaluation failed, falling back to string parsing"
+                );
+            }
+        }
+    }
+
     // Variable reference
     if let Some(var_name) = value_str.strip_prefix('$') {
         return inbox.get(var_name).cloned().unwrap_or(JsonValue::Null);

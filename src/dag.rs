@@ -67,6 +67,8 @@ pub struct DAGNode {
     pub module_name: Option<String>,
     /// Keyword arguments for action calls (name -> literal value or variable reference like "$var")
     pub kwargs: Option<HashMap<String, String>>,
+    /// Original kwarg expressions for type-aware resolution at runtime.
+    pub kwarg_exprs: Option<HashMap<String, ast::Expr>>,
     /// Target variable name where the action result should be stored (for action_call nodes)
     /// For backwards compatibility, this is the first target. Use `targets` for all targets.
     pub target: Option<String>,
@@ -121,6 +123,7 @@ impl DAGNode {
             loop_collection: None,
             loop_body_of: None,
             assign_expr: None,
+            kwarg_exprs: None,
         }
     }
 
@@ -203,6 +206,12 @@ impl DAGNode {
     /// Builder method to set kwargs (for action_call nodes)
     pub fn with_kwargs(mut self, kwargs: HashMap<String, String>) -> Self {
         self.kwargs = Some(kwargs);
+        self
+    }
+
+    /// Builder method to set kwarg expressions for type-aware resolution.
+    pub fn with_kwarg_exprs(mut self, kwarg_exprs: HashMap<String, ast::Expr>) -> Self {
+        self.kwarg_exprs = Some(kwarg_exprs);
         self
     }
 
@@ -1078,9 +1087,11 @@ impl DAGConverter {
                         let node_id = self.next_id("fn_call");
                         let label = format!("{}()", func.name);
                         let kwargs = self.extract_kwargs(&func.kwargs);
+                        let kwarg_exprs = self.extract_kwarg_exprs(&func.kwargs);
                         let mut node = DAGNode::new(node_id.clone(), "fn_call".to_string(), label)
                             .with_fn_call(&func.name)
-                            .with_kwargs(kwargs);
+                            .with_kwargs(kwargs)
+                            .with_kwarg_exprs(kwarg_exprs);
                         if let Some(ref fn_name) = self.current_function {
                             node = node.with_function_name(fn_name);
                         }
@@ -1172,10 +1183,12 @@ impl DAGConverter {
 
         // Extract kwargs from the function call
         let kwargs = self.extract_kwargs(&call.kwargs);
+        let kwarg_exprs = self.extract_kwarg_exprs(&call.kwargs);
 
         let mut node = DAGNode::new(node_id.clone(), "fn_call".to_string(), label)
             .with_fn_call(&call.name)
-            .with_kwargs(kwargs);
+            .with_kwargs(kwargs)
+            .with_kwarg_exprs(kwarg_exprs);
         if let Some(ref fn_name) = self.current_function {
             node = node.with_function_name(fn_name);
         }
@@ -1212,10 +1225,12 @@ impl DAGConverter {
 
         // Extract kwargs as string representations
         let kwargs = self.extract_kwargs(&action.kwargs);
+        let kwarg_exprs = self.extract_kwarg_exprs(&action.kwargs);
 
         let mut node = DAGNode::new(node_id.clone(), "action_call".to_string(), label)
             .with_action(&action.action_name, action.module_name.as_deref())
-            .with_kwargs(kwargs);
+            .with_kwargs(kwargs)
+            .with_kwarg_exprs(kwarg_exprs);
 
         // Set targets for unpacking (store all targets)
         if !targets.is_empty() {
@@ -1246,6 +1261,17 @@ impl DAGConverter {
             if let Some(ref value) = kwarg.value {
                 let value_str = self.expr_to_string(value);
                 result.insert(kwarg.name.clone(), value_str);
+            }
+        }
+        result
+    }
+
+    /// Clone kwarg expressions for runtime evaluation.
+    fn extract_kwarg_exprs(&self, kwargs: &[ast::Kwarg]) -> HashMap<String, ast::Expr> {
+        let mut result = HashMap::new();
+        for kwarg in kwargs {
+            if let Some(ref value) = kwarg.value {
+                result.insert(kwarg.name.clone(), value.clone());
             }
         }
         result
@@ -1320,6 +1346,7 @@ impl DAGConverter {
 
         // Extract kwargs
         let kwargs = self.extract_kwargs(&action.kwargs);
+        let kwarg_exprs = self.extract_kwarg_exprs(&action.kwargs);
 
         // Get the collection expression as a string
         let collection_str = spread
@@ -1338,6 +1365,7 @@ impl DAGConverter {
             DAGNode::new(action_id.clone(), "action_call".to_string(), action_label)
                 .with_action(&action.action_name, action.module_name.as_deref())
                 .with_kwargs(kwargs)
+                .with_kwarg_exprs(kwarg_exprs)
                 .with_spread(&spread.loop_var, &collection_str)
                 .with_target(&spread_result_var)
                 .with_aggregates_to(&agg_id);
@@ -1403,6 +1431,7 @@ impl DAGConverter {
 
         // Extract kwargs
         let kwargs = self.extract_kwargs(&action.kwargs);
+        let kwarg_exprs = self.extract_kwarg_exprs(&action.kwargs);
 
         // Get the collection expression as a string (e.g., "$items" or "range(5)")
         let collection_str = spread
@@ -1421,6 +1450,7 @@ impl DAGConverter {
             DAGNode::new(action_id.clone(), "action_call".to_string(), action_label)
                 .with_action(&action.action_name, action.module_name.as_deref())
                 .with_kwargs(kwargs)
+                .with_kwarg_exprs(kwarg_exprs)
                 .with_spread(&spread.loop_var, &collection_str)
                 .with_target(&spread_result_var) // Set target so results flow to aggregator
                 .with_aggregates_to(&agg_id);
@@ -1521,9 +1551,11 @@ impl DAGConverter {
                         format!("@{}() [{}]", action.action_name, i)
                     };
                     let kwargs = self.extract_kwargs(&action.kwargs);
+                    let kwarg_exprs = self.extract_kwarg_exprs(&action.kwargs);
                     let mut node = DAGNode::new(id.clone(), "action_call".to_string(), label)
                         .with_action(&action.action_name, action.module_name.as_deref())
-                        .with_kwargs(kwargs);
+                        .with_kwargs(kwargs)
+                        .with_kwarg_exprs(kwarg_exprs);
                     if let Some(ref t) = call_target {
                         node = node.with_target(t);
                     }
@@ -1667,11 +1699,13 @@ impl DAGConverter {
                     let fn_call_id = self.next_id("for_body_call");
                     let fn_label = format!("{}()", func.name);
                     let kwargs = self.extract_kwargs(&func.kwargs);
+                    let kwarg_exprs = self.extract_kwarg_exprs(&func.kwargs);
 
                     let mut fn_node =
                         DAGNode::new(fn_call_id.clone(), "fn_call".to_string(), fn_label)
                             .with_fn_call(&func.name)
                             .with_kwargs(kwargs)
+                            .with_kwarg_exprs(kwarg_exprs)
                             .with_loop_body(&loop_id);
                     if let Some(ref current_fn) = self.current_function {
                         fn_node = fn_node.with_function_name(current_fn);
@@ -1725,11 +1759,13 @@ impl DAGConverter {
                     let action_id = self.next_id("for_body_action");
                     let action_label = format!("@{}()", action.action_name);
                     let kwargs = self.extract_kwargs(&action.kwargs);
+                    let kwarg_exprs = self.extract_kwarg_exprs(&action.kwargs);
 
                     let mut action_node =
                         DAGNode::new(action_id.clone(), "action_call".to_string(), action_label)
                             .with_action(&action.action_name, action.module_name.as_deref())
                             .with_kwargs(kwargs)
+                            .with_kwarg_exprs(kwarg_exprs)
                             .with_loop_body(&loop_id);
                     if let Some(ref current_fn) = self.current_function {
                         action_node = action_node.with_function_name(current_fn);
