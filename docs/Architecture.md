@@ -19,6 +19,11 @@ rappel-rs polls the database centrally so we only need 1 connection per host mac
 
 The server receives these completed actions and uses them to increment a state machine build off of the workflow DAG. This state machine determines if any other actions have been "unlocked" by the completion of this action, or if we need to wait for subsequent actions. If they have been unlocked we will insert them into the database for subsequent queuing. The cycle continues until we have a final result that can be set as the output of the full workflow instance. At that point we can wake up any waiting callers.
 
+Key runtime data:
+
+- **Inline scope**: seeded once from workflow inputs, cached per instance, and reused during inline execution so downstream actions can still access original inputs even if no intermediate node re-emits them.
+- **Inbox**: DB-backed per-node variable storage written via DataFlow edges (and loop accumulators). The runner batch-reads inboxes for subgraphs during completion and merges with the inline scope via a single inline-context object.
+
 ## Workers
 
 The `start_workers` binary polls for the work to be done. Launch this a single

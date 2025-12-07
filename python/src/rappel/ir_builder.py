@@ -24,7 +24,7 @@ import ast
 import inspect
 import textwrap
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
 from proto import ast_pb2 as ir
 
@@ -55,6 +55,56 @@ class UnsupportedPatternError(Exception):
 
 # Recommendations for common unsupported patterns
 RECOMMENDATIONS = {
+    "constructor_return": (
+        "Returning a class constructor (like MyModel(...)) directly is not supported.\n"
+        "The workflow IR cannot serialize arbitrary object instantiation.\n\n"
+        "Use an @action to create the object:\n\n"
+        "    @action\n"
+        "    async def build_result(items: list, count: int) -> MyResult:\n"
+        "        return MyResult(items=items, count=count)\n\n"
+        "    # In workflow:\n"
+        "    return await build_result(items, count)"
+    ),
+    "constructor_assignment": (
+        "Assigning a class constructor result (like x = MyClass(...)) is not supported.\n"
+        "The workflow IR cannot serialize arbitrary object instantiation.\n\n"
+        "Use an @action to create the object:\n\n"
+        "    @action\n"
+        "    async def create_config(value: int) -> Config:\n"
+        "        return Config(value=value)\n\n"
+        "    # In workflow:\n"
+        "    config = await create_config(value)"
+    ),
+    "non_action_call": (
+        "Calling a function that is not decorated with @action is not supported.\n"
+        "Only @action decorated functions can be awaited in workflow code.\n\n"
+        "Add the @action decorator to your function:\n\n"
+        "    @action\n"
+        "    async def my_function(x: int) -> int:\n"
+        "        return x * 2"
+    ),
+    "sync_function_call": (
+        "Calling a synchronous function directly in workflow code is not supported.\n"
+        "All computation must happen inside @action decorated async functions.\n\n"
+        "Wrap your logic in an @action:\n\n"
+        "    @action\n"
+        "    async def compute(x: int) -> int:\n"
+        "        return some_sync_function(x)"
+    ),
+    "method_call_non_self": (
+        "Calling methods on objects other than 'self' is not supported in workflow code.\n"
+        "Use an @action to perform method calls:\n\n"
+        "    @action\n"
+        "    async def call_method(obj: MyClass) -> Result:\n"
+        "        return obj.some_method()"
+    ),
+    "builtin_call": (
+        "Calling built-in functions like len(), str(), int() directly is not supported.\n"
+        "Use an @action to perform these operations:\n\n"
+        "    @action\n"
+        "    async def get_length(items: list) -> int:\n"
+        "        return len(items)"
+    ),
     "fstring": (
         "F-strings are not supported in workflow code because they require "
         "runtime string interpolation.\n"
@@ -233,9 +283,12 @@ def build_workflow_ir(workflow_cls: type["Workflow"]) -> ir.Program:
     # Discover imports for built-in detection (e.g., from asyncio import sleep)
     imported_names = _discover_module_imports(module)
 
+    # Discover all async function names in the module (for non-action detection)
+    module_functions = _discover_module_functions(module)
+
     # Build the IR with transformation context
     ctx = TransformContext()
-    builder = IRBuilder(action_defs, ctx, imported_names)
+    builder = IRBuilder(action_defs, ctx, imported_names, module_functions)
     builder.visit(tree)
 
     # Create the Program with the main function and any implicit functions
@@ -267,6 +320,33 @@ def _discover_action_names(module: Any) -> Dict[str, ActionDefinition]:
                 signature=signature,
             )
     return names
+
+
+def _discover_module_functions(module: Any) -> Set[str]:
+    """Discover all async function names defined in a module.
+
+    This is used to detect when users await functions in the same module
+    that are NOT decorated with @action.
+    """
+    function_names: Set[str] = set()
+    for attr_name in dir(module):
+        try:
+            attr = getattr(module, attr_name)
+        except AttributeError:
+            continue
+
+        # Only include functions defined in THIS module (not imported)
+        if not callable(attr):
+            continue
+        if not inspect.iscoroutinefunction(attr):
+            continue
+
+        # Check if the function is defined in this module
+        func_module = getattr(attr, "__module__", None)
+        if func_module == module.__name__:
+            function_names.add(attr_name)
+
+    return function_names
 
 
 @dataclass
@@ -315,10 +395,12 @@ class IRBuilder(ast.NodeVisitor):
         action_defs: Dict[str, ActionDefinition],
         ctx: TransformContext,
         imported_names: Optional[Dict[str, ImportedName]] = None,
+        module_functions: Optional[Set[str]] = None,
     ):
         self._action_defs = action_defs
         self._ctx = ctx
         self._imported_names = imported_names or {}
+        self._module_functions = module_functions or set()
         self.function_def: Optional[ir.FunctionDef] = None
         self._statements: List[ir.Statement] = []
 
@@ -387,8 +469,7 @@ class IRBuilder(ast.NodeVisitor):
         elif isinstance(node, ast.Try):
             return self._visit_try(node)
         elif isinstance(node, ast.Return):
-            result = self._visit_return(node)
-            return [result] if result else []
+            return self._visit_return(node)
         elif isinstance(node, ast.AugAssign):
             result = self._visit_aug_assign(node)
             return [result] if result else []
@@ -485,36 +566,48 @@ class IRBuilder(ast.NodeVisitor):
             )
 
     def _visit_assign(self, node: ast.Assign) -> Optional[ir.Statement]:
-        """Convert assignment to IR."""
-        stmt = ir.Statement(span=_make_span(node))
+        """Convert assignment to IR.
 
-        # Check for asyncio.gather() - convert to parallel block
+        All assignments with targets use the Assignment statement type.
+        This provides uniform unpacking support for:
+        - Action calls: a, b = @get_pair()
+        - Parallel blocks: a, b = parallel: @x() @y()
+        - Regular expressions: a, b = some_list
+
+        Raises UnsupportedPatternError for:
+        - Constructor calls: x = MyClass(...)
+        - Non-action await: x = await some_func()
+        """
+        stmt = ir.Statement(span=_make_span(node))
+        targets = self._get_assign_targets(node.targets)
+
+        # Check for constructor calls in assignment (e.g., x = MyModel(...))
+        self._check_constructor_in_assignment(node.value)
+
+        # Check for asyncio.gather() - convert to parallel or spread expression
         if isinstance(node.value, ast.Await) and isinstance(node.value.value, ast.Call):
             gather_call = node.value.value
             if self._is_asyncio_gather_call(gather_call):
-                target = self._get_assign_target(node.targets)
-                return self._convert_asyncio_gather_to_parallel_block(gather_call, target)
+                gather_result = self._convert_asyncio_gather(gather_call)
+                if gather_result is not None:
+                    if isinstance(gather_result, ir.ParallelExpr):
+                        value = ir.Expr(parallel_expr=gather_result, span=_make_span(node))
+                    else:
+                        # SpreadExpr
+                        value = ir.Expr(spread_expr=gather_result, span=_make_span(node))
+                    assign = ir.Assignment(targets=targets, value=value)
+                    stmt.assignment.CopyFrom(assign)
+                    return stmt
 
-        # Check if this is an action call
+        # Check if this is an action call - wrap in Assignment for uniform unpacking
         action_call = self._extract_action_call(node.value)
         if action_call:
-            # Get target variable name
-            target = self._get_assign_target(node.targets)
-            if target:
-                action_call.target = target
-            stmt.action_call.CopyFrom(action_call)
+            value = ir.Expr(action_call=action_call, span=_make_span(node))
+            assign = ir.Assignment(targets=targets, value=value)
+            stmt.assignment.CopyFrom(assign)
             return stmt
 
-        # Regular assignment
-        targets: List[str] = []
-        for t in node.targets:
-            if isinstance(t, ast.Name):
-                targets.append(t.id)
-            elif isinstance(t, ast.Tuple):
-                for elt in t.elts:
-                    if isinstance(elt, ast.Name):
-                        targets.append(elt.id)
-
+        # Regular assignment (variables, literals, expressions)
         value_expr = _expr_to_ir(node.value)
         if value_expr:
             assign = ir.Assignment(targets=targets, value=value_expr)
@@ -524,20 +617,65 @@ class IRBuilder(ast.NodeVisitor):
         return None
 
     def _visit_expr_stmt(self, node: ast.Expr) -> Optional[ir.Statement]:
-        """Convert expression statement to IR."""
+        """Convert expression statement to IR (side effect only, no assignment)."""
         stmt = ir.Statement(span=_make_span(node))
 
-        # Check for asyncio.gather() - convert to parallel block (no assignment target)
+        # Check for asyncio.gather() - convert to parallel block statement (side effect)
         if isinstance(node.value, ast.Await) and isinstance(node.value.value, ast.Call):
             gather_call = node.value.value
             if self._is_asyncio_gather_call(gather_call):
-                return self._convert_asyncio_gather_to_parallel_block(gather_call, target=None)
+                gather_result = self._convert_asyncio_gather(gather_call)
+                if gather_result is not None:
+                    if isinstance(gather_result, ir.ParallelExpr):
+                        # Side effect only - use ParallelBlock statement
+                        parallel = ir.ParallelBlock()
+                        parallel.calls.extend(gather_result.calls)
+                        stmt.parallel_block.CopyFrom(parallel)
+                        return stmt
+                    else:
+                        # SpreadExpr as side effect - wrap in assignment with no targets
+                        # This handles: await asyncio.gather(*[action(x) for x in items])
+                        value = ir.Expr(spread_expr=gather_result, span=_make_span(node))
+                        assign = ir.Assignment(targets=[], value=value)
+                        stmt.assignment.CopyFrom(assign)
+                        return stmt
 
-        # Check if this is an action call
+        # Check if this is an action call (side effect only)
         action_call = self._extract_action_call(node.value)
         if action_call:
             stmt.action_call.CopyFrom(action_call)
             return stmt
+
+        # Convert list.append(x) to list = list + [x]
+        # This makes the mutation explicit so data flows correctly through the DAG
+        if isinstance(node.value, ast.Call):
+            call = node.value
+            if (
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr == "append"
+                and isinstance(call.func.value, ast.Name)
+                and len(call.args) == 1
+            ):
+                list_name = call.func.value.id
+                append_value = call.args[0]
+                # Create: list = list + [value]
+                list_var = ir.Expr(variable=ir.Variable(name=list_name), span=_make_span(node))
+                value_expr = _expr_to_ir(append_value)
+                if value_expr:
+                    # Create [value] as a list literal
+                    list_literal = ir.Expr(
+                        list=ir.ListExpr(elements=[value_expr]), span=_make_span(node)
+                    )
+                    # Create list + [value]
+                    concat_expr = ir.Expr(
+                        binary_op=ir.BinaryOp(
+                            op=ir.BinaryOperator.BINARY_OP_ADD, left=list_var, right=list_literal
+                        ),
+                        span=_make_span(node),
+                    )
+                    assign = ir.Assignment(targets=[list_name], value=concat_expr)
+                    stmt.assignment.CopyFrom(assign)
+                    return stmt
 
         # Regular expression
         expr = _expr_to_ir(node.value)
@@ -552,6 +690,16 @@ class IRBuilder(ast.NodeVisitor):
 
         If the for loop body has multiple action/function calls, we wrap them
         into a synthetic function and replace the body with a single call.
+
+        For loops that modify out-of-scope variables (accumulators) are detected
+        and those variables are set as targets on the SingleCallBody. This enables
+        the runtime to properly aggregate results into those variables.
+
+        Supported accumulator patterns:
+        1. List append: results.append(value)
+        2. Dict subscript: result[key] = value
+        3. List concatenation: results = results + [value]
+        4. Counter increment: count = count + 1
 
         Python:
             for item in items:
@@ -581,32 +729,191 @@ class IRBuilder(ast.NodeVisitor):
         if not iterable:
             return []
 
+        # Collect variables defined within the loop body (in-scope)
+        in_scope_vars = set(loop_vars)
+
         # Build body statements (recursively transforms nested structures)
         body_stmts: List[ir.Statement] = []
         for body_node in node.body:
             stmts = self._visit_statement(body_node)
             body_stmts.extend(stmts)
+            # Track variables defined by assignments in this iteration
+            for s in stmts:
+                if s.HasField("assignment"):
+                    in_scope_vars.update(s.assignment.targets)
 
-        # Wrap for loop body if multiple calls (use loop_vars as inputs)
-        if self._count_calls(body_stmts) > 1:
-            body_stmts = self._wrap_body_as_function(body_stmts, "for_body", node, inputs=loop_vars)
+        # Detect all out-of-scope variable modifications
+        # These are variables modified in the loop body but defined outside it
+        modified_vars = self._detect_accumulator_targets(body_stmts, in_scope_vars)
 
-        # For loops use SingleCallBody (at most one action/function call per iteration)
-        # Use spread for parallel iteration over collections.
+        # ALWAYS wrap for loop body into a synthetic function for variable isolation.
+        # Variables flow in/out explicitly through function parameters and return values.
+        body_stmts = self._wrap_body_as_function(
+            body_stmts, "for_body", node, inputs=loop_vars, modified_vars=modified_vars
+        )
+
+        # Convert to SingleCallBody (now contains just the synthetic function call)
         stmt = ir.Statement(span=_make_span(node))
+        single_call_body = self._stmts_to_single_call_body(body_stmts, _make_span(node))
+
         for_loop = ir.ForLoop(
             loop_vars=loop_vars,
             iterable=iterable,
-            body=self._stmts_to_single_call_body(body_stmts, _make_span(node)),
+            body=single_call_body,
         )
         stmt.for_loop.CopyFrom(for_loop)
         return [stmt]
+
+    def _detect_accumulator_targets(
+        self, stmts: List[ir.Statement], in_scope_vars: set
+    ) -> List[str]:
+        """Detect out-of-scope variable modifications in for loop body.
+
+        Scans statements for patterns that modify variables defined outside the loop.
+        Returns a list of accumulator variable names that should be set as targets.
+
+        Supported patterns:
+        1. List append: results.append(value) -> "results"
+        2. Dict subscript: result[key] = value -> "result"
+        3. List/set update methods: results.extend(...), results.add(...) -> "results"
+
+        Note: Patterns like `results = results + [x]` and `count = count + 1` create
+        new assignments which are tracked via in_scope_vars and don't need special
+        detection here - they're handled by the regular assignment target logic.
+        """
+        accumulators: List[str] = []
+        seen: set = set()
+
+        for stmt in stmts:
+            var_name = self._extract_accumulator_from_stmt(stmt, in_scope_vars)
+            if var_name and var_name not in seen:
+                accumulators.append(var_name)
+                seen.add(var_name)
+
+            # Recursively check conditionals
+            if stmt.HasField("conditional"):
+                cond = stmt.conditional
+                if cond.HasField("if_branch") and cond.if_branch.HasField("body"):
+                    for var in self._detect_accumulator_targets(
+                        list(cond.if_branch.body.statements), in_scope_vars
+                    ):
+                        if var not in seen:
+                            accumulators.append(var)
+                            seen.add(var)
+                for elif_branch in cond.elif_branches:
+                    if elif_branch.HasField("body"):
+                        for var in self._detect_accumulator_targets(
+                            list(elif_branch.body.statements), in_scope_vars
+                        ):
+                            if var not in seen:
+                                accumulators.append(var)
+                                seen.add(var)
+                if cond.HasField("else_branch") and cond.else_branch.HasField("body"):
+                    for var in self._detect_accumulator_targets(
+                        list(cond.else_branch.body.statements), in_scope_vars
+                    ):
+                        if var not in seen:
+                            accumulators.append(var)
+                            seen.add(var)
+
+        return accumulators
+
+    def _extract_accumulator_from_stmt(
+        self, stmt: ir.Statement, in_scope_vars: set
+    ) -> Optional[str]:
+        """Extract accumulator variable name from a single statement.
+
+        Returns the variable name if this statement modifies an out-of-scope variable,
+        None otherwise.
+        """
+        # Pattern 1: Method calls like list.append(), dict.update(), set.add()
+        if stmt.HasField("expr_stmt"):
+            expr = stmt.expr_stmt.expr
+            if expr.HasField("function_call"):
+                fn_name = expr.function_call.name
+                # Check for mutating method calls: x.append, x.extend, x.add, x.update, etc.
+                mutating_methods = {
+                    ".append",
+                    ".extend",
+                    ".add",
+                    ".update",
+                    ".insert",
+                    ".pop",
+                    ".remove",
+                    ".clear",
+                }
+                for method in mutating_methods:
+                    if fn_name.endswith(method):
+                        var_name = fn_name[: len(fn_name) - len(method)]
+                        # Only return if it's an out-of-scope variable
+                        if var_name and var_name not in in_scope_vars:
+                            return var_name
+
+        # Pattern 2: Subscript assignment like dict[key] = value
+        if stmt.HasField("assignment"):
+            for target in stmt.assignment.targets:
+                # Check if target is a subscript pattern (contains '[')
+                if "[" in target:
+                    # Extract base variable name (before '[')
+                    var_name = target.split("[")[0]
+                    if var_name and var_name not in in_scope_vars:
+                        return var_name
+
+        # Pattern 3: Self-referential assignment like x = x + [y]
+        # The target variable is used on the RHS, so it must come from outside.
+        # Note: We don't check in_scope_vars here because the assignment itself
+        # would have added the target to in_scope_vars, but it still needs its
+        # previous value from outside the loop body.
+        if stmt.HasField("assignment"):
+            assign = stmt.assignment
+            rhs_vars = self._collect_variables_from_expr(assign.value)
+            for target in assign.targets:
+                if target in rhs_vars:
+                    return target
+
+        return None
+
+    def _collect_variables_from_expr(self, expr: ir.Expr) -> set:
+        """Recursively collect all variable names used in an expression."""
+        vars_found: set = set()
+
+        if expr.HasField("variable"):
+            vars_found.add(expr.variable.name)
+        elif expr.HasField("binary_op"):
+            vars_found.update(self._collect_variables_from_expr(expr.binary_op.left))
+            vars_found.update(self._collect_variables_from_expr(expr.binary_op.right))
+        elif expr.HasField("unary_op"):
+            vars_found.update(self._collect_variables_from_expr(expr.unary_op.operand))
+        elif expr.HasField("list"):
+            for elem in expr.list.elements:
+                vars_found.update(self._collect_variables_from_expr(elem))
+        elif expr.HasField("dict"):
+            for key in expr.dict.keys:
+                vars_found.update(self._collect_variables_from_expr(key))
+            for val in expr.dict.values:
+                vars_found.update(self._collect_variables_from_expr(val))
+        elif expr.HasField("index"):
+            vars_found.update(self._collect_variables_from_expr(expr.index.value))
+            vars_found.update(self._collect_variables_from_expr(expr.index.index))
+        elif expr.HasField("dot"):
+            vars_found.update(self._collect_variables_from_expr(expr.dot.value))
+        elif expr.HasField("function_call"):
+            for kwarg in expr.function_call.kwargs:
+                vars_found.update(self._collect_variables_from_expr(kwarg.value))
+        elif expr.HasField("action_call"):
+            for kwarg in expr.action_call.kwargs:
+                vars_found.update(self._collect_variables_from_expr(kwarg.value))
+
+        return vars_found
 
     def _visit_if(self, node: ast.If) -> Optional[ir.Statement]:
         """Convert if statement to IR conditional with branch wrapping.
 
         If any branch has multiple action calls, we wrap it into a synthetic
         function to ensure each branch has at most one call.
+
+        Out-of-scope variable modifications (like list.append()) are detected
+        and the modified variables are passed in/out of the synthetic function.
 
         Python:
             if condition:
@@ -638,9 +945,12 @@ class IRBuilder(ast.NodeVisitor):
             stmts = self._visit_statement(body_node)
             body_stmts.extend(stmts)
 
-        # Wrap if branch body if multiple calls
-        if self._count_calls(body_stmts) > 1:
-            body_stmts = self._wrap_body_as_function(body_stmts, "if_then", node)
+        # ALWAYS wrap if branch body for variable isolation
+        in_scope_vars = self._collect_assigned_vars(body_stmts)
+        modified_vars = self._detect_accumulator_targets(body_stmts, in_scope_vars)
+        body_stmts = self._wrap_body_as_function(
+            body_stmts, "if_then", node, modified_vars=modified_vars
+        )
 
         if_branch = ir.IfBranch(
             condition=condition,
@@ -663,9 +973,12 @@ class IRBuilder(ast.NodeVisitor):
                         stmts = self._visit_statement(body_node)
                         elif_body.extend(stmts)
 
-                    # Wrap elif body if multiple calls
-                    if self._count_calls(elif_body) > 1:
-                        elif_body = self._wrap_body_as_function(elif_body, "if_elif", elif_node)
+                    # ALWAYS wrap elif body for variable isolation
+                    in_scope_vars = self._collect_assigned_vars(elif_body)
+                    modified_vars = self._detect_accumulator_targets(elif_body, in_scope_vars)
+                    elif_body = self._wrap_body_as_function(
+                        elif_body, "if_elif", elif_node, modified_vars=modified_vars
+                    )
 
                     elif_branch = ir.ElifBranch(
                         condition=elif_condition,
@@ -681,9 +994,12 @@ class IRBuilder(ast.NodeVisitor):
                     stmts = self._visit_statement(else_node)
                     else_body.extend(stmts)
 
-                # Wrap else body if multiple calls
-                if self._count_calls(else_body) > 1:
-                    else_body = self._wrap_body_as_function(else_body, "if_else", current.orelse[0])
+                # ALWAYS wrap else body for variable isolation
+                in_scope_vars = self._collect_assigned_vars(else_body)
+                modified_vars = self._detect_accumulator_targets(else_body, in_scope_vars)
+                else_body = self._wrap_body_as_function(
+                    else_body, "if_else", current.orelse[0], modified_vars=modified_vars
+                )
 
                 else_branch = ir.ElseBranch(
                     body=self._stmts_to_single_call_body(
@@ -696,6 +1012,225 @@ class IRBuilder(ast.NodeVisitor):
 
         stmt.conditional.CopyFrom(conditional)
         return stmt
+
+    def _collect_assigned_vars(self, stmts: List[ir.Statement]) -> set:
+        """Collect all variable names assigned in a list of statements."""
+        assigned = set()
+        for stmt in stmts:
+            if stmt.HasField("assignment"):
+                assigned.update(stmt.assignment.targets)
+        return assigned
+
+    def _collect_assigned_vars_in_order(self, stmts: List[ir.Statement]) -> list[str]:
+        """Collect assigned variable names in statement order (deduplicated)."""
+        assigned: list[str] = []
+        seen: set[str] = set()
+
+        for stmt in stmts:
+            if stmt.HasField("assignment"):
+                for target in stmt.assignment.targets:
+                    if target not in seen:
+                        seen.add(target)
+                        assigned.append(target)
+
+            if stmt.HasField("conditional"):
+                cond = stmt.conditional
+                if cond.HasField("if_branch") and cond.if_branch.HasField("body"):
+                    for target in self._collect_assigned_vars_in_order(
+                        list(cond.if_branch.body.statements)
+                    ):
+                        if target not in seen:
+                            seen.add(target)
+                            assigned.append(target)
+                for elif_branch in cond.elif_branches:
+                    if elif_branch.HasField("body"):
+                        for target in self._collect_assigned_vars_in_order(
+                            list(elif_branch.body.statements)
+                        ):
+                            if target not in seen:
+                                seen.add(target)
+                                assigned.append(target)
+                if cond.HasField("else_branch") and cond.else_branch.HasField("body"):
+                    for target in self._collect_assigned_vars_in_order(
+                        list(cond.else_branch.body.statements)
+                    ):
+                        if target not in seen:
+                            seen.add(target)
+                            assigned.append(target)
+
+            if stmt.HasField("for_loop") and stmt.for_loop.HasField("body"):
+                for target in self._collect_assigned_vars_in_order(
+                    list(stmt.for_loop.body.statements)
+                ):
+                    if target not in seen:
+                        seen.add(target)
+                        assigned.append(target)
+
+            if stmt.HasField("try_except"):
+                try_body = stmt.try_except.try_body
+                if try_body.HasField("span"):
+                    for target in self._collect_assigned_vars_in_order(list(try_body.statements)):
+                        if target not in seen:
+                            seen.add(target)
+                            assigned.append(target)
+                for handler in stmt.try_except.handlers:
+                    if handler.HasField("body"):
+                        for target in self._collect_assigned_vars_in_order(
+                            list(handler.body.statements)
+                        ):
+                            if target not in seen:
+                                seen.add(target)
+                                assigned.append(target)
+
+        return assigned
+
+    def _collect_variables_from_single_call_body(self, body: ir.SingleCallBody) -> list[str]:
+        vars_found: list[str] = []
+        seen: set[str] = set()
+
+        if body.HasField("call"):
+            call = body.call
+            if call.HasField("action"):
+                for kwarg in call.action.kwargs:
+                    for var in self._collect_variables_from_expr(kwarg.value):
+                        if var not in seen:
+                            seen.add(var)
+                            vars_found.append(var)
+            elif call.HasField("function"):
+                for kwarg in call.function.kwargs:
+                    for var in self._collect_variables_from_expr(kwarg.value):
+                        if var not in seen:
+                            seen.add(var)
+                            vars_found.append(var)
+
+        for stmt in body.statements:
+            for var in self._collect_variables_from_statements([stmt]):
+                if var not in seen:
+                    seen.add(var)
+                    vars_found.append(var)
+
+        return vars_found
+
+    def _collect_variables_from_statements(self, stmts: List[ir.Statement]) -> list[str]:
+        """Collect variable references from statements in encounter order."""
+        vars_found: list[str] = []
+        seen: set[str] = set()
+
+        for stmt in stmts:
+            if stmt.HasField("assignment") and stmt.assignment.HasField("value"):
+                for var in self._collect_variables_from_expr(stmt.assignment.value):
+                    if var not in seen:
+                        seen.add(var)
+                        vars_found.append(var)
+
+            if stmt.HasField("return_stmt") and stmt.return_stmt.HasField("value"):
+                for var in self._collect_variables_from_expr(stmt.return_stmt.value):
+                    if var not in seen:
+                        seen.add(var)
+                        vars_found.append(var)
+
+            if stmt.HasField("action_call"):
+                expr = ir.Expr(action_call=stmt.action_call, span=stmt.span)
+                for var in self._collect_variables_from_expr(expr):
+                    if var not in seen:
+                        seen.add(var)
+                        vars_found.append(var)
+
+            if stmt.HasField("expr_stmt"):
+                for var in self._collect_variables_from_expr(stmt.expr_stmt.expr):
+                    if var not in seen:
+                        seen.add(var)
+                        vars_found.append(var)
+
+            if stmt.HasField("conditional"):
+                cond = stmt.conditional
+                if cond.HasField("if_branch"):
+                    if cond.if_branch.HasField("condition"):
+                        for var in self._collect_variables_from_expr(cond.if_branch.condition):
+                            if var not in seen:
+                                seen.add(var)
+                                vars_found.append(var)
+                    if cond.if_branch.HasField("body"):
+                        for var in self._collect_variables_from_single_call_body(
+                            cond.if_branch.body
+                        ):
+                            if var not in seen:
+                                seen.add(var)
+                                vars_found.append(var)
+                for elif_branch in cond.elif_branches:
+                    if elif_branch.HasField("condition"):
+                        for var in self._collect_variables_from_expr(elif_branch.condition):
+                            if var not in seen:
+                                seen.add(var)
+                                vars_found.append(var)
+                    if elif_branch.HasField("body"):
+                        for var in self._collect_variables_from_single_call_body(elif_branch.body):
+                            if var not in seen:
+                                seen.add(var)
+                                vars_found.append(var)
+                if cond.HasField("else_branch") and cond.else_branch.HasField("body"):
+                    for var in self._collect_variables_from_single_call_body(cond.else_branch.body):
+                        if var not in seen:
+                            seen.add(var)
+                            vars_found.append(var)
+
+            if stmt.HasField("for_loop"):
+                fl = stmt.for_loop
+                if fl.HasField("iterable"):
+                    for var in self._collect_variables_from_expr(fl.iterable):
+                        if var not in seen:
+                            seen.add(var)
+                            vars_found.append(var)
+                if fl.HasField("body"):
+                    for var in self._collect_variables_from_single_call_body(fl.body):
+                        if var not in seen:
+                            seen.add(var)
+                            vars_found.append(var)
+
+            if stmt.HasField("try_except"):
+                te = stmt.try_except
+                if te.HasField("try_body"):
+                    for var in self._collect_variables_from_single_call_body(te.try_body):
+                        if var not in seen:
+                            seen.add(var)
+                            vars_found.append(var)
+                for handler in te.handlers:
+                    if handler.HasField("body"):
+                        for var in self._collect_variables_from_single_call_body(handler.body):
+                            if var not in seen:
+                                seen.add(var)
+                                vars_found.append(var)
+
+            if stmt.HasField("parallel_block"):
+                for call in stmt.parallel_block.calls:
+                    if call.HasField("action"):
+                        for kwarg in call.action.kwargs:
+                            for var in self._collect_variables_from_expr(kwarg.value):
+                                if var not in seen:
+                                    seen.add(var)
+                                    vars_found.append(var)
+                    elif call.HasField("function"):
+                        for kwarg in call.function.kwargs:
+                            for var in self._collect_variables_from_expr(kwarg.value):
+                                if var not in seen:
+                                    seen.add(var)
+                                    vars_found.append(var)
+
+            if stmt.HasField("spread_action"):
+                spread = stmt.spread_action
+                if spread.HasField("collection"):
+                    for var in self._collect_variables_from_expr(spread.collection):
+                        if var not in seen:
+                            seen.add(var)
+                            vars_found.append(var)
+                if spread.HasField("action"):
+                    for kwarg in spread.action.kwargs:
+                        for var in self._collect_variables_from_expr(kwarg.value):
+                            if var not in seen:
+                                seen.add(var)
+                                vars_found.append(var)
+
+        return vars_found
 
     def _visit_try(self, node: ast.Try) -> List[ir.Statement]:
         """Convert try/except to IR with body wrapping transformation.
@@ -728,12 +1263,35 @@ class IRBuilder(ast.NodeVisitor):
             stmts = self._visit_statement(body_node)
             try_body.extend(stmts)
 
-        # Count action calls and function calls (synthetic functions count too)
-        call_count = self._count_calls(try_body)
+        # ALWAYS wrap try body for variable isolation
+        assigned_vars_ordered = self._collect_assigned_vars_in_order(try_body)
+        assigned_vars_set = set(assigned_vars_ordered)
+        free_vars = [
+            var
+            for var in self._collect_variables_from_statements(try_body)
+            if var not in assigned_vars_set
+        ]
+        modified_vars = self._detect_accumulator_targets(try_body, assigned_vars_set)
 
-        # If multiple calls, wrap into synthetic function
-        if call_count > 1:
-            try_body = self._wrap_body_as_function(try_body, "try_body", node)
+        # Inputs need free variables plus any accumulator-style mutations.
+        try_inputs = []
+        for var in free_vars + modified_vars:
+            if var not in try_inputs:
+                try_inputs.append(var)
+
+        # Outputs include all assigned variables plus accumulator targets.
+        try_outputs: list[str] = []
+        for var in assigned_vars_ordered + modified_vars:
+            if var not in try_outputs:
+                try_outputs.append(var)
+
+        try_body = self._wrap_body_as_function(
+            try_body,
+            "try_body",
+            node,
+            inputs=try_inputs,
+            modified_vars=try_outputs,
+        )
 
         # Build exception handlers (with wrapping if needed)
         handlers: List[ir.ExceptHandler] = []
@@ -753,10 +1311,33 @@ class IRBuilder(ast.NodeVisitor):
                 stmts = self._visit_statement(handler_node)
                 handler_body.extend(stmts)
 
-            # Wrap handler if multiple calls
-            handler_call_count = self._count_calls(handler_body)
-            if handler_call_count > 1:
-                handler_body = self._wrap_body_as_function(handler_body, "except_handler", node)
+            # ALWAYS wrap handler body for variable isolation
+            assigned_vars_ordered = self._collect_assigned_vars_in_order(handler_body)
+            assigned_vars_set = set(assigned_vars_ordered)
+            free_vars = [
+                var
+                for var in self._collect_variables_from_statements(handler_body)
+                if var not in assigned_vars_set
+            ]
+            modified_vars = self._detect_accumulator_targets(handler_body, assigned_vars_set)
+
+            handler_inputs: list[str] = []
+            for var in free_vars + modified_vars:
+                if var not in handler_inputs:
+                    handler_inputs.append(var)
+
+            handler_outputs: list[str] = []
+            for var in assigned_vars_ordered + modified_vars:
+                if var not in handler_outputs:
+                    handler_outputs.append(var)
+
+            handler_body = self._wrap_body_as_function(
+                handler_body,
+                "except_handler",
+                node,
+                inputs=handler_inputs,
+                modified_vars=handler_outputs,
+            )
 
             except_handler = ir.ExceptHandler(
                 exception_types=exception_types,
@@ -785,6 +1366,12 @@ class IRBuilder(ast.NodeVisitor):
         for stmt in stmts:
             if stmt.HasField("action_call"):
                 count += 1
+            elif stmt.HasField("assignment"):
+                # Check if assignment value is an action call or function call
+                if stmt.assignment.value.HasField("action_call"):
+                    count += 1
+                elif stmt.assignment.value.HasField("function_call"):
+                    count += 1
             elif stmt.HasField("expr_stmt"):
                 # Check if expression is a function call
                 if stmt.expr_stmt.expr.HasField("function_call"):
@@ -805,13 +1392,30 @@ class IRBuilder(ast.NodeVisitor):
         # Look for a single call in the statements
         for stmt in stmts:
             if stmt.HasField("action_call"):
+                # ActionCall as a statement has no target (side-effect only)
                 action = stmt.action_call
-                if action.target:
-                    body.target = action.target
                 call = ir.Call()
                 call.action.CopyFrom(action)
                 body.call.CopyFrom(call)
                 return body
+            elif stmt.HasField("assignment"):
+                # Check if assignment value is an action call or function call
+                if stmt.assignment.value.HasField("action_call"):
+                    action = stmt.assignment.value.action_call
+                    # Copy all targets for tuple unpacking support
+                    body.targets.extend(stmt.assignment.targets)
+                    call = ir.Call()
+                    call.action.CopyFrom(action)
+                    body.call.CopyFrom(call)
+                    return body
+                elif stmt.assignment.value.HasField("function_call"):
+                    fn_call = stmt.assignment.value.function_call
+                    # Copy all targets for tuple unpacking support
+                    body.targets.extend(stmt.assignment.targets)
+                    call = ir.Call()
+                    call.function.CopyFrom(fn_call)
+                    body.call.CopyFrom(call)
+                    return body
             elif stmt.HasField("expr_stmt") and stmt.expr_stmt.expr.HasField("function_call"):
                 fn_call = stmt.expr_stmt.expr.function_call
                 call = ir.Call()
@@ -830,24 +1434,62 @@ class IRBuilder(ast.NodeVisitor):
         prefix: str,
         node: ast.AST,
         inputs: Optional[List[str]] = None,
+        modified_vars: Optional[List[str]] = None,
     ) -> List[ir.Statement]:
         """Wrap a body with multiple calls into a synthetic function.
 
-        Returns a list containing a single function call statement.
+        Args:
+            body: The statements to wrap
+            prefix: Name prefix for the synthetic function
+            node: AST node for span information
+            inputs: Variables to pass as inputs (e.g., loop variables)
+            modified_vars: Out-of-scope variables modified in the body.
+                          These are added as inputs AND returned as outputs,
+                          enabling functional transformation of external state.
+
+        Returns a list containing a single function call statement (or assignment
+        if modified_vars are present).
         """
         fn_name = self._ctx.next_implicit_fn_name(prefix)
-        fn_inputs = inputs or []
+        fn_inputs = list(inputs or [])
+
+        # Add modified variables as inputs (they need to be passed in)
+        modified_vars = modified_vars or []
+        for var in modified_vars:
+            if var not in fn_inputs:
+                fn_inputs.append(var)
+
+        # If there are modified variables, add a return statement for them
+        wrapped_body = list(body)
+        if modified_vars:
+            # Create return statement: return (var1, var2, ...) or return var1
+            if len(modified_vars) == 1:
+                return_expr = ir.Expr(
+                    variable=ir.Variable(name=modified_vars[0]),
+                    span=_make_span(node),
+                )
+            else:
+                # Return as list (tuples are represented as lists in IR)
+                return_expr = ir.Expr(
+                    list=ir.ListExpr(
+                        elements=[ir.Expr(variable=ir.Variable(name=var)) for var in modified_vars]
+                    ),
+                    span=_make_span(node),
+                )
+            return_stmt = ir.Statement(span=_make_span(node))
+            return_stmt.return_stmt.CopyFrom(ir.ReturnStmt(value=return_expr))
+            wrapped_body.append(return_stmt)
 
         # Create the synthetic function
         implicit_fn = ir.FunctionDef(
             name=fn_name,
-            io=ir.IoDecl(inputs=fn_inputs, outputs=[]),
-            body=ir.Block(statements=body),
+            io=ir.IoDecl(inputs=fn_inputs, outputs=modified_vars),
+            body=ir.Block(statements=wrapped_body),
             span=_make_span(node),
         )
         self._ctx.implicit_functions.append(implicit_fn)
 
-        # Create a function call statement
+        # Create a function call expression
         kwargs = [
             ir.Kwarg(name=var, value=ir.Expr(variable=ir.Variable(name=var))) for var in fn_inputs
         ]
@@ -855,36 +1497,69 @@ class IRBuilder(ast.NodeVisitor):
             function_call=ir.FunctionCall(name=fn_name, kwargs=kwargs),
             span=_make_span(node),
         )
+
+        # If there are modified variables, create an assignment statement
+        # so the returned values are assigned back to the variables
         call_stmt = ir.Statement(span=_make_span(node))
-        call_stmt.expr_stmt.CopyFrom(ir.ExprStmt(expr=fn_call_expr))
+        if modified_vars:
+            # Create assignment: var1, var2 = fn(...) or var1 = fn(...)
+            assign = ir.Assignment(value=fn_call_expr)
+            assign.targets.extend(modified_vars)
+            call_stmt.assignment.CopyFrom(assign)
+        else:
+            call_stmt.expr_stmt.CopyFrom(ir.ExprStmt(expr=fn_call_expr))
 
         return [call_stmt]
 
-    def _visit_return(self, node: ast.Return) -> Optional[ir.Statement]:
-        """Convert return statement to IR."""
-        stmt = ir.Statement(span=_make_span(node))
+    def _visit_return(self, node: ast.Return) -> List[ir.Statement]:
+        """Convert return statement to IR.
 
+        Return statements should only contain variables or literals, not action calls.
+        If the return contains an action call, we normalize it:
+            return await action()
+        becomes:
+            _return_tmp = await action()
+            return _return_tmp
+
+        Constructor calls (like return MyModel(...)) are not supported and will
+        raise an error with a recommendation to use an @action instead.
+        """
         if node.value:
-            # Check if returning an action call
+            # Check for constructor calls in return (e.g., return MyModel(...))
+            self._check_constructor_in_return(node.value)
+
+            # Check if returning an action call - normalize to assignment + return
             action_call = self._extract_action_call(node.value)
             if action_call:
-                # Return with action call
-                return_stmt = ir.ReturnStmt()
-                # Action calls in returns need special handling
-                expr = _expr_to_ir(node.value)
-                if expr:
-                    return_stmt.value.CopyFrom(expr)
-                stmt.return_stmt.CopyFrom(return_stmt)
-                return stmt
+                # Create a temporary variable for the action result
+                tmp_var = "_return_tmp"
 
+                # Create assignment: _return_tmp = await action()
+                assign_stmt = ir.Statement(span=_make_span(node))
+                value = ir.Expr(action_call=action_call, span=_make_span(node))
+                assign = ir.Assignment(targets=[tmp_var], value=value)
+                assign_stmt.assignment.CopyFrom(assign)
+
+                # Create return: return _return_tmp
+                return_stmt = ir.Statement(span=_make_span(node))
+                var_expr = ir.Expr(variable=ir.Variable(name=tmp_var), span=_make_span(node))
+                ret = ir.ReturnStmt(value=var_expr)
+                return_stmt.return_stmt.CopyFrom(ret)
+
+                return [assign_stmt, return_stmt]
+
+            # Regular return with expression (variable, literal, etc.)
             expr = _expr_to_ir(node.value)
             if expr:
+                stmt = ir.Statement(span=_make_span(node))
                 return_stmt = ir.ReturnStmt(value=expr)
                 stmt.return_stmt.CopyFrom(return_stmt)
-        else:
-            stmt.return_stmt.CopyFrom(ir.ReturnStmt())
+                return [stmt]
 
-        return stmt
+        # Return with no value
+        stmt = ir.Statement(span=_make_span(node))
+        stmt.return_stmt.CopyFrom(ir.ReturnStmt())
+        return [stmt]
 
     def _visit_aug_assign(self, node: ast.AugAssign) -> Optional[ir.Statement]:
         """Convert augmented assignment (+=, -=, etc.) to IR."""
@@ -909,8 +1584,206 @@ class IRBuilder(ast.NodeVisitor):
 
         return None
 
+    def _check_constructor_in_return(self, node: ast.expr) -> None:
+        """Check for constructor calls in return statements.
+
+        Raises UnsupportedPatternError if the return value is a class instantiation
+        like: return MyModel(field=value)
+
+        This is not supported because the workflow IR cannot serialize arbitrary
+        object instantiation. Users should use an @action to create objects.
+        """
+        # Skip if it's an await (action call) - those are fine
+        if isinstance(node, ast.Await):
+            return
+
+        # Check for direct Call that looks like a constructor
+        if isinstance(node, ast.Call):
+            func_name = self._get_constructor_name(node.func)
+            if func_name and self._looks_like_constructor(func_name, node):
+                line = getattr(node, "lineno", None)
+                col = getattr(node, "col_offset", None)
+                raise UnsupportedPatternError(
+                    f"Returning constructor call '{func_name}(...)' is not supported",
+                    RECOMMENDATIONS["constructor_return"],
+                    line=line,
+                    col=col,
+                )
+
+    def _check_constructor_in_assignment(self, node: ast.expr) -> None:
+        """Check for constructor calls in assignments.
+
+        Raises UnsupportedPatternError if the assignment value is a class instantiation
+        like: result = MyModel(field=value)
+
+        This is not supported because the workflow IR cannot serialize arbitrary
+        object instantiation. Users should use an @action to create objects.
+        """
+        # Skip if it's an await (action call) - those are fine
+        if isinstance(node, ast.Await):
+            return
+
+        # Check for direct Call that looks like a constructor
+        if isinstance(node, ast.Call):
+            func_name = self._get_constructor_name(node.func)
+            if func_name and self._looks_like_constructor(func_name, node):
+                line = getattr(node, "lineno", None)
+                col = getattr(node, "col_offset", None)
+                raise UnsupportedPatternError(
+                    f"Assigning constructor call '{func_name}(...)' is not supported",
+                    RECOMMENDATIONS["constructor_assignment"],
+                    line=line,
+                    col=col,
+                )
+
+    def _get_constructor_name(self, func: ast.expr) -> Optional[str]:
+        """Get the name from a function expression if it looks like a constructor."""
+        if isinstance(func, ast.Name):
+            return func.id
+        elif isinstance(func, ast.Attribute):
+            return func.attr
+        return None
+
+    def _looks_like_constructor(self, func_name: str, call: ast.Call) -> bool:
+        """Check if a function call looks like a class constructor.
+
+        A constructor is identified by:
+        1. Name starts with uppercase (PEP8 convention for classes)
+        2. It's not a known action
+        3. It's not a known builtin like String operations
+
+        This is a heuristic - we can't perfectly distinguish constructors
+        from functions without full type information.
+        """
+        # Check if first letter is uppercase (class naming convention)
+        if not func_name or not func_name[0].isupper():
+            return False
+
+        # If it's a known action, it's not a constructor
+        if func_name in self._action_defs:
+            return False
+
+        # Common builtins that start with uppercase but aren't constructors
+        # (these are rarely used in workflow code but let's be safe)
+        builtin_exceptions = {"True", "False", "None", "Ellipsis"}
+        if func_name in builtin_exceptions:
+            return False
+
+        return True
+
+    def _check_non_action_await(self, node: ast.Await) -> None:
+        """Check if an await is for a non-action function.
+
+        Note: We can only reliably detect non-action awaits for functions defined
+        in the same module. Actions imported from other modules will pass through
+        and may fail at runtime if they're not actually actions.
+
+        For now, we only check against common builtins and known non-action patterns.
+        A runtime check will catch functions that aren't registered actions.
+        """
+        awaited = node.value
+        if not isinstance(awaited, ast.Call):
+            return
+
+        # Skip special cases that are handled elsewhere
+        if self._is_run_action_call(awaited):
+            return
+        if self._is_asyncio_sleep_call(awaited):
+            return
+        if self._is_asyncio_gather_call(awaited):
+            return
+
+        # Get the function name
+        func_name = None
+        if isinstance(awaited.func, ast.Name):
+            func_name = awaited.func.id
+        elif isinstance(awaited.func, ast.Attribute):
+            func_name = awaited.func.attr
+
+        if not func_name:
+            return
+
+        # Only raise error for functions defined in THIS module that we know
+        # are NOT actions (i.e., async functions without @action decorator)
+        # We can't reliably detect imported non-actions without full type info.
+        #
+        # The check works by looking at _module_functions which contains
+        # functions defined in the same module as the workflow.
+        if func_name in getattr(self, "_module_functions", set()):
+            if func_name not in self._action_defs:
+                line = getattr(node, "lineno", None)
+                col = getattr(node, "col_offset", None)
+                raise UnsupportedPatternError(
+                    f"Awaiting non-action function '{func_name}()' is not supported",
+                    RECOMMENDATIONS["non_action_call"],
+                    line=line,
+                    col=col,
+                )
+
+    def _check_sync_function_call(self, node: ast.Call) -> None:
+        """Check for synchronous function calls that should be in actions.
+
+        Common patterns like len(), str(), etc. are not supported in workflow code.
+        """
+        func_name = None
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            # Method calls on objects - check the method name
+            func_name = node.func.attr
+
+        if not func_name:
+            return
+
+        # Builtins that users commonly try to use
+        common_builtins = {
+            "len",
+            "str",
+            "int",
+            "float",
+            "bool",
+            "list",
+            "dict",
+            "set",
+            "tuple",
+            "sum",
+            "min",
+            "max",
+            "sorted",
+            "reversed",
+            "enumerate",
+            "zip",
+            "map",
+            "filter",
+            "range",
+            "abs",
+            "round",
+            "print",
+            "type",
+            "isinstance",
+            "hasattr",
+            "getattr",
+            "setattr",
+            "open",
+            "format",
+        }
+
+        if func_name in common_builtins:
+            line = getattr(node, "lineno", None)
+            col = getattr(node, "col_offset", None)
+            raise UnsupportedPatternError(
+                f"Calling built-in function '{func_name}()' directly is not supported",
+                RECOMMENDATIONS["builtin_call"],
+                line=line,
+                col=col,
+            )
+
     def _extract_action_call(self, node: ast.expr) -> Optional[ir.ActionCall]:
-        """Extract an action call from an expression if present."""
+        """Extract an action call from an expression if present.
+
+        Also validates that awaited calls are actually @action decorated functions.
+        Raises UnsupportedPatternError if awaiting a non-action function.
+        """
         if not isinstance(node, ast.Await):
             return None
 
@@ -928,8 +1801,14 @@ class IRBuilder(ast.NodeVisitor):
             # Check for asyncio.sleep() - convert to @sleep action
             if self._is_asyncio_sleep_call(awaited):
                 return self._convert_asyncio_sleep_to_action(awaited)
-            # Direct action call
-            return self._extract_action_call_from_call(awaited)
+            # Try to extract as action call
+            action_call = self._extract_action_call_from_call(awaited)
+            if action_call:
+                return action_call
+
+            # If we get here, it's an await of a non-action function
+            self._check_non_action_await(node)
+            return None
 
         return None
 
@@ -1105,36 +1984,27 @@ class IRBuilder(ast.NodeVisitor):
                 return imported.module == "asyncio" and imported.original_name == "gather"
         return False
 
-    def _convert_asyncio_gather_to_parallel_block(
-        self, node: ast.Call, target: Optional[str] = None
-    ) -> Optional[ir.Statement]:
-        """Convert asyncio.gather(...) to ParallelBlock or SpreadAction IR.
+    def _convert_asyncio_gather(
+        self, node: ast.Call
+    ) -> Optional[Union[ir.ParallelExpr, ir.SpreadExpr]]:
+        """Convert asyncio.gather(...) to ParallelExpr or SpreadExpr IR.
 
         Handles two patterns:
-
-        1. Static gather: asyncio.gather(a(), b(), c())
-           -> ParallelBlock with explicit calls
-
-        2. Dynamic spread: asyncio.gather(*[action(x) for x in items])
-           -> SpreadAction for parallel iteration over collection
-
-        Raises UnsupportedPatternError for:
-        - Spreading a variable: asyncio.gather(*tasks)
-        - Any non-list-comprehension starred expression
+        1. Static gather: asyncio.gather(a(), b(), c()) -> ParallelExpr
+        2. Spread gather: asyncio.gather(*[action(x) for x in items]) -> SpreadExpr
 
         Args:
             node: The asyncio.gather() Call node
-            target: Optional variable name for the result (e.g., "results" or None)
 
         Returns:
-            An IR Statement containing ParallelBlock or SpreadAction, or None if fails.
+            A ParallelExpr, SpreadExpr, or None if conversion fails.
         """
-        # Check for starred expressions
+        # Check for starred expressions - spread pattern
         if len(node.args) == 1 and isinstance(node.args[0], ast.Starred):
             starred = node.args[0]
-            # Only list comprehensions are supported
+            # Only list comprehensions are supported for spread
             if isinstance(starred.value, ast.ListComp):
-                return self._convert_gather_listcomp_to_spread(starred.value, target, node)
+                return self._convert_listcomp_to_spread_expr(starred.value)
             else:
                 # Spreading a variable or other expression is not supported
                 line = getattr(node, "lineno", None)
@@ -1155,11 +2025,8 @@ class IRBuilder(ast.NodeVisitor):
                         col=col,
                     )
 
-        # Standard case: gather(a(), b(), c()) -> ParallelBlock
-        parallel = ir.ParallelBlock()
-
-        if target:
-            parallel.target = target
+        # Standard case: gather(a(), b(), c()) -> ParallelExpr
+        parallel = ir.ParallelExpr()
 
         # Each argument to gather() should be an action call
         for arg in node.args:
@@ -1167,64 +2034,104 @@ class IRBuilder(ast.NodeVisitor):
             if call:
                 parallel.calls.append(call)
 
-        # Only create the statement if we have calls
+        # Only return if we have calls
         if not parallel.calls:
             return None
 
-        stmt = ir.Statement(span=_make_span(node))
-        stmt.parallel_block.CopyFrom(parallel)
-        return stmt
+        return parallel
 
-    def _convert_gather_listcomp_to_spread(
-        self, listcomp: ast.ListComp, target: Optional[str], node: ast.Call
-    ) -> Optional[ir.Statement]:
-        """Convert gather(*[action(x) for x in items]) to SpreadAction IR.
+    def _convert_listcomp_to_spread_expr(self, listcomp: ast.ListComp) -> Optional[ir.SpreadExpr]:
+        """Convert a list comprehension to SpreadExpr IR.
 
-        Python:
-            results = await asyncio.gather(*[
-                process_item(item=item, multiplier=multiplier)
-                for item in items
-            ])
+        Handles patterns like:
+            [action(x=item) for item in collection]
 
-        Becomes IR equivalent of:
-            spread items:item -> results = @process_item(item=item, multiplier=multiplier)
+        The comprehension must have exactly one generator with no conditions,
+        and the element must be an action call.
+
+        Args:
+            listcomp: The ListComp AST node
+
+        Returns:
+            A SpreadExpr, or None if conversion fails.
         """
-        # Extract the action call from the list comprehension's element expression
-        if not isinstance(listcomp.elt, ast.Call):
-            return None
-
-        action_call = self._extract_action_call_from_call(listcomp.elt)
-        if not action_call:
-            return None
-
-        # We only support simple list comprehensions with one generator
+        # Only support simple list comprehensions with one generator
         if len(listcomp.generators) != 1:
-            return None
+            line = getattr(listcomp, "lineno", None)
+            col = getattr(listcomp, "col_offset", None)
+            raise UnsupportedPatternError(
+                "Spread pattern only supports a single loop variable",
+                "Use a simple list comprehension: [action(x) for x in items]",
+                line=line,
+                col=col,
+            )
 
         gen = listcomp.generators[0]
 
-        # Get the loop variable
+        # Check for conditions - not supported
+        if gen.ifs:
+            line = getattr(listcomp, "lineno", None)
+            col = getattr(listcomp, "col_offset", None)
+            raise UnsupportedPatternError(
+                "Spread pattern does not support conditions in list comprehension",
+                "Remove the 'if' clause from the comprehension",
+                line=line,
+                col=col,
+            )
+
+        # Get the loop variable name
         if not isinstance(gen.target, ast.Name):
-            return None
+            line = getattr(listcomp, "lineno", None)
+            col = getattr(listcomp, "col_offset", None)
+            raise UnsupportedPatternError(
+                "Spread pattern requires a simple loop variable",
+                "Use a simple variable: [action(x) for x in items]",
+                line=line,
+                col=col,
+            )
         loop_var = gen.target.id
 
-        # Get the iterable expression
-        iterable = _expr_to_ir(gen.iter)
-        if not iterable:
-            return None
+        # Get the collection expression
+        collection_expr = _expr_to_ir(gen.iter)
+        if not collection_expr:
+            line = getattr(listcomp, "lineno", None)
+            col = getattr(listcomp, "col_offset", None)
+            raise UnsupportedPatternError(
+                "Could not convert collection expression in spread pattern",
+                "Ensure the collection is a simple variable or expression",
+                line=line,
+                col=col,
+            )
 
-        # Build the SpreadAction
-        spread = ir.SpreadAction(
-            loop_var=loop_var,
-            collection=iterable,
-            action=action_call,
-        )
-        if target:
-            spread.target = target
+        # The element must be an action call
+        if not isinstance(listcomp.elt, ast.Call):
+            line = getattr(listcomp, "lineno", None)
+            col = getattr(listcomp, "col_offset", None)
+            raise UnsupportedPatternError(
+                "Spread pattern requires an action call in the list comprehension",
+                "Use: [action(x=item) for item in items]",
+                line=line,
+                col=col,
+            )
 
-        stmt = ir.Statement(span=_make_span(node))
-        stmt.spread_action.CopyFrom(spread)
-        return stmt
+        action_call = self._extract_action_call_from_call(listcomp.elt)
+        if not action_call:
+            line = getattr(listcomp, "lineno", None)
+            col = getattr(listcomp, "col_offset", None)
+            raise UnsupportedPatternError(
+                "Spread pattern element must be an @action call",
+                "Ensure the function is decorated with @action",
+                line=line,
+                col=col,
+            )
+
+        # Build the SpreadExpr
+        spread = ir.SpreadExpr()
+        spread.collection.CopyFrom(collection_expr)
+        spread.loop_var = loop_var
+        spread.action.CopyFrom(action_call)
+
+        return spread
 
     def _convert_gather_arg_to_call(self, node: ast.expr) -> Optional[ir.Call]:
         """Convert a gather argument to an IR Call.
@@ -1345,10 +2252,22 @@ class IRBuilder(ast.NodeVisitor):
         return None
 
     def _get_assign_target(self, targets: List[ast.expr]) -> Optional[str]:
-        """Get the target variable name from assignment targets."""
+        """Get the target variable name from assignment targets (single target only)."""
         if targets and isinstance(targets[0], ast.Name):
             return targets[0].id
         return None
+
+    def _get_assign_targets(self, targets: List[ast.expr]) -> List[str]:
+        """Get all target variable names from assignment targets (including tuple unpacking)."""
+        result: List[str] = []
+        for t in targets:
+            if isinstance(t, ast.Name):
+                result.append(t.id)
+            elif isinstance(t, ast.Tuple):
+                for elt in t.elts:
+                    if isinstance(elt, ast.Name):
+                        result.append(elt.id)
+        return result
 
 
 def _make_span(node: ast.AST) -> ir.Span:

@@ -137,11 +137,14 @@ def test_workflow_ir_includes_module_name() -> None:
     program = TestActionWorkflow.workflow_ir()
     func = program.functions[0]
 
-    # Find action calls in the IR
+    # Find action calls in the IR (both direct statements and in assignments)
     action_calls_found = []
     for stmt in func.body.statements:
         if stmt.HasField("action_call"):
             action_calls_found.append(stmt.action_call)
+        elif stmt.HasField("assignment"):
+            if stmt.assignment.value.HasField("action_call"):
+                action_calls_found.append(stmt.assignment.value.action_call)
 
     # We should have at least 2 action calls (fetch_identifier, store_value)
     assert len(action_calls_found) >= 2

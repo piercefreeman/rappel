@@ -27,8 +27,8 @@ class EntryPoint:
 
 
 ENTRYPOINTS: Sequence[EntryPoint] = (
-    EntryPoint("carabiner-server", "rappel-server"),
-    EntryPoint("boot-carabiner-singleton", "boot-rappel-singleton"),
+    EntryPoint("rappel-server", "rappel-server"),
+    EntryPoint("boot-rappel-singleton", "boot-rappel-singleton"),
     EntryPoint("start_workers", "start_workers"),
 )
 

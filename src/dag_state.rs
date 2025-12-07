@@ -146,7 +146,15 @@ impl<'a> DAGHelper<'a> {
     pub fn get_state_machine_successors(&self, node_id: &str) -> Vec<&'a DAGEdge> {
         self.get_outgoing_edges(node_id)
             .iter()
-            .filter(|e| e.edge_type == EdgeType::StateMachine)
+            .filter(|e| {
+                e.edge_type == EdgeType::StateMachine
+                    && e.exception_types.is_none()
+                    && !e
+                        .condition
+                        .as_deref()
+                        .map(|c| c.starts_with("except:"))
+                        .unwrap_or(false)
+            })
             .copied()
             .collect()
     }
@@ -294,6 +302,12 @@ impl<'a> DAGHelper<'a> {
         let mut successors = Vec::new();
 
         for edge in self.get_state_machine_successors(node_id) {
+            // Skip loop-back edges - these are only followed when explicitly
+            // re-triggering the loop after body completion
+            if edge.is_loop_back {
+                continue;
+            }
+
             // Handle exception edges - these are only followed when an exception occurs
             // They're identified by having exception_types set
             if edge.exception_types.is_some() {
@@ -384,6 +398,12 @@ impl<'a> DAGHelper<'a> {
 
         // Function calls (from parallel blocks) are delegated
         if node.is_fn_call {
+            return ExecutionMode::Delegated;
+        }
+
+        // For-loop nodes are delegated - they need to go through the runner
+        // to properly initialize and manage the loop index
+        if node.node_type == "for_loop" {
             return ExecutionMode::Delegated;
         }
 

@@ -1,5 +1,3 @@
-from pydantic import BaseModel
-
 from rappel import action, workflow
 from rappel.workflow import Workflow, RetryPolicy
 
@@ -8,14 +6,6 @@ class CustomError(Exception):
     """Custom exception defined in the same module as the workflow."""
 
     pass
-
-
-class WorkflowResult(BaseModel):
-    """Result type that mirrors example app's ErrorResult."""
-
-    attempted: bool
-    recovered: bool
-    message: str
 
 
 @action
@@ -46,7 +36,7 @@ class ExceptionWithSuccessWorkflow(Workflow):
     Key difference from simple test: has both success and failure branches.
     """
 
-    async def run(self, should_fail: bool) -> WorkflowResult:
+    async def run(self, should_fail: bool) -> dict:
         recovered = False
         message = ""
 
@@ -61,8 +51,8 @@ class ExceptionWithSuccessWorkflow(Workflow):
             recovered = True
             message = recovered_msg
 
-        return WorkflowResult(
-            attempted=True,
-            recovered=recovered,
-            message=message,
-        )
+        return {
+            "attempted": True,
+            "recovered": recovered,
+            "message": message,
+        }

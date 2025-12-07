@@ -167,6 +167,8 @@ Nothing on the market provides this balance - `rappel` aims to try. We don't exp
 
 ## Other options
 
+_NOTE: Right now you shouldn't use rappel in any production applications. The spec is changing too quickly and we don't guarantee backwards compatibility before 1.0.0. But we would love if you try it out in your side project and see how you find it._
+
 **When should you use Rappel?**
 
 - You're already using Python & Postgres for the core of your stack, either with Mountaineer or FastAPI
@@ -175,7 +177,7 @@ Nothing on the market provides this balance - `rappel` aims to try. We don't exp
 - You want background job code to plug and play with your existing unit test & static analysis stack
 - You are focused on getting to product market fit versus scale
 
-Performance is a top priority of rappel. That's why it's written with a Rust core, is lightweight on your database connection by minimizing connections to ~1 per machine host, and runs continuous benchmarks on CI. But it's not the _only_ priority. After all there's only so much we can do with Postgres as an ACID backing store. Once you start to tax Postgres' capabilities you're probably at the scale where you should switch to a more complicated architecture.
+Performance is a top priority of rappel. That's why it's written with a Rust core, is lightweight on your database connection by isolating them to ~1 pool per machine host, and runs continuous benchmarks on CI. But it's not the _only_ priority. After all there's only so much we can do with Postgres as an ACID backing store. Once you start to tax Postgres' capabilities you're probably at the scale where you should switch to a more complicated architecture.
 
 **When shouldn't you?**
 

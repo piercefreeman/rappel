@@ -26,6 +26,53 @@ const EXCEPTION_CUSTOM_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_exception_custom.py");
 const EXCEPTION_WITH_SUCCESS_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_exception_with_success.py");
+const ERROR_HANDLING_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_error_handling.py");
+const EXCEPTION_WITH_SUCCESS_FAILURE_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_exception_with_success import ExceptionWithSuccessWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ExceptionWithSuccessWorkflow()
+    # Trigger the failure branch so exception handling is exercised.
+    result = await wf.run(should_fail=True)
+    print(f"Registration result (should_fail=True): {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_ERROR_HANDLING_FAILURE_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_error_handling import ErrorHandlingWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ErrorHandlingWorkflow()
+    result = await wf.run(should_fail=True)
+    print(f"Registration result (should_fail=True): {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_ERROR_HANDLING_SUCCESS_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_error_handling import ErrorHandlingWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ErrorHandlingWorkflow()
+    result = await wf.run(should_fail=False)
+    print(f"Registration result (should_fail=False): {result}")
+
+asyncio.run(main())
+"#;
+const IMMEDIATE_CONDITIONAL_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/immediate_conditional_workflow.py");
+const CHAIN_WORKFLOW_MODULE: &str = include_str!("fixtures/chain_workflow.py");
 
 /// Registration script that imports and runs the workflow.
 /// This triggers the workflow decorator which registers the IR via gRPC.
@@ -83,6 +130,86 @@ fn extract_string_from_value(value: &proto::WorkflowArgumentValue) -> Result<Opt
             }
         }
         _ => Ok(None),
+    }
+}
+
+fn proto_value_to_json(value: &proto::WorkflowArgumentValue) -> serde_json::Value {
+    use proto::primitive_workflow_argument::Kind as PrimitiveKind;
+    use proto::workflow_argument_value::Kind;
+
+    match &value.kind {
+        Some(Kind::Primitive(p)) => match &p.kind {
+            Some(PrimitiveKind::IntValue(i)) => serde_json::Value::Number((*i).into()),
+            Some(PrimitiveKind::DoubleValue(f)) => serde_json::Number::from_f64(*f)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            Some(PrimitiveKind::StringValue(s)) => serde_json::Value::String(s.clone()),
+            Some(PrimitiveKind::BoolValue(b)) => serde_json::Value::Bool(*b),
+            Some(PrimitiveKind::NullValue(_)) => serde_json::Value::Null,
+            None => serde_json::Value::Null,
+        },
+        Some(Kind::ListValue(list)) => serde_json::Value::Array(
+            list.items
+                .iter()
+                .map(proto_value_to_json)
+                .collect::<Vec<_>>(),
+        ),
+        Some(Kind::DictValue(dict)) => {
+            let entries: serde_json::Map<String, serde_json::Value> = dict
+                .entries
+                .iter()
+                .filter_map(|arg| {
+                    arg.value
+                        .as_ref()
+                        .map(|v| (arg.key.clone(), proto_value_to_json(v)))
+                })
+                .collect();
+            serde_json::Value::Object(entries)
+        }
+        Some(Kind::TupleValue(tuple)) => serde_json::Value::Array(
+            tuple
+                .items
+                .iter()
+                .map(proto_value_to_json)
+                .collect::<Vec<_>>(),
+        ),
+        Some(Kind::Basemodel(model)) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "__class__".to_string(),
+                serde_json::Value::String(model.name.clone()),
+            );
+            obj.insert(
+                "__module__".to_string(),
+                serde_json::Value::String(model.module.clone()),
+            );
+            if let Some(data_dict) = &model.data {
+                for entry in &data_dict.entries {
+                    if let Some(v) = &entry.value {
+                        obj.insert(entry.key.clone(), proto_value_to_json(v));
+                    }
+                }
+            }
+            serde_json::Value::Object(obj)
+        }
+        Some(Kind::Exception(exc)) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("__exception__".to_string(), serde_json::Value::Bool(true));
+            obj.insert(
+                "type".to_string(),
+                serde_json::Value::String(exc.r#type.clone()),
+            );
+            obj.insert(
+                "module".to_string(),
+                serde_json::Value::String(exc.module.clone()),
+            );
+            obj.insert(
+                "message".to_string(),
+                serde_json::Value::String(exc.message.clone()),
+            );
+            serde_json::Value::Object(obj)
+        }
+        None => serde_json::Value::Null,
     }
 }
 
@@ -466,7 +593,8 @@ async fn exception_with_success_workflow_registers() -> Result<()> {
         entrypoint: "register.py",
         workflow_name: "exceptionwithsuccessworkflow",
         user_module: "integration_exception_with_success",
-        inputs: &[("should_fail", "false")],
+        // Use the stored registration inputs (should_fail=False) as-is.
+        inputs: &[],
     })
     .await?
     else {
@@ -476,6 +604,929 @@ async fn exception_with_success_workflow_registers() -> Result<()> {
     // Execute all actions via the DAGRunner
     harness.dispatch_all().await?;
     info!("workflow completed");
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn exception_with_success_workflow_handles_failure_branch() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_exception_with_success.py",
+                EXCEPTION_WITH_SUCCESS_WORKFLOW_MODULE,
+            ),
+            ("register.py", EXCEPTION_WITH_SUCCESS_FAILURE_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "exceptionwithsuccessworkflow",
+        user_module: "integration_exception_with_success",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing stored result payload"))?;
+
+    let arguments = proto::WorkflowArguments::decode(&stored_payload[..])?;
+    let result_value = arguments
+        .arguments
+        .iter()
+        .find(|arg| arg.key == "result")
+        .and_then(|arg| arg.value.as_ref())
+        .map(proto_value_to_json)
+        .ok_or_else(|| anyhow::anyhow!("missing result value"))?;
+
+    let result_obj = result_value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("result is not an object: {result_value}"))?;
+
+    assert_eq!(
+        result_obj.get("attempted"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    assert_eq!(
+        result_obj.get("recovered"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    let message = result_obj
+        .get("message")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing message in result"))?;
+    assert!(
+        message.contains("Recovered from error"),
+        "unexpected message: {message}"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Error Handling Workflow Test (BaseModel result)
+// =============================================================================
+
+/// Reproduces the example_app error-handling workflow that returns a Pydantic model.
+///
+/// With should_fail=True, risky_action raises, recovery_action runs, and the final
+/// build_error_result action returns an ErrorResult BaseModel. This ensures BaseModel
+/// serialization works end-to-end in failure branches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn error_handling_workflow_returns_basemodel_on_failure() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_error_handling.py",
+                ERROR_HANDLING_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_ERROR_HANDLING_FAILURE_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "errorhandlingworkflow",
+        user_module: "integration_error_handling",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing stored result payload"))?;
+
+    let arguments = proto::WorkflowArguments::decode(&stored_payload[..])?;
+    let result_value = arguments
+        .arguments
+        .iter()
+        .find(|arg| arg.key == "result")
+        .and_then(|arg| arg.value.as_ref())
+        .map(proto_value_to_json)
+        .ok_or_else(|| anyhow::anyhow!("missing result value"))?;
+
+    let result_obj = result_value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("result is not an object: {result_value}"))?;
+
+    assert_eq!(
+        result_obj.get("__class__"),
+        Some(&serde_json::Value::String("ErrorResult".to_string()))
+    );
+    assert_eq!(
+        result_obj.get("__module__"),
+        Some(&serde_json::Value::String(
+            "integration_error_handling".to_string()
+        ))
+    );
+    assert_eq!(
+        result_obj.get("attempted"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    assert_eq!(
+        result_obj.get("recovered"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    let message = result_obj
+        .get("message")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing message in result"))?;
+    assert!(
+        message.contains("Recovered from error"),
+        "unexpected message: {message}"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Ensure the BaseModel result also works on the success branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn error_handling_workflow_returns_basemodel_on_success() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_error_handling.py",
+                ERROR_HANDLING_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_ERROR_HANDLING_SUCCESS_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "errorhandlingworkflow",
+        user_module: "integration_error_handling",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing stored result payload"))?;
+
+    let arguments = proto::WorkflowArguments::decode(&stored_payload[..])?;
+    let result_value = arguments
+        .arguments
+        .iter()
+        .find(|arg| arg.key == "result")
+        .and_then(|arg| arg.value.as_ref())
+        .map(proto_value_to_json)
+        .ok_or_else(|| anyhow::anyhow!("missing result value"))?;
+
+    let result_obj = result_value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("result is not an object: {result_value}"))?;
+
+    assert_eq!(
+        result_obj.get("__class__"),
+        Some(&serde_json::Value::String("ErrorResult".to_string()))
+    );
+    assert_eq!(
+        result_obj.get("recovered"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    let message = result_obj
+        .get("message")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing message in result"))?;
+    assert!(
+        message.contains("Success path:"),
+        "unexpected message: {message}"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Immediate Conditional Workflow Tests
+// =============================================================================
+
+fn make_immediate_conditional_register_script(value: i32) -> String {
+    format!(
+        r#"
+import asyncio
+import os
+
+from immediate_conditional_workflow import ImmediateConditionalWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ImmediateConditionalWorkflow()
+    result = await wf.run(value={value})
+    print(f"Registration result: {{result}}")
+
+asyncio.run(main())
+"#
+    )
+}
+
+/// Test that immediate conditional workflows execute correctly with the "high" branch.
+///
+/// This tests the conditional execution where guards depend on input values directly.
+/// With value=100, 100>=75 so result should be "high:100".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn immediate_conditional_workflow_high_branch() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let register_script = make_immediate_conditional_register_script(100);
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "immediate_conditional_workflow.py",
+                IMMEDIATE_CONDITIONAL_WORKFLOW_MODULE,
+            ),
+            ("register.py", register_script.leak()),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "immediateconditionalworkflow",
+        user_module: "immediate_conditional_workflow",
+        inputs: &[("value", "100")],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result: value=100 -> 100>=75 -> evaluate_high -> "high:100"
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("high:100".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test that immediate conditional workflows execute correctly with the "medium" branch.
+///
+/// With value=50, 50>=25 but 50<75 so result should be "medium:50".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn immediate_conditional_workflow_medium_branch() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let register_script = make_immediate_conditional_register_script(50);
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "immediate_conditional_workflow.py",
+                IMMEDIATE_CONDITIONAL_WORKFLOW_MODULE,
+            ),
+            ("register.py", register_script.leak()),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "immediateconditionalworkflow",
+        user_module: "immediate_conditional_workflow",
+        inputs: &[("value", "50")],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result: value=50 -> 50>=25 -> evaluate_medium -> "medium:50"
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("medium:50".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test that immediate conditional workflows execute correctly with the "low" branch.
+///
+/// With value=10, 10<25 so result should be "low:10".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn immediate_conditional_workflow_low_branch() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let register_script = make_immediate_conditional_register_script(10);
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "immediate_conditional_workflow.py",
+                IMMEDIATE_CONDITIONAL_WORKFLOW_MODULE,
+            ),
+            ("register.py", register_script.leak()),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "immediateconditionalworkflow",
+        user_module: "immediate_conditional_workflow",
+        inputs: &[("value", "10")],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result: value=10 -> 10<25 -> evaluate_low -> "low:10"
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("low:10".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Loop Workflow Test
+// =============================================================================
+
+const LOOP_WORKFLOW_MODULE: &str = include_str!("fixtures/loop_workflow.py");
+
+const REGISTER_LOOP_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from loop_workflow import LoopWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = LoopWorkflow()
+    result = await wf.run(items=["apple", "banana", "cherry"])
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that loop workflows execute correctly with for loop iteration.
+///
+/// This tests the for loop pattern: for item in items -> process_item -> join_results
+/// With items=["apple", "banana", "cherry"], result should be "APPLE,BANANA,CHERRY".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn loop_workflow_executes_all_iterations() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("loop_workflow.py", LOOP_WORKFLOW_MODULE),
+            ("register.py", REGISTER_LOOP_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "loopworkflow",
+        user_module: "loop_workflow",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result: ["apple", "banana", "cherry"] -> ["APPLE", "BANANA", "CHERRY"] -> "APPLE,BANANA,CHERRY"
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("APPLE,BANANA,CHERRY".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Parallel Workflow Test
+// =============================================================================
+
+const PARALLEL_WORKFLOW_MODULE: &str = include_str!("fixtures/parallel_workflow.py");
+const PARALLEL_MATH_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_parallel_math.py");
+
+const REGISTER_PARALLEL_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from parallel_workflow import ParallelWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ParallelWorkflow()
+    result = await wf.run(value=5)
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that parallel workflows execute correctly with asyncio.gather.
+///
+/// This tests the parallel fan-out/fan-in pattern:
+/// value=5 -> gather(compute_double(5), compute_square(5)) -> combine_results
+/// doubled=10, squared=25 -> "doubled:10,squared:25"
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn parallel_workflow_executes_concurrent_actions() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("parallel_workflow.py", PARALLEL_WORKFLOW_MODULE),
+            ("register.py", REGISTER_PARALLEL_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "parallelworkflow",
+        user_module: "parallel_workflow",
+        inputs: &[], // Use default value from Python registration
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result: value=5 -> doubled=10, squared=25 -> "doubled:10,squared:25"
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("doubled:10,squared:25".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+const REGISTER_PARALLEL_MATH_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_parallel_math import ParallelMathWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ParallelMathWorkflow()
+    result = await wf.run(number=5)
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Parallel workflow that returns a BaseModel (example_app parity).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn parallel_math_workflow_executes_and_returns_model() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_parallel_math.py",
+                PARALLEL_MATH_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_PARALLEL_MATH_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "parallelmathworkflow",
+        user_module: "integration_parallel_math",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let arguments = proto::WorkflowArguments::decode(&stored_payload[..])?;
+    let result_value = arguments
+        .arguments
+        .iter()
+        .find(|arg| arg.key == "result")
+        .and_then(|arg| arg.value.as_ref())
+        .map(proto_value_to_json)
+        .ok_or_else(|| anyhow::anyhow!("missing result value"))?;
+    let json_obj = result_value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("result is not an object: {result_value}"))?;
+
+    assert_eq!(
+        json_obj.get("input_number"),
+        Some(&serde_json::Value::Number(5.into()))
+    );
+    assert_eq!(
+        json_obj.get("factorial"),
+        Some(&serde_json::Value::Number(120.into()))
+    );
+    assert_eq!(
+        json_obj.get("fibonacci"),
+        Some(&serde_json::Value::Number(5.into()))
+    );
+    let summary = json_obj
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing summary"))?;
+    assert!(
+        summary.contains("larger") || summary.contains("tame"),
+        "unexpected summary: {summary}"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Additional Conditional Workflow Tests (medium, low branches)
+// =============================================================================
+
+/// Test that conditional workflows execute correctly with the "medium" tier branch.
+///
+/// With tier="medium", score=50, and 50>=25 but 50<75 so result should be "good:50".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn conditional_workflow_medium_branch() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let register_script = make_conditional_register_script("medium");
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("conditional_workflow.py", CONDITIONAL_WORKFLOW_MODULE),
+            ("register.py", register_script.leak()),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "conditionalworkflow",
+        user_module: "conditional_workflow",
+        inputs: &[("tier", "medium")],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result: tier="medium" -> score=50 -> evaluate_medium -> "good:50"
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("good:50".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test that conditional workflows execute correctly with the "low" tier branch.
+///
+/// With tier="low", score=10, and 10<25 so result should be "needs_work:10".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn conditional_workflow_low_branch() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let register_script = make_conditional_register_script("low");
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("conditional_workflow.py", CONDITIONAL_WORKFLOW_MODULE),
+            ("register.py", register_script.leak()),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "conditionalworkflow",
+        user_module: "conditional_workflow",
+        inputs: &[("tier", "low")],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result: tier="low" -> score=10 -> evaluate_low -> "needs_work:10"
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("needs_work:10".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Chain Workflow Tests (example_app pattern)
+// =============================================================================
+
+const REGISTER_CHAIN_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from chain_workflow import ChainWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ChainWorkflow()
+    result = await wf.run(text="hello world")
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that chain workflows execute all actions and combine results correctly.
+///
+/// This matches the SequentialChainWorkflow pattern from example_app:
+/// "hello world" -> "HELLO WORLD" -> "DLROW OLLEH" -> "*** DLROW OLLEH ***"
+/// Then build_chain_result combines: original, step1, step2, step3
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn chain_workflow_executes_all_steps() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("chain_workflow.py", CHAIN_WORKFLOW_MODULE),
+            ("register.py", REGISTER_CHAIN_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "chainworkflow",
+        user_module: "chain_workflow",
+        inputs: &[("text", "hello world")],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result contains all transformations
+    // Expected: "original:hello world,step1:HELLO WORLD,step2:DLROW OLLEH,step3:*** DLROW OLLEH ***"
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some(
+            "original:hello world,step1:HELLO WORLD,step2:DLROW OLLEH,step3:*** DLROW OLLEH ***"
+                .to_string()
+        ),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// For-Loop Workflow Test (loop with append pattern)
+// =============================================================================
+
+const FOR_LOOP_WORKFLOW_MODULE: &str = include_str!("fixtures/for_loop_workflow.py");
+
+const REGISTER_FOR_LOOP_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from for_loop_workflow import ForLoopWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ForLoopWorkflow()
+    result = await wf.run(items=["apple", "banana", "cherry"])
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that for-loop workflows execute correctly with the loop-append pattern.
+///
+/// This tests the classic for loop pattern: for item in items -> process_item -> append
+/// With items=["apple", "banana", "cherry"], result should be "APPLE,BANANA,CHERRY".
+///
+/// This differs from the spread/gather pattern in that items are processed as a
+/// spread operation under the hood, not via parallel gather.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn for_loop_workflow_executes_all_iterations() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("for_loop_workflow.py", FOR_LOOP_WORKFLOW_MODULE),
+            ("register.py", REGISTER_FOR_LOOP_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "forloopworkflow",
+        user_module: "for_loop_workflow",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result: ["apple", "banana", "cherry"] -> ["APPLE", "BANANA", "CHERRY"] -> "APPLE,BANANA,CHERRY"
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("APPLE,BANANA,CHERRY".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Durable Sleep Workflow Test
+// =============================================================================
+
+const SLEEP_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_sleep.py");
+
+const REGISTER_SLEEP_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_sleep import SleepWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = SleepWorkflow()
+    result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that durable sleep workflows execute correctly.
+///
+/// This tests that asyncio.sleep() is converted to a scheduler-managed sleep node.
+/// The sleep is handled by scheduling the action for future dispatch (scheduled_at)
+/// rather than blocking the worker.
+///
+/// The workflow:
+/// 1. get_timestamp() -> records start time
+/// 2. asyncio.sleep(1) -> durable sleep for 1 second
+/// 3. get_timestamp() -> records resume time
+/// 4. format_sleep_result() -> calculates duration
+///
+/// Result should be "slept:1.0s" (approximately 1 second).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn durable_sleep_workflow_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("integration_sleep.py", SLEEP_WORKFLOW_MODULE),
+            ("register.py", REGISTER_SLEEP_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "sleepworkflow",
+        user_module: "integration_sleep",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result - should show approximately 1 second of sleep
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+
+    // The result should be "slept:X.Xs" where X is approximately 1
+    let result = message.expect("result should be present");
+    assert!(
+        result.starts_with("slept:"),
+        "unexpected result format: {result}"
+    );
+
+    // Parse the duration and verify it's approximately 1 second (allowing 0.5-2.0s range)
+    let duration_str = result.trim_start_matches("slept:").trim_end_matches('s');
+    let duration: f64 = duration_str.parse().expect("should parse as float");
+    assert!(
+        (0.5..=2.0).contains(&duration),
+        "sleep duration {duration}s not in expected range 0.5-2.0s"
+    );
 
     harness.shutdown().await?;
     Ok(())
