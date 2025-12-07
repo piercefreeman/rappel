@@ -1066,6 +1066,7 @@ async fn loop_workflow_executes_all_iterations() -> Result<()> {
 // =============================================================================
 
 const PARALLEL_WORKFLOW_MODULE: &str = include_str!("fixtures/parallel_workflow.py");
+const PARALLEL_MATH_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_parallel_math.py");
 
 const REGISTER_PARALLEL_SCRIPT: &str = r#"
 import asyncio
@@ -1122,6 +1123,90 @@ async fn parallel_workflow_executes_concurrent_actions() -> Result<()> {
         message,
         Some("doubled:10,squared:25".to_string()),
         "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+const REGISTER_PARALLEL_MATH_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_parallel_math import ParallelMathWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ParallelMathWorkflow()
+    result = await wf.run(number=5)
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Parallel workflow that returns a BaseModel (example_app parity).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn parallel_math_workflow_executes_and_returns_model() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_parallel_math.py",
+                PARALLEL_MATH_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_PARALLEL_MATH_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "parallelmathworkflow",
+        user_module: "integration_parallel_math",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let arguments = proto::WorkflowArguments::decode(&stored_payload[..])?;
+    let result_value = arguments
+        .arguments
+        .iter()
+        .find(|arg| arg.key == "result")
+        .and_then(|arg| arg.value.as_ref())
+        .map(proto_value_to_json)
+        .ok_or_else(|| anyhow::anyhow!("missing result value"))?;
+    let json_obj = result_value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("result is not an object: {result_value}"))?;
+
+    assert_eq!(
+        json_obj.get("input_number"),
+        Some(&serde_json::Value::Number(5.into()))
+    );
+    assert_eq!(
+        json_obj.get("factorial"),
+        Some(&serde_json::Value::Number(120.into()))
+    );
+    assert_eq!(
+        json_obj.get("fibonacci"),
+        Some(&serde_json::Value::Number(5.into()))
+    );
+    let summary = json_obj
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing summary"))?;
+    assert!(
+        summary.contains("larger") || summary.contains("tame"),
+        "unexpected summary: {summary}"
     );
 
     harness.shutdown().await?;

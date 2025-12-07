@@ -1251,7 +1251,7 @@ fn resolve_kwarg_value(
                 debug!(
                     kwarg = %key,
                     missing_var = %var,
-                    "kwarg variable not found in inbox, defaulting to null"
+                    "kwarg variable not found in inbox"
                 );
                 return JsonValue::Null;
             }

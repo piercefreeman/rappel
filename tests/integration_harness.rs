@@ -449,7 +449,13 @@ impl IntegrationHarness {
 fn build_initial_inputs(pairs: &[(&str, &str)]) -> HashMap<String, JsonValue> {
     pairs
         .iter()
-        .map(|(k, v)| ((*k).to_string(), JsonValue::String((*v).to_string())))
+        .map(|(k, v)| {
+            let parsed = serde_json::from_str::<JsonValue>(v).unwrap_or_else(|_| {
+                // Fallback to string if not valid JSON literal
+                JsonValue::String((*v).to_string())
+            });
+            ((*k).to_string(), parsed)
+        })
         .collect()
 }
 

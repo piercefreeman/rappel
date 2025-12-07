@@ -324,6 +324,33 @@ fn json_bytes_to_workflow_args(payload: &[u8]) -> proto::WorkflowArguments {
     }
 }
 
+/// Load the initial scope for an instance from its stored input_payload.
+async fn load_initial_scope(db: &Database, instance_id: WorkflowInstanceId) -> RunnerResult<Scope> {
+    let instance = db.get_instance(instance_id).await?;
+    let mut scope = Scope::new();
+
+    if let Some(payload) = instance.input_payload {
+        match proto::WorkflowArguments::decode(&payload[..]) {
+            Ok(args) => {
+                for arg in args.arguments {
+                    if let Some(value) = arg.value {
+                        scope.insert(arg.key, proto_value_to_json(&value));
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    instance_id = %instance_id.0,
+                    error = %e,
+                    "failed to decode initial inputs, defaulting to empty scope"
+                );
+            }
+        }
+    }
+
+    Ok(scope)
+}
+
 // ============================================================================
 // DAG Cache
 // ============================================================================
@@ -766,9 +793,9 @@ impl WorkQueueHandler {
         }
 
         // Execute inline subgraph and build completion plan
-        let empty_scope = HashMap::new();
+        let initial_scope = load_initial_scope(&self.db, instance_id).await?;
         let ctx = InlineContext {
-            initial_scope: &empty_scope,
+            initial_scope: &initial_scope,
             existing_inbox: &existing_inbox,
             spread_index: None,
         };
@@ -848,9 +875,9 @@ impl WorkQueueHandler {
             .await?;
 
         // Execute inline subgraph and build completion plan
-        let empty_scope = HashMap::new();
+        let initial_scope = load_initial_scope(&self.db, instance_id).await?;
         let ctx = InlineContext {
-            initial_scope: &empty_scope,
+            initial_scope: &initial_scope,
             existing_inbox: &existing_inbox,
             spread_index: None,
         };
@@ -1786,9 +1813,9 @@ impl DAGRunner {
             .await?;
 
         // Execute inline subgraph
-        let empty_scope = HashMap::new();
+        let initial_scope = load_initial_scope(db, instance_id).await?;
         let ctx = InlineContext {
-            initial_scope: &empty_scope,
+            initial_scope: &initial_scope,
             existing_inbox: &existing_inbox,
             spread_index: None,
         };
