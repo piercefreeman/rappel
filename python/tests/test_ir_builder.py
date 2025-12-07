@@ -471,11 +471,25 @@ class TestForLoopAccumulatorDetection:
         for_loop = self._find_for_loop(program)
         assert for_loop is not None, "Expected for_loop in IR"
 
-        # The action call targets should be present (is_valid, processed from tuple unpacking)
-        targets = list(for_loop.body.targets)
-        assert "is_valid" in targets or "processed" in targets, (
-            f"Expected action targets in body, got: {targets}"
-        )
+        # The action call is in an implicit function (__for_body_N__) because
+        # the for loop body has conditional logic. Check that function for the targets.
+        for_body_fn = None
+        for fn in program.functions:
+            if fn.name.startswith("__for_body_"):
+                for_body_fn = fn
+                break
+        assert for_body_fn is not None, "Expected implicit for_body function"
+
+        # Find the assignment with is_valid/processed targets in the for_body function
+        found_targets = False
+        for stmt in for_body_fn.body.statements:
+            if stmt.HasField("assignment"):
+                targets = list(stmt.assignment.targets)
+                if "is_valid" in targets or "processed" in targets:
+                    found_targets = True
+                    break
+
+        assert found_targets, "Expected action targets (is_valid, processed) in for_body function"
 
     def test_for_with_append_original_fixture(self) -> None:
         """Test: Original for_with_append fixture works correctly."""
@@ -1828,12 +1842,14 @@ class TestForLoopEnumerate:
 
         program = EnumerateWorkflow.workflow_ir()
 
-        # Find the for loop
-        func = program.functions[0]
+        # Find the for loop (may not be in functions[0] if implicit functions are created)
         for_loop = None
-        for stmt in func.body.statements:
-            if stmt.HasField("for_loop"):
-                for_loop = stmt.for_loop
+        for func in program.functions:
+            for stmt in func.body.statements:
+                if stmt.HasField("for_loop"):
+                    for_loop = stmt.for_loop
+                    break
+            if for_loop is not None:
                 break
 
         assert for_loop is not None, "Should have for loop"
@@ -1924,12 +1940,14 @@ class TestElseBranch:
 
         program = IfElseActionWorkflow.workflow_ir()
 
-        # Find conditional
-        func = program.functions[0]
+        # Find conditional (may not be in functions[0] if implicit functions are created)
         conditional = None
-        for stmt in func.body.statements:
-            if stmt.HasField("conditional"):
-                conditional = stmt.conditional
+        for func in program.functions:
+            for stmt in func.body.statements:
+                if stmt.HasField("conditional"):
+                    conditional = stmt.conditional
+                    break
+            if conditional is not None:
                 break
 
         assert conditional is not None, "Should have conditional"
@@ -2115,21 +2133,44 @@ class TestCallInTryBody:
 
         program = TryWithActionWorkflow.workflow_ir()
 
-        # Find try/except
-        func = program.functions[0]
+        # Find try/except (may not be in functions[0] if implicit functions are created)
         try_except = None
-        for stmt in func.body.statements:
-            if stmt.HasField("try_except"):
-                try_except = stmt.try_except
+        for func in program.functions:
+            for stmt in func.body.statements:
+                if stmt.HasField("try_except"):
+                    try_except = stmt.try_except
+                    break
+            if try_except is not None:
                 break
 
         assert try_except is not None, "Should have try/except"
-        # The try_body should have a 'call' field with the action call extracted
-        # and a 'targets' field with the assignment variable(s)
-        assert try_except.try_body.HasField("call"), "Try body should have call extracted"
-        assert try_except.try_body.call.HasField("action"), "Call should be an action"
-        assert try_except.try_body.call.action.action_name == "try_action"
-        assert list(try_except.try_body.targets) == ["result"], "Targets should be ['result']"
+        # The try_body calls an implicit function that contains the action call
+        assert try_except.try_body.HasField("call"), "Try body should have call"
+        assert try_except.try_body.call.HasField("function"), "Call should be a function (implicit)"
+        assert try_except.try_body.call.function.name.startswith("__try_body_"), (
+            f"Should call __try_body_*, got: {try_except.try_body.call.function.name}"
+        )
+
+        # Find the implicit try_body function and verify it contains the action call
+        try_body_fn = None
+        for fn in program.functions:
+            if fn.name.startswith("__try_body_"):
+                try_body_fn = fn
+                break
+        assert try_body_fn is not None, "Should have implicit try_body function"
+
+        # Check that the implicit function has the action call with correct targets
+        found_action = False
+        for stmt in try_body_fn.body.statements:
+            if stmt.HasField("assignment"):
+                if stmt.assignment.value.HasField("action_call"):
+                    if stmt.assignment.value.action_call.action_name == "try_action":
+                        assert list(stmt.assignment.targets) == ["result"], (
+                            f"Expected targets=['result'], got: {list(stmt.assignment.targets)}"
+                        )
+                        found_action = True
+                        break
+        assert found_action, "Should have try_action call in implicit function"
 
 
 class TestPolicyVariations:
