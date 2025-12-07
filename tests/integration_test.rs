@@ -469,7 +469,8 @@ async fn exception_with_success_workflow_registers() -> Result<()> {
         entrypoint: "register.py",
         workflow_name: "exceptionwithsuccessworkflow",
         user_module: "integration_exception_with_success",
-        inputs: &[("should_fail", "false")],
+        // Use the stored registration inputs (should_fail=False) as-is.
+        inputs: &[],
     })
     .await?
     else {

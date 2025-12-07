@@ -2052,24 +2052,11 @@ impl DAGRunner {
         );
     }
 
-    /// Check if all parallel actions are complete and process the aggregator if ready.
-    ///
-    /// For parallel blocks like:
-    ///   a, b = parallel:
-    ///     @action1()
-    ///     @action2()
-    ///
-    /// The aggregator collects control flow from both actions. This function:
-    /// 1. Counts expected parallel actions from the parallel entry node
-    /// 2. Atomically writes inbox entries and increments counter in one transaction
-    /// 3. When all complete, processes the aggregator's successors
+    /// Check if all parallel actions are complete and enqueue the barrier when ready.
     #[allow(clippy::too_many_arguments)]
     async fn check_and_process_parallel_aggregator(
-        _completed_node_id: &str,
         agg_node: &DAGNode,
         dag: &DAG,
-        helper: &DAGHelper<'_>,
-        inline_scope: &mut Scope,
         batch: &mut CompletionBatch,
         instance_id: WorkflowInstanceId,
         db: &Database,
@@ -2108,8 +2095,8 @@ impl DAGRunner {
             })
             .collect();
 
-        // Atomically write inbox entries and increment readiness counter
-        // Uses init-on-first-use pattern so we don't need separate initialization
+        // Atomically write inbox entries, increment readiness counter, and enqueue
+        // the barrier when the last precursor arrives.
         let readiness = db
             .write_inbox_batch_and_increment_readiness(
                 instance_id,
@@ -2126,104 +2113,11 @@ impl DAGRunner {
             is_now_ready = readiness.is_now_ready,
             parallel_action_ids = ?parallel_action_ids,
             inbox_writes_committed = inbox_writes_for_tx.len(),
-            "checking parallel aggregator readiness"
+            "updated parallel barrier readiness"
         );
 
-        // If not all parallel actions are complete, wait for more
-        if !readiness.is_now_ready {
-            return Ok(());
-        }
-
-        debug!(
-            aggregator_id = %agg_id,
-            "parallel aggregator ready, processing successors"
-        );
-
-        // All parallel actions complete! Process aggregator's successors.
-        // For parallel blocks with tuple unpacking, the data has already been
-        // written to downstream nodes via DataFlow edges from each parallel action.
-        // The aggregator's role is just control flow synchronization.
-
-        // Find and process successors of the aggregator
-        let successors = helper.get_ready_successors(agg_id, None);
-        for successor in successors {
-            let succ_node = match dag.nodes.get(&successor.node_id) {
-                Some(n) => n,
-                None => continue,
-            };
-
-            let exec_mode = helper.get_execution_mode(succ_node);
-            match exec_mode {
-                ExecutionMode::Inline => {
-                    // Check for output/return node (workflow completion)
-                    if succ_node.is_output || succ_node.node_type == "return" {
-                        // Get result from inline scope or inbox
-                        let result = inline_scope
-                            .values()
-                            .next()
-                            .cloned()
-                            .unwrap_or(JsonValue::Null);
-
-                        let mut result_map = HashMap::new();
-                        result_map.insert("result".to_string(), result);
-                        let result_payload = Self::serialize_workflow_result(&result_map);
-
-                        batch.instance_completion = Some(InstanceCompletion {
-                            instance_id,
-                            result_payload,
-                        });
-                        continue;
-                    }
-
-                    // Execute inline and continue
-                    let inline_result = Self::execute_inline_node(succ_node, inline_scope)?;
-                    if let Some(ref target) = succ_node.target {
-                        inline_scope.insert(target.clone(), inline_result.clone());
-                        Self::collect_inbox_writes_for_node(
-                            &successor.node_id,
-                            target,
-                            &inline_result,
-                            dag,
-                            instance_id,
-                            &mut batch.inbox_writes,
-                        );
-                    }
-                }
-                ExecutionMode::Delegated => {
-                    // Read inbox from DB - all parallel action inbox writes are already
-                    // committed atomically with the counter increment
-                    let mut inbox = db.read_inbox(instance_id, &successor.node_id).await?;
-
-                    // Merge pending inbox writes from current batch
-                    for pending_write in &batch.inbox_writes {
-                        if pending_write.target_node_id == successor.node_id {
-                            inbox.insert(
-                                pending_write.variable_name.clone(),
-                                pending_write.value.clone(),
-                            );
-                        }
-                    }
-
-                    // Merge inline scope
-                    for (var_name, var_value) in inline_scope.iter() {
-                        inbox
-                            .entry(var_name.clone())
-                            .or_insert_with(|| var_value.clone());
-                    }
-
-                    debug!(
-                        successor_node_id = %successor.node_id,
-                        inbox = ?inbox.keys().collect::<Vec<_>>(),
-                        "creating action for parallel aggregator successor"
-                    );
-
-                    // Create action
-                    let result =
-                        Self::create_actions_for_node(succ_node, instance_id, &inbox, dag)?;
-                    batch.new_actions.extend(result.actions);
-                    batch.inbox_writes.extend(result.inbox_writes);
-                }
-            }
+        if readiness.is_now_ready {
+            debug!(aggregator_id = %agg_id, "parallel barrier ready and enqueued");
         }
 
         Ok(())
@@ -2457,17 +2351,8 @@ impl DAGRunner {
             // Instead, check if all predecessors are complete and process if ready.
             if succ_node.is_aggregator {
                 // Check if all parallel actions feeding this aggregator are complete
-                Self::check_and_process_parallel_aggregator(
-                    &current_node_id,
-                    succ_node,
-                    dag,
-                    helper,
-                    inline_scope,
-                    batch,
-                    instance_id,
-                    db,
-                )
-                .await?;
+                Self::check_and_process_parallel_aggregator(succ_node, dag, batch, instance_id, db)
+                    .await?;
                 continue;
             }
 
@@ -2584,11 +2469,25 @@ impl DAGRunner {
         instance_id: WorkflowInstanceId,
         db: &Database,
     ) -> RunnerResult<()> {
-        let handler_node = match dag.nodes.get(handler_node_id) {
-            Some(n) => n,
+        let (handler_node_id, handler_node) = match dag.nodes.get_key_value(handler_node_id) {
+            Some((id, node)) => (id.as_str(), node),
             None => {
-                warn!(handler_node_id = %handler_node_id, "exception handler node not found");
-                return Ok(());
+                // Some DAG conversions append suffixes to fn_call nodes; try a prefix match fallback.
+                if let Some((id, node)) = dag
+                    .nodes
+                    .iter()
+                    .find(|(id, _)| id.starts_with(handler_node_id))
+                {
+                    debug!(
+                        original_handler_id = %handler_node_id,
+                        handler_node_id = %id,
+                        "exception handler not found by exact id; using prefix match fallback"
+                    );
+                    (id.as_str(), node)
+                } else {
+                    warn!(handler_node_id = %handler_node_id, "exception handler node not found");
+                    return Ok(());
+                }
             }
         };
 
@@ -2800,6 +2699,12 @@ impl DAGRunner {
 
         // Create initial scope from inputs (mutable for inline node execution)
         let mut scope: Scope = initial_inputs;
+
+        debug!(
+            instance_id = %instance_id.0,
+            initial_scope = ?scope,
+            "starting instance with initial scope"
+        );
 
         // Store scope for inline evaluation
         {
@@ -3235,12 +3140,32 @@ impl DAGRunner {
             return Ok(resolved);
         }
 
+        // Normalize common Python bool literal casing
+        match value_str {
+            "True" => return Ok(JsonValue::Bool(true)),
+            "False" => return Ok(JsonValue::Bool(false)),
+            _ => {}
+        }
+
+        debug!(
+            value_str = %value_str,
+            inbox_keys = ?inbox.keys().collect::<Vec<_>>(),
+            "resolving non-variable kwarg"
+        );
+
         // Try to parse as JSON (handles numbers, booleans, strings, etc.)
         match serde_json::from_str(value_str) {
             Ok(v) => Ok(v),
             Err(_) => {
-                // If not valid JSON, treat as raw string
-                Ok(JsonValue::String(value_str.to_string()))
+                // If not valid JSON, treat as raw string but normalize bool-like values
+                let lower = value_str.to_ascii_lowercase();
+                if lower == "true" {
+                    Ok(JsonValue::Bool(true))
+                } else if lower == "false" {
+                    Ok(JsonValue::Bool(false))
+                } else {
+                    Ok(JsonValue::String(value_str.to_string()))
+                }
             }
         }
     }

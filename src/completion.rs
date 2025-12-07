@@ -290,7 +290,15 @@ fn count_sm_predecessors(dag: &DAG, node_id: &str) -> i32 {
     dag.edges
         .iter()
         .filter(|e| {
-            e.target == node_id && e.edge_type == EdgeType::StateMachine && !e.is_loop_back // Don't count loop-back edges
+            e.target == node_id
+                && e.edge_type == EdgeType::StateMachine
+                && !e.is_loop_back // Don't count loop-back edges
+                && e.exception_types.is_none()
+                && !e
+                    .condition
+                    .as_deref()
+                    .map(|c| c.starts_with("except:"))
+                    .unwrap_or(false)
         })
         .count() as i32
 }
@@ -683,6 +691,21 @@ pub fn execute_inline_subgraph(
                         &inline_scope,
                         dag,
                         &mut action_inbox,
+                    );
+
+                    // Ensure inline scope variables are available even if a dataflow edge
+                    // wasn't emitted for this frontier (e.g., missing edge metadata).
+                    for (var, val) in &inline_scope {
+                        action_inbox
+                            .entry(var.clone())
+                            .or_insert_with(|| val.clone());
+                    }
+
+                    debug!(
+                        frontier_node_id = %frontier.node_id,
+                        inline_scope_keys = ?inline_scope.keys().collect::<Vec<_>>(),
+                        action_inbox_keys = ?action_inbox.keys().collect::<Vec<_>>(),
+                        "building action dispatch payload"
                     );
 
                     let dispatch_payload = build_action_payload(frontier_node, &action_inbox)?;
@@ -1169,10 +1192,24 @@ fn resolve_kwarg_value(value_str: &str, inbox: &HashMap<String, JsonValue>) -> J
         return inbox.get(var_name).cloned().unwrap_or(JsonValue::Null);
     }
 
+    // Common bool literal casing from Python source (True/False)
+    match value_str {
+        "True" | "true" => return JsonValue::Bool(true),
+        "False" | "false" => return JsonValue::Bool(false),
+        _ => {}
+    }
+
     // Try to parse as JSON
     match serde_json::from_str(value_str) {
         Ok(v) => v,
-        Err(_) => JsonValue::String(value_str.to_string()),
+        Err(_) => {
+            // If it's a string that looks like a bool, normalize to bool
+            match value_str.to_ascii_lowercase().as_str() {
+                "true" => JsonValue::Bool(true),
+                "false" => JsonValue::Bool(false),
+                _ => JsonValue::String(value_str.to_string()),
+            }
+        }
     }
 }
 

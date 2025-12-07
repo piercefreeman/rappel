@@ -146,7 +146,15 @@ impl<'a> DAGHelper<'a> {
     pub fn get_state_machine_successors(&self, node_id: &str) -> Vec<&'a DAGEdge> {
         self.get_outgoing_edges(node_id)
             .iter()
-            .filter(|e| e.edge_type == EdgeType::StateMachine)
+            .filter(|e| {
+                e.edge_type == EdgeType::StateMachine
+                    && e.exception_types.is_none()
+                    && !e
+                        .condition
+                        .as_deref()
+                        .map(|c| c.starts_with("except:"))
+                        .unwrap_or(false)
+            })
             .copied()
             .collect()
     }

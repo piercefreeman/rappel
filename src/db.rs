@@ -1309,6 +1309,55 @@ impl Database {
         let completed_count: i32 = row.get(0);
         let required_count: i32 = row.get(1);
 
+        // Detect overflow (should never happen) to avoid duplicate enqueues
+        if completed_count > required_count {
+            tx.rollback().await?;
+            return Err(DbError::NotFound(format!(
+                "Readiness overflow for node {}: {} > {}",
+                node_id, completed_count, required_count
+            )));
+        }
+
+        // When this increment makes the node ready, enqueue a barrier in the same transaction.
+        if completed_count == required_count {
+            // Get the next action sequence for this instance
+            let seq_row = sqlx::query(
+                r#"
+                UPDATE workflow_instances
+                SET next_action_seq = next_action_seq + 1
+                WHERE id = $1
+                RETURNING next_action_seq - 1
+                "#,
+            )
+            .bind(instance_id.0)
+            .fetch_one(&mut *tx)
+            .await?;
+            let action_seq: i32 = seq_row.get(0);
+
+            // Enqueue the barrier; processing happens in the runner's barrier handler.
+            sqlx::query(
+                r#"
+                INSERT INTO action_queue
+                    (instance_id, action_seq, module_name, action_name,
+                     dispatch_payload, timeout_seconds, max_retries,
+                     backoff_kind, backoff_base_delay_ms, node_id, node_type, scheduled_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'barrier', NOW())
+                "#,
+            )
+            .bind(instance_id.0)
+            .bind(action_seq)
+            .bind("__internal__")
+            .bind("__barrier__")
+            .bind(Vec::<u8>::new())
+            .bind(300)
+            .bind(3)
+            .bind("exponential")
+            .bind(1000)
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         tx.commit().await?;
 
         Ok(ReadinessResult {
@@ -2456,6 +2505,17 @@ mod tests {
         assert_eq!(result.required_count, 2);
         assert!(!result.is_now_ready);
 
+        // Barrier should not be enqueued yet
+        let queued_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM action_queue WHERE instance_id = $1 AND node_id = $2",
+        )
+        .bind(instance_id.0)
+        .bind("aggregator_1")
+        .fetch_one(&db.pool)
+        .await
+        .expect("failed to query action_queue");
+        assert_eq!(queued_before, 0);
+
         // Verify inbox entries were written
         let inbox1 = db
             .read_inbox(instance_id, "target_1")
@@ -2492,6 +2552,18 @@ mod tests {
 
         assert_eq!(result.completed_count, 2);
         assert!(result.is_now_ready);
+
+        // Barrier should be queued when readiness hits the required count
+        let (queued_node_type, queued_status): (String, String) = sqlx::query_as(
+            "SELECT node_type, status FROM action_queue WHERE instance_id = $1 AND node_id = $2",
+        )
+        .bind(instance_id.0)
+        .bind("aggregator_1")
+        .fetch_one(&db.pool)
+        .await
+        .expect("failed to fetch queued barrier");
+        assert_eq!(queued_node_type, "barrier");
+        assert_eq!(queued_status, "queued");
     }
 
     #[tokio::test]

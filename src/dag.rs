@@ -541,7 +541,9 @@ impl DAGConverter {
             .map(|s| s.as_str())
             .unwrap_or("run");
 
-        self.expand_functions(&unexpanded, entry_fn)
+        let mut dag = self.expand_functions(&unexpanded, entry_fn);
+        self.remap_exception_targets(&mut dag);
+        dag
     }
 
     /// Phase 1: Convert a Rappel program to a DAG with isolated function subgraphs.
@@ -564,6 +566,59 @@ impl DAGConverter {
         }
 
         std::mem::take(&mut self.dag)
+    }
+
+    /// Remap exception edges that still point at fn_call placeholders to the
+    /// first node of their expanded subgraph.
+    fn remap_exception_targets(&self, dag: &mut DAG) {
+        let call_entry_map = Self::build_call_entry_map(dag);
+
+        for edge in dag.edges.iter_mut().filter(|e| e.exception_types.is_some()) {
+            if dag.nodes.contains_key(&edge.target) {
+                continue;
+            }
+
+            if let Some(mapped) = call_entry_map.get(&edge.target) {
+                edge.target = mapped.clone();
+            }
+        }
+
+        // Deduplicate edges after remapping to avoid inflated predecessor counts.
+        let mut seen = HashSet::new();
+        dag.edges.retain(|edge| {
+            let key = format!(
+                "{}|{}|{:?}|{:?}|{:?}|{:?}|{}|{:?}",
+                edge.source,
+                edge.target,
+                edge.edge_type,
+                edge.condition,
+                edge.exception_types,
+                edge.guard_string,
+                edge.is_loop_back,
+                edge.variable
+            );
+            seen.insert(key)
+        });
+    }
+
+    /// Build a mapping from fn_call node ids to the first node of their expansion.
+    fn build_call_entry_map(dag: &DAG) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+
+        for id in dag.nodes.keys() {
+            if let Some((call_id, _)) = id.split_once(':') {
+                // Pick a stable representative for the expanded subgraph.
+                map.entry(call_id.to_string())
+                    .and_modify(|existing| {
+                        if id < existing {
+                            *existing = id.clone();
+                        }
+                    })
+                    .or_insert_with(|| id.clone());
+            }
+        }
+
+        map
     }
 
     /// Phase 2: Expand all function calls into a single global DAG.
@@ -1988,8 +2043,6 @@ impl DAGConverter {
     ///   @risky() --[success]--> join
     ///            --[except:NetworkError]--> @fallback() --> join
     fn convert_try_except(&mut self, try_except: &ast::TryExcept) -> Vec<String> {
-        let mut result_nodes = Vec::new();
-
         // Convert try body (SingleCallBody - exactly one call)
         // This is the action that might throw an exception
         let mut try_body_first: Option<String> = None;
@@ -1999,7 +2052,6 @@ impl DAGConverter {
             if !node_ids.is_empty() {
                 try_body_first = Some(node_ids[0].clone());
                 try_body_last = Some(node_ids.last().unwrap().clone());
-                result_nodes.extend(node_ids);
             }
         }
 
@@ -2010,7 +2062,6 @@ impl DAGConverter {
             join_node = join_node.with_function_name(fn_name);
         }
         self.dag.add_node(join_node);
-        result_nodes.push(join_id.clone());
 
         // Connect try body success path to join
         if let Some(ref try_last) = try_body_last {
@@ -2028,7 +2079,6 @@ impl DAGConverter {
                 if !node_ids.is_empty() {
                     let handler_first = node_ids[0].clone();
                     let handler_last = node_ids.last().unwrap().clone();
-                    result_nodes.extend(node_ids);
 
                     // Edge from try body to handler with exception types
                     if let Some(ref try_last) = try_body_last {
@@ -2049,12 +2099,12 @@ impl DAGConverter {
         // Return: first node is the try body's first action, last is the join
         // We need to return the try body first (for connecting from predecessor)
         // and the join (for connecting to successor)
-        if try_body_first.is_some() {
-            result_nodes
-        } else {
-            // No try body - just return the join
-            vec![join_id]
+        let mut result_nodes = Vec::new();
+        if let Some(first) = try_body_first {
+            result_nodes.push(first);
         }
+        result_nodes.push(join_id);
+        result_nodes
     }
 
     /// Convert a return statement
@@ -2607,6 +2657,48 @@ fn main(input: [], output: [result]):
             !success_edges.is_empty(),
             "Should have success edge from try body"
         );
+    }
+
+    #[test]
+    fn test_try_except_exception_edges_remap_to_expanded_handlers() {
+        let source = r#"fn run(input: [], output: [result]):
+    try:
+        number = @provide_value()
+        @explode_custom(value=number)
+    except CustomError:
+        result = @cleanup(label="custom_fallback")
+    return result"#;
+
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        // Every exception edge should point to a node that exists in the expanded DAG.
+        for edge in dag.edges.iter().filter(|e| e.exception_types.is_some()) {
+            assert!(
+                dag.nodes.contains_key(&edge.target),
+                "exception edge target should exist after expansion: {}",
+                edge.target
+            );
+        }
+
+        // All nodes within the try body should route exceptions to a handler.
+        for node_id in dag
+            .nodes
+            .values()
+            .filter(|n| n.function_name.as_deref() == Some("__try_body_1__"))
+            .map(|n| n.id.as_str())
+        {
+            let has_handler_edge = dag.edges.iter().any(|e| {
+                e.source == node_id
+                    && e.exception_types.is_some()
+                    && dag.nodes.contains_key(&e.target)
+            });
+            assert!(
+                has_handler_edge,
+                "try body node {} should have an exception handler edge",
+                node_id
+            );
+        }
     }
 
     #[test]
