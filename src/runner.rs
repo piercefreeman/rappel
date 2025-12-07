@@ -3863,4 +3863,59 @@ mod tests {
         assert_eq!(inbox_writes[0].value, JsonValue::Number(42.into()));
         assert_eq!(inbox_writes[0].source_node_id, "run_input_1");
     }
+
+    #[test]
+    fn test_seed_scope_and_inbox_preserves_input_types_and_writes_inbox() {
+        use crate::dag::{DAG, DAGEdge, DAGNode};
+
+        let mut dag = DAG {
+            nodes: HashMap::new(),
+            edges: Vec::new(),
+            entry_node: Some("run_input_1".to_string()),
+        };
+
+        let input_node = DAGNode::new(
+            "run_input_1".to_string(),
+            "input".to_string(),
+            "".to_string(),
+        )
+        .with_input(vec!["n".to_string()])
+        .with_function_name("run");
+        dag.nodes.insert("run_input_1".to_string(), input_node);
+
+        let action_node = DAGNode::new(
+            "action_2".to_string(),
+            "action_call".to_string(),
+            "@compute()".to_string(),
+        );
+        dag.nodes.insert("action_2".to_string(), action_node);
+
+        // DataFlow edge from the input node to the action for variable "n".
+        dag.edges.push(DAGEdge::data_flow(
+            "run_input_1".to_string(),
+            "action_2".to_string(),
+            "n",
+        ));
+
+        let mut initial_inputs = HashMap::new();
+        initial_inputs.insert("n".to_string(), JsonValue::Number(7.into()));
+
+        let instance_id = WorkflowInstanceId(Uuid::new_v4());
+        let (scope, inbox_writes) =
+            DAGRunner::seed_scope_and_inbox(&initial_inputs, &dag, "run_input_1", instance_id);
+
+        // Scope should preserve numeric types instead of stringifying JSON inputs.
+        assert_eq!(
+            scope.get("n"),
+            Some(&JsonValue::Number(7.into())),
+            "initial scope should keep the original numeric value"
+        );
+
+        // Inbox writes should include the initial input flowing to downstream nodes.
+        assert_eq!(inbox_writes.len(), 1);
+        assert_eq!(inbox_writes[0].target_node_id, "action_2");
+        assert_eq!(inbox_writes[0].variable_name, "n");
+        assert_eq!(inbox_writes[0].value, JsonValue::Number(7.into()));
+        assert_eq!(inbox_writes[0].source_node_id, "run_input_1");
+    }
 }

@@ -999,6 +999,16 @@ impl DAGConverter {
         // Collect variable modifications (definitions) across all nodes.
         let mut var_modifications: HashMap<String, Vec<String>> = HashMap::new();
         for (node_id, node) in dag.nodes.iter() {
+            if node.is_input {
+                if let Some(ref inputs) = node.io_vars {
+                    for input in inputs {
+                        var_modifications
+                            .entry(input.clone())
+                            .or_default()
+                            .push(node_id.clone());
+                    }
+                }
+            }
             if let Some(ref target) = node.target {
                 var_modifications
                     .entry(target.clone())
