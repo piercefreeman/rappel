@@ -1021,6 +1021,217 @@ class IRBuilder(ast.NodeVisitor):
                 assigned.update(stmt.assignment.targets)
         return assigned
 
+    def _collect_assigned_vars_in_order(self, stmts: List[ir.Statement]) -> list[str]:
+        """Collect assigned variable names in statement order (deduplicated)."""
+        assigned: list[str] = []
+        seen: set[str] = set()
+
+        for stmt in stmts:
+            if stmt.HasField("assignment"):
+                for target in stmt.assignment.targets:
+                    if target not in seen:
+                        seen.add(target)
+                        assigned.append(target)
+
+            if stmt.HasField("conditional"):
+                cond = stmt.conditional
+                if cond.HasField("if_branch") and cond.if_branch.HasField("body"):
+                    for target in self._collect_assigned_vars_in_order(
+                        list(cond.if_branch.body.statements)
+                    ):
+                        if target not in seen:
+                            seen.add(target)
+                            assigned.append(target)
+                for elif_branch in cond.elif_branches:
+                    if elif_branch.HasField("body"):
+                        for target in self._collect_assigned_vars_in_order(
+                            list(elif_branch.body.statements)
+                        ):
+                            if target not in seen:
+                                seen.add(target)
+                                assigned.append(target)
+                if cond.HasField("else_branch") and cond.else_branch.HasField("body"):
+                    for target in self._collect_assigned_vars_in_order(
+                        list(cond.else_branch.body.statements)
+                    ):
+                        if target not in seen:
+                            seen.add(target)
+                            assigned.append(target)
+
+            if stmt.HasField("for_loop") and stmt.for_loop.HasField("body"):
+                for target in self._collect_assigned_vars_in_order(
+                    list(stmt.for_loop.body.statements)
+                ):
+                    if target not in seen:
+                        seen.add(target)
+                        assigned.append(target)
+
+            if stmt.HasField("try_except"):
+                try_body = stmt.try_except.try_body
+                if try_body.HasField("span"):
+                    for target in self._collect_assigned_vars_in_order(list(try_body.statements)):
+                        if target not in seen:
+                            seen.add(target)
+                            assigned.append(target)
+                for handler in stmt.try_except.handlers:
+                    if handler.HasField("body"):
+                        for target in self._collect_assigned_vars_in_order(
+                            list(handler.body.statements)
+                        ):
+                            if target not in seen:
+                                seen.add(target)
+                                assigned.append(target)
+
+        return assigned
+
+    def _collect_variables_from_single_call_body(self, body: ir.SingleCallBody) -> list[str]:
+        vars_found: list[str] = []
+        seen: set[str] = set()
+
+        if body.HasField("call"):
+            call = body.call
+            if call.HasField("action"):
+                for kwarg in call.action.kwargs:
+                    for var in self._collect_variables_from_expr(kwarg.value):
+                        if var not in seen:
+                            seen.add(var)
+                            vars_found.append(var)
+            elif call.HasField("function"):
+                for kwarg in call.function.kwargs:
+                    for var in self._collect_variables_from_expr(kwarg.value):
+                        if var not in seen:
+                            seen.add(var)
+                            vars_found.append(var)
+
+        for stmt in body.statements:
+            for var in self._collect_variables_from_statements([stmt]):
+                if var not in seen:
+                    seen.add(var)
+                    vars_found.append(var)
+
+        return vars_found
+
+    def _collect_variables_from_statements(self, stmts: List[ir.Statement]) -> list[str]:
+        """Collect variable references from statements in encounter order."""
+        vars_found: list[str] = []
+        seen: set[str] = set()
+
+        for stmt in stmts:
+            if stmt.HasField("assignment") and stmt.assignment.HasField("value"):
+                for var in self._collect_variables_from_expr(stmt.assignment.value):
+                    if var not in seen:
+                        seen.add(var)
+                        vars_found.append(var)
+
+            if stmt.HasField("return_stmt") and stmt.return_stmt.HasField("value"):
+                for var in self._collect_variables_from_expr(stmt.return_stmt.value):
+                    if var not in seen:
+                        seen.add(var)
+                        vars_found.append(var)
+
+            if stmt.HasField("action_call"):
+                expr = ir.Expr(action_call=stmt.action_call, span=stmt.span)
+                for var in self._collect_variables_from_expr(expr):
+                    if var not in seen:
+                        seen.add(var)
+                        vars_found.append(var)
+
+            if stmt.HasField("expr_stmt"):
+                for var in self._collect_variables_from_expr(stmt.expr_stmt.expr):
+                    if var not in seen:
+                        seen.add(var)
+                        vars_found.append(var)
+
+            if stmt.HasField("conditional"):
+                cond = stmt.conditional
+                if cond.HasField("if_branch"):
+                    if cond.if_branch.HasField("condition"):
+                        for var in self._collect_variables_from_expr(cond.if_branch.condition):
+                            if var not in seen:
+                                seen.add(var)
+                                vars_found.append(var)
+                    if cond.if_branch.HasField("body"):
+                        for var in self._collect_variables_from_single_call_body(
+                            cond.if_branch.body
+                        ):
+                            if var not in seen:
+                                seen.add(var)
+                                vars_found.append(var)
+                for elif_branch in cond.elif_branches:
+                    if elif_branch.HasField("condition"):
+                        for var in self._collect_variables_from_expr(elif_branch.condition):
+                            if var not in seen:
+                                seen.add(var)
+                                vars_found.append(var)
+                    if elif_branch.HasField("body"):
+                        for var in self._collect_variables_from_single_call_body(elif_branch.body):
+                            if var not in seen:
+                                seen.add(var)
+                                vars_found.append(var)
+                if cond.HasField("else_branch") and cond.else_branch.HasField("body"):
+                    for var in self._collect_variables_from_single_call_body(cond.else_branch.body):
+                        if var not in seen:
+                            seen.add(var)
+                            vars_found.append(var)
+
+            if stmt.HasField("for_loop"):
+                fl = stmt.for_loop
+                if fl.HasField("iterable"):
+                    for var in self._collect_variables_from_expr(fl.iterable):
+                        if var not in seen:
+                            seen.add(var)
+                            vars_found.append(var)
+                if fl.HasField("body"):
+                    for var in self._collect_variables_from_single_call_body(fl.body):
+                        if var not in seen:
+                            seen.add(var)
+                            vars_found.append(var)
+
+            if stmt.HasField("try_except"):
+                te = stmt.try_except
+                if te.HasField("try_body"):
+                    for var in self._collect_variables_from_single_call_body(te.try_body):
+                        if var not in seen:
+                            seen.add(var)
+                            vars_found.append(var)
+                for handler in te.handlers:
+                    if handler.HasField("body"):
+                        for var in self._collect_variables_from_single_call_body(handler.body):
+                            if var not in seen:
+                                seen.add(var)
+                                vars_found.append(var)
+
+            if stmt.HasField("parallel_block"):
+                for call in stmt.parallel_block.calls:
+                    if call.HasField("action"):
+                        for kwarg in call.action.kwargs:
+                            for var in self._collect_variables_from_expr(kwarg.value):
+                                if var not in seen:
+                                    seen.add(var)
+                                    vars_found.append(var)
+                    elif call.HasField("function"):
+                        for kwarg in call.function.kwargs:
+                            for var in self._collect_variables_from_expr(kwarg.value):
+                                if var not in seen:
+                                    seen.add(var)
+                                    vars_found.append(var)
+
+            if stmt.HasField("spread_action"):
+                spread = stmt.spread_action
+                if spread.HasField("collection"):
+                    for var in self._collect_variables_from_expr(spread.collection):
+                        if var not in seen:
+                            seen.add(var)
+                            vars_found.append(var)
+                if spread.HasField("action"):
+                    for kwarg in spread.action.kwargs:
+                        for var in self._collect_variables_from_expr(kwarg.value):
+                            if var not in seen:
+                                seen.add(var)
+                                vars_found.append(var)
+
+        return vars_found
+
     def _visit_try(self, node: ast.Try) -> List[ir.Statement]:
         """Convert try/except to IR with body wrapping transformation.
 
@@ -1053,10 +1264,33 @@ class IRBuilder(ast.NodeVisitor):
             try_body.extend(stmts)
 
         # ALWAYS wrap try body for variable isolation
-        in_scope_vars = self._collect_assigned_vars(try_body)
-        modified_vars = self._detect_accumulator_targets(try_body, in_scope_vars)
+        assigned_vars_ordered = self._collect_assigned_vars_in_order(try_body)
+        assigned_vars_set = set(assigned_vars_ordered)
+        free_vars = [
+            var
+            for var in self._collect_variables_from_statements(try_body)
+            if var not in assigned_vars_set
+        ]
+        modified_vars = self._detect_accumulator_targets(try_body, assigned_vars_set)
+
+        # Inputs need free variables plus any accumulator-style mutations.
+        try_inputs = []
+        for var in free_vars + modified_vars:
+            if var not in try_inputs:
+                try_inputs.append(var)
+
+        # Outputs include all assigned variables plus accumulator targets.
+        try_outputs: list[str] = []
+        for var in assigned_vars_ordered + modified_vars:
+            if var not in try_outputs:
+                try_outputs.append(var)
+
         try_body = self._wrap_body_as_function(
-            try_body, "try_body", node, modified_vars=modified_vars
+            try_body,
+            "try_body",
+            node,
+            inputs=try_inputs,
+            modified_vars=try_outputs,
         )
 
         # Build exception handlers (with wrapping if needed)
@@ -1078,10 +1312,31 @@ class IRBuilder(ast.NodeVisitor):
                 handler_body.extend(stmts)
 
             # ALWAYS wrap handler body for variable isolation
-            in_scope_vars = self._collect_assigned_vars(handler_body)
-            modified_vars = self._detect_accumulator_targets(handler_body, in_scope_vars)
+            assigned_vars_ordered = self._collect_assigned_vars_in_order(handler_body)
+            assigned_vars_set = set(assigned_vars_ordered)
+            free_vars = [
+                var
+                for var in self._collect_variables_from_statements(handler_body)
+                if var not in assigned_vars_set
+            ]
+            modified_vars = self._detect_accumulator_targets(handler_body, assigned_vars_set)
+
+            handler_inputs: list[str] = []
+            for var in free_vars + modified_vars:
+                if var not in handler_inputs:
+                    handler_inputs.append(var)
+
+            handler_outputs: list[str] = []
+            for var in assigned_vars_ordered + modified_vars:
+                if var not in handler_outputs:
+                    handler_outputs.append(var)
+
             handler_body = self._wrap_body_as_function(
-                handler_body, "except_handler", node, modified_vars=modified_vars
+                handler_body,
+                "except_handler",
+                node,
+                inputs=handler_inputs,
+                modified_vars=handler_outputs,
             )
 
             except_handler = ir.ExceptHandler(

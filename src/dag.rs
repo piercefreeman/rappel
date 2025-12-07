@@ -552,6 +552,7 @@ impl DAGConverter {
 
         let mut dag = self.expand_functions(&unexpanded, entry_fn);
         self.remap_exception_targets(&mut dag);
+        self.add_global_data_flow_edges(&mut dag);
         dag
     }
 
@@ -938,6 +939,167 @@ impl DAGConverter {
         }
 
         order
+    }
+
+    /// Recompute data flow edges across the expanded DAG (all functions).
+    ///
+    /// Function expansion can eliminate the original per-function data flow edges.
+    /// This pass rebuilds data flow edges globally so variables defined inside
+    /// expanded helper functions (like implicit try/except bodies) are available
+    /// to downstream nodes in the caller.
+    fn add_global_data_flow_edges(&self, dag: &mut DAG) {
+        // Remove existing data flow edges to avoid duplicates.
+        dag.edges.retain(|e| e.edge_type != EdgeType::DataFlow);
+
+        // Build topological order for all nodes (state machine edges only, skip loop-back).
+        let node_ids: HashSet<String> = dag.nodes.keys().cloned().collect();
+        let order = {
+            let mut in_degree: HashMap<String, usize> =
+                node_ids.iter().map(|n| (n.clone(), 0)).collect();
+            let mut adj: HashMap<String, Vec<String>> =
+                node_ids.iter().map(|n| (n.clone(), Vec::new())).collect();
+
+            for edge in dag.get_state_machine_edges() {
+                if edge.is_loop_back {
+                    continue;
+                }
+                if node_ids.contains(&edge.source) && node_ids.contains(&edge.target) {
+                    adj.get_mut(&edge.source)
+                        .map(|v| v.push(edge.target.clone()));
+                    in_degree.entry(edge.target.clone()).and_modify(|d| *d += 1);
+                }
+            }
+
+            let mut queue: Vec<String> = in_degree
+                .iter()
+                .filter(|(_, deg)| **deg == 0)
+                .map(|(n, _)| n.clone())
+                .collect();
+            let mut order = Vec::new();
+
+            while let Some(node) = queue.pop() {
+                order.push(node.clone());
+                if let Some(neighbors) = adj.get(&node) {
+                    for neighbor in neighbors {
+                        if let Some(deg) = in_degree.get_mut(neighbor) {
+                            if *deg > 0 {
+                                *deg -= 1;
+                                if *deg == 0 {
+                                    queue.push(neighbor.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            order
+        };
+
+        // Collect variable modifications (definitions) across all nodes.
+        let mut var_modifications: HashMap<String, Vec<String>> = HashMap::new();
+        for (node_id, node) in dag.nodes.iter() {
+            if let Some(ref target) = node.target {
+                var_modifications
+                    .entry(target.clone())
+                    .or_default()
+                    .push(node_id.clone());
+            }
+            if let Some(ref targets) = node.targets {
+                for t in targets {
+                    var_modifications
+                        .entry(t.clone())
+                        .or_default()
+                        .push(node_id.clone());
+                }
+            }
+        }
+
+        // Helper: does a node use a variable?
+        let uses_var = |node: &DAGNode, var_name: &str| -> bool {
+            if let Some(ref kwargs) = node.kwargs {
+                for value in kwargs.values() {
+                    if value == &format!("${}", var_name) {
+                        return true;
+                    }
+                }
+            }
+
+            if node.node_type == "for_loop" {
+                if let Some(ref collection) = node.loop_collection {
+                    if collection == var_name
+                        || collection == &format!("${}", var_name)
+                        || collection.strip_prefix('$') == Some(var_name)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            false
+        };
+
+        // Add data flow edges from each modification to downstream uses until next modification.
+        let mut seen_edges: HashSet<(String, String, String)> = HashSet::new();
+        for (var_name, modifications) in var_modifications {
+            for (i, mod_node) in modifications.iter().enumerate() {
+                // Find position of this modification in execution order.
+                let Some(mod_pos) = order.iter().position(|n| n == mod_node) else {
+                    continue;
+                };
+                let next_mod = modifications.get(i + 1);
+
+                for (pos, node_id) in order.iter().enumerate() {
+                    if pos <= mod_pos {
+                        continue;
+                    }
+
+                    if let Some(next) = next_mod {
+                        if node_id == next {
+                            // Still allow edge to the next modification if it uses the var.
+                            if let Some(node) = dag.nodes.get(node_id) {
+                                if uses_var(node, &var_name) {
+                                    let key = (mod_node.clone(), node_id.clone(), var_name.clone());
+                                    if seen_edges.insert(key.clone()) {
+                                        dag.edges.push(DAGEdge {
+                                            source: mod_node.clone(),
+                                            target: node_id.clone(),
+                                            edge_type: EdgeType::DataFlow,
+                                            condition: None,
+                                            variable: Some(var_name.clone()),
+                                            guard_expr: None,
+                                            exception_types: None,
+                                            is_loop_back: false,
+                                            guard_string: None,
+                                        });
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+
+                    if let Some(node) = dag.nodes.get(node_id) {
+                        if uses_var(node, &var_name) {
+                            let key = (mod_node.clone(), node_id.clone(), var_name.clone());
+                            if seen_edges.insert(key.clone()) {
+                                dag.edges.push(DAGEdge {
+                                    source: mod_node.clone(),
+                                    target: node_id.clone(),
+                                    edge_type: EdgeType::DataFlow,
+                                    condition: None,
+                                    variable: Some(var_name.clone()),
+                                    guard_expr: None,
+                                    exception_types: None,
+                                    is_loop_back: false,
+                                    guard_string: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Convert a function definition into an isolated subgraph

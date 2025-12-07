@@ -2355,6 +2355,53 @@ class TestTryExceptWithMultipleCalls:
         assert len(program.functions) > 1, "Should have implicit function for wrapped body"
 
 
+class TestTryExceptStatefulOutputs:
+    """Ensure try/except bodies capture and return mutated variables."""
+
+    def _get_function_by_prefix(self, program: ir.Program, prefix: str) -> ir.FunctionDef:
+        for fn in program.functions:
+            if fn.name.startswith(prefix):
+                return fn
+        msg = f"implicit function with prefix {prefix} not found"
+        raise AssertionError(msg)
+
+    def test_try_body_outputs_and_call_targets(self) -> None:
+        """Try body should surface mutated vars via targets/outputs."""
+        from tests.fixtures_try_except.try_stateful_outputs import TryStatefulOutputsWorkflow
+
+        program = TryStatefulOutputsWorkflow.workflow_ir()
+
+        run_fn = next(fn for fn in program.functions if fn.name == "run")
+        try_stmt = next(
+            stmt for stmt in run_fn.body.statements if stmt.HasField("try_except")
+        ).try_except
+
+        # try body should assign its outputs via SingleCallBody targets
+        assert list(try_stmt.try_body.targets) == ["value", "message"]
+
+        # implicit try body function should declare inputs/outputs explicitly
+        try_fn = self._get_function_by_prefix(program, "__try_body_")
+        assert set(try_fn.io.inputs) >= {"should_fail", "message"}
+        assert set(try_fn.io.outputs) == {"value", "message"}
+
+        # except handler should also return the mutated variables
+        handler = try_stmt.handlers[0]
+        assert set(handler.body.targets) == {"recovered", "message"}
+        handler_fn = self._get_function_by_prefix(program, "__except_handler_")
+        assert set(handler_fn.io.outputs) == {"recovered", "message"}
+
+        # Final action should receive recovered/message kwargs (no missing inputs)
+        build_action = next(
+            stmt
+            for stmt in run_fn.body.statements
+            if stmt.HasField("assignment")
+            and stmt.assignment.value.HasField("action_call")
+            and stmt.assignment.value.action_call.action_name == "finalize_result"
+        ).assignment.value.action_call
+        kwarg_names = {kw.name for kw in build_action.kwargs}
+        assert {"attempted", "recovered", "message"} <= kwarg_names
+
+
 class TestUnsupportedPatternValidation:
     """Test that unsupported patterns raise UnsupportedPatternError with helpful messages."""
 

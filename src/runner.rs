@@ -769,6 +769,7 @@ impl WorkQueueHandler {
         let mut plan = execute_inline_subgraph(
             node_id,
             aggregated,
+            &HashMap::new(),
             &subgraph,
             &existing_inbox,
             &dag,
@@ -852,6 +853,7 @@ impl WorkQueueHandler {
         let mut plan = execute_inline_subgraph(
             node_id,
             sleep_result,
+            &HashMap::new(),
             &subgraph,
             &existing_inbox,
             &dag,
@@ -1560,6 +1562,7 @@ impl DAGRunner {
                             if let Err(e) = Self::process_completion_unified(
                                 &handler.db,
                                 &dag_cache,
+                                &instance_contexts,
                                 &in_flight,
                                 &metrics,
                                 WorkflowInstanceId(instance_id),
@@ -1631,6 +1634,7 @@ impl DAGRunner {
     async fn process_completion_unified(
         db: &Database,
         dag_cache: &DAGCache,
+        instance_contexts: &Arc<RwLock<HashMap<Uuid, Scope>>>,
         in_flight: &InFlightAction,
         metrics: &RoundTripMetrics,
         instance_id: WorkflowInstanceId,
@@ -1653,6 +1657,15 @@ impl DAGRunner {
 
         // Parse spread index if present
         let (base_node_id, spread_index) = Self::parse_spread_node_id(node_id);
+
+        // Merge initial workflow inputs into the inline scope so downstream actions can
+        // access them even if no intermediate node has rewritten them into the inbox.
+        let initial_scope = instance_contexts
+            .read()
+            .await
+            .get(&instance_id.0)
+            .cloned()
+            .unwrap_or_default();
 
         // Parse result from response payload
         let result: JsonValue = if metrics.response_payload.is_empty() {
@@ -1693,6 +1706,7 @@ impl DAGRunner {
         let mut plan = execute_inline_subgraph(
             base_node_id,
             result,
+            &initial_scope,
             &subgraph,
             &existing_inbox,
             &dag,
@@ -1782,6 +1796,7 @@ impl DAGRunner {
         let mut plan = execute_inline_subgraph(
             node_id,
             aggregated,
+            &HashMap::new(),
             &subgraph,
             &existing_inbox,
             &dag,
@@ -2898,6 +2913,15 @@ impl DAGRunner {
                     // Add result to scope if this node has a target
                     if let Some(ref target) = node.target {
                         scope.insert(target.clone(), inline_result.clone());
+                        // Propagate inline defaults to downstream inboxes so later actions receive them
+                        Self::collect_inbox_writes_for_node(
+                            &node.id,
+                            target,
+                            &inline_result,
+                            &dag,
+                            instance_id,
+                            &mut inbox_writes_to_commit,
+                        );
                     }
                     // Also handle multiple targets (tuple unpacking)
                     if let Some(ref targets) = node.targets
@@ -2905,6 +2929,30 @@ impl DAGRunner {
                     {
                         scope.insert(targets[0].clone(), inline_result.clone());
                         // For multiple targets, the inline_result would be an array
+                        Self::collect_inbox_writes_for_node(
+                            &node.id,
+                            &targets[0],
+                            &inline_result,
+                            &dag,
+                            instance_id,
+                            &mut inbox_writes_to_commit,
+                        );
+                    } else if let Some(ref targets) = node.targets
+                        && targets.len() > 1
+                        && let Some(items) = inline_result.as_array()
+                    {
+                        for (idx, target) in targets.iter().enumerate() {
+                            let value = items.get(idx).cloned().unwrap_or(JsonValue::Null);
+                            scope.insert(target.clone(), value.clone());
+                            Self::collect_inbox_writes_for_node(
+                                &node.id,
+                                target,
+                                &value,
+                                &dag,
+                                instance_id,
+                                &mut inbox_writes_to_commit,
+                            );
+                        }
                     }
 
                     let inline_successors = helper.get_ready_successors(&node_id, None);

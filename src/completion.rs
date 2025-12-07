@@ -474,9 +474,11 @@ pub enum CompletionError {
 /// are executed and have their frontiers processed.
 ///
 /// Returns a CompletionPlan ready to be executed as a single transaction.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_inline_subgraph(
     completed_node_id: &str,
     completed_result: JsonValue,
+    initial_scope: &HashMap<String, JsonValue>,
     subgraph: &SubgraphAnalysis,
     existing_inbox: &HashMap<String, HashMap<String, JsonValue>>,
     dag: &DAG,
@@ -487,7 +489,7 @@ pub fn execute_inline_subgraph(
     let helper = DAGHelper::new(dag);
 
     // Initialize inline scope with completed node's result
-    let mut inline_scope: InlineScope = HashMap::new();
+    let mut inline_scope: InlineScope = initial_scope.clone();
     if let Some(node) = dag.nodes.get(completed_node_id)
         && let Some(ref target) = node.target
     {
@@ -881,14 +883,34 @@ pub fn execute_inline_subgraph(
                         dag,
                         &mut loop_inbox,
                     );
+                    // Ensure inline scope values (e.g., accumulators) are persisted even if
+                    // DataFlow edges were missing or not annotated.
+                    for (var, val) in &inline_scope {
+                        loop_inbox.insert(var.clone(), val.clone());
+                    }
 
                     debug!(
                         for_loop_id = %frontier.node_id,
                         loop_i_var = %loop_i_var,
                         current_index = current_index,
                         is_loop_back = is_loop_back,
-                        "for_loop frontier: updating loop index"
+                            "for_loop frontier: updating loop index"
                     );
+
+                    // Persist the updated loop variables (including any mutated accumulators)
+                    // back to the for_loop's inbox so subsequent iterations and break
+                    // successors see the latest values.
+                    loop_inbox.insert(loop_i_var.clone(), JsonValue::Number(current_index.into()));
+                    for (var_name, value) in &loop_inbox {
+                        plan.inbox_writes.push(InboxWrite {
+                            instance_id,
+                            target_node_id: frontier.node_id.clone(),
+                            variable_name: var_name.clone(),
+                            value: value.clone(),
+                            source_node_id: completed_node_id.to_string(),
+                            spread_index: None,
+                        });
+                    }
 
                     // For loop-back iterations, reset the for_loop's readiness before incrementing
                     if is_loop_back {
@@ -1500,10 +1522,12 @@ fn workflow(input: [x], output: [result]):
         let result = serde_json::json!("hello world");
         let existing_inbox = HashMap::new();
         let instance_id = WorkflowInstanceId(Uuid::new_v4());
+        let initial_scope: HashMap<String, JsonValue> = HashMap::new();
 
         let plan = execute_inline_subgraph(
             &action_node.id,
             result,
+            &initial_scope,
             &subgraph,
             &existing_inbox,
             &dag,

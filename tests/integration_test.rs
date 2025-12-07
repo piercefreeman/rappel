@@ -26,6 +26,7 @@ const EXCEPTION_CUSTOM_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_exception_custom.py");
 const EXCEPTION_WITH_SUCCESS_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_exception_with_success.py");
+const ERROR_HANDLING_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_error_handling.py");
 const EXCEPTION_WITH_SUCCESS_FAILURE_SCRIPT: &str = r#"
 import asyncio
 import os
@@ -38,6 +39,34 @@ async def main():
     # Trigger the failure branch so exception handling is exercised.
     result = await wf.run(should_fail=True)
     print(f"Registration result (should_fail=True): {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_ERROR_HANDLING_FAILURE_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_error_handling import ErrorHandlingWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ErrorHandlingWorkflow()
+    result = await wf.run(should_fail=True)
+    print(f"Registration result (should_fail=True): {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_ERROR_HANDLING_SUCCESS_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_error_handling import ErrorHandlingWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ErrorHandlingWorkflow()
+    result = await wf.run(should_fail=False)
+    print(f"Registration result (should_fail=False): {result}")
 
 asyncio.run(main())
 "#;
@@ -638,6 +667,156 @@ async fn exception_with_success_workflow_handles_failure_branch() -> Result<()> 
         .ok_or_else(|| anyhow::anyhow!("missing message in result"))?;
     assert!(
         message.contains("Recovered from error"),
+        "unexpected message: {message}"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Error Handling Workflow Test (BaseModel result)
+// =============================================================================
+
+/// Reproduces the example_app error-handling workflow that returns a Pydantic model.
+///
+/// With should_fail=True, risky_action raises, recovery_action runs, and the final
+/// build_error_result action returns an ErrorResult BaseModel. This ensures BaseModel
+/// serialization works end-to-end in failure branches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn error_handling_workflow_returns_basemodel_on_failure() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_error_handling.py",
+                ERROR_HANDLING_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_ERROR_HANDLING_FAILURE_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "errorhandlingworkflow",
+        user_module: "integration_error_handling",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing stored result payload"))?;
+
+    let arguments = proto::WorkflowArguments::decode(&stored_payload[..])?;
+    let result_value = arguments
+        .arguments
+        .iter()
+        .find(|arg| arg.key == "result")
+        .and_then(|arg| arg.value.as_ref())
+        .map(proto_value_to_json)
+        .ok_or_else(|| anyhow::anyhow!("missing result value"))?;
+
+    let result_obj = result_value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("result is not an object: {result_value}"))?;
+
+    assert_eq!(
+        result_obj.get("__class__"),
+        Some(&serde_json::Value::String("ErrorResult".to_string()))
+    );
+    assert_eq!(
+        result_obj.get("__module__"),
+        Some(&serde_json::Value::String(
+            "integration_error_handling".to_string()
+        ))
+    );
+    assert_eq!(
+        result_obj.get("attempted"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    assert_eq!(
+        result_obj.get("recovered"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    let message = result_obj
+        .get("message")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing message in result"))?;
+    assert!(
+        message.contains("Recovered from error"),
+        "unexpected message: {message}"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Ensure the BaseModel result also works on the success branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn error_handling_workflow_returns_basemodel_on_success() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_error_handling.py",
+                ERROR_HANDLING_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_ERROR_HANDLING_SUCCESS_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "errorhandlingworkflow",
+        user_module: "integration_error_handling",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing stored result payload"))?;
+
+    let arguments = proto::WorkflowArguments::decode(&stored_payload[..])?;
+    let result_value = arguments
+        .arguments
+        .iter()
+        .find(|arg| arg.key == "result")
+        .and_then(|arg| arg.value.as_ref())
+        .map(proto_value_to_json)
+        .ok_or_else(|| anyhow::anyhow!("missing result value"))?;
+
+    let result_obj = result_value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("result is not an object: {result_value}"))?;
+
+    assert_eq!(
+        result_obj.get("__class__"),
+        Some(&serde_json::Value::String("ErrorResult".to_string()))
+    );
+    assert_eq!(
+        result_obj.get("recovered"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    let message = result_obj
+        .get("message")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing message in result"))?;
+    assert!(
+        message.contains("Success path:"),
         "unexpected message: {message}"
     );
 
