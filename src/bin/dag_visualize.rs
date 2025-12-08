@@ -426,9 +426,9 @@ fn generate_html(data: &VisualizationData) -> Result<String> {
         }}
 
         .edge-data {{
-            stroke: #9333ea;
-            stroke-width: 1.5;
-            stroke-dasharray: 5, 5;
+            stroke: #a855f7;
+            stroke-width: 2;
+            stroke-dasharray: 6, 4;
             fill: none;
             opacity: 0;
             transition: opacity 0.2s ease;
@@ -436,7 +436,19 @@ fn generate_html(data: &VisualizationData) -> Result<String> {
         }}
 
         .edge-data.visible {{
-            opacity: 0.7;
+            opacity: 1;
+        }}
+
+        .edge-label {{
+            font-family: 'SF Mono', monospace;
+            font-size: 10px;
+            fill: #c084fc;
+            font-weight: 500;
+            transition: opacity 0.2s ease;
+        }}
+
+        .edge-label.visible {{
+            opacity: 1 !important;
         }}
 
         .edge-loop-back {{
@@ -483,12 +495,12 @@ fn generate_html(data: &VisualizationData) -> Result<String> {
         }}
 
         .legend-color.data {{
-            background: #9333ea;
+            background: #a855f7;
             background: repeating-linear-gradient(
                 90deg,
-                #9333ea,
-                #9333ea 5px,
-                transparent 5px,
+                #a855f7,
+                #a855f7 6px,
+                transparent 6px,
                 transparent 10px
             );
         }}
@@ -610,7 +622,7 @@ fn generate_html(data: &VisualizationData) -> Result<String> {
                                 <polygon points="0 0, 10 3.5, 0 7" fill="#4b5563"/>
                             </marker>
                             <marker id="arrowhead-data" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-                                <polygon points="0 0, 10 3.5, 0 7" fill="#9333ea"/>
+                                <polygon points="0 0, 10 3.5, 0 7" fill="#a855f7"/>
                             </marker>
                         </defs>
                     </svg>
@@ -732,6 +744,7 @@ fn generate_html(data: &VisualizationData) -> Result<String> {
 
         // Layout parameters
         const padding = 40;
+        const topPadding = 150;  // Extra space at top for data flow arcs
         const columnGap = 260;
         const rowGap = 100;
         const nodeWidth = 180;
@@ -745,14 +758,14 @@ fn generate_html(data: &VisualizationData) -> Result<String> {
         levels.forEach((levelNodes, depth) => {{
             levelNodes.forEach((node, index) => {{
                 const x = padding + depth * columnGap;
-                const y = padding + index * rowGap;
+                const y = topPadding + index * rowGap;
                 positions.set(node.id, {{ x, y, cx: x + nodeWidth / 2, cy: y + nodeHeight / 2 }});
                 maxX = Math.max(maxX, x + nodeWidth);
                 maxY = Math.max(maxY, y + nodeHeight);
             }});
         }});
 
-        // Set SVG size
+        // Set SVG size (extra space at top for data flow arcs)
         svg.setAttribute('width', maxX + padding);
         svg.setAttribute('height', maxY + padding);
         container.style.minWidth = (maxX + padding) + 'px';
@@ -761,27 +774,53 @@ fn generate_html(data: &VisualizationData) -> Result<String> {
         // Draw edges
         const edgeElements = new Map();
 
+        // Track data flow edge indices for vertical offset
+        const dataFlowIndex = new Map();
+
         edges.forEach((edge, idx) => {{
             const start = positions.get(edge.source);
             const end = positions.get(edge.target);
             if (!start || !end) return;
 
             const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            const isDataFlow = edge.edge_type === 'data_flow';
 
             // Calculate path
             let d;
-            if (edge.is_loop_back) {{
-                // Loop back: curve around
+            if (isDataFlow) {{
+                // Data flow edges: arc ABOVE the graph with variable heights
+                const edgeKey = `${{edge.source}}->${{edge.target}}`;
+                let offsetIdx = dataFlowIndex.get(edge.target) || 0;
+                dataFlowIndex.set(edge.target, offsetIdx + 1);
+
+                // Calculate arc height based on horizontal distance and index
+                const dx = Math.abs(end.cx - start.cx);
+                const baseArcHeight = Math.max(80, dx * 0.3);
+                const arcHeight = baseArcHeight + (offsetIdx * 25);
+
+                // Start from top of source node, end at top of target node
+                const startX = start.cx;
+                const startY = start.y - 5;
+                const endX = end.cx;
+                const endY = end.y - 5;
+
+                // Control point for the arc (above both nodes)
+                const midX = (startX + endX) / 2;
+                const midY = Math.min(startY, endY) - arcHeight;
+
+                d = `M${{startX}},${{startY}} Q${{midX}},${{midY}} ${{endX}},${{endY}}`;
+            }} else if (edge.is_loop_back) {{
+                // Loop back: curve around below
                 const midY = Math.max(start.cy, end.cy) + 60;
                 d = `M${{start.cx + nodeWidth/2}},${{start.cy}}
                      Q${{start.cx + nodeWidth/2 + 40}},${{midY}} ${{end.cx}},${{end.cy + nodeHeight/2}}`;
             }} else if (start.x > end.x) {{
-                // Backward edge
+                // Backward control flow edge
                 const midY = Math.min(start.cy, end.cy) - 50;
                 d = `M${{start.cx - nodeWidth/2}},${{start.cy}}
                      Q${{(start.cx + end.cx)/2}},${{midY}} ${{end.cx + nodeWidth/2}},${{end.cy}}`;
             }} else {{
-                // Forward edge
+                // Forward control flow edge
                 const dx = end.cx - start.cx;
                 d = `M${{start.cx + nodeWidth/2}},${{start.cy}}
                      C${{start.cx + nodeWidth/2 + dx/3}},${{start.cy}}
@@ -791,10 +830,36 @@ fn generate_html(data: &VisualizationData) -> Result<String> {
 
             path.setAttribute('d', d);
 
-            if (edge.edge_type === 'data_flow') {{
+            if (isDataFlow) {{
                 path.classList.add('edge-data');
                 path.dataset.target = edge.target;
                 path.dataset.source = edge.source;
+                if (edge.variable) {{
+                    path.dataset.variable = edge.variable;
+                }}
+
+                // Add variable label on the arc
+                if (edge.variable) {{
+                    const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                    const offsetIdx = (dataFlowIndex.get(edge.target) || 1) - 1;
+                    const dx = Math.abs(end.cx - start.cx);
+                    const baseArcHeight = Math.max(80, dx * 0.3);
+                    const arcHeight = baseArcHeight + (offsetIdx * 25);
+                    const midX = (start.cx + end.cx) / 2;
+                    const midY = Math.min(start.y, end.y) - arcHeight - 5;
+
+                    label.setAttribute('x', midX);
+                    label.setAttribute('y', midY);
+                    label.setAttribute('text-anchor', 'middle');
+                    label.setAttribute('class', 'edge-label');
+                    label.textContent = edge.variable;
+                    label.style.opacity = '0';
+                    label.dataset.target = edge.target;
+                    svg.appendChild(label);
+
+                    if (!edgeElements.has(edge.target)) edgeElements.set(edge.target, []);
+                    edgeElements.get(edge.target).push(label);
+                }}
             }} else {{
                 path.classList.add('edge-control');
                 if (edge.is_loop_back) {{
@@ -804,7 +869,7 @@ fn generate_html(data: &VisualizationData) -> Result<String> {
 
             svg.appendChild(path);
 
-            if (edge.edge_type === 'data_flow') {{
+            if (isDataFlow) {{
                 if (!edgeElements.has(edge.target)) edgeElements.set(edge.target, []);
                 edgeElements.get(edge.target).push(path);
             }}
