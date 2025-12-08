@@ -630,20 +630,36 @@ class IRBuilder(ast.NodeVisitor):
         ast.copy_location(init_assign_ast, node)
         ast.fix_missing_locations(init_assign_ast)
 
-        # Build the append step: active_users = active_users + [elt]
-        append_assign_ast = ast.Assign(
-            targets=[ast.Name(id=target_name, ctx=ast.Store())],
-            value=ast.BinOp(
-                left=ast.Name(id=target_name, ctx=ast.Load()),
-                op=ast.Add(),
-                right=ast.List(elts=[copy.deepcopy(listcomp.elt)], ctx=ast.Load()),
-            ),
-            type_comment=None,
-        )
-        ast.copy_location(append_assign_ast, node.value)
-        ast.fix_missing_locations(append_assign_ast)
+        def _make_append_assignment(value_expr: ast.expr) -> ast.Assign:
+            append_assign = ast.Assign(
+                targets=[ast.Name(id=target_name, ctx=ast.Store())],
+                value=ast.BinOp(
+                    left=ast.Name(id=target_name, ctx=ast.Load()),
+                    op=ast.Add(),
+                    right=ast.List(elts=[copy.deepcopy(value_expr)], ctx=ast.Load()),
+                ),
+                type_comment=None,
+            )
+            ast.copy_location(append_assign, node.value)
+            ast.fix_missing_locations(append_assign)
+            return append_assign
 
-        loop_body: List[ast.stmt] = []
+        append_statements: List[ast.stmt] = []
+        if isinstance(listcomp.elt, ast.IfExp):
+            then_assign = _make_append_assignment(listcomp.elt.body)
+            else_assign = _make_append_assignment(listcomp.elt.orelse)
+            branch_if = ast.If(
+                test=copy.deepcopy(listcomp.elt.test),
+                body=[then_assign],
+                orelse=[else_assign],
+            )
+            ast.copy_location(branch_if, listcomp.elt)
+            ast.fix_missing_locations(branch_if)
+            append_statements.append(branch_if)
+        else:
+            append_statements.append(_make_append_assignment(listcomp.elt))
+
+        loop_body: List[ast.stmt] = append_statements
         if gen.ifs:
             condition: ast.expr
             if len(gen.ifs) == 1:
@@ -651,12 +667,10 @@ class IRBuilder(ast.NodeVisitor):
             else:
                 condition = ast.BoolOp(op=ast.And(), values=[copy.deepcopy(iff) for iff in gen.ifs])
                 ast.copy_location(condition, gen.ifs[0])
-            if_stmt = ast.If(test=condition, body=[append_assign_ast], orelse=[])
+            if_stmt = ast.If(test=condition, body=append_statements, orelse=[])
             ast.copy_location(if_stmt, gen.ifs[0])
             ast.fix_missing_locations(if_stmt)
-            loop_body.append(if_stmt)
-        else:
-            loop_body.append(append_assign_ast)
+            loop_body = [if_stmt]
 
         loop_ast = ast.For(
             target=copy.deepcopy(gen.target),
@@ -1005,7 +1019,7 @@ class IRBuilder(ast.NodeVisitor):
             vars_found.update(self._collect_variables_from_expr(expr.index.value))
             vars_found.update(self._collect_variables_from_expr(expr.index.index))
         elif expr.HasField("dot"):
-            vars_found.update(self._collect_variables_from_expr(expr.dot.value))
+            vars_found.update(self._collect_variables_from_expr(expr.dot.object))
         elif expr.HasField("function_call"):
             for kwarg in expr.function_call.kwargs:
                 vars_found.update(self._collect_variables_from_expr(kwarg.value))

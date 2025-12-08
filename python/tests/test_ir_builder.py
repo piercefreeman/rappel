@@ -1155,6 +1155,43 @@ class TestUnsupportedPatternDetection:
         assert "user" in for_loop.loop_vars, "Loop variable should match comprehension"
         assert "active_users" in for_loop.body.targets, "Accumulator target should be propagated"
 
+    def test_list_comprehension_ifexp_assignment_is_supported(self) -> None:
+        """Test: ternary expressions in list comprehensions expand into conditional IR."""
+        from tests.fixtures_comprehension.list_comprehension_ifexp import (
+            ListComprehensionIfExpWorkflow,
+        )
+
+        program = ListComprehensionIfExpWorkflow.workflow_ir()
+
+        for_loop = next(
+            (
+                stmt.for_loop
+                for fn in program.functions
+                for stmt in fn.body.statements
+                if stmt.HasField("for_loop")
+            ),
+            None,
+        )
+        assert for_loop is not None, "Expected for loop generated from list comprehension"
+        assert "statuses" in for_loop.body.targets, "Accumulator target should be detected"
+
+        for_body_fn = next(
+            (fn for fn in program.functions if fn.name.startswith("__for_body_")),
+            None,
+        )
+        assert for_body_fn is not None, "Expected implicit for_body function for comprehension"
+        conditional_stmt = next(
+            (
+                stmt.conditional
+                for stmt in for_body_fn.body.statements
+                if stmt.HasField("conditional")
+            ),
+            None,
+        )
+        assert conditional_stmt is not None, "Expected conditional derived from ternary expression"
+        assert "statuses" in conditional_stmt.if_branch.body.targets
+        assert conditional_stmt.else_branch.body.targets
+
     def test_delete_statement_raises_error(self) -> None:
         """Test: del statements raise error with recommendation."""
         import pytest
