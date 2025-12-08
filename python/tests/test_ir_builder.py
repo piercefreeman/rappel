@@ -1128,28 +1128,32 @@ class TestUnsupportedPatternDetection:
         assert "Lambda" in error.message, "Error should mention lambda"
         assert "@action" in error.recommendation, "Recommendation should suggest using @action"
 
-    def test_list_comprehension_outside_gather_raises_error(self) -> None:
-        """Test: list comprehensions outside gather context raise error."""
-        import pytest
-
-        from rappel import UnsupportedPatternError, workflow
-        from rappel.workflow import Workflow
-
-        @workflow
-        class ListCompWorkflow(Workflow):
-            async def run(self, items: list) -> list:
-                doubled = [x * 2 for x in items]
-                return doubled
-
-        with pytest.raises(UnsupportedPatternError) as exc_info:
-            ListCompWorkflow.workflow_ir()
-
-        error = exc_info.value
-        assert isinstance(error, UnsupportedPatternError)
-        assert "List comprehension" in error.message, "Error should mention list comprehensions"
-        assert "asyncio.gather" in error.recommendation, (
-            "Recommendation should mention gather context"
+    def test_list_comprehension_assignment_is_supported(self) -> None:
+        """Test: list comprehension assignments expand into for loop IR."""
+        from tests.fixtures_comprehension.list_comprehension_assignment import (
+            ListComprehensionAssignmentWorkflow,
         )
+
+        program = ListComprehensionAssignmentWorkflow.workflow_ir()
+
+        run_fn = next(fn for fn in program.functions if fn.name == "run")
+
+        has_initializer = any(
+            stmt.HasField("assignment")
+            and list(stmt.assignment.targets) == ["active_users"]
+            and stmt.assignment.value.HasField("list")
+            and len(stmt.assignment.value.list.elements) == 0
+            for stmt in run_fn.body.statements
+        )
+        assert has_initializer, "Expected accumulator initialization for active_users"
+
+        for_loop = next(
+            (stmt.for_loop for stmt in run_fn.body.statements if stmt.HasField("for_loop")),
+            None,
+        )
+        assert for_loop is not None, "Expected for loop generated from list comprehension"
+        assert "user" in for_loop.loop_vars, "Loop variable should match comprehension"
+        assert "active_users" in for_loop.body.targets, "Accumulator target should be propagated"
 
     def test_delete_statement_raises_error(self) -> None:
         """Test: del statements raise error with recommendation."""
@@ -2494,8 +2498,8 @@ class TestUnsupportedPatternValidation:
         error = cast(UnsupportedPatternError, exc_info.value)
         assert "while" in error.message.lower()
 
-    def test_list_comprehension_raises_error(self) -> None:
-        """Test: list comprehensions outside gather raise UnsupportedPatternError."""
+    def test_list_comprehension_return_raises_error(self) -> None:
+        """Test: list comprehensions returned directly raise UnsupportedPatternError."""
         from typing import cast
 
         import pytest

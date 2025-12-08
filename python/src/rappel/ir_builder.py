@@ -21,6 +21,7 @@ UnsupportedPatternError with clear recommendations for how to rewrite the code.
 """
 
 import ast
+import copy
 import inspect
 import textwrap
 from dataclasses import dataclass
@@ -147,7 +148,8 @@ RECOMMENDATIONS = {
         "Use an @action to define the function logic."
     ),
     "list_comprehension": (
-        "List comprehensions are only supported inside asyncio.gather(*[...]).\n"
+        "List comprehensions are only supported when assigned directly to a variable "
+        "or inside asyncio.gather(*[...]).\n"
         "For other cases, use a for loop or an @action."
     ),
     "dict_comprehension": (
@@ -456,6 +458,9 @@ class IRBuilder(ast.NodeVisitor):
         Raises UnsupportedPatternError for unsupported statement types.
         """
         if isinstance(node, ast.Assign):
+            expanded = self._expand_list_comprehension_assignment(node)
+            if expanded is not None:
+                return expanded
             result = self._visit_assign(node)
             return [result] if result else []
         elif isinstance(node, ast.Expr):
@@ -564,6 +569,112 @@ class IRBuilder(ast.NodeVisitor):
                 line=line,
                 col=col,
             )
+
+    def _expand_list_comprehension_assignment(
+        self, node: ast.Assign
+    ) -> Optional[List[ir.Statement]]:
+        """Expand a list comprehension assignment into loop-based statements.
+
+        Example:
+            active_users = [user for user in users if user.active]
+
+        Becomes:
+            active_users = []
+            for user in users:
+                if user.active:
+                    active_users = active_users + [user]
+        """
+        if not isinstance(node.value, ast.ListComp):
+            return None
+
+        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            line = getattr(node, "lineno", None)
+            col = getattr(node, "col_offset", None)
+            raise UnsupportedPatternError(
+                "List comprehension assignments must target a single variable",
+                "Assign the comprehension to a simple variable like `results = [x for x in items]`",
+                line=line,
+                col=col,
+            )
+
+        listcomp = node.value
+        if len(listcomp.generators) != 1:
+            line = getattr(listcomp, "lineno", None)
+            col = getattr(listcomp, "col_offset", None)
+            raise UnsupportedPatternError(
+                "List comprehensions with multiple generators are not supported",
+                "Use nested for loops instead of combining multiple generators in one comprehension",
+                line=line,
+                col=col,
+            )
+
+        gen = listcomp.generators[0]
+        if gen.is_async:
+            line = getattr(listcomp, "lineno", None)
+            col = getattr(listcomp, "col_offset", None)
+            raise UnsupportedPatternError(
+                "Async list comprehensions are not supported",
+                "Rewrite using an explicit async for loop",
+                line=line,
+                col=col,
+            )
+
+        target_name = node.targets[0].id
+
+        # Initialize the accumulator list: active_users = []
+        init_assign_ast = ast.Assign(
+            targets=[ast.Name(id=target_name, ctx=ast.Store())],
+            value=ast.List(elts=[], ctx=ast.Load()),
+            type_comment=None,
+        )
+        ast.copy_location(init_assign_ast, node)
+        ast.fix_missing_locations(init_assign_ast)
+
+        # Build the append step: active_users = active_users + [elt]
+        append_assign_ast = ast.Assign(
+            targets=[ast.Name(id=target_name, ctx=ast.Store())],
+            value=ast.BinOp(
+                left=ast.Name(id=target_name, ctx=ast.Load()),
+                op=ast.Add(),
+                right=ast.List(elts=[copy.deepcopy(listcomp.elt)], ctx=ast.Load()),
+            ),
+            type_comment=None,
+        )
+        ast.copy_location(append_assign_ast, node.value)
+        ast.fix_missing_locations(append_assign_ast)
+
+        loop_body: List[ast.stmt] = []
+        if gen.ifs:
+            condition: ast.expr
+            if len(gen.ifs) == 1:
+                condition = copy.deepcopy(gen.ifs[0])
+            else:
+                condition = ast.BoolOp(op=ast.And(), values=[copy.deepcopy(iff) for iff in gen.ifs])
+                ast.copy_location(condition, gen.ifs[0])
+            if_stmt = ast.If(test=condition, body=[append_assign_ast], orelse=[])
+            ast.copy_location(if_stmt, gen.ifs[0])
+            ast.fix_missing_locations(if_stmt)
+            loop_body.append(if_stmt)
+        else:
+            loop_body.append(append_assign_ast)
+
+        loop_ast = ast.For(
+            target=copy.deepcopy(gen.target),
+            iter=copy.deepcopy(gen.iter),
+            body=loop_body,
+            orelse=[],
+            type_comment=None,
+        )
+        ast.copy_location(loop_ast, node)
+        ast.fix_missing_locations(loop_ast)
+
+        statements: List[ir.Statement] = []
+        init_stmt = self._visit_assign(init_assign_ast)
+        if init_stmt:
+            statements.append(init_stmt)
+        statements.extend(self._visit_for(loop_ast))
+
+        return statements
 
     def _visit_assign(self, node: ast.Assign) -> Optional[ir.Statement]:
         """Convert assignment to IR.
@@ -790,31 +901,29 @@ class IRBuilder(ast.NodeVisitor):
                 accumulators.append(var_name)
                 seen.add(var_name)
 
-            # Recursively check conditionals
+            # Check conditionals for accumulator targets in branch bodies
             if stmt.HasField("conditional"):
                 cond = stmt.conditional
-                if cond.HasField("if_branch") and cond.if_branch.HasField("body"):
-                    for var in self._detect_accumulator_targets(
-                        list(cond.if_branch.body.statements), in_scope_vars
-                    ):
-                        if var not in seen:
-                            accumulators.append(var)
-                            seen.add(var)
-                for elif_branch in cond.elif_branches:
-                    if elif_branch.HasField("body"):
+                branch_bodies = [cond.if_branch.body] if cond.HasField("if_branch") else []
+                branch_bodies.extend(
+                    branch.body for branch in cond.elif_branches if branch.HasField("body")
+                )
+                if cond.HasField("else_branch"):
+                    branch_bodies.append(cond.else_branch.body)
+
+                for body in branch_bodies:
+                    for target in body.targets:
+                        if target not in in_scope_vars and target not in seen:
+                            accumulators.append(target)
+                            seen.add(target)
+
+                    if body.statements:
                         for var in self._detect_accumulator_targets(
-                            list(elif_branch.body.statements), in_scope_vars
+                            list(body.statements), in_scope_vars
                         ):
                             if var not in seen:
                                 accumulators.append(var)
                                 seen.add(var)
-                if cond.HasField("else_branch") and cond.else_branch.HasField("body"):
-                    for var in self._detect_accumulator_targets(
-                        list(cond.else_branch.body.statements), in_scope_vars
-                    ):
-                        if var not in seen:
-                            accumulators.append(var)
-                            seen.add(var)
 
         return accumulators
 
