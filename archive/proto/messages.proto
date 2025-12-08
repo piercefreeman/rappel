@@ -1,0 +1,180 @@
+syntax = "proto3";
+
+package rappel.messages;
+
+import "google/protobuf/struct.proto";
+
+// =============================================================================
+// Worker Bridge Communication
+// =============================================================================
+// These messages handle the core communication between the Rust server and
+// Python workers. Workers connect via gRPC streaming and execute actions.
+
+enum MessageKind {
+  MESSAGE_KIND_UNSPECIFIED = 0;
+  MESSAGE_KIND_ACTION_DISPATCH = 1;  // Server -> Worker: execute this action
+  MESSAGE_KIND_ACTION_RESULT = 2;    // Worker -> Server: here's the result
+  MESSAGE_KIND_ACK = 3;              // Worker -> Server: message received
+  MESSAGE_KIND_HEARTBEAT = 4;        // Bidirectional: keep-alive signal
+  MESSAGE_KIND_WORKER_HELLO = 5;     // Worker -> Server: handshake on connect
+}
+
+// Universal transport wrapper for all worker bridge messages.
+// The `kind` field indicates how to decode the `payload`.
+message Envelope {
+  uint64 delivery_id = 1;     // Unique ID for correlation (ack, response)
+  uint32 partition_id = 2;    // Optional logical grouping
+  MessageKind kind = 3;       // Message type discriminator
+  bytes payload = 4;          // Encoded message (ActionDispatch, ActionResult, etc.)
+}
+
+// Server -> Worker: instruction to execute an action
+message ActionDispatch {
+  string action_id = 1;              // Unique action identifier
+  string instance_id = 2;            // Workflow instance this action belongs to
+  uint32 sequence = 3;               // Sequence number within instance
+
+  // Action execution details
+  string action_name = 4;            // Name of the action function to call
+  string module_name = 5;            // Python module containing the action
+  WorkflowArguments kwargs = 6;      // Keyword arguments for the action
+
+  // Execution policies
+  optional uint32 timeout_seconds = 7;
+  optional uint32 max_retries = 8;
+  optional uint32 attempt_number = 9;
+  optional string dispatch_token = 10;  // UUID for result correlation
+}
+
+// Worker -> Server: result of action execution
+message ActionResult {
+  string action_id = 1;
+  bool success = 2;
+  WorkflowArguments payload = 3;     // Result or error details
+  uint64 worker_start_ns = 4;        // Perf counter at execution start
+  uint64 worker_end_ns = 5;          // Perf counter at execution end
+  optional string dispatch_token = 6;
+  optional string error_type = 7;    // Exception type if success=false
+  optional string error_message = 8; // Exception message if success=false
+}
+
+// Worker -> Server: acknowledgment of message receipt
+message Ack {
+  uint64 acked_delivery_id = 1;
+}
+
+// Worker -> Server: initial handshake when connecting
+message WorkerHello {
+  uint64 worker_id = 1;
+}
+
+// =============================================================================
+// Value Serialization
+// =============================================================================
+// All values passed between Rust and Python must be JSON-serializable.
+// These messages define the wire format for workflow arguments and results.
+
+message WorkflowArgumentValue {
+  oneof kind {
+    PrimitiveWorkflowArgument primitive = 1;
+    BaseModelWorkflowArgument basemodel = 2;
+    WorkflowErrorValue exception = 3;
+    WorkflowListArgument list_value = 4;
+    WorkflowTupleArgument tuple_value = 5;
+    WorkflowDictArgument dict_value = 6;
+  }
+}
+
+message WorkflowArgument {
+  string key = 1;
+  WorkflowArgumentValue value = 2;
+}
+
+message WorkflowArguments {
+  repeated WorkflowArgument arguments = 1;
+}
+
+message PrimitiveWorkflowArgument {
+  oneof kind {
+    string string_value = 1;
+    double double_value = 2;
+    sint64 int_value = 3;
+    bool bool_value = 4;
+    google.protobuf.NullValue null_value = 5;
+  }
+}
+
+// Pydantic BaseModel or similar structured types
+message BaseModelWorkflowArgument {
+  string module = 1;
+  string name = 2;
+  WorkflowDictArgument data = 3;
+}
+
+// Serialized exception for error propagation
+message WorkflowErrorValue {
+  string type = 1;
+  string module = 2;
+  string message = 3;
+  string traceback = 4;
+}
+
+message WorkflowListArgument {
+  repeated WorkflowArgumentValue items = 1;
+}
+
+message WorkflowTupleArgument {
+  repeated WorkflowArgumentValue items = 1;
+}
+
+message WorkflowDictArgument {
+  repeated WorkflowArgument entries = 1;
+}
+
+// =============================================================================
+// Workflow Registration
+// =============================================================================
+// Messages for registering workflows and starting instances.
+
+// Workflow registration containing the IR program
+message WorkflowRegistration {
+  string workflow_name = 1;
+  bytes ir = 2;                      // Serialized IR program (from ast.proto)
+  string ir_hash = 3;                // Hash of the IR for versioning
+  WorkflowArguments initial_context = 4;
+  bool concurrent = 5;               // Whether multiple instances can run
+}
+
+message RegisterWorkflowRequest {
+  WorkflowRegistration registration = 1;
+}
+
+message RegisterWorkflowResponse {
+  string workflow_version_id = 1;
+  string workflow_instance_id = 2;
+}
+
+message WaitForInstanceRequest {
+  string instance_id = 1;
+  double poll_interval_secs = 2;
+}
+
+message WaitForInstanceResponse {
+  bytes payload = 1;
+}
+
+// =============================================================================
+// gRPC Service Definitions
+// =============================================================================
+
+// Bidirectional streaming service for worker communication.
+// Workers connect and maintain a persistent stream for action dispatch/results.
+service WorkerBridge {
+  rpc Attach(stream Envelope) returns (stream Envelope);
+}
+
+// Workflow management service for client operations.
+service WorkflowService {
+  rpc RegisterWorkflow(RegisterWorkflowRequest) returns (RegisterWorkflowResponse);
+  rpc WaitForInstance(WaitForInstanceRequest) returns (WaitForInstanceResponse);
+}

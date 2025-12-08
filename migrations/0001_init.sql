@@ -1,133 +1,94 @@
--- Core schema for Rappel workflow execution engine
--- Uses Postgres-specific features: UUID, TIMESTAMPTZ, BYTEA, SKIP LOCKED support
+-- Initial schema for rappel workflow engine.
+--
+-- Two main tables:
+-- 1. workflow_instances: Tracks workflow execution state
+-- 2. actions: Queue of actions per instance (inbox pattern)
 
--- Workflow version definitions (compiled IR programs)
-CREATE TABLE workflow_versions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    workflow_name TEXT NOT NULL,
-    dag_hash TEXT NOT NULL,
-    -- Serialized AST proto (rappel.ast.Program)
-    program_proto BYTEA NOT NULL,
-    concurrent BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+-- Instance status enum
+CREATE TYPE instance_status AS ENUM ('running', 'waiting_for_actions', 'completed', 'failed');
 
-    UNIQUE (workflow_name, dag_hash)
-);
+-- Action status enum
+CREATE TYPE action_status AS ENUM ('queued', 'dispatched', 'completed', 'failed');
 
-CREATE INDEX idx_workflow_versions_name ON workflow_versions(workflow_name);
-
--- Workflow instances (running or completed executions)
+-- Workflow instances
 CREATE TABLE workflow_instances (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    partition_id INTEGER NOT NULL DEFAULT 0,
+    id UUID PRIMARY KEY,
     workflow_name TEXT NOT NULL,
-    workflow_version_id UUID REFERENCES workflow_versions(id),
-    -- Sequence counter for actions within this instance
-    next_action_seq INTEGER NOT NULL DEFAULT 0,
-    -- Serialized input arguments (WorkflowArguments proto)
-    input_payload BYTEA,
-    -- Serialized result (WorkflowArguments proto) - set when complete
-    result_payload BYTEA,
-    -- Status: 'running', 'completed', 'failed'
-    status TEXT NOT NULL DEFAULT 'running',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    completed_at TIMESTAMPTZ
-);
-
-CREATE INDEX idx_workflow_instances_status ON workflow_instances(status);
-CREATE INDEX idx_workflow_instances_version ON workflow_instances(workflow_version_id);
-
--- Action queue (the core work queue for distributed execution)
-CREATE TABLE action_queue (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    instance_id UUID NOT NULL REFERENCES workflow_instances(id) ON DELETE CASCADE,
-    partition_id INTEGER NOT NULL DEFAULT 0,
-    -- Sequence number within the instance (for ordering)
-    action_seq INTEGER NOT NULL,
-    -- Action identification
     module_name TEXT NOT NULL,
-    action_name TEXT NOT NULL,
-    -- Serialized dispatch payload (ActionDispatch proto or similar)
-    dispatch_payload BYTEA NOT NULL,
+    status instance_status NOT NULL DEFAULT 'running',
 
-    -- Status: 'queued', 'dispatched', 'completed', 'failed', 'timed_out'
-    status TEXT NOT NULL DEFAULT 'queued',
+    -- Initial arguments for the workflow
+    initial_args JSONB NOT NULL DEFAULT '{}',
 
-    -- Retry configuration
-    attempt_number INTEGER NOT NULL DEFAULT 0,
-    max_retries INTEGER NOT NULL DEFAULT 3,
-    timeout_seconds INTEGER NOT NULL DEFAULT 300,
-    timeout_retry_limit INTEGER NOT NULL DEFAULT 3,
-    -- 'failure' or 'timeout' - determines which retry limit applies
-    retry_kind TEXT NOT NULL DEFAULT 'failure',
+    -- Final result when completed
+    result JSONB,
 
-    -- Backoff configuration
-    -- 'none', 'linear', 'exponential'
-    backoff_kind TEXT NOT NULL DEFAULT 'none',
-    backoff_base_delay_ms INTEGER NOT NULL DEFAULT 0,
-    backoff_multiplier DOUBLE PRECISION NOT NULL DEFAULT 2.0,
+    -- How many actions have been completed (used for replay index)
+    actions_until_index INTEGER NOT NULL DEFAULT 0,
 
-    -- Dispatch tracking
-    delivery_id BIGINT,
-    -- Unique token for idempotent completion marking
-    delivery_token UUID,
+    -- When to next schedule this instance for execution
+    -- NULL means ready immediately, non-NULL means wait until then
+    scheduled_at TIMESTAMPTZ,
 
-    -- Timestamps
-    scheduled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    deadline_at TIMESTAMPTZ,
-    enqueued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    dispatched_at TIMESTAMPTZ,
-    acked_at TIMESTAMPTZ,
-    completed_at TIMESTAMPTZ,
-
-    -- Result
-    success BOOLEAN,
-    result_payload BYTEA,
-    last_error TEXT,
-
-    -- DAG node reference (for tracking which IR node this action represents)
-    node_id TEXT,
-
-    UNIQUE (instance_id, action_seq)
-);
-
--- Critical index for SKIP LOCKED dispatch query
--- Composite index on (scheduled_at, action_seq) for efficient ordering
-CREATE INDEX idx_action_queue_dispatch
-    ON action_queue(scheduled_at, action_seq)
-    WHERE status = 'queued';
-
--- Index for finding timed-out actions
-CREATE INDEX idx_action_queue_deadline
-    ON action_queue(deadline_at)
-    WHERE status = 'dispatched' AND deadline_at IS NOT NULL;
-
--- Index for retry queries
-CREATE INDEX idx_action_queue_retry
-    ON action_queue(partition_id, status, attempt_number)
-    WHERE status IN ('failed', 'timed_out');
-
--- Index for instance-based queries
-CREATE INDEX idx_action_queue_instance ON action_queue(instance_id);
-
--- Execution context (accumulated variable bindings during workflow execution)
-CREATE TABLE instance_context (
-    instance_id UUID PRIMARY KEY REFERENCES workflow_instances(id) ON DELETE CASCADE,
-    -- JSON object mapping variable names to serialized values
-    context_json JSONB NOT NULL DEFAULT '{}',
-    -- Exception information for error handling
-    exceptions_json JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Loop iteration state (for tracking progress through loops)
-CREATE TABLE loop_state (
+-- Index for claiming ready instances
+CREATE INDEX idx_instances_ready ON workflow_instances (status, scheduled_at, created_at)
+    WHERE status = 'waiting_for_actions';
+
+-- Actions queue (inbox per instance)
+CREATE TABLE actions (
+    id UUID PRIMARY KEY,
     instance_id UUID NOT NULL REFERENCES workflow_instances(id) ON DELETE CASCADE,
-    loop_id TEXT NOT NULL,
-    current_index INTEGER NOT NULL DEFAULT 0,
-    -- Serialized accumulators (map of name -> collected values)
-    accumulators BYTEA,
+
+    -- Position in the action sequence for this instance
+    sequence INTEGER NOT NULL,
+
+    -- Action details
+    action_name TEXT NOT NULL,
+    module_name TEXT NOT NULL,
+    kwargs JSONB NOT NULL DEFAULT '{}',
+
+    -- Execution state
+    status action_status NOT NULL DEFAULT 'queued',
+    result JSONB,
+    error_message TEXT,
+
+    -- Dispatch token for idempotent completion
+    dispatch_token UUID,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    PRIMARY KEY (instance_id, loop_id)
+    -- Ensure unique sequence per instance
+    UNIQUE (instance_id, sequence)
 );
+
+-- Index for claiming queued actions
+CREATE INDEX idx_actions_queued ON actions (status, created_at)
+    WHERE status = 'queued';
+
+-- Index for getting completed actions by instance
+CREATE INDEX idx_actions_instance_completed ON actions (instance_id, sequence)
+    WHERE status = 'completed';
+
+-- Trigger to update updated_at on row changes
+CREATE OR REPLACE FUNCTION update_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER workflow_instances_updated_at
+    BEFORE UPDATE ON workflow_instances
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();
+
+CREATE TRIGGER actions_updated_at
+    BEFORE UPDATE ON actions
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();

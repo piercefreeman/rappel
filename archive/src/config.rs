@@ -1,0 +1,133 @@
+//! Configuration loading from environment variables.
+//!
+//! Uses the following environment variables:
+//! - `DATABASE_URL`: PostgreSQL connection string (required)
+//! - `RAPPEL_HTTP_ADDR`: HTTP server bind address (default: 127.0.0.1:24117)
+//! - `RAPPEL_GRPC_ADDR`: gRPC server bind address (default: HTTP port + 1)
+//! - `RAPPEL_WORKER_COUNT`: Number of Python workers (default: num_cpus)
+//! - `RAPPEL_MAX_CONCURRENT`: Max concurrent action dispatches (default: 32)
+//! - `RAPPEL_POLL_INTERVAL_MS`: Dispatcher poll interval (default: 100)
+//! - `RAPPEL_BATCH_SIZE`: Actions to dispatch per poll (default: 100)
+
+use std::{env, net::SocketAddr, str::FromStr};
+
+use anyhow::{Context, Result};
+
+/// Server configuration
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// PostgreSQL connection URL
+    pub database_url: String,
+
+    /// HTTP server bind address
+    pub http_addr: SocketAddr,
+
+    /// gRPC server bind address (for worker bridge)
+    pub grpc_addr: SocketAddr,
+
+    /// Number of Python worker processes
+    pub worker_count: usize,
+
+    /// Maximum concurrent action dispatches
+    pub max_concurrent: usize,
+
+    /// Dispatcher poll interval in milliseconds
+    pub poll_interval_ms: u64,
+
+    /// Number of actions to dispatch per poll cycle
+    pub batch_size: i32,
+}
+
+impl Config {
+    /// Load configuration from environment variables
+    ///
+    /// Loads `.env` file if present, then reads from environment.
+    pub fn from_env() -> Result<Self> {
+        // Load .env file if it exists
+        dotenvy::dotenv().ok();
+
+        let database_url =
+            env::var("DATABASE_URL").context("DATABASE_URL environment variable is required")?;
+
+        let http_addr =
+            env::var("RAPPEL_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:24117".to_string());
+        let http_addr =
+            SocketAddr::from_str(&http_addr).context("invalid RAPPEL_HTTP_ADDR format")?;
+
+        let grpc_addr = match env::var("RAPPEL_GRPC_ADDR") {
+            Ok(s) => SocketAddr::from_str(&s).context("invalid RAPPEL_GRPC_ADDR format")?,
+            Err(_) => {
+                let mut addr = http_addr;
+                addr.set_port(http_addr.port() + 1);
+                addr
+            }
+        };
+
+        let worker_count = env::var("RAPPEL_WORKER_COUNT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(num_cpus::get);
+
+        let max_concurrent = env::var("RAPPEL_MAX_CONCURRENT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32);
+
+        let poll_interval_ms = env::var("RAPPEL_POLL_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+
+        let batch_size = env::var("RAPPEL_BATCH_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+
+        Ok(Self {
+            database_url,
+            http_addr,
+            grpc_addr,
+            worker_count,
+            max_concurrent,
+            poll_interval_ms,
+            batch_size,
+        })
+    }
+
+    /// Create a test configuration with defaults
+    #[cfg(test)]
+    pub fn test_config(database_url: &str) -> Self {
+        Self {
+            database_url: database_url.to_string(),
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            grpc_addr: "127.0.0.1:0".parse().unwrap(),
+            worker_count: 2,
+            max_concurrent: 10,
+            poll_interval_ms: 50,
+            batch_size: 10,
+        }
+    }
+}
+
+/// Get the database URL from environment
+pub fn database_url() -> Result<String> {
+    dotenvy::dotenv().ok();
+    env::var("DATABASE_URL").context("DATABASE_URL environment variable is required")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_grpc_port() {
+        // When GRPC addr not set, it should be HTTP port + 1
+        let http_addr: SocketAddr = "127.0.0.1:24117".parse().unwrap();
+        let expected_grpc: SocketAddr = "127.0.0.1:24118".parse().unwrap();
+
+        let mut grpc_addr = http_addr;
+        grpc_addr.set_port(http_addr.port() + 1);
+
+        assert_eq!(grpc_addr, expected_grpc);
+    }
+}

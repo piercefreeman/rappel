@@ -5,48 +5,73 @@ package rappel.messages;
 import "google/protobuf/struct.proto";
 
 // =============================================================================
-// Worker Bridge Communication
+// Worker Type Separation
 // =============================================================================
-// These messages handle the core communication between the Rust server and
-// Python workers. Workers connect via gRPC streaming and execute actions.
+// The system uses two separate worker clusters:
+// 1. ActionWorker - Executes individual actions (pure functions)
+// 2. InstanceWorker - Runs workflow instances using durable execution
+
+enum WorkerType {
+  WORKER_TYPE_UNSPECIFIED = 0;
+  WORKER_TYPE_ACTION = 1;      // Executes individual actions
+  WORKER_TYPE_INSTANCE = 2;    // Runs workflow instances with replay
+}
+
+// =============================================================================
+// Common Message Types
+// =============================================================================
 
 enum MessageKind {
   MESSAGE_KIND_UNSPECIFIED = 0;
-  MESSAGE_KIND_ACTION_DISPATCH = 1;  // Server -> Worker: execute this action
-  MESSAGE_KIND_ACTION_RESULT = 2;    // Worker -> Server: here's the result
-  MESSAGE_KIND_ACK = 3;              // Worker -> Server: message received
-  MESSAGE_KIND_HEARTBEAT = 4;        // Bidirectional: keep-alive signal
-  MESSAGE_KIND_WORKER_HELLO = 5;     // Worker -> Server: handshake on connect
+
+  // Action Worker Messages
+  MESSAGE_KIND_ACTION_DISPATCH = 1;    // Server -> ActionWorker: execute this action
+  MESSAGE_KIND_ACTION_RESULT = 2;      // ActionWorker -> Server: here's the result
+
+  // Instance Worker Messages
+  MESSAGE_KIND_INSTANCE_DISPATCH = 10; // Server -> InstanceWorker: run instance
+  MESSAGE_KIND_INSTANCE_ACTIONS = 11;  // InstanceWorker -> Server: pending actions
+  MESSAGE_KIND_INSTANCE_COMPLETE = 12; // InstanceWorker -> Server: workflow done
+
+  // Common Messages
+  MESSAGE_KIND_ACK = 20;               // Worker -> Server: message received
+  MESSAGE_KIND_HEARTBEAT = 21;         // Bidirectional: keep-alive signal
+  MESSAGE_KIND_WORKER_HELLO = 22;      // Worker -> Server: handshake on connect
 }
 
 // Universal transport wrapper for all worker bridge messages.
-// The `kind` field indicates how to decode the `payload`.
 message Envelope {
-  uint64 delivery_id = 1;     // Unique ID for correlation (ack, response)
+  uint64 delivery_id = 1;     // Unique ID for correlation
   uint32 partition_id = 2;    // Optional logical grouping
   MessageKind kind = 3;       // Message type discriminator
-  bytes payload = 4;          // Encoded message (ActionDispatch, ActionResult, etc.)
+  bytes payload = 4;          // Encoded message
 }
 
-// Server -> Worker: instruction to execute an action
+// =============================================================================
+// Action Worker Messages
+// =============================================================================
+// Action workers execute individual actions (pure functions).
+// They receive an action dispatch and return a result.
+
+// Server -> ActionWorker: instruction to execute an action
 message ActionDispatch {
   string action_id = 1;              // Unique action identifier
   string instance_id = 2;            // Workflow instance this action belongs to
-  uint32 sequence = 3;               // Sequence number within instance
+  uint32 sequence = 3;               // Position in instance's action queue
 
   // Action execution details
-  string action_name = 4;            // Name of the action function to call
+  string action_name = 4;            // Name of the action function
   string module_name = 5;            // Python module containing the action
-  WorkflowArguments kwargs = 6;      // Keyword arguments for the action
+  WorkflowArguments kwargs = 6;      // Keyword arguments
 
   // Execution policies
   optional uint32 timeout_seconds = 7;
   optional uint32 max_retries = 8;
   optional uint32 attempt_number = 9;
-  optional string dispatch_token = 10;  // UUID for result correlation
+  optional string dispatch_token = 10;  // UUID for idempotent completion
 }
 
-// Worker -> Server: result of action execution
+// ActionWorker -> Server: result of action execution
 message ActionResult {
   string action_id = 1;
   bool success = 2;
@@ -58,6 +83,79 @@ message ActionResult {
   optional string error_message = 8; // Exception message if success=false
 }
 
+// =============================================================================
+// Instance Worker Messages
+// =============================================================================
+// Instance workers run workflow instances using durable execution.
+// They replay completed actions and report new pending actions.
+
+// Server -> InstanceWorker: run workflow instance up to specified point
+message InstanceDispatch {
+  string instance_id = 1;
+  string workflow_name = 2;
+  string module_name = 3;
+
+  // How far to run: execute the workflow replaying actions up to this index
+  // New actions discovered after this point become pending
+  uint32 actions_until_index = 4;
+
+  // Initial workflow arguments (for first run)
+  WorkflowArguments initial_args = 5;
+
+  // Completed action results to replay (in order)
+  repeated ActionResult completed_actions = 6;
+
+  // Scheduling metadata
+  int64 scheduled_at_ms = 7;         // When this dispatch was queued
+  optional string dispatch_token = 8;
+}
+
+// InstanceWorker -> Server: pending actions discovered during execution
+message InstanceActions {
+  string instance_id = 1;
+  uint32 replayed_count = 2;         // How many actions were replayed
+
+  // Newly discovered pending actions
+  repeated PendingAction pending_actions = 3;
+
+  optional string dispatch_token = 4;
+}
+
+// A pending action discovered during workflow execution
+message PendingAction {
+  string action_id = 1;              // Generated UUID
+  uint32 sequence = 2;               // Position in discovery order
+  string action_name = 3;
+  string module_name = 4;
+  WorkflowArguments kwargs = 5;
+
+  // Optional policies from decorator
+  optional uint32 timeout_seconds = 6;
+  optional uint32 max_retries = 7;
+}
+
+// InstanceWorker -> Server: workflow completed successfully
+message InstanceComplete {
+  string instance_id = 1;
+  WorkflowArguments result = 2;      // Final workflow return value
+  uint32 total_actions = 3;          // Total actions executed
+  optional string dispatch_token = 4;
+}
+
+// InstanceWorker -> Server: workflow failed with error
+message InstanceFailed {
+  string instance_id = 1;
+  string error_type = 2;
+  string error_message = 3;
+  string traceback = 4;
+  uint32 actions_completed = 5;
+  optional string dispatch_token = 6;
+}
+
+// =============================================================================
+// Common Worker Messages
+// =============================================================================
+
 // Worker -> Server: acknowledgment of message receipt
 message Ack {
   uint64 acked_delivery_id = 1;
@@ -66,13 +164,12 @@ message Ack {
 // Worker -> Server: initial handshake when connecting
 message WorkerHello {
   uint64 worker_id = 1;
+  WorkerType worker_type = 2;        // What kind of worker this is
 }
 
 // =============================================================================
 // Value Serialization
 // =============================================================================
-// All values passed between Rust and Python must be JSON-serializable.
-// These messages define the wire format for workflow arguments and results.
 
 message WorkflowArgumentValue {
   oneof kind {
@@ -104,14 +201,12 @@ message PrimitiveWorkflowArgument {
   }
 }
 
-// Pydantic BaseModel or similar structured types
 message BaseModelWorkflowArgument {
   string module = 1;
   string name = 2;
   WorkflowDictArgument data = 3;
 }
 
-// Serialized exception for error propagation
 message WorkflowErrorValue {
   string type = 1;
   string module = 2;
@@ -134,15 +229,12 @@ message WorkflowDictArgument {
 // =============================================================================
 // Workflow Registration
 // =============================================================================
-// Messages for registering workflows and starting instances.
 
-// Workflow registration containing the IR program
 message WorkflowRegistration {
   string workflow_name = 1;
-  bytes ir = 2;                      // Serialized IR program (from ast.proto)
-  string ir_hash = 3;                // Hash of the IR for versioning
-  WorkflowArguments initial_context = 4;
-  bool concurrent = 5;               // Whether multiple instances can run
+  string module_name = 2;            // Python module containing workflow
+  WorkflowArguments initial_args = 3;
+  bool concurrent = 4;               // Whether multiple instances can run
 }
 
 message RegisterWorkflowRequest {
@@ -150,8 +242,8 @@ message RegisterWorkflowRequest {
 }
 
 message RegisterWorkflowResponse {
-  string workflow_version_id = 1;
-  string workflow_instance_id = 2;
+  string workflow_id = 1;
+  string instance_id = 2;
 }
 
 message WaitForInstanceRequest {
@@ -167,9 +259,15 @@ message WaitForInstanceResponse {
 // gRPC Service Definitions
 // =============================================================================
 
-// Bidirectional streaming service for worker communication.
-// Workers connect and maintain a persistent stream for action dispatch/results.
-service WorkerBridge {
+// Bidirectional streaming for action workers.
+// Action workers connect and receive action dispatch/result messages.
+service ActionWorkerBridge {
+  rpc Attach(stream Envelope) returns (stream Envelope);
+}
+
+// Bidirectional streaming for instance workers.
+// Instance workers connect and receive instance dispatch messages.
+service InstanceWorkerBridge {
   rpc Attach(stream Envelope) returns (stream Envelope);
 }
 

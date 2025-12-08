@@ -1,188 +1,115 @@
-import importlib
-import traceback
+"""
+Serialization utilities for workflow arguments and results.
+
+Handles conversion between Python values and protobuf WorkflowArguments.
+"""
+
 from typing import Any
 
-from google.protobuf import json_format, struct_pb2
-from pydantic import BaseModel
-
-from proto import messages_pb2 as pb2
-
-NULL_VALUE = struct_pb2.NULL_VALUE  # type: ignore[attr-defined]
-
-PRIMITIVE_TYPES = (str, int, float, bool, type(None))
+# Import proto types when available
+# from proto import messages_pb2 as pb
 
 
-def dumps(value: Any) -> pb2.WorkflowArgumentValue:
-    """Serialize a Python value into a WorkflowArgumentValue message."""
+def serialize_value(value: Any) -> Any:
+    """
+    Serialize a Python value to protobuf WorkflowArgumentValue.
 
-    return _to_argument_value(value)
-
-
-def loads(data: Any) -> Any:
-    """Deserialize a workflow argument payload into a Python object."""
-
-    if isinstance(data, pb2.WorkflowArgumentValue):
-        argument = data
-    elif isinstance(data, dict):
-        argument = pb2.WorkflowArgumentValue()
-        json_format.ParseDict(data, argument)
-    else:
-        raise TypeError("argument value payload must be a dict or ArgumentValue message")
-    return _from_argument_value(argument)
-
-
-def build_arguments_from_kwargs(kwargs: dict[str, Any]) -> pb2.WorkflowArguments:
-    arguments = pb2.WorkflowArguments()
-    for key, value in kwargs.items():
-        entry = arguments.arguments.add()
-        entry.key = key
-        entry.value.CopyFrom(dumps(value))
-    return arguments
-
-
-def arguments_to_kwargs(arguments: pb2.WorkflowArguments | None) -> dict[str, Any]:
-    if arguments is None:
-        return {}
-    result: dict[str, Any] = {}
-    for entry in arguments.arguments:
-        result[entry.key] = loads(entry.value)
-    return result
-
-
-def _to_argument_value(value: Any) -> pb2.WorkflowArgumentValue:
-    argument = pb2.WorkflowArgumentValue()
-    if isinstance(value, PRIMITIVE_TYPES):
-        argument.primitive.CopyFrom(_serialize_primitive(value))
-        return argument
-    if isinstance(value, BaseException):
-        argument.exception.type = value.__class__.__name__
-        argument.exception.module = value.__class__.__module__
-        argument.exception.message = str(value)
-        tb_text = "".join(traceback.format_exception(type(value), value, value.__traceback__))
-        argument.exception.traceback = tb_text
-        return argument
-    if _is_base_model(value):
-        model_class = value.__class__
-        model_data = _serialize_model_data(value)
-        argument.basemodel.module = model_class.__module__
-        argument.basemodel.name = model_class.__qualname__
-        # Serialize as dict to preserve types (Struct converts all numbers to float)
-        for key, item in model_data.items():
-            entry = argument.basemodel.data.entries.add()
-            entry.key = key
-            entry.value.CopyFrom(_to_argument_value(item))
-        return argument
-    if isinstance(value, dict):
-        argument.dict_value.SetInParent()
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise TypeError("workflow dict keys must be strings")
-            entry = argument.dict_value.entries.add()
-            entry.key = key
-            entry.value.CopyFrom(_to_argument_value(item))
-        return argument
-    if isinstance(value, list):
-        argument.list_value.SetInParent()
-        for item in value:
-            item_value = argument.list_value.items.add()
-            item_value.CopyFrom(_to_argument_value(item))
-        return argument
-    if isinstance(value, tuple):
-        argument.tuple_value.SetInParent()
-        for item in value:
-            item_value = argument.tuple_value.items.add()
-            item_value.CopyFrom(_to_argument_value(item))
-        return argument
-    raise TypeError(f"unsupported value type {type(value)!r}")
-
-
-def _from_argument_value(argument: pb2.WorkflowArgumentValue) -> Any:
-    kind = argument.WhichOneof("kind")  # type: ignore[attr-defined]
-    if kind == "primitive":
-        return _primitive_to_python(argument.primitive)
-    if kind == "basemodel":
-        module = argument.basemodel.module
-        name = argument.basemodel.name
-        # Deserialize dict entries to preserve types
-        data: dict[str, Any] = {}
-        for entry in argument.basemodel.data.entries:
-            data[entry.key] = _from_argument_value(entry.value)
-        return _instantiate_serialized_model(module, name, data)
-    if kind == "exception":
-        return {
-            "type": argument.exception.type,
-            "module": argument.exception.module,
-            "message": argument.exception.message,
-            "traceback": argument.exception.traceback,
-        }
-    if kind == "list_value":
-        return [_from_argument_value(item) for item in argument.list_value.items]
-    if kind == "tuple_value":
-        return tuple(_from_argument_value(item) for item in argument.tuple_value.items)
-    if kind == "dict_value":
-        result: dict[str, Any] = {}
-        for entry in argument.dict_value.entries:
-            result[entry.key] = _from_argument_value(entry.value)
-        return result
-    raise ValueError("argument value missing kind discriminator")
-
-
-def _serialize_model_data(model: BaseModel) -> dict[str, Any]:
-    if hasattr(model, "model_dump"):
-        return model.model_dump(mode="python")  # type: ignore[attr-defined]
-    if hasattr(model, "dict"):
-        return model.dict()  # type: ignore[attr-defined]
-    return model.__dict__
-
-
-def _serialize_primitive(value: Any) -> pb2.PrimitiveWorkflowArgument:
-    primitive = pb2.PrimitiveWorkflowArgument()
+    Supports:
+    - Primitives: str, int, float, bool, None
+    - Collections: list, tuple, dict
+    - Pydantic BaseModel
+    - Exceptions
+    """
+    # TODO: Implement when proto is compiled
+    # For now, return JSON-serializable representation
     if value is None:
-        primitive.null_value = NULL_VALUE
+        return {"type": "null", "value": None}
     elif isinstance(value, bool):
-        primitive.bool_value = value
-    elif isinstance(value, int) and not isinstance(value, bool):
-        primitive.int_value = value
+        return {"type": "bool", "value": value}
+    elif isinstance(value, int):
+        return {"type": "int", "value": value}
     elif isinstance(value, float):
-        primitive.double_value = value
+        return {"type": "float", "value": value}
     elif isinstance(value, str):
-        primitive.string_value = value
-    else:  # pragma: no cover - unreachable given PRIMITIVE_TYPES
-        raise TypeError(f"unsupported primitive type {type(value)!r}")
-    return primitive
+        return {"type": "string", "value": value}
+    elif isinstance(value, (list, tuple)):
+        return {
+            "type": "list" if isinstance(value, list) else "tuple",
+            "value": [serialize_value(v) for v in value],
+        }
+    elif isinstance(value, dict):
+        return {
+            "type": "dict",
+            "value": {k: serialize_value(v) for k, v in value.items()},
+        }
+    elif hasattr(value, "model_dump"):
+        # Pydantic BaseModel
+        return {
+            "type": "basemodel",
+            "module": type(value).__module__,
+            "name": type(value).__name__,
+            "data": serialize_value(value.model_dump()),
+        }
+    elif isinstance(value, Exception):
+        import traceback
+
+        return {
+            "type": "exception",
+            "exception_type": type(value).__name__,
+            "module": type(value).__module__,
+            "message": str(value),
+            "traceback": traceback.format_exc(),
+        }
+    else:
+        raise TypeError(f"Cannot serialize value of type {type(value)}")
 
 
-def _primitive_to_python(primitive: pb2.PrimitiveWorkflowArgument) -> Any:
-    kind = primitive.WhichOneof("kind")  # type: ignore[attr-defined]
-    if kind == "string_value":
-        return primitive.string_value
-    if kind == "double_value":
-        return primitive.double_value
-    if kind == "int_value":
-        return primitive.int_value
-    if kind == "bool_value":
-        return primitive.bool_value
-    if kind == "null_value":
+def deserialize_value(data: Any) -> Any:
+    """
+    Deserialize a protobuf WorkflowArgumentValue to Python value.
+    """
+    # TODO: Implement when proto is compiled
+    if not isinstance(data, dict) or "type" not in data:
+        return data
+
+    value_type = data["type"]
+    value = data.get("value")
+
+    if value_type == "null":
         return None
-    raise ValueError("primitive argument missing kind discriminator")
+    elif value_type in ("bool", "int", "float", "string"):
+        return value
+    elif value_type == "list":
+        return [deserialize_value(v) for v in value]
+    elif value_type == "tuple":
+        return tuple(deserialize_value(v) for v in value)
+    elif value_type == "dict":
+        return {k: deserialize_value(v) for k, v in value.items()}
+    elif value_type == "basemodel":
+        # Reconstruct Pydantic model
+        import importlib
+
+        module = importlib.import_module(data["module"])
+        model_cls = getattr(module, data["name"])
+        return model_cls(**deserialize_value(data["data"]))
+    elif value_type == "exception":
+        # Return exception info as dict (can't reconstruct arbitrary exceptions)
+        return {
+            "exception_type": data["exception_type"],
+            "message": data["message"],
+            "traceback": data["traceback"],
+        }
+    else:
+        raise ValueError(f"Unknown value type: {value_type}")
 
 
-def _instantiate_serialized_model(module: str, name: str, model_data: dict[str, Any]) -> Any:
-    cls = _import_symbol(module, name)
-    if hasattr(cls, "model_validate"):
-        return cls.model_validate(model_data)  # type: ignore[attr-defined]
-    return cls(**model_data)
+def serialize_kwargs(kwargs: dict[str, Any]) -> Any:
+    """Serialize keyword arguments for proto."""
+    return {k: serialize_value(v) for k, v in kwargs.items()}
 
 
-def _is_base_model(value: Any) -> bool:
-    return isinstance(value, BaseModel)
-
-
-def _import_symbol(module: str, qualname: str) -> Any:
-    module_obj = importlib.import_module(module)
-    attr: Any = module_obj
-    for part in qualname.split("."):
-        attr = getattr(attr, part)
-    if not isinstance(attr, type):
-        raise ValueError(f"{qualname} from {module} is not a class")
-    return attr
+def deserialize_kwargs(data: Any) -> dict[str, Any]:
+    """Deserialize keyword arguments from proto."""
+    if not isinstance(data, dict):
+        return {}
+    return {k: deserialize_value(v) for k, v in data.items()}

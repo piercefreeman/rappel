@@ -1,41 +1,27 @@
-"""Public API for user-defined rappel actions."""
+"""
+Rappel - Distributed & durable background events in Python.
 
-from . import bridge  # noqa: F401
-from . import workflow_runtime as _workflow_runtime  # noqa: F401
-from .actions import (
-    ActionResultPayload,
-    action,
-    deserialize_result_payload,
-    serialize_error_payload,
-    serialize_result_payload,
+This module provides durable workflow execution where workflows are
+replayed on restart, and actions are executed by a separate worker pool.
+"""
+
+from rappel.actions import action
+from rappel.durable import (
+    ActionCall,
+    ActionResult,
+    ActionStatus,
+    WorkflowInstance,
+    run_until_actions,
 )
-from .dependencies import Depend, provide_dependencies
-from .exceptions import ExhaustedRetries, ExhaustedRetriesError
-from .ir_builder import UnsupportedPatternError, build_workflow_ir
-from .registry import registry
-from .workflow import (
-    RetryPolicy,
-    Workflow,
-    workflow,
-    workflow_registry,
-)
+from rappel.workflow import Workflow, workflow
 
 __all__ = [
     "action",
-    "registry",
-    "ActionResultPayload",
-    "Workflow",
     "workflow",
-    "workflow_registry",
-    "RetryPolicy",
-    "build_workflow_ir",
-    "serialize_result_payload",
-    "deserialize_result_payload",
-    "serialize_error_payload",
-    "Depend",
-    "provide_dependencies",
-    "bridge",
-    "ExhaustedRetries",
-    "ExhaustedRetriesError",
-    "UnsupportedPatternError",
+    "Workflow",
+    "ActionCall",
+    "ActionResult",
+    "ActionStatus",
+    "WorkflowInstance",
+    "run_until_actions",
 ]

@@ -12,16 +12,8 @@ name = "rappel-server"
 path = "src/bin/rappel-server.rs"
 
 [[bin]]
-name = "boot-rappel-singleton"
-path = "src/bin/boot-rappel-singleton.rs"
-
-[[bin]]
 name = "benchmark"
 path = "src/bin/benchmark.rs"
-
-[[bin]]
-name = "start_workers"
-path = "src/bin/start_workers.rs"
 
 [dependencies]
 anyhow = "1"

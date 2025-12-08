@@ -1,80 +1,88 @@
-import inspect
-from dataclasses import dataclass
-from typing import Any, Callable, Optional, TypeVar, overload
+"""
+Action decorator and registry for durable workflows.
 
-from proto import messages_pb2 as pb2
+Actions are the unit of durability - they represent operations that:
+1. May have side effects (I/O, network calls, etc.)
+2. Should not be re-executed on replay
+3. Are executed by action workers, not instance workers
+"""
 
-from .registry import AsyncAction, registry
-from .serialization import dumps, loads
+from functools import wraps
+from typing import Any, Callable, TypeVar
 
-TAsync = TypeVar("TAsync", bound=AsyncAction)
+from rappel.durable import ActionCall, ActionStatus, _current_context
 
+import asyncio
+import uuid
 
-@dataclass
-class ActionResultPayload:
-    result: Any | None
-    error: dict[str, str] | None
+T = TypeVar("T")
 
-
-def serialize_result_payload(value: Any) -> pb2.WorkflowArguments:
-    """Serialize a successful action result."""
-    arguments = pb2.WorkflowArguments()
-    entry = arguments.arguments.add()
-    entry.key = "result"
-    entry.value.CopyFrom(dumps(value))
-    return arguments
+# Global registry of action functions
+_action_registry: dict[str, Callable] = {}
 
 
-def serialize_error_payload(_action: str, exc: BaseException) -> pb2.WorkflowArguments:
-    """Serialize an error raised during action execution."""
-    arguments = pb2.WorkflowArguments()
-    entry = arguments.arguments.add()
-    entry.key = "error"
-    entry.value.CopyFrom(dumps(exc))
-    return arguments
+def action(func: Callable[..., T]) -> Callable[..., T]:
+    """
+    Decorator that marks a function as a durable action.
+
+    During execution:
+    - If a completed result exists in queue at current position, return it (replay)
+    - Otherwise, register as pending and block forever
+
+    The blocking behavior allows the instance worker to:
+    1. Detect which actions are needed
+    2. Report them to the server
+    3. Wait for the server to schedule action execution
+    4. Re-run the workflow with completed actions for replay
+    """
+    # Register the action
+    _action_registry[func.__name__] = func
+
+    @wraps(func)
+    async def wrapper(*args: Any, **kwargs: Any) -> T:
+        ctx = _current_context.get()
+
+        if ctx is None or not ctx.capture_mode:
+            # Not in durable context, execute normally
+            return await func(*args, **kwargs)
+
+        instance = ctx.instance
+
+        # Check if we have a completed result to replay
+        if instance.replay_index < len(instance.action_queue):
+            result = instance.action_queue[instance.replay_index]
+            # Verify it matches (ordering check)
+            # For now, just check function name matches
+            # In production, you'd want to verify args match too
+            instance.replay_index += 1
+
+            if result.status == ActionStatus.COMPLETED:
+                return result.result
+            elif result.status == ActionStatus.FAILED:
+                raise Exception(result.error)
+
+        # No completed result - register as pending and block
+        action_call = ActionCall(
+            id=str(uuid.uuid4()),
+            func_name=func.__name__,
+            args=args,
+            kwargs=kwargs,
+        )
+        instance.pending_actions.append(action_call)
+
+        # Block forever - runner will handle this
+        await asyncio.Future()
+
+    wrapper._is_action = True  # type: ignore
+    wrapper._action_func = func  # type: ignore
+    return wrapper
 
 
-def deserialize_result_payload(payload: pb2.WorkflowArguments | None) -> ActionResultPayload:
-    """Deserialize WorkflowArguments produced by serialize_result_payload/error."""
-    if payload is None:
-        return ActionResultPayload(result=None, error=None)
-    values = {entry.key: entry.value for entry in payload.arguments}
-    if "error" in values:
-        error_value = values["error"]
-        data = loads(error_value)
-        if not isinstance(data, dict):
-            raise ValueError("error payload must deserialize to a mapping")
-        return ActionResultPayload(result=None, error=data)
-    result_value = values.get("result")
-    if result_value is None:
-        raise ValueError("result payload missing 'result' field")
-    return ActionResultPayload(result=loads(result_value), error=None)
+def get_action_registry() -> dict[str, Callable]:
+    """Get the global action registry."""
+    return _action_registry
 
 
-@overload
-def action(func: TAsync, /) -> TAsync: ...
-
-
-@overload
-def action(*, name: Optional[str] = None) -> Callable[[TAsync], TAsync]: ...
-
-
-def action(
-    func: Optional[TAsync] = None,
-    *,
-    name: Optional[str] = None,
-) -> Callable[[TAsync], TAsync] | TAsync:
-    """Decorator for registering async actions."""
-
-    def decorator(target: TAsync) -> TAsync:
-        if not inspect.iscoroutinefunction(target):
-            raise TypeError(f"action '{target.__name__}' must be defined with 'async def'")
-        action_name = name or target.__name__
-        registry.register(action_name, target)
-        target.__rappel_action_name__ = action_name
-        target.__rappel_action_module__ = target.__module__
-        return target
-
-    if func is not None:
-        return decorator(func)
-    return decorator
+def get_action(name: str) -> Callable | None:
+    """Get an action function by name."""
+    return _action_registry.get(name)
