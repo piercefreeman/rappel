@@ -557,6 +557,30 @@ pub fn execute_inline_subgraph(
         }
     }
 
+    // If the completed node is inside a for-loop body, merge the loop controller's
+    // inbox so loop-scoped variables (e.g., accumulators, loop index) are available
+    // while executing inline nodes from the body completion. Some DAGs may not
+    // populate `loop_body_of`, so fall back to walking predecessors to find the
+    // nearest for_loop node.
+    let loop_context = dag.nodes.get(completed_node_id).and_then(|completed_node| {
+        if completed_node.node_type == "for_loop" {
+            return None;
+        }
+        completed_node
+            .loop_body_of
+            .clone()
+            .or_else(|| find_enclosing_for_loop(completed_node_id, dag, &helper))
+    });
+    if let Some(loop_id) = loop_context
+        && let Some(loop_inbox) = existing_inbox.get(&loop_id)
+    {
+        for (var, val) in loop_inbox {
+            inline_scope
+                .entry(var.clone())
+                .or_insert_with(|| val.clone());
+        }
+    }
+
     // BFS traversal with guard evaluation
     // Track which nodes we've visited and which inline nodes we've executed
     let mut visited: HashSet<String> = HashSet::new();
@@ -927,6 +951,8 @@ pub fn execute_inline_subgraph(
                     // For loop-back iterations, reset the for_loop's readiness before incrementing
                     if is_loop_back {
                         plan.readiness_resets.push(frontier.node_id.clone());
+                        let body_nodes = collect_loop_body_nodes(&frontier.node_id, &helper);
+                        plan.readiness_resets.extend(body_nodes);
                     }
 
                     // Add readiness increment for the for_loop
@@ -1093,6 +1119,63 @@ pub fn evaluate_guard_string(
         "unknown guard string pattern, assuming false"
     );
     false
+}
+
+/// Walk state machine predecessors to find the nearest enclosing for_loop node.
+fn find_enclosing_for_loop(node_id: &str, dag: &DAG, helper: &DAGHelper) -> Option<String> {
+    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    queue.push_back(node_id.to_string());
+
+    while let Some(current) = queue.pop_front() {
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+
+        if current != node_id
+            && dag
+                .nodes
+                .get(&current)
+                .is_some_and(|n| n.node_type == "for_loop")
+        {
+            return Some(current);
+        }
+
+        for edge in helper.get_incoming_edges(&current) {
+            if edge.edge_type == EdgeType::StateMachine {
+                queue.push_back(edge.source.clone());
+            }
+        }
+    }
+
+    None
+}
+
+/// Collect nodes that form the body of a for_loop by walking backwards from
+/// loop-back edges targeting the loop controller.
+fn collect_loop_body_nodes(loop_id: &str, helper: &DAGHelper) -> HashSet<String> {
+    let mut body: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+
+    for edge in helper.get_incoming_edges(loop_id) {
+        if edge.edge_type == EdgeType::StateMachine && edge.is_loop_back {
+            queue.push_back(edge.source.clone());
+        }
+    }
+
+    while let Some(current) = queue.pop_front() {
+        if !body.insert(current.clone()) {
+            continue;
+        }
+
+        for edge in helper.get_incoming_edges(&current) {
+            if edge.edge_type == EdgeType::StateMachine && edge.source != loop_id {
+                queue.push_back(edge.source.clone());
+            }
+        }
+    }
+
+    body
 }
 
 /// Collect DataFlow edge writes from inline scope to a target node.

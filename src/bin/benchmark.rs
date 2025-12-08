@@ -307,6 +307,7 @@ async fn wait_for_completion(
 ) -> Result<u64> {
     let start = std::time::Instant::now();
     let expected_count = instance_ids.len();
+    let mut last_log = std::time::Instant::now();
 
     loop {
         if start.elapsed() > timeout {
@@ -352,6 +353,21 @@ async fn wait_for_completion(
             return Ok(action_count as u64);
         }
 
+        if last_log.elapsed() > Duration::from_secs(1) {
+            let completed_actions: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM action_queue WHERE status = 'completed'")
+                    .fetch_one(database.pool())
+                    .await
+                    .unwrap_or(0);
+            info!(
+                completed_instances = completed,
+                total_instances = expected_count,
+                completed_actions = completed_actions,
+                "Benchmark in progress"
+            );
+            last_log = std::time::Instant::now();
+        }
+
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -386,7 +402,9 @@ async fn main() -> Result<()> {
     let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| {
         "postgresql://mountaineer:mountaineer@localhost:5432/mountaineer_daemons".to_string()
     });
-    let database = Arc::new(Database::connect(&database_url).await?);
+    let pool_size = (args.hosts * args.workers_per_host * 2).max(20);
+    let database = Arc::new(Database::connect_with_pool_size(&database_url, pool_size).await?);
+    info!(%database_url, pool_size, "database connected");
 
     // Clean up database
     sqlx::query("TRUNCATE action_queue, instance_context, loop_state, workflow_instances, workflow_versions CASCADE")

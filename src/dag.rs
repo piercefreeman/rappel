@@ -948,7 +948,15 @@ impl DAGConverter {
     /// expanded helper functions (like implicit try/except bodies) are available
     /// to downstream nodes in the caller.
     fn add_global_data_flow_edges(&self, dag: &mut DAG) {
-        // Remove existing data flow edges to avoid duplicates.
+        // Preserve existing data flow edges (they carry important loop metadata
+        // like loop indices and accumulator wiring) and avoid duplicating them
+        // when we add the global edges below.
+        let existing_data_flow: Vec<DAGEdge> = dag
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::DataFlow)
+            .cloned()
+            .collect();
         dag.edges.retain(|e| e.edge_type != EdgeType::DataFlow);
 
         // Build topological order for all nodes (state machine edges only, skip loop-back).
@@ -1027,6 +1035,69 @@ impl DAGConverter {
 
         // Helper: does a node use a variable?
         let uses_var = |node: &DAGNode, var_name: &str| -> bool {
+            fn expr_uses_var(expr: &ast::Expr, var_name: &str) -> bool {
+                use ast::expr;
+
+                match &expr.kind {
+                    Some(expr::Kind::Variable(v)) => v.name == var_name,
+                    Some(expr::Kind::BinaryOp(b)) => {
+                        expr_uses_var(
+                            b.left
+                                .as_ref()
+                                .expect("binary op must have left expression"),
+                            var_name,
+                        ) || expr_uses_var(
+                            b.right
+                                .as_ref()
+                                .expect("binary op must have right expression"),
+                            var_name,
+                        )
+                    }
+                    Some(expr::Kind::UnaryOp(u)) => u
+                        .operand
+                        .as_ref()
+                        .map(|op| expr_uses_var(op, var_name))
+                        .unwrap_or(false),
+                    Some(expr::Kind::List(list)) => list
+                        .elements
+                        .iter()
+                        .any(|elem| expr_uses_var(elem, var_name)),
+                    Some(expr::Kind::Dict(dict)) => dict.entries.iter().any(|entry| {
+                        entry
+                            .key
+                            .as_ref()
+                            .map(|k| expr_uses_var(k, var_name))
+                            .unwrap_or(false)
+                            || entry
+                                .value
+                                .as_ref()
+                                .map(|v| expr_uses_var(v, var_name))
+                                .unwrap_or(false)
+                    }),
+                    Some(expr::Kind::Index(idx)) => {
+                        idx.object
+                            .as_ref()
+                            .map(|v| expr_uses_var(v, var_name))
+                            .unwrap_or(false)
+                            || idx
+                                .index
+                                .as_ref()
+                                .map(|i| expr_uses_var(i, var_name))
+                                .unwrap_or(false)
+                    }
+                    Some(expr::Kind::FunctionCall(call)) => {
+                        call.args.iter().any(|arg| expr_uses_var(arg, var_name))
+                            || call.kwargs.iter().any(|kw| {
+                                kw.value
+                                    .as_ref()
+                                    .map(|v| expr_uses_var(v, var_name))
+                                    .unwrap_or(false)
+                            })
+                    }
+                    _ => false,
+                }
+            }
+
             if let Some(ref kwargs) = node.kwargs {
                 for value in kwargs.values() {
                     if value == &format!("${}", var_name) {
@@ -1046,18 +1117,37 @@ impl DAGConverter {
                 }
             }
 
+            if let Some(ref assign_expr) = node.assign_expr {
+                if expr_uses_var(assign_expr, var_name) {
+                    return true;
+                }
+            }
+
             false
         };
 
         // Add data flow edges from each modification to downstream uses until next modification.
-        let mut seen_edges: HashSet<(String, String, String)> = HashSet::new();
+        let mut seen_edges: HashSet<(String, String, Option<String>)> = HashSet::new();
+        for edge in &existing_data_flow {
+            seen_edges.insert((
+                edge.source.clone(),
+                edge.target.clone(),
+                edge.variable.clone(),
+            ));
+        }
+
         for (var_name, modifications) in var_modifications {
-            for (i, mod_node) in modifications.iter().enumerate() {
+            // Sort modifications in topological order for deterministic edges.
+            let mut mods = modifications.clone();
+            mods.sort_by_key(|id| order.iter().position(|n| n == id).unwrap_or(order.len()));
+            mods.dedup();
+
+            for (i, mod_node) in mods.iter().enumerate() {
                 // Find position of this modification in execution order.
                 let Some(mod_pos) = order.iter().position(|n| n == mod_node) else {
                     continue;
                 };
-                let next_mod = modifications.get(i + 1);
+                let next_mod = mods.get(i + 1);
 
                 for (pos, node_id) in order.iter().enumerate() {
                     if pos <= mod_pos {
@@ -1069,7 +1159,8 @@ impl DAGConverter {
                             // Still allow edge to the next modification if it uses the var.
                             if let Some(node) = dag.nodes.get(node_id) {
                                 if uses_var(node, &var_name) {
-                                    let key = (mod_node.clone(), node_id.clone(), var_name.clone());
+                                    let key =
+                                        (mod_node.clone(), node_id.clone(), Some(var_name.clone()));
                                     if seen_edges.insert(key.clone()) {
                                         dag.edges.push(DAGEdge {
                                             source: mod_node.clone(),
@@ -1091,7 +1182,7 @@ impl DAGConverter {
 
                     if let Some(node) = dag.nodes.get(node_id) {
                         if uses_var(node, &var_name) {
-                            let key = (mod_node.clone(), node_id.clone(), var_name.clone());
+                            let key = (mod_node.clone(), node_id.clone(), Some(var_name.clone()));
                             if seen_edges.insert(key.clone()) {
                                 dag.edges.push(DAGEdge {
                                     source: mod_node.clone(),
@@ -1110,6 +1201,9 @@ impl DAGConverter {
                 }
             }
         }
+
+        // Add back the original data flow edges we preserved up front.
+        dag.edges.extend(existing_data_flow);
     }
 
     /// Convert a function definition into an isolated subgraph
