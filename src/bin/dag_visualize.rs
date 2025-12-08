@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use clap::Parser;
 use prost::Message;
-use rappel::{convert_to_dag, ir_ast, ir_printer, parse, EdgeType};
+use rappel::{EdgeType, convert_to_dag, ir_ast, ir_printer, parse};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::process::Command;
@@ -60,7 +60,6 @@ struct NodeData {
     guard_expr: Option<String>,
     is_input: bool,
     is_output: bool,
-    is_loop_head: bool,
     is_aggregator: bool,
     is_spread: bool,
 }
@@ -138,7 +137,7 @@ fn main() -> Result<()> {
             let guard_expr_str = node
                 .guard_expr
                 .as_ref()
-                .map(|e| rappel::ast_printer::print_expr(e));
+                .map(rappel::ast_printer::print_expr);
 
             NodeData {
                 id: node.id.clone(),
@@ -150,7 +149,6 @@ fn main() -> Result<()> {
                 guard_expr: guard_expr_str,
                 is_input: node.is_input,
                 is_output: node.is_output,
-                is_loop_head: node.is_loop_head,
                 is_aggregator: node.is_aggregator,
                 is_spread: node.is_spread,
             }
@@ -891,7 +889,6 @@ fn generate_html(data: &VisualizationData) -> Result<String> {
             else if (node.is_output) dataType = 'output';
             else if (node.is_aggregator) dataType = 'aggregator';
             else if (node.is_spread) dataType = 'spread_action';
-            else if (node.is_loop_head) dataType = 'for_loop';
             else if (node.node_type === 'branch' || node.node_type === 'if') dataType = 'branch';
             else if (node.node_type === 'join') dataType = 'join';
 

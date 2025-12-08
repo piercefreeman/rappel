@@ -10,6 +10,7 @@ import base64
 import importlib.util
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 # Add the python src and proto to path for imports
 project_root = Path(__file__).parent.parent
@@ -18,12 +19,16 @@ proto_path = project_root / "python"  # proto module is at python/proto/
 sys.path.insert(0, str(python_src))
 sys.path.insert(0, str(proto_path))
 
-from rappel.ir_builder import build_workflow_ir
-from rappel.workflow import Workflow
+if TYPE_CHECKING:
+    sys.path.insert(0, str(python_src))
+    sys.path.insert(0, str(proto_path))
+    from rappel.workflow import Workflow
 
 
-def load_workflow_from_file(file_path: str) -> type[Workflow]:
+def load_workflow_from_file(file_path: str) -> type["Workflow"]:
     """Load a workflow class from a Python file."""
+    from rappel.workflow import Workflow
+
     path = Path(file_path).resolve()
 
     # Load the module
@@ -51,12 +56,17 @@ def load_workflow_from_file(file_path: str) -> type[Workflow]:
         raise ValueError(f"No workflow class found in {path}")
 
     if len(workflow_classes) > 1:
-        print(f"Warning: Multiple workflow classes found, using {workflow_classes[0].__name__}", file=sys.stderr)
+        print(
+            f"Warning: Multiple workflow classes found, using {workflow_classes[0].__name__}",
+            file=sys.stderr,
+        )
 
     return workflow_classes[0]
 
 
 def main():
+    from rappel.ir_builder import build_workflow_ir
+
     parser = argparse.ArgumentParser(description="Generate IR from a Python workflow file")
     parser.add_argument("file", help="Path to Python workflow file")
     parser.add_argument(
@@ -94,6 +104,7 @@ def main():
     elif args.format == "text":
         # Pretty print the protobuf
         from google.protobuf import text_format
+
         output = text_format.MessageToString(program)
         if args.output:
             Path(args.output).write_text(output)

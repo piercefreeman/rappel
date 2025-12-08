@@ -25,8 +25,8 @@ fn main() {
     let nodes: BTreeMap<_, _> = dag.nodes.iter().collect();
     for (id, node) in nodes.iter() {
         println!(
-            "{}: type={} targets={:?} loop_body_of={:?} loop_collection={:?} kwargs={:?}",
-            id, node.node_type, node.targets, node.loop_body_of, node.loop_collection, node.kwargs
+            "{}: type={} targets={:?} kwargs={:?}",
+            id, node.node_type, node.targets, node.kwargs
         );
     }
     if let Some(assign) = dag

@@ -43,10 +43,6 @@ pub struct DAGNode {
     pub node_uuid: Uuid,
     /// Which function this node belongs to (None = top-level)
     pub function_name: Option<String>,
-    /// Whether this is a loop head node
-    pub is_loop_head: bool,
-    /// Loop variables (for for_loop nodes)
-    pub loop_vars: Option<Vec<String>>,
     /// Whether this is an aggregator node
     pub is_aggregator: bool,
     /// Node ID this aggregates from (for aggregator nodes)
@@ -84,10 +80,6 @@ pub struct DAGNode {
     pub aggregates_to: Option<String>,
     /// Guard expression for conditional nodes (if/elif). Evaluated at runtime to determine branch.
     pub guard_expr: Option<ast::Expr>,
-    /// Collection being iterated over (for for_loop nodes)
-    pub loop_collection: Option<String>,
-    /// For loop body nodes, the ID of the for_loop node they belong to
-    pub loop_body_of: Option<String>,
     /// Expression for assignment nodes (evaluated at runtime)
     pub assign_expr: Option<ast::Expr>,
 }
@@ -101,8 +93,6 @@ impl DAGNode {
             label,
             node_uuid: Uuid::new_v4(),
             function_name: None,
-            is_loop_head: false,
-            loop_vars: None,
             is_aggregator: false,
             aggregates_from: None,
             is_fn_call: false,
@@ -120,8 +110,6 @@ impl DAGNode {
             spread_collection: None,
             aggregates_to: None,
             guard_expr: None,
-            loop_collection: None,
-            loop_body_of: None,
             assign_expr: None,
             kwarg_exprs: None,
         }
@@ -158,13 +146,6 @@ impl DAGNode {
     /// Builder method to set function name
     pub fn with_function_name(mut self, name: &str) -> Self {
         self.function_name = Some(name.to_string());
-        self
-    }
-
-    /// Builder method to mark as loop head
-    pub fn with_loop_head(mut self, loop_vars: Vec<String>) -> Self {
-        self.is_loop_head = true;
-        self.loop_vars = Some(loop_vars);
         self
     }
 
@@ -226,18 +207,6 @@ impl DAGNode {
     /// Builder method to set aggregator node ID for spread actions
     pub fn with_aggregates_to(mut self, aggregator_id: &str) -> Self {
         self.aggregates_to = Some(aggregator_id.to_string());
-        self
-    }
-
-    /// Builder method to set collection for for_loop nodes
-    pub fn with_loop_collection(mut self, collection: &str) -> Self {
-        self.loop_collection = Some(collection.to_string());
-        self
-    }
-
-    /// Builder method to mark a node as the body of a for_loop
-    pub fn with_loop_body(mut self, loop_id: &str) -> Self {
-        self.loop_body_of = Some(loop_id.to_string());
         self
     }
 }
@@ -698,8 +667,11 @@ impl DAGConverter {
                 None => continue,
             };
 
-            // For inlined functions, skip input/output boundary nodes
-            if !is_entry_function && (node.is_input || node.is_output) {
+            // For inlined functions, skip input/output boundary nodes and return nodes
+            // Return nodes in synthetic functions (try/except bodies, for loop bodies, etc.)
+            // are artifacts of the function wrapping and serve no purpose after expansion
+            if !is_entry_function && (node.is_input || node.is_output || node.node_type == "return")
+            {
                 continue;
             }
 
@@ -1101,17 +1073,6 @@ impl DAGConverter {
             if let Some(ref kwargs) = node.kwargs {
                 for value in kwargs.values() {
                     if value == &format!("${}", var_name) {
-                        return true;
-                    }
-                }
-            }
-
-            if node.node_type == "for_loop" {
-                if let Some(ref collection) = node.loop_collection {
-                    if collection == var_name
-                        || collection == &format!("${}", var_name)
-                        || collection.strip_prefix('$') == Some(var_name)
-                    {
                         return true;
                     }
                 }
@@ -1900,27 +1861,28 @@ impl DAGConverter {
         result_nodes
     }
 
-    /// Convert a for loop.
+    /// Convert a for loop to normalized DAG nodes.
     ///
-    /// For loops create a sequential loop structure:
-    /// 1. A for_loop node (loop controller) that manages iteration state
-    /// 2. Body nodes (action_call or fn_call) for each iteration
-    /// 3. "continue" edge from controller to body (with guard: has_more_items)
-    /// 4. "break" edge from controller to next node (with guard: !has_more_items)
-    /// 5. Edge from body back to controller (loop back)
+    /// For loops are decomposed into primitive nodes:
+    /// 1. loop_init (assignment): Initialize index to 0
+    /// 2. loop_cond (branch): Condition check with guarded edges
+    /// 3. loop_extract (assignment): Extract current item from collection
+    /// 4. body nodes: The actual loop body (action_call, fn_call, etc.)
+    /// 5. loop_incr (assignment): Increment the index
+    /// 6. Back-edge from incr to cond
     ///
     /// The structure is:
-    ///   for_loop ──[continue]──> body ──[loop_back]──┐
-    ///      │                                         │
-    ///      │ [break]                                 │
-    ///      ▼                                         │
-    ///   next_node                                    │
-    ///      ◄─────────────────────────────────────────┘
+    ///                              ┌──────────────────────────────────────────────────────┐
+    ///                              │                                                      │
+    ///                              ▼                                                      │
+    ///   loop_init ──> loop_cond ──[guard: i<len]──> loop_extract ──> body ──> loop_incr ──┘
+    ///                     │
+    ///                     └──[guard: NOT(i<len)]──> (next node via result_nodes)
     ///
-    /// Modified variables (accumulators) are passed in/out of the body via
-    /// the synthetic function's inputs/outputs, enabling mutable state.
+    /// This structure uses the same guard evaluation as if/else branches,
+    /// requiring no special runtime handling for loops.
     fn convert_for_loop(&mut self, for_loop: &ast::ForLoop) -> Vec<String> {
-        let loop_id = self.next_id("for_loop");
+        let loop_id = self.next_id("loop");
         let loop_vars_str = for_loop.loop_vars.join(", ");
 
         // Get the iterable expression
@@ -1930,172 +1892,233 @@ impl DAGConverter {
             .map(|c| self.expr_to_string(c))
             .unwrap_or_default();
 
-        let label = format!("for {} in {}", loop_vars_str, collection_str);
-
         // The loop index variable name (internal)
         let loop_i_var = format!("__loop_{}_i", loop_id);
 
         // Build guard expression: __loop_i < len(collection)
-        let guard_expr = Self::build_loop_guard(&loop_i_var, collection_expr.as_ref());
+        let continue_guard = Self::build_loop_guard(&loop_i_var, collection_expr.as_ref());
 
-        let mut loop_node = DAGNode::new(loop_id.clone(), "for_loop".to_string(), label)
-            .with_loop_head(for_loop.loop_vars.clone())
-            .with_loop_collection(&collection_str);
-        if let Some(ref guard) = guard_expr {
-            loop_node = loop_node.with_guard_expr(guard.clone());
-        }
+        // Build break guard: NOT(__loop_i < len(collection))
+        let break_guard = continue_guard.as_ref().map(|guard| ast::Expr {
+            span: None,
+            kind: Some(ast::expr::Kind::UnaryOp(Box::new(ast::UnaryOp {
+                op: ast::UnaryOperator::UnaryOpNot as i32,
+                operand: Some(Box::new(guard.clone())),
+            }))),
+        });
+
+        // ============================================================
+        // 1. Create loop_init node: __loop_i = 0
+        // ============================================================
+        let init_id = self.next_id("loop_init");
+        let init_label = format!("{} = 0", loop_i_var);
+        let init_expr = ast::Expr {
+            span: None,
+            kind: Some(ast::expr::Kind::Literal(ast::Literal {
+                value: Some(ast::literal::Value::IntValue(0)),
+            })),
+        };
+        let mut init_node = DAGNode::new(init_id.clone(), "assignment".to_string(), init_label)
+            .with_target(&loop_i_var)
+            .with_assign_expr(init_expr);
         if let Some(ref fn_name) = self.current_function {
-            loop_node = loop_node.with_function_name(fn_name);
+            init_node = init_node.with_function_name(fn_name);
         }
-        self.dag.add_node(loop_node);
+        self.dag.add_node(init_node);
+        self.track_var_definition(&loop_i_var, &init_id);
 
-        // Track loop variables as defined by the for_loop node
+        // ============================================================
+        // 2. Create loop_cond node (branch): decision point
+        // ============================================================
+        let cond_id = self.next_id("loop_cond");
+        let cond_label = format!("for {} in {}", loop_vars_str, collection_str);
+        let mut cond_node =
+            DAGNode::new(cond_id.clone(), "branch".to_string(), cond_label.clone());
+        if let Some(ref fn_name) = self.current_function {
+            cond_node = cond_node.with_function_name(fn_name);
+        }
+        self.dag.add_node(cond_node);
+
+        // Connect init -> cond
+        self.dag
+            .add_edge(DAGEdge::state_machine(init_id.clone(), cond_id.clone()));
+
+        // ============================================================
+        // 3. Create loop_extract node(s): extract loop variable(s)
+        // ============================================================
+        // Build expression: item = collection[__loop_i]
+        let extract_id = self.next_id("loop_extract");
+
+        // Build the index expression: collection[__loop_i]
+        let index_expr = if let Some(ref coll) = collection_expr {
+            ast::Expr {
+                span: None,
+                kind: Some(ast::expr::Kind::Index(Box::new(ast::IndexAccess {
+                    object: Some(Box::new(coll.clone())),
+                    index: Some(Box::new(ast::Expr {
+                        span: None,
+                        kind: Some(ast::expr::Kind::Variable(ast::Variable {
+                            name: loop_i_var.clone(),
+                        })),
+                    })),
+                }))),
+            }
+        } else {
+            // Fallback: shouldn't happen, but use empty list
+            ast::Expr {
+                span: None,
+                kind: Some(ast::expr::Kind::List(ast::ListExpr { elements: vec![] })),
+            }
+        };
+
+        let extract_label = format!("{} = {}[{}]", loop_vars_str, collection_str, loop_i_var);
+        let mut extract_node =
+            DAGNode::new(extract_id.clone(), "assignment".to_string(), extract_label)
+                .with_targets(&for_loop.loop_vars)
+                .with_assign_expr(index_expr);
+        if let Some(ref fn_name) = self.current_function {
+            extract_node = extract_node.with_function_name(fn_name);
+        }
+        self.dag.add_node(extract_node);
+
+        // Track loop variables as defined by extract node
         for loop_var in &for_loop.loop_vars {
-            self.track_var_definition(loop_var, &loop_id);
+            self.track_var_definition(loop_var, &extract_id);
         }
 
-        let result_nodes = vec![loop_id.clone()];
+        // Connect cond -> extract with continue guard
+        if let Some(ref guard) = continue_guard {
+            self.dag.add_edge(DAGEdge::state_machine_with_guard(
+                cond_id.clone(),
+                extract_id.clone(),
+                guard.clone(),
+            ));
+        } else {
+            self.dag
+                .add_edge(DAGEdge::state_machine(cond_id.clone(), extract_id.clone()));
+        }
 
-        // Convert the loop body (SingleCallBody)
+        // ============================================================
+        // 4. Convert body nodes
+        // ============================================================
+        let mut body_first: Option<String> = None;
+        let mut body_last: Option<String> = None;
+        let mut body_targets: Vec<String> = Vec::new();
+
         if let Some(body) = &for_loop.body {
-            // Handle function call in body (e.g., synthetic __for_body_X__)
-            if let Some(call) = &body.call {
-                if let Some(ast::call::Kind::Function(func)) = &call.kind {
-                    // Create fn_call node for the body function
-                    let fn_call_id = self.next_id("for_body_call");
-                    let fn_label = format!("{}()", func.name);
-                    let kwargs = self.extract_kwargs(&func.kwargs);
-                    let kwarg_exprs = self.extract_kwarg_exprs(&func.kwargs);
+            // Convert the body using convert_single_call_body
+            let body_node_ids = self.convert_single_call_body(body);
+            if !body_node_ids.is_empty() {
+                body_first = Some(body_node_ids[0].clone());
+                body_last = Some(body_node_ids.last().unwrap().clone());
+            }
 
-                    let mut fn_node =
-                        DAGNode::new(fn_call_id.clone(), "fn_call".to_string(), fn_label)
-                            .with_fn_call(&func.name)
-                            .with_kwargs(kwargs)
-                            .with_kwarg_exprs(kwarg_exprs)
-                            .with_loop_body(&loop_id);
-                    if let Some(ref current_fn) = self.current_function {
-                        fn_node = fn_node.with_function_name(current_fn);
-                    }
-                    if !body.targets.is_empty() {
-                        fn_node = fn_node.with_targets(&body.targets);
-                    }
-                    self.dag.add_node(fn_node);
+            // Collect all targets: both from the call and from assignment statements
+            body_targets = body.targets.clone();
 
-                    // Connect for_loop -> body with guard: __loop_i < len(collection)
-                    if let Some(ref guard) = guard_expr {
-                        self.dag.add_edge(DAGEdge::state_machine_with_guard(
-                            loop_id.clone(),
-                            fn_call_id.clone(),
-                            guard.clone(),
-                        ));
-                    } else {
-                        self.dag
-                            .add_edge(DAGEdge::state_machine(loop_id.clone(), fn_call_id.clone()));
-                    }
-
-                    // Data flow: loop index from for_loop to body
-                    self.dag.add_edge(DAGEdge::data_flow(
-                        loop_id.clone(),
-                        fn_call_id.clone(),
-                        &loop_i_var,
-                    ));
-
-                    // Connect body -> for_loop (loop back) - this creates the cycle
-                    self.dag.add_edge(
-                        DAGEdge::state_machine(fn_call_id.clone(), loop_id.clone())
-                            .with_loop_back(true),
-                    );
-
-                    // Data flow: loop index back from body to for_loop
-                    self.dag.add_edge(DAGEdge::data_flow(
-                        fn_call_id.clone(),
-                        loop_id.clone(),
-                        &loop_i_var,
-                    ));
-
-                    // Track targets at for_loop node (accumulated results available after loop)
-                    for target in &body.targets {
-                        self.track_var_definition(target, &loop_id);
-                    }
-
-                    // Don't add body to result_nodes - it's internal to the loop
-                    // result_nodes.push(fn_call_id);
-                } else if let Some(ast::call::Kind::Action(action)) = &call.kind {
-                    // Direct action call in body (no function wrapper)
-                    let action_id = self.next_id("for_body_action");
-                    let action_label = format!("@{}()", action.action_name);
-                    let kwargs = self.extract_kwargs(&action.kwargs);
-                    let kwarg_exprs = self.extract_kwarg_exprs(&action.kwargs);
-
-                    let mut action_node =
-                        DAGNode::new(action_id.clone(), "action_call".to_string(), action_label)
-                            .with_action(&action.action_name, action.module_name.as_deref())
-                            .with_kwargs(kwargs)
-                            .with_kwarg_exprs(kwarg_exprs)
-                            .with_loop_body(&loop_id);
-                    if let Some(ref current_fn) = self.current_function {
-                        action_node = action_node.with_function_name(current_fn);
-                    }
-                    if !body.targets.is_empty() {
-                        action_node = action_node.with_targets(&body.targets);
-                    }
-                    self.dag.add_node(action_node);
-
-                    // Connect for_loop -> body with guard: __loop_i < len(collection)
-                    if let Some(ref guard) = guard_expr {
-                        self.dag.add_edge(DAGEdge::state_machine_with_guard(
-                            loop_id.clone(),
-                            action_id.clone(),
-                            guard.clone(),
-                        ));
-                    } else {
-                        self.dag
-                            .add_edge(DAGEdge::state_machine(loop_id.clone(), action_id.clone()));
-                    }
-
-                    // Data flow: loop index from for_loop to body
-                    self.dag.add_edge(DAGEdge::data_flow(
-                        loop_id.clone(),
-                        action_id.clone(),
-                        &loop_i_var,
-                    ));
-
-                    // Connect body -> for_loop (loop back) - this creates the cycle
-                    self.dag.add_edge(
-                        DAGEdge::state_machine(action_id.clone(), loop_id.clone())
-                            .with_loop_back(true),
-                    );
-
-                    // Data flow: loop index back from body to for_loop
-                    self.dag.add_edge(DAGEdge::data_flow(
-                        action_id.clone(),
-                        loop_id.clone(),
-                        &loop_i_var,
-                    ));
-
-                    // Track targets at for_loop node (accumulated results available after loop)
-                    for target in &body.targets {
-                        self.track_var_definition(target, &loop_id);
-                    }
-
-                    // Don't add body to result_nodes - it's internal to the loop
-                    // result_nodes.push(action_id);
-                }
-            } else {
-                // Pure data body (no call) - track assignments
-                for stmt in &body.statements {
-                    if let Some(ast::statement::Kind::Assignment(assign)) = &stmt.kind {
-                        for target in &assign.targets {
-                            self.track_var_definition(target, &loop_id);
+            // Also collect targets from assignment statements in the body
+            for stmt in &body.statements {
+                if let Some(ast::statement::Kind::Assignment(assign)) = &stmt.kind {
+                    for target in &assign.targets {
+                        if !body_targets.contains(target) {
+                            body_targets.push(target.clone());
                         }
                     }
                 }
             }
         }
 
-        // The for_loop node itself is the "last" node - the break edge will be added
-        // when connecting to the next statement in the sequence
-        result_nodes
+        // Connect extract -> body (first node)
+        if let Some(ref first) = body_first {
+            self.dag
+                .add_edge(DAGEdge::state_machine(extract_id.clone(), first.clone()));
+        }
+
+        // ============================================================
+        // 5. Create loop_incr node: __loop_i = __loop_i + 1
+        // ============================================================
+        let incr_id = self.next_id("loop_incr");
+        let incr_label = format!("{} = {} + 1", loop_i_var, loop_i_var);
+
+        // Build expression: __loop_i + 1
+        let incr_expr = ast::Expr {
+            span: None,
+            kind: Some(ast::expr::Kind::BinaryOp(Box::new(ast::BinaryOp {
+                left: Some(Box::new(ast::Expr {
+                    span: None,
+                    kind: Some(ast::expr::Kind::Variable(ast::Variable {
+                        name: loop_i_var.clone(),
+                    })),
+                })),
+                op: ast::BinaryOperator::BinaryOpAdd as i32,
+                right: Some(Box::new(ast::Expr {
+                    span: None,
+                    kind: Some(ast::expr::Kind::Literal(ast::Literal {
+                        value: Some(ast::literal::Value::IntValue(1)),
+                    })),
+                })),
+            }))),
+        };
+
+        let mut incr_node = DAGNode::new(incr_id.clone(), "assignment".to_string(), incr_label)
+            .with_target(&loop_i_var)
+            .with_assign_expr(incr_expr);
+        if let Some(ref fn_name) = self.current_function {
+            incr_node = incr_node.with_function_name(fn_name);
+        }
+        self.dag.add_node(incr_node);
+        self.track_var_definition(&loop_i_var, &incr_id);
+
+        // Connect body (last) -> incr, or extract -> incr if no body
+        if let Some(ref last) = body_last {
+            self.dag
+                .add_edge(DAGEdge::state_machine(last.clone(), incr_id.clone()));
+        } else {
+            self.dag
+                .add_edge(DAGEdge::state_machine(extract_id.clone(), incr_id.clone()));
+        }
+
+        // ============================================================
+        // 6. Back-edge: incr -> cond
+        // ============================================================
+        self.dag.add_edge(
+            DAGEdge::state_machine(incr_id.clone(), cond_id.clone()).with_loop_back(true),
+        );
+
+        // ============================================================
+        // 7. Create loop_exit node (join point for break path)
+        // ============================================================
+        let exit_id = self.next_id("loop_exit");
+        let exit_label = format!("end for {}", loop_vars_str);
+        let mut exit_node = DAGNode::new(exit_id.clone(), "join".to_string(), exit_label);
+        if let Some(ref fn_name) = self.current_function {
+            exit_node = exit_node.with_function_name(fn_name);
+        }
+        // Track body targets on the exit node so they're available after the loop
+        if !body_targets.is_empty() {
+            exit_node.targets = Some(body_targets.clone());
+            for target in &body_targets {
+                self.track_var_definition(target, &exit_id);
+            }
+        }
+        self.dag.add_node(exit_node);
+
+        // Connect cond -> exit with break guard
+        if let Some(ref guard) = break_guard {
+            self.dag.add_edge(DAGEdge::state_machine_with_guard(
+                cond_id.clone(),
+                exit_id.clone(),
+                guard.clone(),
+            ));
+        } else {
+            // No guard means always break (empty collection edge case)
+            self.dag
+                .add_edge(DAGEdge::state_machine(cond_id.clone(), exit_id.clone()));
+        }
+
+        // Return: init is the first node, exit is the last node
+        // The caller will connect the previous node to init, and exit to the next node
+        vec![init_id, exit_id]
     }
 
     /// Convert a conditional (if/elif/else)
@@ -2575,7 +2598,7 @@ impl DAGConverter {
         }
     }
 
-    /// Check if a node uses a variable (references it in kwargs or loop_collection)
+    /// Check if a node uses a variable (references it in kwargs)
     fn node_uses_variable(&self, node: &DAGNode, var_name: &str) -> bool {
         // Check kwargs for variable references
         if let Some(ref kwargs) = node.kwargs {
@@ -2589,51 +2612,6 @@ impl DAGConverter {
                 // Check for $var_name pattern
                 if value == &format!("${}", var_name) {
                     return true;
-                }
-            }
-        }
-
-        // Check loop_collection for for_loop nodes
-        if node.node_type == "for_loop" {
-            if let Some(ref collection) = node.loop_collection {
-                // The collection could be a variable name directly or with $ prefix
-                // (expr_to_string converts Variable to $name format)
-                let matches = collection == var_name
-                    || collection == &format!("${}", var_name)
-                    || collection.strip_prefix('$') == Some(var_name);
-                tracing::debug!(
-                    node_id = %node.id,
-                    var_name = %var_name,
-                    collection = %collection,
-                    matches = matches,
-                    "checking if for_loop uses variable"
-                );
-                if matches {
-                    return true;
-                }
-            }
-
-            // Also check if the for_loop's body uses this variable
-            // The body is a fn_call that's a direct successor of the for_loop
-            for edge in self.dag.get_state_machine_edges() {
-                if edge.source == node.id && !edge.is_loop_back {
-                    if let Some(body_node) = self.dag.nodes.get(&edge.target) {
-                        if body_node.node_type == "fn_call" {
-                            if let Some(ref kwargs) = body_node.kwargs {
-                                for value in kwargs.values() {
-                                    if value == &format!("${}", var_name) {
-                                        tracing::debug!(
-                                            node_id = %node.id,
-                                            var_name = %var_name,
-                                            body_id = %body_node.id,
-                                            "for_loop uses variable via body"
-                                        );
-                                        return true;
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -2773,9 +2751,30 @@ mod tests {
         let program = parse(source).unwrap();
         let dag = convert_to_dag(&program);
 
-        // Check that for loop node exists
+        // In normalized loop structure, for loops are decomposed into:
+        // - loop_init (assignment): initialize index
+        // - loop_cond (branch): condition check
+        // - loop_extract (assignment): extract item
+        // - body nodes
+        // - loop_incr (assignment): increment index
+        // - loop_exit (join): exit point
         let node_types: HashSet<_> = dag.nodes.values().map(|n| n.node_type.as_str()).collect();
-        assert!(node_types.contains("for_loop"));
+        assert!(
+            node_types.contains("branch"),
+            "Should have branch node for loop condition"
+        );
+        assert!(
+            node_types.contains("join"),
+            "Should have join node for loop exit"
+        );
+        assert!(
+            node_types.contains("assignment"),
+            "Should have assignment nodes for loop init/extract/incr"
+        );
+
+        // Check for back-edge (loop structure)
+        let back_edges: Vec<_> = dag.edges.iter().filter(|e| e.is_loop_back).collect();
+        assert!(!back_edges.is_empty(), "Should have a back-edge for loop");
     }
 
     #[test]
@@ -3212,7 +3211,7 @@ fn main(input: [], output: [result]):
 
     #[test]
     fn test_dag_for_loop_has_loop_vars() {
-        // Test that for loop nodes correctly track loop variables
+        // Test that loop variable extraction is correctly tracked in normalized structure
         let source = r#"fn iterate(input: [items], output: [results]):
     results = []
     for i, item in enumerate(items):
@@ -3221,18 +3220,28 @@ fn main(input: [], output: [result]):
         let program = parse(source).unwrap();
         let dag = convert_to_dag(&program);
 
-        // Find the for_loop node
-        let for_node = dag
-            .nodes
-            .values()
-            .find(|n| n.node_type == "for_loop")
-            .expect("Should have for_loop node");
+        // In normalized structure, loop variables are tracked in the loop_extract assignment node
+        // The extract label is: "{loop_vars} = {collection}[{index_var}]"
+        // So we look for an assignment containing the loop vars and the collection
+        let extract_node = dag.nodes.values().find(|n| {
+            n.node_type == "assignment"
+                && n.id.contains("loop_extract")
+        });
+        assert!(
+            extract_node.is_some(),
+            "Should have loop_extract assignment node"
+        );
 
-        assert!(for_node.is_loop_head);
+        // Verify the extract node has the correct targets
+        let extract = extract_node.unwrap();
         assert_eq!(
-            for_node.loop_vars,
+            extract.targets,
             Some(vec!["i".to_string(), "item".to_string()])
         );
+
+        // Verify the loop structure has a back-edge
+        let back_edges: Vec<_> = dag.edges.iter().filter(|e| e.is_loop_back).collect();
+        assert!(!back_edges.is_empty(), "Should have a back-edge for loop");
     }
 
     #[test]
@@ -3600,21 +3609,31 @@ fn main(input: [], output: [result]):
 
         let dag = convert_to_dag(&program);
 
-        // The for loop creates a "for_loop" node that contains the body
-        // Find the action node for process_item
+        // In normalized loop structure, find the action node for process_item
         let action_node = dag.nodes.values().find(|n| {
             n.node_type == "action_call" && n.action_name.as_deref() == Some("process_item")
         });
 
-        // Verify the for_loop node exists
-        let loop_node = dag
+        // Verify the loop structure exists (branch for condition, join for exit)
+        let loop_cond = dag
             .nodes
             .values()
-            .find(|n| n.node_type == "for_loop")
-            .expect("Should have for_loop node");
+            .find(|n| n.node_type == "branch" && n.label.contains("for"))
+            .expect("Should have branch node for loop condition");
 
-        // Loop node should exist and have proper structure
-        assert!(!loop_node.id.is_empty());
+        let loop_exit = dag
+            .nodes
+            .values()
+            .find(|n| n.node_type == "join" && n.label.contains("end for"))
+            .expect("Should have join node for loop exit");
+
+        // Loop nodes should exist and have proper structure
+        assert!(!loop_cond.id.is_empty());
+        assert!(!loop_exit.id.is_empty());
+
+        // Verify there's a back-edge
+        let back_edges: Vec<_> = dag.edges.iter().filter(|e| e.is_loop_back).collect();
+        assert!(!back_edges.is_empty(), "Should have a back-edge for loop");
 
         // If action is directly in the loop body (not wrapped), verify targets
         if let Some(action) = action_node {
@@ -4263,6 +4282,137 @@ fn main(input: [], output: [result]):
         assert!(
             step3_edge.is_some(),
             "Should have DataFlow edge for 'step3' to build_chain_result"
+        );
+    }
+
+    #[test]
+    fn test_data_flow_for_loop_shadows_initial_assignment() {
+        // Test that the normalized loop structure correctly tracks loop body targets.
+        //
+        // When we have:
+        //   results = []
+        //   for item in items:
+        //       results = results + [item]
+        //   use_results(data=results)
+        //
+        // The loop_exit (join) node should track 'results' as a target since it's
+        // modified inside the loop body.
+        let source = r#"fn run(input: [items], output: [final_result]):
+    results = []
+    for item in items:
+        results = results + [item]
+    final_result = @use_results(data=results)
+    return final_result"#;
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        // Verify the normalized loop structure exists
+        let back_edges: Vec<_> = dag.edges.iter().filter(|e| e.is_loop_back).collect();
+        assert!(!back_edges.is_empty(), "Should have back-edges for loop");
+
+        // Find the loop_exit (join) node - this is where loop's final values come from
+        let loop_exit = dag
+            .nodes
+            .values()
+            .find(|n| n.node_type == "join" && n.label.contains("end for"))
+            .expect("Should have loop_exit (join) node");
+
+        // Verify the loop_exit node tracks 'results' as a target (modified in loop body)
+        assert!(
+            loop_exit
+                .targets
+                .as_ref()
+                .is_some_and(|t| t.contains(&"results".to_string())),
+            "Loop exit should track 'results' as a target since it's modified in the loop body"
+        );
+
+        // Find the action node that uses 'results'
+        let use_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("use_results"))
+            .expect("Should have use_results action node");
+
+        // Verify there's at least one data flow edge from loop_exit to the action
+        let data_flow_edges = dag.get_data_flow_edges();
+        let has_loop_exit_edge = data_flow_edges.iter().any(|e| {
+            e.variable.as_deref() == Some("results")
+                && e.source == loop_exit.id
+                && e.target == use_action.id
+        });
+
+        assert!(
+            has_loop_exit_edge,
+            "Should have data flow edge from loop_exit to use_action for 'results'"
+        );
+    }
+
+    #[test]
+    fn test_synthetic_function_return_nodes_stripped_on_expansion() {
+        // Test that return nodes from synthetic functions (try/except bodies, for loop bodies,
+        // if/elif/else branches) are stripped when the function is expanded inline.
+        //
+        // These return nodes are artifacts of how multi-statement bodies are wrapped into
+        // synthetic functions. They serve no purpose in the expanded DAG and should be removed.
+        let source = r#"fn run(input: [x], output: [result]):
+    try:
+        result = @risky_action(x=x)
+    except NetworkError:
+        result = @fallback_action(x=x)
+    return result"#;
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        // Count return nodes - there should only be ONE (the main function's return)
+        let return_nodes: Vec<_> = dag
+            .nodes
+            .values()
+            .filter(|n| n.node_type == "return")
+            .collect();
+
+        println!("Return nodes found:");
+        for node in &return_nodes {
+            println!(
+                "  {}: {} (function: {:?})",
+                node.id, node.label, node.function_name
+            );
+        }
+
+        assert_eq!(
+            return_nodes.len(),
+            1,
+            "Should have exactly 1 return node (main function's return), got {}. \
+             Synthetic function return nodes should be stripped during expansion.",
+            return_nodes.len()
+        );
+
+        // The only return node should be from the main 'run' function
+        let return_node = return_nodes[0];
+        assert_eq!(
+            return_node.function_name.as_deref(),
+            Some("run"),
+            "The only return node should be from the main 'run' function"
+        );
+
+        // Verify the try/except body actions exist (they should be expanded)
+        let action_nodes: Vec<_> = dag
+            .nodes
+            .values()
+            .filter(|n| n.node_type == "action_call")
+            .collect();
+
+        let action_names: HashSet<_> = action_nodes
+            .iter()
+            .filter_map(|n| n.action_name.as_deref())
+            .collect();
+
+        assert!(
+            action_names.contains("risky_action"),
+            "Should have risky_action node from try body"
+        );
+        assert!(
+            action_names.contains("fallback_action"),
+            "Should have fallback_action node from except handler"
         );
     }
 }

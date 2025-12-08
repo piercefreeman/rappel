@@ -67,8 +67,6 @@ pub enum FrontierCategory {
     Barrier,
     /// Workflow completion (output/return node).
     Output,
-    /// For-loop controller that manages iteration state.
-    ForLoop,
 }
 
 // ============================================================================
@@ -188,7 +186,6 @@ pub struct ReadinessIncrement {
 pub enum NodeType {
     Action,
     Barrier,
-    ForLoop,
     Sleep,
 }
 
@@ -197,7 +194,6 @@ impl NodeType {
         match self {
             NodeType::Action => "action",
             NodeType::Barrier => "barrier",
-            NodeType::ForLoop => "for_loop",
             NodeType::Sleep => "sleep",
         }
     }
@@ -264,14 +260,11 @@ fn categorize_node(node: &DAGNode) -> NodeCategory {
         return NodeCategory::Output;
     }
 
-    // Aggregators are barriers (wait for multiple spread results)
-    if node.is_aggregator {
+    // Aggregators and joins are barriers (wait for multiple predecessors)
+    // With normalized loops, the loop_exit (join) node is a barrier that
+    // waits for the loop condition to evaluate to false.
+    if node.is_aggregator || node.node_type == "join" {
         return NodeCategory::Barrier;
-    }
-
-    // For-loop controller nodes are frontiers that manage iteration
-    if node.node_type == "for_loop" {
-        return NodeCategory::ForLoop;
     }
 
     // Action calls (external) need worker execution
@@ -280,7 +273,7 @@ fn categorize_node(node: &DAGNode) -> NodeCategory {
         return NodeCategory::Action;
     }
 
-    // Everything else is inline: assignments, expressions, control flow, fn_call, return
+    // Everything else is inline: assignments, expressions, control flow (branch), fn_call, return
     NodeCategory::Inline
 }
 
@@ -291,7 +284,6 @@ enum NodeCategory {
     Action,
     Barrier,
     Output,
-    ForLoop,
 }
 
 /// Count the number of StateMachine predecessors for a node.
@@ -397,15 +389,6 @@ pub fn analyze_subgraph(start_node_id: &str, dag: &DAG, helper: &DAGHelper) -> S
                         required_count,
                     });
                 }
-            }
-            NodeCategory::ForLoop => {
-                let required_count = count_sm_predecessors(dag, &node_id);
-                analysis.frontier_nodes.push(FrontierNode {
-                    node_id,
-                    category: FrontierCategory::ForLoop,
-                    required_count,
-                });
-                // Don't traverse past for_loop - it manages its own iteration
             }
         }
     }
@@ -557,30 +540,6 @@ pub fn execute_inline_subgraph(
         }
     }
 
-    // If the completed node is inside a for-loop body, merge the loop controller's
-    // inbox so loop-scoped variables (e.g., accumulators, loop index) are available
-    // while executing inline nodes from the body completion. Some DAGs may not
-    // populate `loop_body_of`, so fall back to walking predecessors to find the
-    // nearest for_loop node.
-    let loop_context = dag.nodes.get(completed_node_id).and_then(|completed_node| {
-        if completed_node.node_type == "for_loop" {
-            return None;
-        }
-        completed_node
-            .loop_body_of
-            .clone()
-            .or_else(|| find_enclosing_for_loop(completed_node_id, dag, &helper))
-    });
-    if let Some(loop_id) = loop_context
-        && let Some(loop_inbox) = existing_inbox.get(&loop_id)
-    {
-        for (var, val) in loop_inbox {
-            inline_scope
-                .entry(var.clone())
-                .or_insert_with(|| val.clone());
-        }
-    }
-
     // BFS traversal with guard evaluation
     // Track which nodes we've visited and which inline nodes we've executed
     let mut visited: HashSet<String> = HashSet::new();
@@ -686,7 +645,7 @@ pub fn execute_inline_subgraph(
     // Process only the reachable frontier nodes
     for frontier in &subgraph.frontier_nodes {
         // Skip frontiers that weren't reachable via passing guards
-        let reached_via_loop_back = match reachable_frontiers.get(&frontier.node_id) {
+        let _reached_via_loop_back = match reachable_frontiers.get(&frontier.node_id) {
             Some(&via_loop_back) => via_loop_back,
             None => continue, // Not reachable
         };
@@ -872,101 +831,6 @@ pub fn execute_inline_subgraph(
                         result_payload: serialize_workflow_result(&result_value)?,
                     });
                 }
-                FrontierCategory::ForLoop => {
-                    // For-loop controller: manage iteration state
-                    // The loop index variable is stored in the inbox as __loop_{loop_id}_i
-                    let loop_i_var = format!("__loop_{}_i", frontier.node_id);
-
-                    // Use the loop-back info tracked during BFS traversal
-                    let is_loop_back = reached_via_loop_back;
-
-                    // Get current loop index from inline_scope (which has the body's iteration index)
-                    // This is more reliable than reading from for_loop's inbox when concurrent
-                    // body completions might be racing.
-                    let mut loop_inbox = existing_inbox
-                        .get(&frontier.node_id)
-                        .cloned()
-                        .unwrap_or_default();
-
-                    let current_index: i64 = if is_loop_back {
-                        // Coming from loop-back: the body's inbox contains the iteration index
-                        // that was just completed. Read from inline_scope (populated from body's
-                        // inbox) and increment by 1.
-                        let body_index = inline_scope
-                            .get(&loop_i_var)
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0);
-                        body_index + 1
-                    } else {
-                        // First entry: initialize to 0
-                        0
-                    };
-
-                    // Write the updated loop index to the for_loop's inbox
-                    plan.inbox_writes.push(InboxWrite {
-                        instance_id,
-                        target_node_id: frontier.node_id.clone(),
-                        variable_name: loop_i_var.clone(),
-                        value: JsonValue::Number(current_index.into()),
-                        source_node_id: completed_node_id.to_string(),
-                        spread_index: None,
-                    });
-
-                    // Also merge collection data into inbox
-                    merge_data_flow_into_inbox(
-                        &frontier.node_id,
-                        &inline_scope,
-                        dag,
-                        &mut loop_inbox,
-                    );
-                    // Ensure inline scope values (e.g., accumulators) are persisted even if
-                    // DataFlow edges were missing or not annotated.
-                    for (var, val) in &inline_scope {
-                        loop_inbox.insert(var.clone(), val.clone());
-                    }
-
-                    debug!(
-                        for_loop_id = %frontier.node_id,
-                        loop_i_var = %loop_i_var,
-                        current_index = current_index,
-                        is_loop_back = is_loop_back,
-                            "for_loop frontier: updating loop index"
-                    );
-
-                    // Persist the updated loop variables (including any mutated accumulators)
-                    // back to the for_loop's inbox so subsequent iterations and break
-                    // successors see the latest values.
-                    loop_inbox.insert(loop_i_var.clone(), JsonValue::Number(current_index.into()));
-                    for (var_name, value) in &loop_inbox {
-                        plan.inbox_writes.push(InboxWrite {
-                            instance_id,
-                            target_node_id: frontier.node_id.clone(),
-                            variable_name: var_name.clone(),
-                            value: value.clone(),
-                            source_node_id: completed_node_id.to_string(),
-                            spread_index: None,
-                        });
-                    }
-
-                    // For loop-back iterations, reset the for_loop's readiness before incrementing
-                    if is_loop_back {
-                        plan.readiness_resets.push(frontier.node_id.clone());
-                        let body_nodes = collect_loop_body_nodes(&frontier.node_id, &helper);
-                        plan.readiness_resets.extend(body_nodes);
-                    }
-
-                    // Add readiness increment for the for_loop
-                    // When it becomes ready, the runner will evaluate its guard
-                    plan.readiness_increments.push(ReadinessIncrement {
-                        node_id: frontier.node_id.clone(),
-                        required_count: frontier.required_count,
-                        node_type: NodeType::ForLoop,
-                        module_name: None,
-                        action_name: None,
-                        dispatch_payload: None,
-                        scheduled_at: None,
-                    });
-                }
             }
         }
     }
@@ -1119,63 +983,6 @@ pub fn evaluate_guard_string(
         "unknown guard string pattern, assuming false"
     );
     false
-}
-
-/// Walk state machine predecessors to find the nearest enclosing for_loop node.
-fn find_enclosing_for_loop(node_id: &str, dag: &DAG, helper: &DAGHelper) -> Option<String> {
-    let mut queue: VecDeque<String> = VecDeque::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    queue.push_back(node_id.to_string());
-
-    while let Some(current) = queue.pop_front() {
-        if !visited.insert(current.clone()) {
-            continue;
-        }
-
-        if current != node_id
-            && dag
-                .nodes
-                .get(&current)
-                .is_some_and(|n| n.node_type == "for_loop")
-        {
-            return Some(current);
-        }
-
-        for edge in helper.get_incoming_edges(&current) {
-            if edge.edge_type == EdgeType::StateMachine {
-                queue.push_back(edge.source.clone());
-            }
-        }
-    }
-
-    None
-}
-
-/// Collect nodes that form the body of a for_loop by walking backwards from
-/// loop-back edges targeting the loop controller.
-fn collect_loop_body_nodes(loop_id: &str, helper: &DAGHelper) -> HashSet<String> {
-    let mut body: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<String> = VecDeque::new();
-
-    for edge in helper.get_incoming_edges(loop_id) {
-        if edge.edge_type == EdgeType::StateMachine && edge.is_loop_back {
-            queue.push_back(edge.source.clone());
-        }
-    }
-
-    while let Some(current) = queue.pop_front() {
-        if !body.insert(current.clone()) {
-            continue;
-        }
-
-        for edge in helper.get_incoming_edges(&current) {
-            if edge.edge_type == EdgeType::StateMachine && edge.source != loop_id {
-                queue.push_back(edge.source.clone());
-            }
-        }
-    }
-
-    body
 }
 
 /// Collect DataFlow edge writes from inline scope to a target node.
@@ -1443,6 +1250,7 @@ mod tests {
     use super::*;
     use crate::dag::convert_to_dag;
     use crate::parser::parse;
+    use serde_json::json;
 
     /// Helper to create a DAG from IR source
     fn dag_from_source(source: &str) -> DAG {
