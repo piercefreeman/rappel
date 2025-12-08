@@ -23,6 +23,10 @@ path = "src/bin/benchmark.rs"
 name = "start_workers"
 path = "src/bin/start_workers.rs"
 
+[[bin]]
+name = "dag-visualize"
+path = "src/bin/dag_visualize.rs"
+
 [dependencies]
 anyhow = "1"
 axum = "0.7"
