@@ -688,15 +688,24 @@ impl WorkQueueHandler {
         batch_size: usize,
         completion_tx: mpsc::Sender<(InFlightAction, RoundTripMetrics)>,
     ) -> RunnerResult<usize> {
+        let total_start = std::time::Instant::now();
+
         let available = self.slot_tracker.available_slots();
         if available == 0 {
             return Ok(0);
         }
 
         let limit = available.min(batch_size);
+        let db_start = std::time::Instant::now();
         let nodes = self.db.dispatch_runnable_nodes(limit as i32).await?;
+        let db_us = db_start.elapsed().as_micros() as u64;
         let dispatched = nodes.len();
 
+        let mut barrier_count = 0;
+        let mut action_count = 0;
+        let mut sleep_count = 0;
+
+        let dispatch_start = std::time::Instant::now();
         for node in nodes {
             match node.node_type.as_str() {
                 "barrier" | "branch" | "join" => {
@@ -705,17 +714,34 @@ impl WorkQueueHandler {
                     // - branch: conditional decision points (if/elif/else, loop conditions)
                     // - join: merge points after conditionals or loops
                     self.process_barrier(node).await?;
+                    barrier_count += 1;
                 }
                 "sleep" => {
                     // Process durable sleep inline (no worker dispatch)
                     self.process_sleep_action(node, completion_tx.clone())
                         .await?;
+                    sleep_count += 1;
                 }
                 _ => {
                     // Dispatch actions to workers
                     self.dispatch_action(node, completion_tx.clone()).await?;
+                    action_count += 1;
                 }
             }
+        }
+        let dispatch_us = dispatch_start.elapsed().as_micros() as u64;
+
+        if dispatched > 0 {
+            info!(
+                total_us = total_start.elapsed().as_micros() as u64,
+                db_fetch_us = db_us,
+                dispatch_us = dispatch_us,
+                dispatched = dispatched,
+                barriers = barrier_count,
+                actions = action_count,
+                sleeps = sleep_count,
+                "fetch_and_dispatch timing"
+            );
         }
 
         Ok(dispatched)
@@ -727,6 +753,8 @@ impl WorkQueueHandler {
     /// The barrier's inbox is guaranteed to be fully populated because all
     /// predecessors completed and wrote their data before the barrier was enqueued.
     async fn process_barrier(&self, barrier: QueuedAction) -> RunnerResult<()> {
+        let total_start = std::time::Instant::now();
+
         let instance_id = WorkflowInstanceId(barrier.instance_id);
         let node_id = match barrier.node_id.as_deref() {
             Some(id) => id,
@@ -755,6 +783,7 @@ impl WorkQueueHandler {
         let helper = DAGHelper::new(&dag);
 
         // Read aggregated results from inbox (for spread actions with spread_index)
+        let inbox_start = std::time::Instant::now();
         let spread_results = self
             .db
             .read_inbox_for_aggregator(instance_id, node_id)
@@ -765,6 +794,7 @@ impl WorkQueueHandler {
 
         // Also read named variables from the barrier's inbox (for parallel blocks)
         let barrier_inbox = self.db.read_inbox(instance_id, node_id).await?;
+        let inbox_us = inbox_start.elapsed().as_micros() as u64;
 
         debug!(
             barrier_id = %node_id,
@@ -774,13 +804,17 @@ impl WorkQueueHandler {
         );
 
         // Analyze subgraph from barrier
+        let subgraph_start = std::time::Instant::now();
         let subgraph = analyze_subgraph(node_id, &dag, &helper);
+        let subgraph_us = subgraph_start.elapsed().as_micros() as u64;
 
         // Batch fetch inbox for all nodes in subgraph
+        let batch_start = std::time::Instant::now();
         let mut existing_inbox = self
             .db
             .batch_read_inbox(instance_id, &subgraph.all_node_ids)
             .await?;
+        let batch_us = batch_start.elapsed().as_micros() as u64;
 
         // Merge barrier's named variables into the existing inbox so they're available
         // to successors. This is how parallel block results flow to downstream nodes.
@@ -792,6 +826,7 @@ impl WorkQueueHandler {
         }
 
         // Execute inline subgraph and build completion plan
+        let inline_start = std::time::Instant::now();
         let initial_scope = load_initial_scope(&self.db, instance_id).await?;
         let ctx = InlineContext {
             initial_scope: &initial_scope,
@@ -810,15 +845,24 @@ impl WorkQueueHandler {
             Vec::new(),
             None,
         );
+        let inline_us = inline_start.elapsed().as_micros() as u64;
 
         // Execute completion plan in single atomic transaction
+        let db_start = std::time::Instant::now();
         let result = self.db.execute_completion_plan(instance_id, plan).await?;
+        let db_us = db_start.elapsed().as_micros() as u64;
 
         info!(
             barrier_id = %node_id,
-            newly_ready_nodes = ?result.newly_ready_nodes,
+            total_us = total_start.elapsed().as_micros() as u64,
+            inbox_us = inbox_us,
+            subgraph_us = subgraph_us,
+            batch_us = batch_us,
+            inline_us = inline_us,
+            db_us = db_us,
+            newly_ready = result.newly_ready_nodes.len(),
             workflow_completed = result.workflow_completed,
-            "processed barrier"
+            "process_barrier timing"
         );
 
         Ok(())
@@ -1287,6 +1331,8 @@ impl DAGRunner {
         metrics: &RoundTripMetrics,
         instance_id: WorkflowInstanceId,
     ) -> RunnerResult<crate::completion::CompletionResult> {
+        let total_start = std::time::Instant::now();
+
         // Get DAG for this workflow instance
         let dag = match dag_cache.get_dag_for_instance(instance_id).await? {
             Some(dag) => dag,
@@ -1336,7 +1382,9 @@ impl DAGRunner {
         let helper = DAGHelper::new(&dag);
 
         // Step 1: Analyze subgraph
+        let subgraph_start = std::time::Instant::now();
         let subgraph = analyze_subgraph(base_node_id, &dag, &helper);
+        let subgraph_ms = subgraph_start.elapsed().as_micros() as u64;
 
         debug!(
             node_id = %node_id,
@@ -1346,11 +1394,14 @@ impl DAGRunner {
         );
 
         // Step 2: Batch fetch inbox for all nodes in subgraph
+        let inbox_start = std::time::Instant::now();
         let existing_inbox = db
             .batch_read_inbox(instance_id, &subgraph.all_node_ids)
             .await?;
+        let inbox_ms = inbox_start.elapsed().as_micros() as u64;
 
         // Step 3: Execute inline subgraph and build completion plan
+        let inline_start = std::time::Instant::now();
         let ctx = InlineContext {
             initial_scope: &initial_scope,
             existing_inbox: &existing_inbox,
@@ -1368,6 +1419,7 @@ impl DAGRunner {
             metrics.response_payload.clone(),
             metrics.error_message.clone(),
         );
+        let inline_ms = inline_start.elapsed().as_micros() as u64;
 
         debug!(
             node_id = %node_id,
@@ -1378,14 +1430,21 @@ impl DAGRunner {
         );
 
         // Step 4: Execute completion plan in single atomic transaction
+        let db_start = std::time::Instant::now();
         let result = db.execute_completion_plan(instance_id, plan).await?;
+        let db_ms = db_start.elapsed().as_micros() as u64;
 
+        let total_ms = total_start.elapsed().as_micros() as u64;
         info!(
             node_id = %node_id,
-            newly_ready_nodes = ?result.newly_ready_nodes,
+            total_us = total_ms,
+            subgraph_us = subgraph_ms,
+            inbox_us = inbox_ms,
+            inline_us = inline_ms,
+            db_us = db_ms,
+            newly_ready = result.newly_ready_nodes.len(),
             workflow_completed = result.workflow_completed,
-            was_stale = result.was_stale,
-            "executed completion plan"
+            "process_completion timing"
         );
 
         Ok(result)
