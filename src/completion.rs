@@ -288,7 +288,16 @@ enum NodeCategory {
 
 /// Count the number of StateMachine predecessors for a node.
 /// Excludes loop-back edges since they don't contribute to initial readiness.
+/// For join nodes with `join_required_count` set, uses that override value instead.
 fn count_sm_predecessors(dag: &DAG, node_id: &str) -> i32 {
+    // Check if this node has an explicit join_required_count set
+    // (used for conditional joins where only one branch executes)
+    if let Some(node) = dag.nodes.get(node_id) {
+        if let Some(required) = node.join_required_count {
+            return required;
+        }
+    }
+
     dag.edges
         .iter()
         .filter(|e| {
@@ -639,7 +648,7 @@ pub fn execute_inline_subgraph(
     // This is crucial for chain workflows where action_5 needs step1 from action_2,
     // but action_5 is not in the frontier when action_2 completes.
     let all_df_writes =
-        collect_all_data_flow_writes(&inline_scope, dag, instance_id, completed_node_id);
+        collect_all_data_flow_writes(&inline_scope, dag, instance_id, completed_node_id, &executed_inline);
     plan.inbox_writes.extend(all_df_writes);
 
     // Process only the reachable frontier nodes
@@ -705,6 +714,20 @@ pub fn execute_inline_subgraph(
                         "building action dispatch payload"
                     );
 
+                    // Write action_inbox variables to the action's inbox in DB.
+                    // This ensures variables are available when the action completes
+                    // and we traverse to successor nodes (e.g., loop_incr after fn_call).
+                    for (var_name, value) in &action_inbox {
+                        plan.inbox_writes.push(InboxWrite {
+                            instance_id,
+                            target_node_id: frontier.node_id.clone(),
+                            variable_name: var_name.clone(),
+                            value: value.clone(),
+                            source_node_id: completed_node_id.to_string(),
+                            spread_index: None,
+                        });
+                    }
+
                     let dispatch_payload = build_action_payload(frontier_node, &action_inbox)?;
 
                     // Check if this is a sleep action
@@ -723,6 +746,16 @@ pub fn execute_inline_subgraph(
                     } else {
                         (NodeType::Action, None)
                     };
+
+                    // For actions with required_count=1, always reset readiness before incrementing.
+                    // This handles loop iterations where the same action is re-triggered:
+                    // - First iteration increments 0->1, action fires
+                    // - Second iteration would increment 1->2 without reset
+                    // Since an action with required_count=1 can only be triggered by one
+                    // predecessor at a time, resetting before incrementing is always safe.
+                    if frontier.required_count == 1 {
+                        plan.readiness_resets.push(frontier.node_id.clone());
+                    }
 
                     plan.readiness_increments.push(ReadinessIncrement {
                         node_id: frontier.node_id.clone(),
@@ -754,6 +787,14 @@ pub fn execute_inline_subgraph(
                             source_node_id: completed_node_id.to_string(),
                             spread_index: None,
                         });
+                    }
+
+                    // For barriers with required_count=1 (e.g., conditional joins in loops),
+                    // reset readiness before incrementing to handle re-execution.
+                    // NEVER reset aggregators - they collect from spread actions and have
+                    // their required_count set dynamically based on spread size.
+                    if frontier.required_count == 1 && !frontier_node.is_aggregator {
+                        plan.readiness_resets.push(frontier.node_id.clone());
                     }
 
                     plan.readiness_increments.push(ReadinessIncrement {
@@ -1026,6 +1067,7 @@ fn collect_all_data_flow_writes(
     dag: &DAG,
     instance_id: WorkflowInstanceId,
     completed_node_id: &str,
+    executed_inline: &[String],
 ) -> Vec<InboxWrite> {
     let mut writes = Vec::new();
 
@@ -1035,20 +1077,23 @@ fn collect_all_data_flow_writes(
             && let Some(ref var_name) = edge.variable
             && let Some(value) = inline_scope.get(var_name)
         {
-            // Only write if the source is either the completed node or the input node
+            // Only write if the source is either the completed node, an input node,
+            // or an inline node that was executed during this traversal
             // (i.e., don't re-write variables from nodes that haven't completed yet)
             if let Some(completed_node) = dag.nodes.get(completed_node_id) {
                 // The variable should come from either:
                 // 1. The completed node's target (it just produced this variable)
                 // 2. The input node (workflow inputs are always in scope)
+                // 3. An inline node that executed during this traversal (e.g., loop_init)
                 let is_from_completed = completed_node.target.as_deref() == Some(var_name);
                 let is_from_input = dag
                     .nodes
                     .get(&edge.source)
                     .map(|n| n.is_input)
                     .unwrap_or(false);
+                let is_from_executed_inline = executed_inline.contains(&edge.source);
 
-                if is_from_completed || is_from_input {
+                if is_from_completed || is_from_input || is_from_executed_inline {
                     writes.push(InboxWrite {
                         instance_id,
                         target_node_id: edge.target.clone(),
@@ -1250,7 +1295,6 @@ mod tests {
     use super::*;
     use crate::dag::convert_to_dag;
     use crate::parser::parse;
-    use serde_json::json;
 
     /// Helper to create a DAG from IR source
     fn dag_from_source(source: &str) -> DAG {

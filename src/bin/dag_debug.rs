@@ -46,9 +46,10 @@ fn main() {
         .iter()
         .filter(|e| e.edge_type == EdgeType::StateMachine)
     {
+        let guard_str = edge.guard_expr.as_ref().map(|g| rappel::ast_printer::print_expr(g));
         println!(
             "{} -> {} (loop_back={} guard={:?})",
-            edge.source, edge.target, edge.is_loop_back, edge.guard_string
+            edge.source, edge.target, edge.is_loop_back, guard_str
         );
     }
 
@@ -67,6 +68,14 @@ fn main() {
     }
 
     let helper = DAGHelper::new(&dag);
+
+    // Check spread_action_17 subgraph
+    let spread_subgraph = analyze_subgraph("spread_action_17", &dag, &helper);
+    println!(
+        "\nFrontiers from spread_action_17: {:?}",
+        spread_subgraph.frontier_nodes
+    );
+
     let subgraph = analyze_subgraph("aggregator_18", &dag, &helper);
     println!(
         "\nFrontiers from aggregator_18: {:?}",

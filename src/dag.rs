@@ -82,6 +82,10 @@ pub struct DAGNode {
     pub guard_expr: Option<ast::Expr>,
     /// Expression for assignment nodes (evaluated at runtime)
     pub assign_expr: Option<ast::Expr>,
+    /// For join nodes: override the required predecessor count.
+    /// If Some(n), exactly n predecessors must complete before this join fires.
+    /// Used for conditional joins where branches are mutually exclusive (only 1 fires).
+    pub join_required_count: Option<i32>,
 }
 
 impl DAGNode {
@@ -112,6 +116,7 @@ impl DAGNode {
             guard_expr: None,
             assign_expr: None,
             kwarg_exprs: None,
+            join_required_count: None,
         }
     }
 
@@ -207,6 +212,12 @@ impl DAGNode {
     /// Builder method to set aggregator node ID for spread actions
     pub fn with_aggregates_to(mut self, aggregator_id: &str) -> Self {
         self.aggregates_to = Some(aggregator_id.to_string());
+        self
+    }
+
+    /// Builder method to set join required count (for conditional joins)
+    pub fn with_join_required_count(mut self, count: i32) -> Self {
+        self.join_required_count = Some(count);
         self
     }
 }
@@ -843,7 +854,9 @@ impl DAGConverter {
                     mapped.clone()
                 }
             } else {
-                continue; // Source not mapped (shouldn't happen)
+                // Source not in id_map - it's outside the current expansion scope
+                // (e.g., fn_call being expanded, or external node). Skip this edge.
+                continue;
             };
 
             let new_target = match id_map.get(&edge.target) {
@@ -1005,6 +1018,18 @@ impl DAGConverter {
             }
         }
 
+        // Collect edge guard expressions by source node, so we can check them without
+        // borrowing dag.edges inside the closure (which would conflict with later mutations)
+        let mut node_guard_exprs: HashMap<String, Vec<ast::Expr>> = HashMap::new();
+        for edge in &dag.edges {
+            if let Some(ref guard) = edge.guard_expr {
+                node_guard_exprs
+                    .entry(edge.source.clone())
+                    .or_default()
+                    .push(guard.clone());
+            }
+        }
+
         // Helper: does a node use a variable?
         let uses_var = |node: &DAGNode, var_name: &str| -> bool {
             fn expr_uses_var(expr: &ast::Expr, var_name: &str) -> bool {
@@ -1084,6 +1109,16 @@ impl DAGConverter {
                 }
             }
 
+            // Check edge guards: if this node is the source of an edge with a guard
+            // that uses the variable, the node needs that variable in scope
+            if let Some(guards) = node_guard_exprs.get(&node.id) {
+                for guard in guards {
+                    if expr_uses_var(guard, var_name) {
+                        return true;
+                    }
+                }
+            }
+
             false
         };
 
@@ -1119,7 +1154,15 @@ impl DAGConverter {
                         if node_id == next {
                             // Still allow edge to the next modification if it uses the var.
                             if let Some(node) = dag.nodes.get(node_id) {
-                                if uses_var(node, &var_name) {
+                                let uses = uses_var(node, &var_name);
+                                tracing::debug!(
+                                    node_id = %node_id,
+                                    var_name = %var_name,
+                                    has_assign_expr = node.assign_expr.is_some(),
+                                    uses = uses,
+                                    "checking next modifier uses var"
+                                );
+                                if uses {
                                     let key =
                                         (mod_node.clone(), node_id.clone(), Some(var_name.clone()));
                                     if seen_edges.insert(key.clone()) {
@@ -1240,8 +1283,9 @@ impl DAGConverter {
     fn build_loop_guard(loop_i_var: &str, collection: Option<&ast::Expr>) -> Option<ast::Expr> {
         let collection_expr = collection?;
 
-        // Build: __loop_i < len(collection)
+        // Build: __loop_i < len(items=collection)
         // Using BinaryOp with BINARY_OP_LT
+        // Note: The len() builtin expects kwargs["items"], so we pass via kwargs
         Some(ast::Expr {
             kind: Some(ast::expr::Kind::BinaryOp(Box::new(ast::BinaryOp {
                 left: Some(Box::new(ast::Expr {
@@ -1254,8 +1298,11 @@ impl DAGConverter {
                 right: Some(Box::new(ast::Expr {
                     kind: Some(ast::expr::Kind::FunctionCall(ast::FunctionCall {
                         name: "len".to_string(),
-                        args: vec![collection_expr.clone()],
-                        kwargs: vec![],
+                        args: vec![],
+                        kwargs: vec![ast::Kwarg {
+                            name: "items".to_string(),
+                            value: Some(collection_expr.clone()),
+                        }],
                     })),
                     span: None,
                 })),
@@ -1950,25 +1997,23 @@ impl DAGConverter {
         let extract_id = self.next_id("loop_extract");
 
         // Build the index expression: collection[__loop_i]
-        let index_expr = if let Some(ref coll) = collection_expr {
-            ast::Expr {
-                span: None,
-                kind: Some(ast::expr::Kind::Index(Box::new(ast::IndexAccess {
-                    object: Some(Box::new(coll.clone())),
-                    index: Some(Box::new(ast::Expr {
-                        span: None,
-                        kind: Some(ast::expr::Kind::Variable(ast::Variable {
-                            name: loop_i_var.clone(),
-                        })),
+        let coll = collection_expr.as_ref().unwrap_or_else(|| {
+            panic!(
+                "BUG: for-loop collection expression is None for loop '{}'",
+                loop_vars_str
+            )
+        });
+        let index_expr = ast::Expr {
+            span: None,
+            kind: Some(ast::expr::Kind::Index(Box::new(ast::IndexAccess {
+                object: Some(Box::new(coll.clone())),
+                index: Some(Box::new(ast::Expr {
+                    span: None,
+                    kind: Some(ast::expr::Kind::Variable(ast::Variable {
+                        name: loop_i_var.clone(),
                     })),
-                }))),
-            }
-        } else {
-            // Fallback: shouldn't happen, but use empty list
-            ast::Expr {
-                span: None,
-                kind: Some(ast::expr::Kind::List(ast::ListExpr { elements: vec![] })),
-            }
+                })),
+            }))),
         };
 
         let extract_label = format!("{} = {}[{}]", loop_vars_str, collection_str, loop_i_var);
@@ -2215,9 +2260,10 @@ impl DAGConverter {
             }
         }
 
-        // Create join node
+        // Create join node - conditional joins only expect 1 predecessor (branches are mutually exclusive)
         let join_id = self.next_id("join");
-        let mut join_node = DAGNode::new(join_id.clone(), "join".to_string(), "join".to_string());
+        let mut join_node = DAGNode::new(join_id.clone(), "join".to_string(), "join".to_string())
+            .with_join_required_count(1);
         if let Some(ref fn_name) = self.current_function {
             join_node = join_node.with_function_name(fn_name);
         }
@@ -2226,20 +2272,14 @@ impl DAGConverter {
 
         // Connect branch node to then branch with guard
         if let Some(ref then_target) = then_first {
-            if let Some(ref guard) = guard_expr {
-                self.dag.add_edge(DAGEdge::state_machine_with_guard(
-                    branch_id.clone(),
-                    then_target.clone(),
-                    guard.clone(),
-                ));
-            } else {
-                // No guard means unconditional (shouldn't happen for if branches)
-                self.dag.add_edge(DAGEdge::state_machine_with_condition(
-                    branch_id.clone(),
-                    then_target.clone(),
-                    "then",
-                ));
-            }
+            let guard = guard_expr.as_ref().unwrap_or_else(|| {
+                panic!("BUG: if statement 'then' branch has no guard expression")
+            });
+            self.dag.add_edge(DAGEdge::state_machine_with_guard(
+                branch_id.clone(),
+                then_target.clone(),
+                guard.clone(),
+            ));
         }
 
         // Connect branch node to elif branches with compound guards
@@ -2328,13 +2368,9 @@ impl DAGConverter {
 
         // Combine with AND operators
         if parts.is_empty() {
-            // Shouldn't happen, but return a true literal as fallback
-            ast::Expr {
-                span: None,
-                kind: Some(ast::expr::Kind::Literal(ast::Literal {
-                    value: Some(ast::literal::Value::BoolValue(true)),
-                })),
-            }
+            panic!(
+                "BUG: build_elif_guard called with no prior conditions and no current condition"
+            );
         } else if parts.len() == 1 {
             parts.remove(0)
         } else {
@@ -2380,9 +2416,10 @@ impl DAGConverter {
             }
         }
 
-        // Create join node
+        // Create join node - try/except joins only expect 1 predecessor (success or exception path)
         let join_id = self.next_id("join");
-        let mut join_node = DAGNode::new(join_id.clone(), "join".to_string(), "join".to_string());
+        let mut join_node = DAGNode::new(join_id.clone(), "join".to_string(), "join".to_string())
+            .with_join_required_count(1);
         if let Some(ref fn_name) = self.current_function {
             join_node = join_node.with_function_name(fn_name);
         }
