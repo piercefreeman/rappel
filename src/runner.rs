@@ -2183,7 +2183,8 @@ impl DAGRunner {
                             &successor.node_id,
                         ) {
                             GuardResult::Pass => {
-                                work_queue.push_back((successor.node_id, passthrough_result.clone()));
+                                work_queue
+                                    .push_back((successor.node_id, passthrough_result.clone()));
                             }
                             GuardResult::Fail | GuardResult::Error(_) => {
                                 // Guard failed or had an error - skip this branch
@@ -2345,16 +2346,16 @@ impl DAGRunner {
                 if let Some(ref expr) = node.assign_expr {
                     match ExpressionEvaluator::evaluate(expr, scope) {
                         Ok(val) => {
-                            if let Some(ref target) = node.target {
-                                if target.starts_with("__loop_") {
-                                    tracing::debug!(
-                                        node_id = %node.id,
-                                        target,
-                                        scope_value = ?scope.get(target),
-                                        result = ?val,
-                                        "loop assignment evaluation"
-                                    );
-                                }
+                            if let Some(ref target) = node.target
+                                && target.starts_with("__loop_")
+                            {
+                                tracing::debug!(
+                                    node_id = %node.id,
+                                    target,
+                                    scope_value = ?scope.get(target),
+                                    result = ?val,
+                                    "loop assignment evaluation"
+                                );
                             }
                             Ok(val)
                         }

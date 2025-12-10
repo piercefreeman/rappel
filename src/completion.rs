@@ -484,7 +484,9 @@ pub enum CompletionError {
     #[error("Guard evaluation error at node '{node_id}': {message}")]
     GuardEvaluationError { node_id: String, message: String },
 
-    #[error("Workflow dead-end: no reachable frontier nodes after completing '{completed_node_id}'. Guard evaluation errors: {guard_errors:?}")]
+    #[error(
+        "Workflow dead-end: no reachable frontier nodes after completing '{completed_node_id}'. Guard evaluation errors: {guard_errors:?}"
+    )]
     WorkflowDeadEnd {
         completed_node_id: String,
         guard_errors: Vec<(String, String)>,
@@ -1904,10 +1906,7 @@ fn workflow(input: [x], output: [result]):
             completed_node_id: "action_5".to_string(),
             guard_errors: vec![
                 ("branch_10".to_string(), "Missing variable 'x'".to_string()),
-                (
-                    "branch_11".to_string(),
-                    "Missing variable 'y'".to_string(),
-                ),
+                ("branch_11".to_string(), "Missing variable 'y'".to_string()),
             ],
         };
 

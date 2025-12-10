@@ -81,6 +81,7 @@ async def handle_normal(count: int) -> str:
 @action
 async def risky_operation(data: list) -> dict[str, Any]:
     """An operation that might fail - used in try/except."""
+    # raise NetworkError("This operation failed as requested!")
     return {"success": True, "data_length": len(data)}
 
 
@@ -91,14 +92,15 @@ async def fallback_operation(data: list) -> dict[str, Any]:
 
 
 @action
-async def aggregate_results(items: list, status_a: dict, status_b: dict, final_status: str) -> dict[str, Any]:
+async def aggregate_results(items: list, status_a: dict, status_b: dict, final_status: str, risky_result: dict) -> dict[str, Any]:
     """Aggregate all results into a final summary."""
     return {
         "total_items": len(items),
         "status_a": status_a,
         "status_b": status_b,
         "final_status": final_status,
-        "complete": True
+        "complete": True,
+        "risky_result": risky_result,
     }
 
 
@@ -163,6 +165,7 @@ class CompleteFeatureWorkflow(Workflow):
             status_a=status_a,
             status_b=status_b,
             final_status=final_status,
+            risky_result=risky_result,
         )
 
         return summary

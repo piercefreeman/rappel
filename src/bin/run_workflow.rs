@@ -40,7 +40,10 @@ use rappel::{
 // ============================================================================
 
 #[derive(Parser, Debug)]
-#[command(name = "run-workflow", about = "Run a Rappel workflow from a Python file")]
+#[command(
+    name = "run-workflow",
+    about = "Run a Rappel workflow from a Python file"
+)]
 struct Args {
     /// Path to the Python workflow file
     #[arg(required = true)]
@@ -317,7 +320,7 @@ fn extract_workflow_class(source: &str) -> Result<String> {
                     // Extract class name
                     let rest = trimmed.strip_prefix("class ").unwrap();
                     let class_name = rest
-                        .split(|c: char| c == '(' || c == ':')
+                        .split(['(', ':'])
                         .next()
                         .context("Failed to parse class name")?
                         .trim();
@@ -389,13 +392,12 @@ async fn wait_for_completion(
 
         // Check workflow instance status using a direct query to avoid pool contention
         // The database.get_instance uses the shared pool which may be contended by the runner
-        let status: String = sqlx::query_scalar(
-            "SELECT status FROM workflow_instances WHERE id = $1"
-        )
-        .bind(instance_id.0)
-        .fetch_one(database.pool())
-        .await
-        .unwrap_or_else(|_| "unknown".to_string());
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM workflow_instances WHERE id = $1")
+                .bind(instance_id.0)
+                .fetch_one(database.pool())
+                .await
+                .unwrap_or_else(|_| "unknown".to_string());
 
         match status.as_str() {
             "completed" => {
@@ -545,9 +547,7 @@ async fn main() -> Result<()> {
             .add_directive("rappel::db=info".parse().unwrap())
     };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(log_filter)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(log_filter).init();
 
     // Validate workflow file exists
     if !args.workflow_file.exists() {
@@ -576,21 +576,26 @@ async fn main() -> Result<()> {
     let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| {
         "postgresql://mountaineer:mountaineer@localhost:5432/mountaineer_daemons".to_string()
     });
-    eprintln!("[run-workflow] Connecting to database at {}...", database_url);
+    eprintln!(
+        "[run-workflow] Connecting to database at {}...",
+        database_url
+    );
 
     // Use a larger pool size to avoid contention between runner and polling
     let pool_size = (args.workers * 2).max(20);
     let database = tokio::time::timeout(
         Duration::from_secs(5),
-        Database::connect_with_pool_size(&database_url, pool_size)
+        Database::connect_with_pool_size(&database_url, pool_size),
     )
     .await
-    .map_err(|_| anyhow!(
-        "Database connection timed out after 5 seconds.\n\
+    .map_err(|_| {
+        anyhow!(
+            "Database connection timed out after 5 seconds.\n\
          Please ensure PostgreSQL is running and accessible at: {}\n\
          You can set DATABASE_URL environment variable to override.",
-        database_url
-    ))?
+            database_url
+        )
+    })?
     .context("Failed to connect to database")?;
 
     let database = Arc::new(database);
@@ -608,7 +613,10 @@ async fn main() -> Result<()> {
 
     // Start worker bridge
     let worker_bridge = WorkerBridgeServer::start(None).await?;
-    eprintln!("[run-workflow] Worker bridge started on {}", worker_bridge.addr());
+    eprintln!(
+        "[run-workflow] Worker bridge started on {}",
+        worker_bridge.addr()
+    );
 
     // Set up Python environment and register workflow
     eprintln!("[run-workflow] Setting up Python environment...");
@@ -729,12 +737,11 @@ async fn main() -> Result<()> {
     match completed {
         Ok(_) => {
             // Fetch the result payload now that runner is shutdown
-            let result_payload: Option<Vec<u8>> = sqlx::query_scalar(
-                "SELECT result_payload FROM workflow_instances WHERE id = $1"
-            )
-            .bind(instance_id.0)
-            .fetch_one(database.pool())
-            .await?;
+            let result_payload: Option<Vec<u8>> =
+                sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
+                    .bind(instance_id.0)
+                    .fetch_one(database.pool())
+                    .await?;
 
             if let Some(result_payload) = result_payload {
                 let result = proto::WorkflowArguments::decode(&result_payload[..])

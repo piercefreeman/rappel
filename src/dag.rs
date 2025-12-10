@@ -1175,7 +1175,7 @@ impl DAGConverter {
 
             // Check kwarg_exprs for variable references
             if let Some(ref kwarg_exprs) = node.kwarg_exprs {
-                for (_, expr) in kwarg_exprs {
+                for expr in kwarg_exprs.values() {
                     if expr_uses_var(expr, var_name) {
                         tracing::trace!(
                             node_id = %node.id,
@@ -1278,14 +1278,10 @@ impl DAGConverter {
         // and the loop back edge source.
         // We do this by BFS backwards from loop_back sources, stopping at nodes that are
         // direct successors of loop heads (the loop heads themselves are boundary nodes).
-        let loop_back_sources: HashSet<String> = loop_back_edges
-            .iter()
-            .map(|e| e.source.clone())
-            .collect();
-        let loop_back_targets: HashSet<String> = loop_back_edges
-            .iter()
-            .map(|e| e.target.clone())
-            .collect();
+        let loop_back_sources: HashSet<String> =
+            loop_back_edges.iter().map(|e| e.source.clone()).collect();
+        let loop_back_targets: HashSet<String> =
+            loop_back_edges.iter().map(|e| e.target.clone()).collect();
         let mut nodes_in_loop: HashSet<String> = loop_back_sources.clone();
         {
             // BFS backwards from loop_back sources to find all nodes inside loops
@@ -4791,7 +4787,8 @@ fn run(input: [items, threshold], output: []):
         let program = parse(COMPLETE_FEATURE_WORKFLOW_IR).expect("Should parse complete workflow");
         assert_eq!(program.functions.len(), 7, "Should have 7 functions");
 
-        let function_names: HashSet<_> = program.functions.iter().map(|f| f.name.as_str()).collect();
+        let function_names: HashSet<_> =
+            program.functions.iter().map(|f| f.name.as_str()).collect();
         assert!(function_names.contains("run"));
         assert!(function_names.contains("__for_body_1__"));
         assert!(function_names.contains("__if_then_2__"));
@@ -4881,7 +4878,10 @@ fn run(input: [items, threshold], output: []):
         assert!(
             fn_call_to_synthetic.is_empty(),
             "Synthetic if/elif/else functions should be expanded, not left as fn_call nodes. Found: {:?}",
-            fn_call_to_synthetic.iter().map(|n| &n.id).collect::<Vec<_>>()
+            fn_call_to_synthetic
+                .iter()
+                .map(|n| &n.id)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -4931,7 +4931,10 @@ fn run(input: [items, threshold], output: []):
         assert!(
             fn_call_to_for_body.is_empty(),
             "For loop body function should be expanded. Found fn_call nodes: {:?}",
-            fn_call_to_for_body.iter().map(|n| &n.id).collect::<Vec<_>>()
+            fn_call_to_for_body
+                .iter()
+                .map(|n| &n.id)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -4963,16 +4966,20 @@ fn run(input: [items, threshold], output: []):
             .values()
             .filter(|n| n.is_fn_call)
             .filter(|n| {
-                n.called_function.as_ref().map(|f| {
-                    f.starts_with("__try_body") || f.starts_with("__except_handler")
-                }).unwrap_or(false)
+                n.called_function
+                    .as_ref()
+                    .map(|f| f.starts_with("__try_body") || f.starts_with("__except_handler"))
+                    .unwrap_or(false)
             })
             .collect();
 
         assert!(
             fn_call_to_try_except.is_empty(),
             "Try/except synthetic functions should be expanded. Found: {:?}",
-            fn_call_to_try_except.iter().map(|n| &n.id).collect::<Vec<_>>()
+            fn_call_to_try_except
+                .iter()
+                .map(|n| &n.id)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -5278,10 +5285,7 @@ fn run(input: [items, threshold], output: []):
             .filter(|e| e.exception_types.is_some())
             .collect();
 
-        assert!(
-            !exception_edges.is_empty(),
-            "Should have exception edges"
-        );
+        assert!(!exception_edges.is_empty(), "Should have exception edges");
 
         // Check for success edge from try body
         let success_edges: Vec<_> = dag
@@ -5343,11 +5347,7 @@ fn run(input: [items, threshold], output: []):
         let dag = convert_to_dag(&program);
 
         // All fn_call nodes to internal synthetic functions should be expanded
-        let fn_call_nodes: Vec<_> = dag
-            .nodes
-            .values()
-            .filter(|n| n.is_fn_call)
-            .collect();
+        let fn_call_nodes: Vec<_> = dag.nodes.values().filter(|n| n.is_fn_call).collect();
 
         // Print details for debugging
         if !fn_call_nodes.is_empty() {
@@ -5409,17 +5409,17 @@ fn run(input: [items, threshold], output: []):
         let input_data_edges: Vec<_> = dag
             .edges
             .iter()
-            .filter(|e| {
-                e.edge_type == EdgeType::DataFlow
-                    && e.source == input_node.id
-            })
+            .filter(|e| e.edge_type == EdgeType::DataFlow && e.source == input_node.id)
             .collect();
 
         // Input node should have some outgoing data edges
         assert!(
             !input_data_edges.is_empty(),
             "Input node should have outgoing data flow edges. Found: {:?}",
-            input_data_edges.iter().map(|e| (&e.target, &e.variable)).collect::<Vec<_>>()
+            input_data_edges
+                .iter()
+                .map(|e| (&e.target, &e.variable))
+                .collect::<Vec<_>>()
         );
     }
 }
