@@ -1402,6 +1402,20 @@ impl DAGRunner {
             .await?;
         let inbox_ms = inbox_start.elapsed().as_micros() as u64;
 
+        // DEBUG: Log full inbox state for completed node
+        info!(
+            node_id = %node_id,
+            existing_inbox_keys = ?existing_inbox.keys().collect::<Vec<_>>(),
+            "DEBUG: existing inbox node keys"
+        );
+        for (inbox_node_id, inbox_vars) in &existing_inbox {
+            info!(
+                inbox_node_id = %inbox_node_id,
+                inbox_vars = ?inbox_vars,
+                "DEBUG: inbox contents for node"
+            );
+        }
+
         // Step 3: Execute inline subgraph and build completion plan
         let inline_start = std::time::Instant::now();
         let ctx = InlineContext {
@@ -1430,6 +1444,29 @@ impl DAGRunner {
             has_instance_completion = plan.instance_completion.is_some(),
             "built completion plan"
         );
+
+        // DEBUG: Log all inbox writes in the plan
+        for write in &plan.inbox_writes {
+            info!(
+                target_node_id = %write.target_node_id,
+                variable_name = %write.variable_name,
+                value = ?write.value,
+                source_node_id = %write.source_node_id,
+                spread_index = ?write.spread_index,
+                "DEBUG: plan inbox write"
+            );
+        }
+
+        // DEBUG: Log all readiness increments
+        for inc in &plan.readiness_increments {
+            info!(
+                node_id = %inc.node_id,
+                required_count = inc.required_count,
+                node_type = ?inc.node_type,
+                action_name = ?inc.action_name,
+                "DEBUG: plan readiness increment"
+            );
+        }
 
         // Step 4: Execute completion plan in single atomic transaction
         let db_start = std::time::Instant::now();

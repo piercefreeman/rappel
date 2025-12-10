@@ -6,7 +6,7 @@
 
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet, VecDeque};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use uuid::Uuid;
 
@@ -515,6 +515,16 @@ pub fn execute_inline_subgraph(
     dag: &DAG,
     instance_id: WorkflowInstanceId,
 ) -> Result<CompletionPlan, CompletionError> {
+    info!(
+        completed_node_id = %completed_node_id,
+        completed_result = ?completed_result,
+        spread_index = ?ctx.spread_index,
+        initial_scope_keys = ?ctx.initial_scope.keys().collect::<Vec<_>>(),
+        existing_inbox_keys = ?ctx.existing_inbox.keys().collect::<Vec<_>>(),
+        subgraph_inline_nodes = ?subgraph.inline_nodes,
+        subgraph_frontier_nodes = ?subgraph.frontier_nodes.iter().map(|f| &f.node_id).collect::<Vec<_>>(),
+        "DEBUG: execute_inline_subgraph START"
+    );
     let mut plan = CompletionPlan::new(completed_node_id.to_string());
     let helper = DAGHelper::new(dag);
     let InlineContext {
@@ -671,33 +681,39 @@ pub fn execute_inline_subgraph(
 
         if is_frontier {
             // Mark as reachable frontier with loop-back info
+            info!(
+                node_id = %node_id,
+                reached_via_loop_back = reached_via_loop_back,
+                node_type = %node.node_type,
+                "DEBUG: reached frontier node"
+            );
             reachable_frontiers.insert(node_id.clone(), reached_via_loop_back);
             // Don't traverse past frontier nodes
         } else {
             // This is an inline node - execute it
             let result = execute_inline_node(node, &inline_scope);
-            tracing::debug!(
+            info!(
                 node_id = %node.id,
                 node_type = %node.node_type,
                 target = ?node.target,
                 result = ?result,
                 scope_keys = ?inline_scope.keys().collect::<Vec<_>>(),
-                "executed inline node (completion)"
+                "DEBUG: executed inline node (completion)"
             );
             if let Some(ref target) = node.target {
-                tracing::debug!(
+                info!(
                     node_id = %node.id,
                     target = %target,
                     old_value = ?inline_scope.get(target),
                     new_value = ?result,
-                    "scope update"
+                    "DEBUG: scope update"
                 );
                 inline_scope.insert(target.clone(), result);
-                tracing::debug!(
+                info!(
                     node_id = %node.id,
                     target = %target,
                     inserted_value = ?inline_scope.get(target),
-                    "scope after insert"
+                    "DEBUG: scope after insert"
                 );
             }
             executed_inline.push(node_id.clone());
@@ -742,13 +758,23 @@ pub fn execute_inline_subgraph(
         }
     }
 
-    debug!(
+    info!(
         completed_node_id = %completed_node_id,
         executed_inline_count = executed_inline.len(),
+        executed_inline_nodes = ?executed_inline,
         reachable_frontiers_count = reachable_frontiers.len(),
         reachable_frontiers = ?reachable_frontiers.keys().collect::<Vec<_>>(),
-        "BFS traversal complete"
+        inline_scope_keys = ?inline_scope.keys().collect::<Vec<_>>(),
+        "DEBUG: BFS traversal complete"
     );
+    // Log the full inline scope after traversal
+    for (var, val) in &inline_scope {
+        info!(
+            variable = %var,
+            value = ?val,
+            "DEBUG: inline scope variable after BFS"
+        );
+    }
 
     // Detect dead-end: no reachable frontiers AND no workflow completion yet
     // This indicates the workflow got stuck (e.g., all branches of a conditional blocked)
@@ -823,12 +849,13 @@ pub fn execute_inline_subgraph(
                         &mut action_inbox,
                     );
 
-                    // Ensure inline scope variables are available even if a dataflow edge
-                    // wasn't emitted for this frontier (e.g., missing edge metadata).
+                    // Overwrite action_inbox with inline scope values. The inline scope contains
+                    // freshly computed values from the current BFS traversal (e.g., loop variable
+                    // updates), which must take precedence over stale values from existing_inbox.
+                    // This is critical for for-loops where variables like `processed` accumulate
+                    // across iterations - we need the updated value, not the stale DB value.
                     for (var, val) in &inline_scope {
-                        action_inbox
-                            .entry(var.clone())
-                            .or_insert_with(|| val.clone());
+                        action_inbox.insert(var.clone(), val.clone());
                     }
 
                     debug!(
