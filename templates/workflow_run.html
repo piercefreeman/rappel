@@ -4,64 +4,64 @@
 
 {% block content %}
 <section class="space-y-4">
-    <a href="/workflow/{{ workflow.id }}" class="text-xs uppercase tracking-[0.4em] text-zinc-500 transition hover:text-zinc-300">&larr; Back to workflow detail</a>
+    <a href="/workflow/{{ workflow.id }}" class="text-xs uppercase tracking-[0.4em] text-zinc-500 transition hover:text-zinc-700 dark:hover:text-zinc-300">&larr; Back to workflow detail</a>
     <div class="space-y-2">
-        <h1 class="text-3xl font-semibold tracking-tight text-white">Run {{ instance.id | truncate(length=8, end="...") }}</h1>
-        <p class="text-sm text-zinc-400">{{ workflow.name }}</p>
+        <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-white">Run {{ instance.id | truncate(length=8, end="...") }}</h1>
+        <p class="text-sm text-zinc-600 dark:text-zinc-400">{{ workflow.name }}</p>
     </div>
-    <dl class="grid gap-4 rounded-2xl border border-zinc-900 bg-zinc-900/40 p-6 md:grid-cols-2 lg:grid-cols-4">
+    <dl class="grid gap-4 rounded-2xl border border-zinc-200 dark:border-zinc-900 bg-zinc-100 dark:bg-zinc-900/40 p-6 md:grid-cols-2 lg:grid-cols-4">
         <div>
             <dt class="text-xs uppercase tracking-[0.4em] text-zinc-500">Version ID</dt>
-            <dd class="text-lg font-semibold text-white">{{ workflow.id | truncate(length=8, end="...") }}</dd>
+            <dd class="text-lg font-semibold text-zinc-900 dark:text-white">{{ workflow.id | truncate(length=8, end="...") }}</dd>
         </div>
         <div>
             <dt class="text-xs uppercase tracking-[0.4em] text-zinc-500">Run Created</dt>
-            <dd class="text-lg font-semibold text-white">{{ instance.created_at }}</dd>
+            <dd class="text-lg font-semibold text-zinc-900 dark:text-white">{{ instance.created_at }}</dd>
         </div>
         <div>
             <dt class="text-xs uppercase tracking-[0.4em] text-zinc-500">Status</dt>
-            <dd class="text-lg font-semibold text-white">{{ instance.status }}</dd>
+            <dd class="text-lg font-semibold text-zinc-900 dark:text-white">{{ instance.status }}</dd>
         </div>
         <div>
             <dt class="text-xs uppercase tracking-[0.4em] text-zinc-500">Progress</dt>
-            <dd class="text-lg font-semibold text-white">{{ instance.progress }}</dd>
+            <dd class="text-lg font-semibold text-zinc-900 dark:text-white">{{ instance.progress }}</dd>
         </div>
     </dl>
 </section>
 
 <section class="grid gap-6 lg:grid-cols-2">
-    <div class="rounded-2xl border border-zinc-900 bg-zinc-900/40 p-5">
+    <div class="rounded-2xl border border-zinc-200 dark:border-zinc-900 bg-zinc-100 dark:bg-zinc-900/40 p-5">
         <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Input Payload</p>
-        <pre class="mt-3 overflow-x-auto whitespace-pre-wrap rounded-xl bg-zinc-950/70 p-4 text-xs text-zinc-200">{{ instance.input_payload }}</pre>
+        <pre class="mt-3 overflow-x-auto whitespace-pre-wrap rounded-xl bg-zinc-200/70 dark:bg-zinc-950/70 p-4 text-xs text-zinc-800 dark:text-zinc-200">{{ instance.input_payload }}</pre>
     </div>
-    <div class="rounded-2xl border border-zinc-900 bg-zinc-900/40 p-5">
+    <div class="rounded-2xl border border-zinc-200 dark:border-zinc-900 bg-zinc-100 dark:bg-zinc-900/40 p-5">
         <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Result Payload</p>
-        <pre class="mt-3 overflow-x-auto whitespace-pre-wrap rounded-xl bg-zinc-950/70 p-4 text-xs text-zinc-200">{{ instance.result_payload }}</pre>
+        <pre class="mt-3 overflow-x-auto whitespace-pre-wrap rounded-xl bg-zinc-200/70 dark:bg-zinc-950/70 p-4 text-xs text-zinc-800 dark:text-zinc-200">{{ instance.result_payload }}</pre>
     </div>
 </section>
 
 <section class="space-y-3">
     <div>
         <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Execution</p>
-        <h2 class="text-2xl font-semibold text-white">DAG Execution Status</h2>
+        <h2 class="text-2xl font-semibold text-zinc-900 dark:text-white">DAG Execution Status</h2>
     </div>
-    <div id="execution-graph" class="relative min-h-[280px] overflow-hidden rounded-2xl border border-zinc-900 bg-gradient-to-br from-zinc-950 to-zinc-900">
-        <p id="graph-empty" class="p-6 text-sm text-zinc-400">No DAG nodes to display.</p>
+    <div id="execution-graph" class="relative min-h-[280px] overflow-hidden rounded-2xl border border-zinc-200 dark:border-zinc-900 bg-gradient-to-br from-zinc-100 to-white dark:from-zinc-950 dark:to-zinc-900">
+        <p id="graph-empty" class="p-6 text-sm text-zinc-600 dark:text-zinc-400">No DAG nodes to display.</p>
     </div>
 </section>
 
 <section class="space-y-3">
     <div>
         <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Nodes</p>
-        <h2 class="text-2xl font-semibold text-white">Execution Details</h2>
-        <p class="text-sm text-zinc-400">Click a node in the graph or list to view details</p>
+        <h2 class="text-2xl font-semibold text-zinc-900 dark:text-white">Execution Details</h2>
+        <p class="text-sm text-zinc-600 dark:text-zinc-400">Click a node in the graph or list to view details</p>
     </div>
     <div class="grid gap-6 lg:grid-cols-2">
         <!-- Node list (left side) -->
         <div class="space-y-3">
             {% for node in nodes %}
                 <div id="node-list-{{ node.id }}"
-                     class="node-list-item cursor-pointer rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4 transition hover:border-zinc-700 hover:bg-zinc-900/60"
+                     class="node-list-item cursor-pointer rounded-2xl border border-zinc-300 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900/40 p-4 transition hover:border-zinc-400 dark:hover:border-zinc-700 hover:bg-zinc-200/60 dark:hover:bg-zinc-900/60"
                      data-node-id="{{ node.id }}"
                      data-module="{{ node.module }}"
                      data-action="{{ node.action }}"
@@ -70,46 +70,46 @@
                      data-response="{{ node.response_payload | escape }}">
                     <div class="flex items-center justify-between gap-2">
                         <div class="min-w-0 flex-1">
-                            <p class="text-sm font-semibold text-white truncate">{{ node.id }}</p>
-                            <p class="text-xs text-zinc-400 truncate">{{ node.action }} <span class="text-zinc-500">({{ node.module }})</span></p>
+                            <p class="text-sm font-semibold text-zinc-900 dark:text-white truncate">{{ node.id }}</p>
+                            <p class="text-xs text-zinc-600 dark:text-zinc-400 truncate">{{ node.action }} <span class="text-zinc-500">({{ node.module }})</span></p>
                         </div>
                         <span class="shrink-0 rounded-full px-2 py-1 text-xs font-semibold uppercase tracking-wide
-                            {% if node.status == 'completed' %}bg-emerald-900/50 text-emerald-400
-                            {% elif node.status == 'failed' %}bg-red-900/50 text-red-400
-                            {% elif node.status == 'dispatched' %}bg-amber-900/50 text-amber-400
-                            {% else %}bg-zinc-800 text-zinc-400{% endif %}">
+                            {% if node.status == 'completed' %}bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-400
+                            {% elif node.status == 'failed' %}bg-red-100 dark:bg-red-900/50 text-red-700 dark:text-red-400
+                            {% elif node.status == 'dispatched' %}bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-400
+                            {% else %}bg-zinc-200 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400{% endif %}">
                             {{ node.status }}
                         </span>
                     </div>
                 </div>
             {% endfor %}
             {% if nodes | length == 0 %}
-                <div class="rounded-2xl border border-dashed border-zinc-800 bg-zinc-900/40 p-6 text-sm text-zinc-400">
+                <div class="rounded-2xl border border-dashed border-zinc-300 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900/40 p-6 text-sm text-zinc-600 dark:text-zinc-400">
                     No actions have been executed yet.
                 </div>
             {% endif %}
         </div>
 
         <!-- Detail panel (right side) -->
-        <div id="detail-panel" class="rounded-2xl border border-zinc-900 bg-zinc-900/40 p-5 lg:sticky lg:top-6 lg:self-start">
-            <div id="detail-placeholder" class="text-center py-8 text-zinc-400">
+        <div id="detail-panel" class="rounded-2xl border border-zinc-200 dark:border-zinc-900 bg-zinc-100 dark:bg-zinc-900/40 p-5 lg:sticky lg:top-6 lg:self-start">
+            <div id="detail-placeholder" class="text-center py-8 text-zinc-600 dark:text-zinc-400">
                 <p class="text-sm">Select a node to view details</p>
             </div>
             <div id="detail-content" class="hidden space-y-4">
                 <div class="flex items-center justify-between gap-2">
                     <div>
-                        <p id="detail-node-id" class="text-lg font-semibold text-white"></p>
-                        <p id="detail-action-info" class="text-sm text-zinc-300"></p>
+                        <p id="detail-node-id" class="text-lg font-semibold text-zinc-900 dark:text-white"></p>
+                        <p id="detail-action-info" class="text-sm text-zinc-700 dark:text-zinc-300"></p>
                     </div>
                     <span id="detail-status" class="rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-wide"></span>
                 </div>
                 <div>
                     <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Request</p>
-                    <pre id="detail-request" class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl bg-zinc-950/70 p-3 text-xs text-zinc-200"></pre>
+                    <pre id="detail-request" class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl bg-zinc-200/70 dark:bg-zinc-950/70 p-3 text-xs text-zinc-800 dark:text-zinc-200"></pre>
                 </div>
                 <div>
                     <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Response</p>
-                    <pre id="detail-response" class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl bg-zinc-950/70 p-3 text-xs text-zinc-200"></pre>
+                    <pre id="detail-response" class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl bg-zinc-200/70 dark:bg-zinc-950/70 p-3 text-xs text-zinc-800 dark:text-zinc-200"></pre>
                 </div>
             </div>
         </div>
@@ -197,8 +197,8 @@ document.addEventListener('DOMContentLoaded', () => {
         el.dataset.nodeId = node.id;
         el.innerHTML = `
           <p class="text-[10px] font-mono uppercase tracking-wide" style="color: ${colors.text}">${node.id}</p>
-          <p class="text-sm font-semibold text-white truncate">${node.action}</p>
-          <p class="text-[10px] text-zinc-400 truncate">${node.module}</p>
+          <p class="text-sm font-semibold text-zinc-900 dark:text-white truncate">${node.action}</p>
+          <p class="text-[10px] text-zinc-600 dark:text-zinc-400 truncate">${node.module}</p>
         `;
         el.addEventListener('click', () => selectNode(node.id));
         container.appendChild(el);
@@ -230,7 +230,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const d = `M${start.x},${start.y} C${midX},${start.y} ${midX},${end.y} ${end.x},${end.y}`;
         connector.setAttribute('d', d);
         connector.setAttribute('fill', 'none');
-        connector.setAttribute('stroke', '#4b5563');
+        connector.setAttribute('stroke', document.documentElement.classList.contains('dark') ? '#4b5563' : '#d4d4d8');
         connector.setAttribute('stroke-width', '2');
         connector.setAttribute('stroke-linecap', 'round');
         svg.appendChild(connector);
@@ -244,8 +244,8 @@ document.addEventListener('DOMContentLoaded', () => {
   function selectNode(nodeId) {
     // Clear previous selection
     document.querySelectorAll('.node-list-item').forEach(el => {
-      el.classList.remove('border-indigo-500', 'bg-indigo-900/20');
-      el.classList.add('border-zinc-800');
+      el.classList.remove('border-indigo-500', 'bg-indigo-100', 'dark:bg-indigo-900/20');
+      el.classList.add('border-zinc-300', 'dark:border-zinc-800');
     });
     document.querySelectorAll('#execution-graph [data-node-id]').forEach(el => {
       el.classList.remove('ring-2', 'ring-indigo-500');
@@ -256,8 +256,8 @@ document.addEventListener('DOMContentLoaded', () => {
     // Highlight selected node in list
     const listItem = document.getElementById(`node-list-${nodeId}`);
     if (listItem) {
-      listItem.classList.remove('border-zinc-800');
-      listItem.classList.add('border-indigo-500', 'bg-indigo-900/20');
+      listItem.classList.remove('border-zinc-300', 'dark:border-zinc-800');
+      listItem.classList.add('border-indigo-500', 'bg-indigo-100', 'dark:bg-indigo-900/20');
 
       // Update detail panel
       const placeholder = document.getElementById('detail-placeholder');
@@ -275,13 +275,13 @@ document.addEventListener('DOMContentLoaded', () => {
       statusEl.textContent = status;
       statusEl.className = 'rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-wide';
       if (status === 'completed') {
-        statusEl.classList.add('bg-emerald-900/50', 'text-emerald-400');
+        statusEl.classList.add('bg-emerald-100', 'dark:bg-emerald-900/50', 'text-emerald-700', 'dark:text-emerald-400');
       } else if (status === 'failed') {
-        statusEl.classList.add('bg-red-900/50', 'text-red-400');
+        statusEl.classList.add('bg-red-100', 'dark:bg-red-900/50', 'text-red-700', 'dark:text-red-400');
       } else if (status === 'dispatched') {
-        statusEl.classList.add('bg-amber-900/50', 'text-amber-400');
+        statusEl.classList.add('bg-amber-100', 'dark:bg-amber-900/50', 'text-amber-700', 'dark:text-amber-400');
       } else {
-        statusEl.classList.add('bg-zinc-800', 'text-zinc-400');
+        statusEl.classList.add('bg-zinc-200', 'dark:bg-zinc-800', 'text-zinc-600', 'dark:text-zinc-400');
       }
 
       document.getElementById('detail-request').textContent = listItem.dataset.request;
