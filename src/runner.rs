@@ -3203,6 +3203,9 @@ mod tests {
             retry_kind: "failure".to_string(),
             node_id: Some("node_1".to_string()),
             node_type: "action".to_string(),
+            result_payload: None,
+            success: None,
+            status: "dispatched".to_string(),
         };
 
         tracker.add(action.clone(), 0);

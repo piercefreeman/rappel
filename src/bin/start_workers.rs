@@ -5,15 +5,18 @@
 //! - Starts the WorkerBridge gRPC server for worker connections
 //! - Spawns a pool of Python workers
 //! - Runs the DAGRunner to process workflow actions
+//! - Optionally starts the web dashboard for monitoring
 //!
 //! Configuration is via environment variables:
 //! - DATABASE_URL: PostgreSQL connection string (required)
-//! - CARABINER_USER_MODULE or RAPPEL_USER_MODULE: Python module to preload
-//! - CARABINER_WORKER_COUNT or RAPPEL_WORKER_COUNT: Number of workers (default: num_cpus)
+//! - RAPPEL_USER_MODULE: Python module to preload
+//! - RAPPEL_WORKER_COUNT: Number of workers (default: num_cpus)
 //! - RAPPEL_BATCH_SIZE: Actions per poll cycle (default: 100)
 //! - RAPPEL_POLL_INTERVAL_MS: Poll interval in ms (default: 100)
+//! - RAPPEL_WEBAPP_ENABLED: Set to "true" or "1" to enable web dashboard
+//! - RAPPEL_WEBAPP_ADDR: Web dashboard address (default: 0.0.0.0:24119)
 
-use std::{env, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use tokio::{select, signal};
@@ -21,8 +24,8 @@ use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use rappel::{
-    Config, DAGRunner, Database, PythonWorkerConfig, PythonWorkerPool, RunnerConfig,
-    WorkerBridgeServer,
+    DAGRunner, Database, PythonWorkerConfig, PythonWorkerPool, RunnerConfig, WebappServer,
+    WorkerBridgeServer, get_config,
 };
 
 #[tokio::main]
@@ -36,19 +39,14 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Load configuration
-    let config = Config::from_env()?;
-
-    // Get user module from environment (support both old and new env var names)
-    let user_module = env::var("CARABINER_USER_MODULE")
-        .or_else(|_| env::var("RAPPEL_USER_MODULE"))
-        .ok();
+    // Load configuration from global cache
+    let config = get_config();
 
     info!(
         worker_count = config.worker_count,
         batch_size = config.batch_size,
         poll_interval_ms = config.poll_interval_ms,
-        user_module = ?user_module,
+        user_module = ?config.user_module,
         "starting worker pool"
     );
 
@@ -60,9 +58,12 @@ async fn main() -> Result<()> {
     let worker_bridge = WorkerBridgeServer::start(Some(config.grpc_addr)).await?;
     info!(addr = %worker_bridge.addr(), "worker bridge started");
 
+    // Start webapp server if enabled
+    let webapp_server = WebappServer::start(config.webapp.clone(), Arc::clone(&database)).await?;
+
     // Configure Python workers
     let mut worker_config = PythonWorkerConfig::new();
-    if let Some(module) = &user_module {
+    if let Some(module) = &config.user_module {
         worker_config = worker_config.with_user_module(module);
     }
 
@@ -126,6 +127,11 @@ async fn main() -> Result<()> {
 
     // Shutdown worker bridge
     worker_bridge.shutdown().await;
+
+    // Shutdown webapp server if running
+    if let Some(webapp) = webapp_server {
+        webapp.shutdown().await;
+    }
 
     info!("shutdown complete");
     Ok(())

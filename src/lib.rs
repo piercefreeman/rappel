@@ -32,11 +32,14 @@ pub mod messages;
 pub mod parser;
 pub mod runner;
 pub mod server_client;
+pub mod server_webapp;
 pub mod server_worker;
 pub mod worker;
 
 // Configuration
-pub use config::Config;
+pub use config::{
+    Config, DEFAULT_BASE_PORT, DEFAULT_WEBAPP_ADDR, WebappConfig, get_config, try_get_config,
+};
 
 // Database
 pub use db::{
@@ -46,7 +49,7 @@ pub use db::{
 };
 
 // Worker infrastructure
-pub use messages::{MessageError, ast as ir_ast, proto};
+pub use messages::{MessageError, ast as ir_ast, proto, workflow_arguments_to_json};
 pub use server_worker::{WorkerBridgeChannels, WorkerBridgeServer};
 pub use worker::{
     ActionDispatchPayload, PythonWorker, PythonWorkerConfig, PythonWorkerPool, RoundTripMetrics,
@@ -81,3 +84,6 @@ pub use completion::{
     analyze_subgraph, evaluate_guard, execute_inline_subgraph, find_direct_predecessor_in_path,
     is_direct_predecessor,
 };
+
+// Webapp server
+pub use server_webapp::WebappServer;

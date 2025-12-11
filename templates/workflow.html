@@ -4,27 +4,27 @@
 
 {% block content %}
 <section class="space-y-4">
-    <a href="/" class="text-xs uppercase tracking-[0.4em] text-zinc-500 transition hover:text-zinc-300">&larr; Back to all workflows</a>
+    <a href="/" class="text-xs uppercase tracking-[0.4em] text-zinc-500 transition hover:text-zinc-700 dark:hover:text-zinc-300">&larr; Back to all workflows</a>
     <div class="space-y-2">
-        <h1 class="text-3xl font-semibold tracking-tight text-white">{{ workflow.name }}</h1>
-        <p class="text-sm text-zinc-400">Workflow version #{{ workflow.id }}</p>
+        <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-white">{{ workflow.name }}</h1>
+        <p class="text-sm text-zinc-600 dark:text-zinc-400">Workflow version #{{ workflow.id }}</p>
     </div>
-    <dl class="grid gap-4 rounded-2xl border border-zinc-900 bg-zinc-900/40 p-6 sm:grid-cols-2">
+    <dl class="grid gap-4 rounded-2xl border border-zinc-200 dark:border-zinc-900 bg-zinc-100 dark:bg-zinc-900/40 p-6 sm:grid-cols-2">
         <div>
             <dt class="text-xs uppercase tracking-[0.4em] text-zinc-500">Version ID</dt>
-            <dd class="text-lg font-semibold text-white">{{ workflow.id }}</dd>
+            <dd class="text-lg font-semibold text-zinc-900 dark:text-white">{{ workflow.id }}</dd>
         </div>
         <div>
             <dt class="text-xs uppercase tracking-[0.4em] text-zinc-500">Created</dt>
-            <dd class="text-lg font-semibold text-white">{{ workflow.created_at }}</dd>
+            <dd class="text-lg font-semibold text-zinc-900 dark:text-white">{{ workflow.created_at }}</dd>
         </div>
         <div>
             <dt class="text-xs uppercase tracking-[0.4em] text-zinc-500">Hash</dt>
-            <dd class="font-mono text-sm text-zinc-200 break-all">{{ workflow.hash }}</dd>
+            <dd class="font-mono text-sm text-zinc-800 dark:text-zinc-200 break-all">{{ workflow.hash }}</dd>
         </div>
         <div>
             <dt class="text-xs uppercase tracking-[0.4em] text-zinc-500">Execution</dt>
-            <dd class="text-lg font-semibold text-white">{{ workflow.concurrency_label }}</dd>
+            <dd class="text-lg font-semibold text-zinc-900 dark:text-white">{{ workflow.concurrency_label }}</dd>
         </div>
     </dl>
 </section>
@@ -32,42 +32,42 @@
 <section class="space-y-3">
     <div>
         <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Visualization</p>
-        <h2 class="text-2xl font-semibold text-white">DAG Layout</h2>
+        <h2 class="text-2xl font-semibold text-zinc-900 dark:text-white">DAG Layout</h2>
     </div>
-    <div id="workflow-graph" class="relative min-h-[280px] overflow-hidden rounded-2xl border border-zinc-900 bg-gradient-to-br from-zinc-950 to-zinc-900">
-        <p id="graph-empty" class="p-6 text-sm text-zinc-400">Workflow nodes will draw here once a DAG is registered.</p>
+    <div id="workflow-graph" class="relative min-h-[280px] max-h-[500px] overflow-auto rounded-2xl border border-zinc-200 dark:border-zinc-900 bg-gradient-to-br from-zinc-100 to-white dark:from-zinc-950 dark:to-zinc-900">
+        <p id="graph-empty" class="p-6 text-sm text-zinc-600 dark:text-zinc-400">Workflow nodes will draw here once a DAG is registered.</p>
     </div>
 </section>
 
 <section class="space-y-3">
     <div>
         <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Recent Runs</p>
-        <h2 class="text-2xl font-semibold text-white">Latest Workflow Instances</h2>
+        <h2 class="text-2xl font-semibold text-zinc-900 dark:text-white">Latest Workflow Instances</h2>
     </div>
     {% if has_runs %}
-        <div class="rounded-2xl border border-zinc-900 bg-zinc-900/40">
+        <div class="rounded-2xl border border-zinc-200 dark:border-zinc-900 bg-zinc-100 dark:bg-zinc-900/40">
             <div class="overflow-x-auto">
-                <table class="min-w-full divide-y divide-zinc-800 text-sm">
-                    <thead class="bg-zinc-900/60">
+                <table class="min-w-full divide-y divide-zinc-200 dark:divide-zinc-800 text-sm">
+                    <thead class="bg-zinc-200/60 dark:bg-zinc-900/60">
                         <tr>
-                            <th class="px-4 py-3 text-left font-semibold text-zinc-400">Instance</th>
-                            <th class="px-4 py-3 text-left font-semibold text-zinc-400">Created</th>
-                            <th class="px-4 py-3 text-left font-semibold text-zinc-400">Status</th>
-                            <th class="px-4 py-3 text-left font-semibold text-zinc-400">Progress</th>
+                            <th class="px-4 py-3 text-left font-semibold text-zinc-600 dark:text-zinc-400">Instance</th>
+                            <th class="px-4 py-3 text-left font-semibold text-zinc-600 dark:text-zinc-400">Created</th>
+                            <th class="px-4 py-3 text-left font-semibold text-zinc-600 dark:text-zinc-400">Status</th>
+                            <th class="px-4 py-3 text-left font-semibold text-zinc-600 dark:text-zinc-400">Progress</th>
                             <th class="px-4 py-3"></th>
                         </tr>
                     </thead>
-                    <tbody class="divide-y divide-zinc-800">
+                    <tbody class="divide-y divide-zinc-200 dark:divide-zinc-800">
                         {% for run in recent_runs %}
                             <tr>
-                                <td class="px-4 py-3 font-mono text-xs text-zinc-300">{{ run.id }}</td>
-                                <td class="px-4 py-3 text-zinc-300">{{ run.created_at }}</td>
+                                <td class="px-4 py-3 font-mono text-xs text-zinc-700 dark:text-zinc-300">{{ run.id }}</td>
+                                <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">{{ run.created_at }}</td>
                                 <td class="px-4 py-3">
-                                    <span class="rounded-full bg-zinc-800 px-2 py-1 text-xs font-semibold text-zinc-200">{{ run.status }}</span>
+                                    <span class="rounded-full bg-zinc-200 dark:bg-zinc-800 px-2 py-1 text-xs font-semibold text-zinc-800 dark:text-zinc-200">{{ run.status }}</span>
                                 </td>
-                                <td class="px-4 py-3 text-zinc-300">{{ run.progress }}</td>
+                                <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">{{ run.progress }}</td>
                                 <td class="px-4 py-3 text-right">
-                                    <a href="{{ run.url }}" class="text-sm font-semibold text-indigo-400 transition hover:text-indigo-300">View &rarr;</a>
+                                    <a href="{{ run.url }}" class="text-sm font-semibold text-indigo-600 dark:text-indigo-400 transition hover:text-indigo-500 dark:hover:text-indigo-300">View &rarr;</a>
                                 </td>
                             </tr>
                         {% endfor %}
@@ -76,145 +76,204 @@
             </div>
         </div>
     {% else %}
-        <div class="rounded-2xl border border-dashed border-zinc-800 bg-zinc-900/40 p-6 text-sm text-zinc-400">
+        <div class="rounded-2xl border border-dashed border-zinc-300 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900/40 p-6 text-sm text-zinc-600 dark:text-zinc-400">
             No workflow runs recorded yet.
         </div>
     {% endif %}
 </section>
 
-<section class="space-y-3">
-    <div>
-        <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Nodes</p>
-        <h2 class="text-2xl font-semibold text-white">Workflow Steps</h2>
-    </div>
-    {% if has_nodes %}
-        <div class="grid gap-4 lg:grid-cols-2">
-            {% for node in nodes %}
-                <div class="rounded-2xl border border-zinc-900 bg-zinc-900/40 p-5">
-                    <div class="flex items-center justify-between">
-                        <p class="text-lg font-semibold text-white">{{ node.id }}</p>
-                        <span class="text-xs uppercase tracking-[0.4em] text-zinc-500">{{ node.module }}</span>
-                    </div>
-                    <p class="text-sm text-zinc-300">{{ node.action }}</p>
-                    <div class="mt-4 space-y-2 text-sm text-zinc-400">
-                        <p><span class="font-semibold text-zinc-300">Depends on:</span> {{ node.depends_on_display }}</p>
-                        <p><span class="font-semibold text-zinc-300">Waits for:</span> {{ node.waits_for_display }}</p>
-                        <p><span class="font-semibold text-zinc-300">Guard:</span> {{ node.guard }}</p>
-                    </div>
-                </div>
-            {% endfor %}
-        </div>
-    {% else %}
-        <div class="rounded-2xl border border-dashed border-zinc-800 bg-zinc-900/40 p-6 text-sm text-zinc-400">
-            This workflow has no DAG nodes.
-        </div>
-    {% endif %}
-</section>
 {% endblock content %}
 
 {% block scripts %}
 <script>
-document.addEventListener('DOMContentLoaded', () => {
-  const graphData = {{ graph_data | json_encode | safe }};
-  if (!graphData || !graphData.nodes || !graphData.nodes.length) {
-    return;
+const graphData = {{ graph_data | json_encode | safe }};
+
+/**
+ * DAGLayout - Reusable class for rendering DAG visualizations
+ * Supports both horizontal and vertical orientations
+ */
+class DAGLayout {
+  constructor(container, options = {}) {
+    this.container = container;
+    this.options = {
+      orientation: options.orientation || 'horizontal',
+      nodeWidth: options.nodeWidth || 180,
+      nodeHeight: options.nodeHeight || 72,
+      padding: options.padding || 32,
+      gap: options.gap || 200,
+      rowGap: options.rowGap || 100,
+      onNodeClick: options.onNodeClick || null,
+    };
+    this.positions = new Map();
+    this.nodeElements = new Map();
   }
-  const placeholder = document.getElementById('graph-empty');
-  if (placeholder) {
-    placeholder.remove();
-  }
-  const container = document.getElementById('workflow-graph');
-  if (!container) {
-    return;
-  }
-  const nodes = graphData.nodes;
-  const padding = 32;
-  const columnGap = 220;
-  const rowGap = 140;
-  const nodeWidth = 180;
-  const nodeHeight = 90;
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  svg.setAttribute('class', 'absolute inset-0 h-full w-full pointer-events-none');
-  container.appendChild(svg);
-  const nodeMap = new Map(nodes.map((node) => [node.id, node]));
-  const depthCache = new Map();
-  const computeDepth = (nodeId, stack = new Set()) => {
-    if (depthCache.has(nodeId)) {
-      return depthCache.get(nodeId);
-    }
-    const node = nodeMap.get(nodeId);
-    if (!node || !node.depends_on.length) {
-      depthCache.set(nodeId, 0);
-      return 0;
-    }
-    if (stack.has(nodeId)) {
-      return 0;
-    }
-    stack.add(nodeId);
-    let depth = 0;
-    node.depends_on.forEach((dep) => {
-      depth = Math.max(depth, computeDepth(dep, stack) + 1);
+
+  render(nodes) {
+    if (!nodes || !nodes.length) return;
+
+    this.container.innerHTML = '';
+
+    const nodeMap = new Map(nodes.map(n => [n.id, n]));
+    const depthCache = new Map();
+
+    const computeDepth = (nodeId, stack = new Set()) => {
+      if (depthCache.has(nodeId)) return depthCache.get(nodeId);
+      const node = nodeMap.get(nodeId);
+      if (!node || !node.depends_on || !node.depends_on.length) {
+        depthCache.set(nodeId, 0);
+        return 0;
+      }
+      if (stack.has(nodeId)) return 0;
+      stack.add(nodeId);
+      let depth = 0;
+      node.depends_on.forEach(dep => {
+        depth = Math.max(depth, computeDepth(dep, stack) + 1);
+      });
+      stack.delete(nodeId);
+      depthCache.set(nodeId, depth);
+      return depth;
+    };
+
+    const levels = [];
+    nodes.forEach(node => {
+      const depth = computeDepth(node.id);
+      if (!levels[depth]) levels[depth] = [];
+      levels[depth].push(node);
     });
-    stack.delete(nodeId);
-    depthCache.set(nodeId, depth);
-    return depth;
-  };
-  const levels = [];
-  nodes.forEach((node) => {
-    const depth = computeDepth(node.id);
-    if (!levels[depth]) {
-      levels[depth] = [];
+
+    const normalizedLevels = Array.from({ length: levels.length }, (_, i) => levels[i] || []);
+    const { nodeWidth, nodeHeight, padding, gap, rowGap, orientation } = this.options;
+
+    // Calculate total dimensions first
+    const maxDepth = normalizedLevels.length;
+    const maxNodesInLevel = Math.max(...normalizedLevels.map(l => l.length), 1);
+
+    let totalWidth, totalHeight;
+    if (orientation === 'vertical') {
+      totalWidth = padding * 2 + maxNodesInLevel * nodeWidth + (maxNodesInLevel - 1) * (rowGap / 2);
+      totalHeight = padding * 2 + maxDepth * gap + nodeHeight;
+    } else {
+      totalWidth = padding * 2 + maxDepth * (nodeWidth + gap);
+      totalHeight = padding * 2 + maxNodesInLevel * rowGap + nodeHeight;
     }
-    levels[depth].push(node);
-  });
-  const normalizedLevels = Array.from({ length: levels.length }, (_, index) => levels[index] || []);
-  const positions = new Map();
-  normalizedLevels.forEach((levelNodes, depth) => {
-    levelNodes.forEach((node, index) => {
-      const left = padding + depth * columnGap;
-      const top = padding + index * rowGap;
-      const el = document.createElement('div');
-      el.className = 'absolute rounded-2xl border border-zinc-800 bg-zinc-950/80 px-4 py-3 shadow-lg';
-      el.style.left = `${left}px`;
-      el.style.top = `${top}px`;
-      el.style.width = `${nodeWidth}px`;
-      el.innerHTML = `
-        <p class="text-[11px] font-mono uppercase tracking-wide text-zinc-500">${node.id}</p>
-        <p class="text-sm font-semibold text-white">${node.action}</p>
-        <p class="text-xs text-zinc-400">${node.module}</p>
-      `;
-      container.appendChild(el);
-      positions.set(node.id, {
-        x: left + nodeWidth / 2,
-        y: top + nodeHeight / 2,
+
+    // Create wrapper that defines the full scrollable area
+    const wrapper = document.createElement('div');
+    wrapper.style.cssText = `position: relative; width: ${totalWidth}px; height: ${Math.max(totalHeight, 240)}px;`;
+    this.container.appendChild(wrapper);
+
+    // Create SVG sized to full content
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.style.cssText = 'position: absolute; top: 0; left: 0; pointer-events: none;';
+    svg.setAttribute('width', totalWidth);
+    svg.setAttribute('height', Math.max(totalHeight, 240));
+    wrapper.appendChild(svg);
+
+    // Create node elements
+    normalizedLevels.forEach((levelNodes, depth) => {
+      levelNodes.forEach((node, index) => {
+        let left, top;
+        if (orientation === 'vertical') {
+          left = padding + index * (nodeWidth + rowGap / 2);
+          top = padding + depth * gap;
+        } else {
+          left = padding + depth * (nodeWidth + gap);
+          top = padding + index * rowGap;
+        }
+
+        this.positions.set(node.id, {
+          x: left + nodeWidth / 2,
+          y: top + nodeHeight / 2,
+          left, top
+        });
+
+        const el = this.createNodeElement(node, left, top);
+        wrapper.appendChild(el);
+        this.nodeElements.set(node.id, el);
       });
     });
-  });
-  const rowCounts = normalizedLevels.map((level) => Math.max(level.length, 1));
-  const maxRows = rowCounts.length ? Math.max(...rowCounts) : 1;
-  const totalWidth = padding * 2 + Math.max(normalizedLevels.length - 1, 0) * columnGap + nodeWidth;
-  const totalHeight = padding * 2 + (maxRows - 1) * rowGap + nodeHeight;
-  container.style.height = `${Math.max(totalHeight, 240)}px`;
-  svg.setAttribute('width', totalWidth);
-  svg.setAttribute('height', Math.max(totalHeight, 240));
-  nodes.forEach((node) => {
-    node.depends_on.forEach((dependency) => {
-      const start = positions.get(dependency);
-      const end = positions.get(node.id);
-      if (!start || !end) {
-        return;
-      }
-      const connector = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      const midX = (start.x + end.x) / 2;
-      const d = `M${start.x},${start.y} C${midX},${start.y} ${midX},${end.y} ${end.x},${end.y}`;
-      connector.setAttribute('d', d);
-      connector.setAttribute('fill', 'none');
-      connector.setAttribute('stroke', '#4b5563');
-      connector.setAttribute('stroke-width', '2');
-      connector.setAttribute('stroke-linecap', 'round');
-      svg.appendChild(connector);
+
+    // Draw edges
+    const isDark = document.documentElement.classList.contains('dark');
+    const strokeColor = isDark ? '#52525b' : '#d4d4d8';
+
+    nodes.forEach(node => {
+      if (!node.depends_on) return;
+      node.depends_on.forEach(depId => {
+        const start = this.positions.get(depId);
+        const end = this.positions.get(node.id);
+        if (!start || !end) return;
+
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        let d;
+        if (orientation === 'vertical') {
+          const midY = (start.y + end.y) / 2;
+          d = `M${start.x},${start.y + nodeHeight/2} C${start.x},${midY} ${end.x},${midY} ${end.x},${end.y - nodeHeight/2}`;
+        } else {
+          const midX = (start.x + end.x) / 2;
+          d = `M${start.x + nodeWidth/2},${start.y} C${midX},${start.y} ${midX},${end.y} ${end.x - nodeWidth/2},${end.y}`;
+        }
+        path.setAttribute('d', d);
+        path.setAttribute('fill', 'none');
+        path.setAttribute('stroke', strokeColor);
+        path.setAttribute('stroke-width', '2');
+        path.setAttribute('stroke-linecap', 'round');
+        svg.appendChild(path);
+      });
     });
+  }
+
+  createNodeElement(node, left, top) {
+    const { nodeWidth, nodeHeight } = this.options;
+    const isDark = document.documentElement.classList.contains('dark');
+
+    const el = document.createElement('div');
+    el.className = 'absolute rounded-xl px-4 py-3 transition-all duration-150';
+    el.style.cssText = `
+      left: ${left}px;
+      top: ${top}px;
+      width: ${nodeWidth}px;
+      min-height: ${nodeHeight}px;
+      background: ${isDark ? '#27272a' : '#ffffff'};
+      border: 2px solid ${isDark ? '#3f3f46' : '#d4d4d8'};
+      box-shadow: 0 4px 12px rgba(0,0,0,${isDark ? '0.3' : '0.08'});
+    `;
+    el.dataset.nodeId = node.id;
+
+    el.innerHTML = `
+      <p class="text-[10px] font-mono font-medium uppercase tracking-wider ${isDark ? 'text-zinc-500' : 'text-zinc-400'}">${node.id}</p>
+      <p class="text-sm font-semibold mt-1 ${isDark ? 'text-white' : 'text-zinc-900'}">${node.action}</p>
+      <p class="text-xs ${isDark ? 'text-zinc-400' : 'text-zinc-600'}">${node.module}</p>
+    `;
+
+    if (this.options.onNodeClick) {
+      el.classList.add('cursor-pointer', 'hover:scale-[1.02]', 'hover:shadow-lg');
+      el.addEventListener('click', () => this.options.onNodeClick(node.id));
+    }
+
+    return el;
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  if (!graphData || !graphData.nodes || !graphData.nodes.length) return;
+
+  const placeholder = document.getElementById('graph-empty');
+  if (placeholder) placeholder.remove();
+
+  const container = document.getElementById('workflow-graph');
+  if (!container) return;
+
+  const dag = new DAGLayout(container, {
+    orientation: 'horizontal',
+    nodeWidth: 180,
+    nodeHeight: 72,
+    padding: 32,
+    gap: 200,
+    rowGap: 100
   });
+
+  dag.render(graphData.nodes);
 });
 </script>
 {% endblock scripts %}

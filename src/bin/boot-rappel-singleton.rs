@@ -23,8 +23,7 @@ use serde::Deserialize;
 use tracing::{debug, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Default base port for probing
-const DEFAULT_BASE_PORT: u16 = 24117;
+use rappel::try_get_config;
 
 /// Number of ports to probe
 const PORT_PROBE_COUNT: u16 = 10;
@@ -59,11 +58,10 @@ async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let port_file = parse_port_file_arg(&args);
 
-    // Try to find existing server
-    let base_port = env::var("RAPPEL_BASE_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_BASE_PORT);
+    // Try to find existing server - use config if available, otherwise default
+    let base_port = try_get_config()
+        .map(|c| c.base_port)
+        .unwrap_or(rappel::DEFAULT_BASE_PORT);
 
     info!(base_port, "probing for existing rappel server");
 

@@ -6,6 +6,7 @@ use rappel::{
     completion::{InlineContext, analyze_subgraph, execute_inline_subgraph},
     convert_to_dag,
     dag_state::DAGHelper,
+    get_config,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
@@ -23,10 +24,9 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
-    // Connect to database
-    let database_url =
-        std::env::var("DATABASE_URL").expect("DATABASE_URL environment variable required");
-    let database = Database::connect(&database_url)
+    // Connect to database using centralized config
+    let config = get_config();
+    let database = Database::connect(&config.database_url)
         .await
         .expect("failed to connect to database");
 

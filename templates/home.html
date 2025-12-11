@@ -5,23 +5,23 @@
 {% block content %}
 <section class="space-y-2">
     <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Overview</p>
-    <h1 class="text-3xl font-semibold tracking-tight text-white">Registered Workflow Versions</h1>
-    <p class="text-sm text-zinc-400">These workflow DAGs are available in the database backing this server.</p>
+    <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-white">Registered Workflow Versions</h1>
+    <p class="text-sm text-zinc-600 dark:text-zinc-400">These workflow DAGs are available in the database backing this server.</p>
 </section>
 
 {% if workflows | length == 0 %}
-    <div class="rounded-2xl border border-dashed border-zinc-800 bg-zinc-900/40 p-6 text-center text-zinc-400">
+    <div class="rounded-2xl border border-dashed border-zinc-300 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900/40 p-6 text-center text-zinc-600 dark:text-zinc-400">
         No workflow versions found. Register a workflow to see it appear here.
     </div>
 {% else %}
     <div class="space-y-4">
         {% for workflow in workflows %}
-            <a href="/workflow/{{ workflow.id }}" class="flex flex-col gap-2 rounded-2xl border border-zinc-800 bg-gradient-to-r from-zinc-900/70 to-zinc-900/30 px-5 py-4 transition hover:border-zinc-600 hover:from-zinc-900 hover:to-zinc-900">
+            <a href="/workflow/{{ workflow.id }}" class="flex flex-col gap-2 rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-gradient-to-r from-zinc-50 to-white dark:from-zinc-900/70 dark:to-zinc-900/30 px-5 py-4 transition hover:border-zinc-400 dark:hover:border-zinc-600 hover:from-zinc-100 hover:to-zinc-50 dark:hover:from-zinc-900 dark:hover:to-zinc-900">
                 <div class="flex items-center justify-between">
-                    <p class="text-lg font-semibold text-white">{{ workflow.name }}</p>
-                    <span class="text-xs text-zinc-400">Version #{{ workflow.id }}</span>
+                    <p class="text-lg font-semibold text-zinc-900 dark:text-white">{{ workflow.name }}</p>
+                    <span class="text-xs text-zinc-600 dark:text-zinc-400">Version #{{ workflow.id }}</span>
                 </div>
-                <div class="flex flex-wrap gap-4 text-sm text-zinc-400">
+                <div class="flex flex-wrap gap-4 text-sm text-zinc-600 dark:text-zinc-400">
                     <span class="font-mono text-xs">hash {{ workflow.hash }}</span>
                     <span>{{ workflow.created_at }}</span>
                 </div>
