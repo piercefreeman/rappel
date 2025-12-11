@@ -489,20 +489,20 @@ impl Database {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Process timed-out actions: requeue if retries remain, mark permanently failed otherwise.
+    /// Mark timed-out actions as failed.
     ///
-    /// This is a combined atomic operation that:
-    /// 1. Finds dispatched actions past their deadline (using SKIP LOCKED for multi-host safety)
-    /// 2. If retries remaining: requeues with incremented attempt_number and backoff delay
-    /// 3. If retries exhausted: marks as permanently 'timed_out' (terminal state)
+    /// This finds dispatched actions past their deadline and marks them as 'failed'
+    /// with retry_kind='timeout'. The actual retry/requeue logic is handled by
+    /// `requeue_failed_actions`, which processes both timeout and explicit failures.
     ///
-    /// Returns a tuple of (requeued_count, permanently_failed_count)
-    pub async fn process_timed_out_actions(&self, limit: i32) -> DbResult<(i64, i64)> {
+    /// Uses SKIP LOCKED for multi-host safety.
+    ///
+    /// Returns the number of actions marked as failed.
+    pub async fn mark_timed_out_actions(&self, limit: i32) -> DbResult<i64> {
         let result = sqlx::query(
             r#"
             WITH overdue AS (
-                SELECT id, attempt_number, timeout_retry_limit,
-                       backoff_kind, backoff_base_delay_ms, backoff_multiplier
+                SELECT id
                 FROM action_queue
                 WHERE status = 'dispatched'
                   AND deadline_at IS NOT NULL
@@ -511,77 +511,51 @@ impl Database {
                 LIMIT $1
             )
             UPDATE action_queue aq
-            SET
-                -- If retries exhausted -> 'timed_out' (terminal), else -> 'queued' (retry)
-                status = CASE
-                    WHEN overdue.attempt_number >= overdue.timeout_retry_limit THEN 'timed_out'
-                    ELSE 'queued'
-                END,
+            SET status = 'failed',
                 retry_kind = 'timeout',
-                -- Only increment attempt_number if retrying
-                attempt_number = CASE
-                    WHEN overdue.attempt_number >= overdue.timeout_retry_limit THEN aq.attempt_number
-                    ELSE aq.attempt_number + 1
-                END,
-                -- Calculate backoff-delayed scheduled_at if retrying
-                scheduled_at = CASE
-                    WHEN overdue.attempt_number >= overdue.timeout_retry_limit THEN aq.scheduled_at
-                    ELSE NOW() + (
-                        CASE aq.backoff_kind
-                            WHEN 'linear' THEN (aq.backoff_base_delay_ms * (aq.attempt_number + 1))
-                            WHEN 'exponential' THEN (aq.backoff_base_delay_ms * POWER(aq.backoff_multiplier, aq.attempt_number))
-                            ELSE 0
-                        END || ' milliseconds'
-                    )::interval
-                END,
-                -- Clear deadline and delivery token (for both retry and permanent failure)
+                -- Clear deadline and delivery token so old workers can't complete
                 deadline_at = NULL,
                 delivery_token = NULL
             FROM overdue
             WHERE aq.id = overdue.id
-            RETURNING
-                CASE WHEN aq.status = 'queued' THEN 1 ELSE 0 END as requeued,
-                CASE WHEN aq.status = 'timed_out' THEN 1 ELSE 0 END as permanently_failed
             "#,
         )
         .bind(limit)
-        .fetch_all(&self.pool)
+        .execute(&self.pool)
         .await?;
 
-        let mut requeued_count = 0i64;
-        let mut permanently_failed_count = 0i64;
-
-        for row in result {
-            requeued_count += row.get::<i32, _>("requeued") as i64;
-            permanently_failed_count += row.get::<i32, _>("permanently_failed") as i64;
+        let count = result.rows_affected() as i64;
+        if count > 0 {
+            tracing::info!(count = count, "marked timed-out actions as failed");
         }
 
-        if requeued_count > 0 || permanently_failed_count > 0 {
-            tracing::info!(
-                requeued = requeued_count,
-                permanently_failed = permanently_failed_count,
-                "process_timed_out_actions"
-            );
-        }
-
-        Ok((requeued_count, permanently_failed_count))
+        Ok(count)
     }
 
-    /// Requeue failed actions for retry (explicit failures, not timeouts).
+    /// Requeue failed actions for retry (handles both explicit failures and timeouts).
     ///
-    /// This handles actions that failed due to errors (not timeouts).
+    /// This is the single place where retry/backoff logic is implemented. It handles:
+    /// - Actions with retry_kind='failure' (explicit errors) using max_retries limit
+    /// - Actions with retry_kind='timeout' (timed out) using timeout_retry_limit
+    ///
+    /// Actions that have exhausted their retries are marked with terminal status
+    /// ('failed' or 'timed_out' respectively).
+    ///
     /// Uses SKIP LOCKED for multi-host safety.
     ///
-    /// Returns the number of actions requeued.
-    pub async fn requeue_failed_actions(&self, limit: i32) -> DbResult<i64> {
+    /// Returns a tuple of (requeued_count, permanently_failed_count)
+    pub async fn requeue_failed_actions(&self, limit: i32) -> DbResult<(i64, i64)> {
         let result = sqlx::query(
             r#"
             WITH retryable AS (
-                SELECT id
+                SELECT id, retry_kind, attempt_number, max_retries, timeout_retry_limit
                 FROM action_queue
                 WHERE status = 'failed'
-                  AND retry_kind = 'failure'
-                  AND attempt_number < max_retries
+                  AND (
+                      (retry_kind = 'failure' AND attempt_number < max_retries)
+                      OR
+                      (retry_kind = 'timeout' AND attempt_number < timeout_retry_limit)
+                  )
                 FOR UPDATE SKIP LOCKED
                 LIMIT $1
             )
@@ -599,13 +573,54 @@ impl Database {
                 delivery_token = NULL
             FROM retryable
             WHERE aq.id = retryable.id
+            RETURNING 1 as requeued
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let requeued_count = result.len() as i64;
+
+        // Now mark actions that have exhausted their retries as permanently failed
+        let permanent_result = sqlx::query(
+            r#"
+            WITH exhausted AS (
+                SELECT id, retry_kind
+                FROM action_queue
+                WHERE status = 'failed'
+                  AND (
+                      (retry_kind = 'failure' AND attempt_number >= max_retries)
+                      OR
+                      (retry_kind = 'timeout' AND attempt_number >= timeout_retry_limit)
+                  )
+                FOR UPDATE SKIP LOCKED
+                LIMIT $1
+            )
+            UPDATE action_queue aq
+            SET status = CASE
+                    WHEN exhausted.retry_kind = 'timeout' THEN 'timed_out'
+                    ELSE 'failed'
+                END
+            FROM exhausted
+            WHERE aq.id = exhausted.id
             "#,
         )
         .bind(limit)
         .execute(&self.pool)
         .await?;
 
-        Ok(result.rows_affected() as i64)
+        let permanently_failed_count = permanent_result.rows_affected() as i64;
+
+        if requeued_count > 0 || permanently_failed_count > 0 {
+            tracing::info!(
+                requeued = requeued_count,
+                permanently_failed = permanently_failed_count,
+                "requeue_failed_actions"
+            );
+        }
+
+        Ok((requeued_count, permanently_failed_count))
     }
 
     // ========================================================================

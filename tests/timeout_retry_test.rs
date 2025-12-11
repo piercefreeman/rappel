@@ -1,7 +1,9 @@
 //! Tests for action timeout and retry handling.
 //!
-//! These tests verify the process_timed_out_actions and requeue_failed_actions
-//! database operations work correctly.
+//! These tests verify the two-phase timeout/retry system:
+//! 1. mark_timed_out_actions: Marks overdue dispatched actions as 'failed' with retry_kind='timeout'
+//! 2. requeue_failed_actions: Handles ALL failed actions (timeouts + explicit failures),
+//!    applying backoff logic and retry limits in one place
 
 use std::env;
 
@@ -90,14 +92,19 @@ async fn insert_test_action(
     Ok(row.get("id"))
 }
 
-/// Helper to get action status and attempt_number.
-async fn get_action_state(db: &Database, action_id: Uuid) -> Result<(String, i32)> {
-    let row = sqlx::query("SELECT status, attempt_number FROM action_queue WHERE id = $1")
-        .bind(action_id)
-        .fetch_one(db.pool())
-        .await?;
+/// Helper to get action status, attempt_number, and retry_kind.
+async fn get_action_state(db: &Database, action_id: Uuid) -> Result<(String, i32, String)> {
+    let row =
+        sqlx::query("SELECT status, attempt_number, retry_kind FROM action_queue WHERE id = $1")
+            .bind(action_id)
+            .fetch_one(db.pool())
+            .await?;
 
-    Ok((row.get("status"), row.get("attempt_number")))
+    Ok((
+        row.get("status"),
+        row.get("attempt_number"),
+        row.get("retry_kind"),
+    ))
 }
 
 /// Helper to get action scheduled_at.
@@ -111,84 +118,43 @@ async fn get_action_scheduled_at(db: &Database, action_id: Uuid) -> Result<chron
 }
 
 // =============================================================================
-// process_timed_out_actions Tests
+// mark_timed_out_actions Tests
 // =============================================================================
 
 #[tokio::test]
 #[serial]
-async fn test_process_timed_out_actions_requeues_with_retries_remaining() -> Result<()> {
+async fn test_mark_timed_out_actions_marks_overdue_as_failed() -> Result<()> {
     let Some(db) = setup_db().await else {
         return Ok(());
     };
 
     let (_, instance_id) = create_test_instance(&db).await?;
 
-    // Create a dispatched action with deadline in the past and retries remaining
+    // Create a dispatched action with deadline in the past
     let past_deadline = Utc::now() - Duration::seconds(60);
     let action_id = insert_test_action(
         &db,
         instance_id,
         "dispatched",
-        0, // attempt_number = 0
-        3, // timeout_retry_limit = 3 (so 0 < 3, retries remaining)
+        0,
+        3,
         Some(past_deadline),
         "exponential",
         1000,
     )
     .await?;
 
-    // Process timed out actions
-    let (requeued, permanently_failed) = db.process_timed_out_actions(100).await?;
+    // Mark timed out actions
+    let count = db.mark_timed_out_actions(100).await?;
+    assert_eq!(count, 1, "should have marked 1 action");
 
-    assert_eq!(requeued, 1, "should have requeued 1 action");
-    assert_eq!(permanently_failed, 0, "should have 0 permanently failed");
-
-    // Verify action state
-    let (status, attempt_number) = get_action_state(&db, action_id).await?;
-    assert_eq!(status, "queued", "action should be requeued");
-    assert_eq!(attempt_number, 1, "attempt_number should be incremented");
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_process_timed_out_actions_permanently_fails_when_retries_exhausted() -> Result<()> {
-    let Some(db) = setup_db().await else {
-        return Ok(());
-    };
-
-    let (_, instance_id) = create_test_instance(&db).await?;
-
-    // Create a dispatched action with deadline in the past and NO retries remaining
-    let past_deadline = Utc::now() - Duration::seconds(60);
-    let action_id = insert_test_action(
-        &db,
-        instance_id,
-        "dispatched",
-        3, // attempt_number = 3
-        3, // timeout_retry_limit = 3 (so 3 >= 3, no retries remaining)
-        Some(past_deadline),
-        "exponential",
-        1000,
-    )
-    .await?;
-
-    // Process timed out actions
-    let (requeued, permanently_failed) = db.process_timed_out_actions(100).await?;
-
-    assert_eq!(requeued, 0, "should have 0 requeued");
-    assert_eq!(permanently_failed, 1, "should have 1 permanently failed");
-
-    // Verify action state
-    let (status, attempt_number) = get_action_state(&db, action_id).await?;
+    // Verify action state - should be 'failed' with retry_kind='timeout'
+    let (status, attempt_number, retry_kind) = get_action_state(&db, action_id).await?;
+    assert_eq!(status, "failed", "action should be marked as failed");
+    assert_eq!(retry_kind, "timeout", "retry_kind should be timeout");
     assert_eq!(
-        status, "timed_out",
-        "action should be permanently timed_out"
-    );
-    assert_eq!(
-        attempt_number, 3,
-        "attempt_number should NOT be incremented"
+        attempt_number, 0,
+        "attempt_number should NOT be incremented yet"
     );
 
     Ok(())
@@ -196,7 +162,7 @@ async fn test_process_timed_out_actions_permanently_fails_when_retries_exhausted
 
 #[tokio::test]
 #[serial]
-async fn test_process_timed_out_actions_ignores_non_overdue_actions() -> Result<()> {
+async fn test_mark_timed_out_actions_ignores_non_overdue() -> Result<()> {
     let Some(db) = setup_db().await else {
         return Ok(());
     };
@@ -217,185 +183,20 @@ async fn test_process_timed_out_actions_ignores_non_overdue_actions() -> Result<
     )
     .await?;
 
-    // Process timed out actions
-    let (requeued, permanently_failed) = db.process_timed_out_actions(100).await?;
-
-    assert_eq!(requeued, 0, "should have 0 requeued");
-    assert_eq!(permanently_failed, 0, "should have 0 permanently failed");
+    // Mark timed out actions
+    let count = db.mark_timed_out_actions(100).await?;
+    assert_eq!(count, 0, "should have marked 0 actions");
 
     // Verify action state unchanged
-    let (status, attempt_number) = get_action_state(&db, action_id).await?;
+    let (status, _, _) = get_action_state(&db, action_id).await?;
     assert_eq!(status, "dispatched", "action should still be dispatched");
-    assert_eq!(attempt_number, 0, "attempt_number should be unchanged");
 
     Ok(())
 }
 
 #[tokio::test]
 #[serial]
-async fn test_process_timed_out_actions_ignores_non_dispatched_actions() -> Result<()> {
-    let Some(db) = setup_db().await else {
-        return Ok(());
-    };
-
-    let (_, instance_id) = create_test_instance(&db).await?;
-
-    // Create a queued action (not dispatched) with past deadline
-    let past_deadline = Utc::now() - Duration::seconds(60);
-    let action_id = insert_test_action(
-        &db,
-        instance_id,
-        "queued", // Not dispatched!
-        0,
-        3,
-        Some(past_deadline),
-        "exponential",
-        1000,
-    )
-    .await?;
-
-    // Process timed out actions
-    let (requeued, permanently_failed) = db.process_timed_out_actions(100).await?;
-
-    assert_eq!(requeued, 0, "should have 0 requeued");
-    assert_eq!(permanently_failed, 0, "should have 0 permanently failed");
-
-    // Verify action state unchanged
-    let (status, _) = get_action_state(&db, action_id).await?;
-    assert_eq!(status, "queued", "action should still be queued");
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_process_timed_out_actions_applies_exponential_backoff() -> Result<()> {
-    let Some(db) = setup_db().await else {
-        return Ok(());
-    };
-
-    let (_, instance_id) = create_test_instance(&db).await?;
-
-    // Create a dispatched action with exponential backoff
-    let past_deadline = Utc::now() - Duration::seconds(60);
-    let action_id = insert_test_action(
-        &db,
-        instance_id,
-        "dispatched",
-        1, // attempt_number = 1 (second attempt)
-        3, // timeout_retry_limit = 3
-        Some(past_deadline),
-        "exponential",
-        1000, // base delay = 1000ms
-    )
-    .await?;
-
-    // Process timed out actions
-    let (requeued, _) = db.process_timed_out_actions(100).await?;
-    assert_eq!(requeued, 1);
-
-    let after_scheduled = get_action_scheduled_at(&db, action_id).await?;
-
-    // With exponential backoff: base_delay * 2^attempt_number = 1000 * 2^1 = 2000ms
-    // The scheduled_at should be at least 2000ms in the future from NOW()
-    let actual_delay = after_scheduled - Utc::now();
-
-    // Allow some tolerance (should be close to 2000ms, but check it's at least 1500ms)
-    assert!(
-        actual_delay > Duration::milliseconds(1500),
-        "backoff delay should be at least 1500ms, got {:?}",
-        actual_delay
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_process_timed_out_actions_applies_linear_backoff() -> Result<()> {
-    let Some(db) = setup_db().await else {
-        return Ok(());
-    };
-
-    let (_, instance_id) = create_test_instance(&db).await?;
-
-    // Create a dispatched action with linear backoff
-    let past_deadline = Utc::now() - Duration::seconds(60);
-    let action_id = insert_test_action(
-        &db,
-        instance_id,
-        "dispatched",
-        1, // attempt_number = 1
-        3, // timeout_retry_limit = 3
-        Some(past_deadline),
-        "linear",
-        1000, // base delay = 1000ms
-    )
-    .await?;
-
-    // Process timed out actions
-    let (requeued, _) = db.process_timed_out_actions(100).await?;
-    assert_eq!(requeued, 1);
-
-    let after_scheduled = get_action_scheduled_at(&db, action_id).await?;
-
-    // With linear backoff: base_delay * (attempt_number + 1) = 1000 * (1 + 1) = 2000ms
-    let actual_delay = after_scheduled - Utc::now();
-
-    // Allow some tolerance
-    assert!(
-        actual_delay > Duration::milliseconds(1500),
-        "backoff delay should be at least 1500ms, got {:?}",
-        actual_delay
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_process_timed_out_actions_handles_no_backoff() -> Result<()> {
-    let Some(db) = setup_db().await else {
-        return Ok(());
-    };
-
-    let (_, instance_id) = create_test_instance(&db).await?;
-
-    // Create a dispatched action with no backoff
-    let past_deadline = Utc::now() - Duration::seconds(60);
-    let action_id = insert_test_action(
-        &db,
-        instance_id,
-        "dispatched",
-        0,
-        3,
-        Some(past_deadline),
-        "none", // No backoff
-        1000,
-    )
-    .await?;
-
-    // Process timed out actions
-    let (requeued, _) = db.process_timed_out_actions(100).await?;
-    assert_eq!(requeued, 1);
-
-    let after_scheduled = get_action_scheduled_at(&db, action_id).await?;
-
-    // With no backoff, scheduled_at should be very close to NOW()
-    let actual_delay = after_scheduled - Utc::now();
-
-    assert!(
-        actual_delay < Duration::seconds(1),
-        "with no backoff, delay should be minimal, got {:?}",
-        actual_delay
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_process_timed_out_actions_clears_delivery_token() -> Result<()> {
+async fn test_mark_timed_out_actions_clears_delivery_token() -> Result<()> {
     let Some(db) = setup_db().await else {
         return Ok(());
     };
@@ -426,10 +227,10 @@ async fn test_process_timed_out_actions_clears_delivery_token() -> Result<()> {
         "delivery_token should be set initially"
     );
 
-    // Process timed out actions
-    db.process_timed_out_actions(100).await?;
+    // Mark timed out actions
+    db.mark_timed_out_actions(100).await?;
 
-    // Verify delivery_token is cleared
+    // Verify delivery_token and deadline are cleared
     let row = sqlx::query("SELECT delivery_token, deadline_at FROM action_queue WHERE id = $1")
         .bind(action_id)
         .fetch_one(db.pool())
@@ -445,68 +246,7 @@ async fn test_process_timed_out_actions_clears_delivery_token() -> Result<()> {
 
 #[tokio::test]
 #[serial]
-async fn test_process_timed_out_actions_mixed_results() -> Result<()> {
-    let Some(db) = setup_db().await else {
-        return Ok(());
-    };
-
-    let (_, instance_id) = create_test_instance(&db).await?;
-    let past_deadline = Utc::now() - Duration::seconds(60);
-
-    // Action 1: Should be requeued (retries remaining)
-    let action1_id = insert_test_action(
-        &db,
-        instance_id,
-        "dispatched",
-        0, // attempt_number
-        3, // timeout_retry_limit
-        Some(past_deadline),
-        "exponential",
-        1000,
-    )
-    .await?;
-
-    // We need to insert another action with a different action_seq
-    sqlx::query(
-        r#"
-        INSERT INTO action_queue (
-            instance_id, action_seq, module_name, action_name,
-            dispatch_payload, status, attempt_number, timeout_retry_limit,
-            deadline_at, backoff_kind, backoff_base_delay_ms,
-            delivery_token, dispatched_at
-        )
-        VALUES ($1, 1, 'test_module', 'test_action', $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-        RETURNING id
-        "#,
-    )
-    .bind(instance_id.0)
-    .bind(Vec::<u8>::new())
-    .bind("dispatched")
-    .bind(3i32) // attempt_number = 3 (exhausted)
-    .bind(3i32) // timeout_retry_limit = 3
-    .bind(Some(past_deadline))
-    .bind("exponential")
-    .bind(1000i32)
-    .bind(Uuid::new_v4())
-    .fetch_one(db.pool())
-    .await?;
-
-    // Process timed out actions
-    let (requeued, permanently_failed) = db.process_timed_out_actions(100).await?;
-
-    assert_eq!(requeued, 1, "should have 1 requeued");
-    assert_eq!(permanently_failed, 1, "should have 1 permanently failed");
-
-    // Verify action 1 was requeued
-    let (status1, _) = get_action_state(&db, action1_id).await?;
-    assert_eq!(status1, "queued");
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_process_timed_out_actions_respects_limit() -> Result<()> {
+async fn test_mark_timed_out_actions_respects_limit() -> Result<()> {
     let Some(db) = setup_db().await else {
         return Ok(());
     };
@@ -536,14 +276,9 @@ async fn test_process_timed_out_actions_respects_limit() -> Result<()> {
         .await?;
     }
 
-    // Process with limit of 2
-    let (requeued, permanently_failed) = db.process_timed_out_actions(2).await?;
-
-    assert_eq!(
-        requeued + permanently_failed,
-        2,
-        "should only process 2 actions"
-    );
+    // Mark with limit of 2
+    let count = db.mark_timed_out_actions(2).await?;
+    assert_eq!(count, 2, "should only mark 2 actions");
 
     // Count remaining dispatched actions
     let row = sqlx::query("SELECT COUNT(*) as count FROM action_queue WHERE status = 'dispatched'")
@@ -561,7 +296,7 @@ async fn test_process_timed_out_actions_respects_limit() -> Result<()> {
 
 #[tokio::test]
 #[serial]
-async fn test_requeue_failed_actions_requeues_with_retries_remaining() -> Result<()> {
+async fn test_requeue_failed_actions_requeues_failure_with_retries() -> Result<()> {
     let Some(db) = setup_db().await else {
         return Ok(());
     };
@@ -577,18 +312,18 @@ async fn test_requeue_failed_actions_requeues_with_retries_remaining() -> Result
             backoff_kind, backoff_base_delay_ms
         )
         VALUES ($1, 0, 'test_module', 'test_action', $2, 'failed', 'failure', 0, 3, 'exponential', 1000)
-        RETURNING id
         "#,
     )
     .bind(instance_id.0)
     .bind(Vec::<u8>::new())
-    .fetch_one(db.pool())
+    .execute(db.pool())
     .await?;
 
     // Requeue failed actions
-    let requeued = db.requeue_failed_actions(100).await?;
+    let (requeued, permanently_failed) = db.requeue_failed_actions(100).await?;
 
     assert_eq!(requeued, 1, "should have requeued 1 action");
+    assert_eq!(permanently_failed, 0, "should have 0 permanently failed");
 
     // Verify it was requeued
     let row = sqlx::query("SELECT status, attempt_number FROM action_queue WHERE instance_id = $1")
@@ -606,7 +341,52 @@ async fn test_requeue_failed_actions_requeues_with_retries_remaining() -> Result
 
 #[tokio::test]
 #[serial]
-async fn test_requeue_failed_actions_ignores_exhausted_retries() -> Result<()> {
+async fn test_requeue_failed_actions_requeues_timeout_with_retries() -> Result<()> {
+    let Some(db) = setup_db().await else {
+        return Ok(());
+    };
+
+    let (_, instance_id) = create_test_instance(&db).await?;
+
+    // Create a failed action with retry_kind='timeout' and retries remaining
+    sqlx::query(
+        r#"
+        INSERT INTO action_queue (
+            instance_id, action_seq, module_name, action_name,
+            dispatch_payload, status, retry_kind, attempt_number, timeout_retry_limit,
+            backoff_kind, backoff_base_delay_ms
+        )
+        VALUES ($1, 0, 'test_module', 'test_action', $2, 'failed', 'timeout', 0, 3, 'exponential', 1000)
+        "#,
+    )
+    .bind(instance_id.0)
+    .bind(Vec::<u8>::new())
+    .execute(db.pool())
+    .await?;
+
+    // Requeue failed actions
+    let (requeued, permanently_failed) = db.requeue_failed_actions(100).await?;
+
+    assert_eq!(requeued, 1, "should have requeued 1 timeout action");
+    assert_eq!(permanently_failed, 0, "should have 0 permanently failed");
+
+    // Verify it was requeued
+    let row = sqlx::query("SELECT status, attempt_number FROM action_queue WHERE instance_id = $1")
+        .bind(instance_id.0)
+        .fetch_one(db.pool())
+        .await?;
+    let status: String = row.get("status");
+    let attempt: i32 = row.get("attempt_number");
+
+    assert_eq!(status, "queued");
+    assert_eq!(attempt, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_requeue_failed_actions_permanently_fails_exhausted_failure() -> Result<()> {
     let Some(db) = setup_db().await else {
         return Ok(());
     };
@@ -630,11 +410,12 @@ async fn test_requeue_failed_actions_ignores_exhausted_retries() -> Result<()> {
     .await?;
 
     // Requeue failed actions
-    let requeued = db.requeue_failed_actions(100).await?;
+    let (requeued, permanently_failed) = db.requeue_failed_actions(100).await?;
 
-    assert_eq!(requeued, 0, "should not have requeued any actions");
+    assert_eq!(requeued, 0, "should have 0 requeued");
+    assert_eq!(permanently_failed, 1, "should have 1 permanently failed");
 
-    // Verify it's still failed
+    // Verify it's still failed (terminal state for failure type)
     let row = sqlx::query("SELECT status FROM action_queue WHERE instance_id = $1")
         .bind(instance_id.0)
         .fetch_one(db.pool())
@@ -647,22 +428,22 @@ async fn test_requeue_failed_actions_ignores_exhausted_retries() -> Result<()> {
 
 #[tokio::test]
 #[serial]
-async fn test_requeue_failed_actions_ignores_timeout_retry_kind() -> Result<()> {
+async fn test_requeue_failed_actions_permanently_fails_exhausted_timeout() -> Result<()> {
     let Some(db) = setup_db().await else {
         return Ok(());
     };
 
     let (_, instance_id) = create_test_instance(&db).await?;
 
-    // Create a failed action with timeout retry_kind (should be ignored by requeue_failed_actions)
+    // Create a failed action with retry_kind='timeout' and NO retries remaining
     sqlx::query(
         r#"
         INSERT INTO action_queue (
             instance_id, action_seq, module_name, action_name,
-            dispatch_payload, status, retry_kind, attempt_number, max_retries,
+            dispatch_payload, status, retry_kind, attempt_number, timeout_retry_limit,
             backoff_kind, backoff_base_delay_ms
         )
-        VALUES ($1, 0, 'test_module', 'test_action', $2, 'failed', 'timeout', 0, 3, 'exponential', 1000)
+        VALUES ($1, 0, 'test_module', 'test_action', $2, 'failed', 'timeout', 3, 3, 'exponential', 1000)
         "#,
     )
     .bind(instance_id.0)
@@ -671,16 +452,247 @@ async fn test_requeue_failed_actions_ignores_timeout_retry_kind() -> Result<()> 
     .await?;
 
     // Requeue failed actions
-    let requeued = db.requeue_failed_actions(100).await?;
+    let (requeued, permanently_failed) = db.requeue_failed_actions(100).await?;
 
-    assert_eq!(requeued, 0, "should not requeue timeout-type failures");
+    assert_eq!(requeued, 0, "should have 0 requeued");
+    assert_eq!(permanently_failed, 1, "should have 1 permanently failed");
+
+    // Verify it's marked as 'timed_out' (terminal state for timeout type)
+    let row = sqlx::query("SELECT status FROM action_queue WHERE instance_id = $1")
+        .bind(instance_id.0)
+        .fetch_one(db.pool())
+        .await?;
+    let status: String = row.get("status");
+    assert_eq!(status, "timed_out");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_requeue_failed_actions_applies_exponential_backoff() -> Result<()> {
+    let Some(db) = setup_db().await else {
+        return Ok(());
+    };
+
+    let (_, instance_id) = create_test_instance(&db).await?;
+
+    // Create a failed action with exponential backoff
+    let action_id: Uuid = sqlx::query(
+        r#"
+        INSERT INTO action_queue (
+            instance_id, action_seq, module_name, action_name,
+            dispatch_payload, status, retry_kind, attempt_number, max_retries,
+            backoff_kind, backoff_base_delay_ms
+        )
+        VALUES ($1, 0, 'test_module', 'test_action', $2, 'failed', 'failure', 1, 3, 'exponential', 1000)
+        RETURNING id
+        "#,
+    )
+    .bind(instance_id.0)
+    .bind(Vec::<u8>::new())
+    .fetch_one(db.pool())
+    .await?
+    .get("id");
+
+    // Requeue failed actions
+    let (requeued, _) = db.requeue_failed_actions(100).await?;
+    assert_eq!(requeued, 1);
+
+    let after_scheduled = get_action_scheduled_at(&db, action_id).await?;
+
+    // With exponential backoff: base_delay * 2^attempt_number = 1000 * 2^1 = 2000ms
+    let actual_delay = after_scheduled - Utc::now();
+
+    // Allow some tolerance (should be close to 2000ms, but check it's at least 1500ms)
+    assert!(
+        actual_delay > Duration::milliseconds(1500),
+        "backoff delay should be at least 1500ms, got {:?}",
+        actual_delay
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_requeue_failed_actions_applies_linear_backoff() -> Result<()> {
+    let Some(db) = setup_db().await else {
+        return Ok(());
+    };
+
+    let (_, instance_id) = create_test_instance(&db).await?;
+
+    // Create a failed action with linear backoff
+    let action_id: Uuid = sqlx::query(
+        r#"
+        INSERT INTO action_queue (
+            instance_id, action_seq, module_name, action_name,
+            dispatch_payload, status, retry_kind, attempt_number, max_retries,
+            backoff_kind, backoff_base_delay_ms
+        )
+        VALUES ($1, 0, 'test_module', 'test_action', $2, 'failed', 'failure', 1, 3, 'linear', 1000)
+        RETURNING id
+        "#,
+    )
+    .bind(instance_id.0)
+    .bind(Vec::<u8>::new())
+    .fetch_one(db.pool())
+    .await?
+    .get("id");
+
+    // Requeue failed actions
+    let (requeued, _) = db.requeue_failed_actions(100).await?;
+    assert_eq!(requeued, 1);
+
+    let after_scheduled = get_action_scheduled_at(&db, action_id).await?;
+
+    // With linear backoff: base_delay * (attempt_number + 1) = 1000 * (1 + 1) = 2000ms
+    let actual_delay = after_scheduled - Utc::now();
+
+    assert!(
+        actual_delay > Duration::milliseconds(1500),
+        "backoff delay should be at least 1500ms, got {:?}",
+        actual_delay
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_requeue_failed_actions_handles_no_backoff() -> Result<()> {
+    let Some(db) = setup_db().await else {
+        return Ok(());
+    };
+
+    let (_, instance_id) = create_test_instance(&db).await?;
+
+    // Create a failed action with no backoff
+    let action_id: Uuid = sqlx::query(
+        r#"
+        INSERT INTO action_queue (
+            instance_id, action_seq, module_name, action_name,
+            dispatch_payload, status, retry_kind, attempt_number, max_retries,
+            backoff_kind, backoff_base_delay_ms
+        )
+        VALUES ($1, 0, 'test_module', 'test_action', $2, 'failed', 'failure', 0, 3, 'none', 1000)
+        RETURNING id
+        "#,
+    )
+    .bind(instance_id.0)
+    .bind(Vec::<u8>::new())
+    .fetch_one(db.pool())
+    .await?
+    .get("id");
+
+    // Requeue failed actions
+    let (requeued, _) = db.requeue_failed_actions(100).await?;
+    assert_eq!(requeued, 1);
+
+    let after_scheduled = get_action_scheduled_at(&db, action_id).await?;
+
+    // With no backoff, scheduled_at should be very close to NOW()
+    let actual_delay = after_scheduled - Utc::now();
+
+    assert!(
+        actual_delay < Duration::seconds(1),
+        "with no backoff, delay should be minimal, got {:?}",
+        actual_delay
+    );
 
     Ok(())
 }
 
 // =============================================================================
-// Integration-like tests
+// Two-Phase Integration Tests
 // =============================================================================
+
+#[tokio::test]
+#[serial]
+async fn test_two_phase_timeout_requeues_with_retries() -> Result<()> {
+    let Some(db) = setup_db().await else {
+        return Ok(());
+    };
+
+    let (_, instance_id) = create_test_instance(&db).await?;
+
+    // Create a dispatched action with deadline in the past and retries remaining
+    let past_deadline = Utc::now() - Duration::seconds(60);
+    let action_id = insert_test_action(
+        &db,
+        instance_id,
+        "dispatched",
+        0, // attempt_number = 0
+        3, // timeout_retry_limit = 3 (so 0 < 3, retries remaining)
+        Some(past_deadline),
+        "exponential",
+        1000,
+    )
+    .await?;
+
+    // Phase 1: Mark timed out
+    let marked = db.mark_timed_out_actions(100).await?;
+    assert_eq!(marked, 1);
+
+    // Verify intermediate state
+    let (status, attempt, retry_kind) = get_action_state(&db, action_id).await?;
+    assert_eq!(status, "failed");
+    assert_eq!(retry_kind, "timeout");
+    assert_eq!(attempt, 0); // Not incremented yet
+
+    // Phase 2: Requeue failed actions
+    let (requeued, permanently_failed) = db.requeue_failed_actions(100).await?;
+    assert_eq!(requeued, 1);
+    assert_eq!(permanently_failed, 0);
+
+    // Verify final state
+    let (status, attempt, _) = get_action_state(&db, action_id).await?;
+    assert_eq!(status, "queued");
+    assert_eq!(attempt, 1); // Now incremented
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_two_phase_timeout_permanently_fails_when_exhausted() -> Result<()> {
+    let Some(db) = setup_db().await else {
+        return Ok(());
+    };
+
+    let (_, instance_id) = create_test_instance(&db).await?;
+
+    // Create a dispatched action with deadline in the past and NO retries remaining
+    let past_deadline = Utc::now() - Duration::seconds(60);
+    let action_id = insert_test_action(
+        &db,
+        instance_id,
+        "dispatched",
+        3, // attempt_number = 3
+        3, // timeout_retry_limit = 3 (so 3 >= 3, no retries remaining)
+        Some(past_deadline),
+        "exponential",
+        1000,
+    )
+    .await?;
+
+    // Phase 1: Mark timed out
+    let marked = db.mark_timed_out_actions(100).await?;
+    assert_eq!(marked, 1);
+
+    // Phase 2: Requeue failed actions (should permanently fail)
+    let (requeued, permanently_failed) = db.requeue_failed_actions(100).await?;
+    assert_eq!(requeued, 0);
+    assert_eq!(permanently_failed, 1);
+
+    // Verify final state - should be 'timed_out' (terminal)
+    let (status, attempt, _) = get_action_state(&db, action_id).await?;
+    assert_eq!(status, "timed_out");
+    assert_eq!(attempt, 3); // Not incremented
+
+    Ok(())
+}
 
 #[tokio::test]
 #[serial]
@@ -721,28 +733,27 @@ async fn test_full_timeout_retry_cycle() -> Result<()> {
     assert_eq!(status, "dispatched");
     assert!(deadline.is_some());
 
-    // Manually set deadline to past to simulate timeout
+    // Simulate timeout by setting deadline to past
     sqlx::query("UPDATE action_queue SET deadline_at = NOW() - INTERVAL '1 minute' WHERE id = $1")
         .bind(action_id)
         .execute(db.pool())
         .await?;
 
-    // Process timed out actions - should requeue
-    let (requeued, permanently_failed) = db.process_timed_out_actions(100).await?;
+    // Two-phase: mark then requeue
+    db.mark_timed_out_actions(100).await?;
+    let (requeued, permanently_failed) = db.requeue_failed_actions(100).await?;
     assert_eq!(requeued, 1);
     assert_eq!(permanently_failed, 0);
 
     // Verify it's requeued with incremented attempt
-    let (status, attempt) = get_action_state(&db, action_id).await?;
+    let (status, attempt, _) = get_action_state(&db, action_id).await?;
     assert_eq!(status, "queued");
     assert_eq!(attempt, 1);
 
-    // Dispatch again
-    let actions = db.dispatch_actions(10).await?;
-    assert_eq!(actions.len(), 1);
-
-    // Simulate timeout again (repeat for all retries)
+    // Dispatch again and repeat timeout cycle
     for expected_attempt in 2..=3 {
+        db.dispatch_actions(10).await?;
+
         sqlx::query(
             "UPDATE action_queue SET deadline_at = NOW() - INTERVAL '1 minute' WHERE id = $1",
         )
@@ -750,34 +761,30 @@ async fn test_full_timeout_retry_cycle() -> Result<()> {
         .execute(db.pool())
         .await?;
 
-        let (requeued, permanently_failed) = db.process_timed_out_actions(100).await?;
+        db.mark_timed_out_actions(100).await?;
+        let (requeued, permanently_failed) = db.requeue_failed_actions(100).await?;
+        assert_eq!(requeued, 1);
+        assert_eq!(permanently_failed, 0);
 
-        if expected_attempt <= 3 {
-            // Still has retries
-            assert_eq!(requeued, 1);
-            assert_eq!(permanently_failed, 0);
-
-            let (status, attempt) = get_action_state(&db, action_id).await?;
-            assert_eq!(status, "queued");
-            assert_eq!(attempt, expected_attempt);
-
-            // Dispatch again
-            db.dispatch_actions(10).await?;
-        }
+        let (status, attempt, _) = get_action_state(&db, action_id).await?;
+        assert_eq!(status, "queued");
+        assert_eq!(attempt, expected_attempt);
     }
 
-    // Final timeout - should be permanently failed
+    // Final dispatch and timeout - should be permanently failed
+    db.dispatch_actions(10).await?;
     sqlx::query("UPDATE action_queue SET deadline_at = NOW() - INTERVAL '1 minute' WHERE id = $1")
         .bind(action_id)
         .execute(db.pool())
         .await?;
 
-    let (requeued, permanently_failed) = db.process_timed_out_actions(100).await?;
+    db.mark_timed_out_actions(100).await?;
+    let (requeued, permanently_failed) = db.requeue_failed_actions(100).await?;
     assert_eq!(requeued, 0);
     assert_eq!(permanently_failed, 1);
 
     // Verify it's permanently timed_out
-    let (status, attempt) = get_action_state(&db, action_id).await?;
+    let (status, attempt, _) = get_action_state(&db, action_id).await?;
     assert_eq!(status, "timed_out");
     assert_eq!(attempt, 3); // Not incremented for permanent failure
 

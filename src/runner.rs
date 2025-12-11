@@ -1289,35 +1289,51 @@ impl DAGRunner {
                     });
                 }
 
-                // Check for timed-out actions periodically
-                // Uses SKIP LOCKED so multiple runner instances can safely run this concurrently
+                // Check for timed-out and failed actions periodically.
+                // Uses SKIP LOCKED so multiple runner instances can safely run this concurrently.
+                //
+                // Two-phase approach:
+                // 1. mark_timed_out_actions: Marks overdue dispatched actions as 'failed' with retry_kind='timeout'
+                // 2. requeue_failed_actions: Handles ALL failed actions (both timeouts and explicit failures),
+                //    applying backoff logic and retry limits in one place
+                //
+                // If we process a full batch, we immediately re-run without waiting for the
+                // next interval tick. This allows us to quickly drain large backlogs (e.g.,
+                // 10k actions that all timed out simultaneously) without being throttled by
+                // the sleep interval.
                 _ = timeout_check_interval.tick() => {
                     let batch_size = self.config.timeout_check_batch_size;
+                    let mut should_continue = true;
 
-                    match self.completion_handler.db.process_timed_out_actions(batch_size).await {
-                        Ok((requeued, failed)) => {
-                            if requeued > 0 || failed > 0 {
-                                info!(
-                                    requeued = requeued,
-                                    permanently_failed = failed,
-                                    "processed timed-out actions"
-                                );
+                    while should_continue {
+                        should_continue = false;
+
+                        // Phase 1: Mark timed-out actions as failed (with retry_kind='timeout')
+                        match self.completion_handler.db.mark_timed_out_actions(batch_size).await {
+                            Ok(count) => {
+                                // If we hit the batch limit, there may be more to process
+                                if count >= batch_size as i64 {
+                                    should_continue = true;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to mark timed-out actions: {}", e);
                             }
                         }
-                        Err(e) => {
-                            error!("Failed to process timed-out actions: {}", e);
-                        }
-                    }
 
-                    // Also requeue any explicitly failed actions that have retries remaining
-                    match self.completion_handler.db.requeue_failed_actions(batch_size).await {
-                        Ok(count) => {
-                            if count > 0 {
-                                info!(requeued = count, "requeued failed actions");
+                        // Phase 2: Requeue all failed actions (both timeouts and explicit failures)
+                        // This is the single place where retry/backoff logic is applied
+                        match self.completion_handler.db.requeue_failed_actions(batch_size).await {
+                            Ok((requeued, permanently_failed)) => {
+                                let total = requeued + permanently_failed;
+                                // If we hit the batch limit, there may be more to process
+                                if total >= batch_size as i64 {
+                                    should_continue = true;
+                                }
                             }
-                        }
-                        Err(e) => {
-                            error!("Failed to requeue failed actions: {}", e);
+                            Err(e) => {
+                                error!("Failed to requeue failed actions: {}", e);
+                            }
                         }
                     }
                 }
