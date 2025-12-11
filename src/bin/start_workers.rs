@@ -5,6 +5,7 @@
 //! - Starts the WorkerBridge gRPC server for worker connections
 //! - Spawns a pool of Python workers
 //! - Runs the DAGRunner to process workflow actions
+//! - Optionally starts the web dashboard for monitoring
 //!
 //! Configuration is via environment variables:
 //! - DATABASE_URL: PostgreSQL connection string (required)
@@ -12,6 +13,8 @@
 //! - CARABINER_WORKER_COUNT or RAPPEL_WORKER_COUNT: Number of workers (default: num_cpus)
 //! - RAPPEL_BATCH_SIZE: Actions per poll cycle (default: 100)
 //! - RAPPEL_POLL_INTERVAL_MS: Poll interval in ms (default: 100)
+//! - CARABINER_WEBAPP_ENABLED: Set to "true" or "1" to enable web dashboard
+//! - CARABINER_WEBAPP_PORT: Web dashboard port (default: 24119)
 
 use std::{env, sync::Arc};
 
@@ -22,7 +25,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use rappel::{
     Config, DAGRunner, Database, PythonWorkerConfig, PythonWorkerPool, RunnerConfig,
-    WorkerBridgeServer,
+    WebappConfig, WebappServer, WorkerBridgeServer,
 };
 
 #[tokio::main]
@@ -59,6 +62,10 @@ async fn main() -> Result<()> {
     // Start worker bridge server
     let worker_bridge = WorkerBridgeServer::start(Some(config.grpc_addr)).await?;
     info!(addr = %worker_bridge.addr(), "worker bridge started");
+
+    // Start webapp server if enabled
+    let webapp_config = WebappConfig::from_env();
+    let webapp_server = WebappServer::start(webapp_config, Arc::clone(&database)).await?;
 
     // Configure Python workers
     let mut worker_config = PythonWorkerConfig::new();
@@ -126,6 +133,11 @@ async fn main() -> Result<()> {
 
     // Shutdown worker bridge
     worker_bridge.shutdown().await;
+
+    // Shutdown webapp server if running
+    if let Some(webapp) = webapp_server {
+        webapp.shutdown().await;
+    }
 
     info!("shutdown complete");
     Ok(())

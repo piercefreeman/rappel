@@ -32,6 +32,7 @@ pub mod messages;
 pub mod parser;
 pub mod runner;
 pub mod server_client;
+pub mod server_webapp;
 pub mod server_worker;
 pub mod worker;
 
@@ -81,3 +82,6 @@ pub use completion::{
     analyze_subgraph, evaluate_guard, execute_inline_subgraph, find_direct_predecessor_in_path,
     is_direct_predecessor,
 };
+
+// Webapp server
+pub use server_webapp::{WebappConfig, WebappServer};

@@ -486,6 +486,31 @@ impl Database {
         Ok(instances)
     }
 
+    /// List instances for a specific workflow version
+    pub async fn list_instances_for_version(
+        &self,
+        version_id: WorkflowVersionId,
+        limit: i64,
+    ) -> DbResult<Vec<WorkflowInstance>> {
+        let instances = sqlx::query_as::<_, WorkflowInstance>(
+            r#"
+            SELECT id, partition_id, workflow_name, workflow_version_id,
+                   next_action_seq, input_payload, result_payload, status,
+                   created_at, completed_at
+            FROM workflow_instances
+            WHERE workflow_version_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(version_id.0)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(instances)
+    }
+
     /// Get a workflow instance by ID
     pub async fn get_instance(&self, id: WorkflowInstanceId) -> DbResult<WorkflowInstance> {
         let instance = sqlx::query_as::<_, WorkflowInstance>(
