@@ -147,9 +147,9 @@ async fn run_server(
 ) {
     let app = Router::new()
         .route("/", get(list_workflows))
-        .route("/workflow/{workflow_version_id}", get(workflow_detail))
+        .route("/workflow/:workflow_version_id", get(workflow_detail))
         .route(
-            "/workflow/{workflow_version_id}/run/{instance_id}",
+            "/workflow/:workflow_version_id/run/:instance_id",
             get(workflow_run_detail),
         )
         .route("/healthz", get(healthz))
@@ -721,5 +721,462 @@ mod tests {
             format_dependencies(&["a".to_string(), "b".to_string()]),
             "a, b"
         );
+    }
+
+    #[test]
+    fn test_format_payload_empty() {
+        assert_eq!(format_payload(&None), "(empty)");
+        assert_eq!(format_payload(&Some(vec![])), "(empty)");
+    }
+
+    #[test]
+    fn test_format_binary_payload_json() {
+        let json = r#"{"key": "value"}"#;
+        let result = format_binary_payload(json.as_bytes());
+        assert!(result.contains("key"));
+        assert!(result.contains("value"));
+    }
+
+    #[test]
+    fn test_format_binary_payload_plain_text() {
+        let text = "hello world";
+        let result = format_binary_payload(text.as_bytes());
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn test_format_binary_payload_binary() {
+        let bytes = vec![0xFF, 0xFE, 0x00, 0x01];
+        let result = format_binary_payload(&bytes);
+        assert_eq!(result, "(4 bytes)");
+    }
+
+    // ========================================================================
+    // Template Rendering Tests
+    // ========================================================================
+
+    fn test_templates() -> Tera {
+        init_templates().expect("failed to initialize templates")
+    }
+
+    #[test]
+    fn test_render_home_page_empty() {
+        let templates = test_templates();
+        let html = render_home_page(&templates, &[]);
+
+        assert!(html.contains("Registered Workflow Versions"));
+        assert!(html.contains("No workflow versions found"));
+    }
+
+    #[test]
+    fn test_render_home_page_with_workflows() {
+        let templates = test_templates();
+        let workflows = vec![
+            WorkflowVersionSummary {
+                id: Uuid::new_v4(),
+                workflow_name: "test_workflow".to_string(),
+                dag_hash: "abc123def456".to_string(),
+                concurrent: false,
+                created_at: chrono::Utc::now(),
+            },
+            WorkflowVersionSummary {
+                id: Uuid::new_v4(),
+                workflow_name: "another_workflow".to_string(),
+                dag_hash: "xyz789".to_string(),
+                concurrent: true,
+                created_at: chrono::Utc::now(),
+            },
+        ];
+
+        let html = render_home_page(&templates, &workflows);
+
+        assert!(html.contains("test_workflow"));
+        assert!(html.contains("another_workflow"));
+        assert!(html.contains("abc123def456")); // hash should be truncated if > 12 chars
+    }
+
+    #[test]
+    fn test_render_error_page() {
+        let templates = test_templates();
+        let html = render_error_page(&templates, "Test Error", "Something went wrong");
+
+        assert!(html.contains("Test Error"));
+        assert!(html.contains("Something went wrong"));
+    }
+
+    #[test]
+    fn test_render_workflow_detail_page() {
+        let templates = test_templates();
+        let version = crate::db::WorkflowVersion {
+            id: Uuid::new_v4(),
+            workflow_name: "my_workflow".to_string(),
+            dag_hash: "hash123456789".to_string(),
+            program_proto: vec![], // Empty proto - will result in empty DAG
+            concurrent: true,
+            created_at: chrono::Utc::now(),
+        };
+        let instances: Vec<crate::db::WorkflowInstance> = vec![];
+
+        let html = render_workflow_detail_page(&templates, &version, &instances);
+
+        assert!(html.contains("my_workflow"));
+        assert!(html.contains("Concurrent"));
+        assert!(html.contains("hash12345678...")); // truncated hash (first 12 chars)
+    }
+
+    #[test]
+    fn test_render_workflow_detail_page_with_instances() {
+        let templates = test_templates();
+        let version_id = Uuid::new_v4();
+        let version = crate::db::WorkflowVersion {
+            id: version_id,
+            workflow_name: "my_workflow".to_string(),
+            dag_hash: "hash123".to_string(),
+            program_proto: vec![],
+            concurrent: false,
+            created_at: chrono::Utc::now(),
+        };
+        let instances = vec![crate::db::WorkflowInstance {
+            id: Uuid::new_v4(),
+            partition_id: 0,
+            workflow_name: "my_workflow".to_string(),
+            workflow_version_id: Some(version_id),
+            next_action_seq: 5,
+            input_payload: None,
+            result_payload: None,
+            status: "completed".to_string(),
+            created_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+        }];
+
+        let html = render_workflow_detail_page(&templates, &version, &instances);
+
+        assert!(html.contains("my_workflow"));
+        assert!(html.contains("Serial")); // not concurrent
+        assert!(html.contains("completed"));
+        assert!(html.contains("seq 5"));
+    }
+
+    #[test]
+    fn test_render_workflow_run_page() {
+        let templates = test_templates();
+        let version_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+
+        let version = crate::db::WorkflowVersion {
+            id: version_id,
+            workflow_name: "test_workflow".to_string(),
+            dag_hash: "hash123".to_string(),
+            program_proto: vec![],
+            concurrent: false,
+            created_at: chrono::Utc::now(),
+        };
+
+        let instance = crate::db::WorkflowInstance {
+            id: instance_id,
+            partition_id: 0,
+            workflow_name: "test_workflow".to_string(),
+            workflow_version_id: Some(version_id),
+            next_action_seq: 3,
+            input_payload: Some(b"{\"arg\": 42}".to_vec()),
+            result_payload: Some(b"{\"result\": 100}".to_vec()),
+            status: "completed".to_string(),
+            created_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+        };
+
+        let actions: Vec<crate::db::QueuedAction> = vec![];
+
+        let html = render_workflow_run_page(&templates, &version, &instance, &actions);
+
+        assert!(html.contains("test_workflow"));
+        assert!(html.contains("completed"));
+        assert!(html.contains("arg")); // from input payload
+        assert!(html.contains("42"));
+        assert!(html.contains("result")); // from result payload
+        assert!(html.contains("100"));
+    }
+
+    #[test]
+    fn test_render_workflow_run_page_with_actions() {
+        let templates = test_templates();
+        let version_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+
+        let version = crate::db::WorkflowVersion {
+            id: version_id,
+            workflow_name: "action_workflow".to_string(),
+            dag_hash: "hash456".to_string(),
+            program_proto: vec![],
+            concurrent: true,
+            created_at: chrono::Utc::now(),
+        };
+
+        let instance = crate::db::WorkflowInstance {
+            id: instance_id,
+            partition_id: 0,
+            workflow_name: "action_workflow".to_string(),
+            workflow_version_id: Some(version_id),
+            next_action_seq: 2,
+            input_payload: None,
+            result_payload: None,
+            status: "running".to_string(),
+            created_at: chrono::Utc::now(),
+            completed_at: None,
+        };
+
+        let actions = vec![crate::db::QueuedAction {
+            id: Uuid::new_v4(),
+            instance_id,
+            partition_id: 0,
+            action_seq: 1,
+            module_name: "my_module".to_string(),
+            action_name: "do_something".to_string(),
+            dispatch_payload: b"{\"x\": 1}".to_vec(),
+            timeout_seconds: 30,
+            max_retries: 3,
+            attempt_number: 1,
+            delivery_token: Uuid::new_v4(),
+            timeout_retry_limit: 2,
+            retry_kind: "exponential".to_string(),
+            node_id: Some("action_0".to_string()),
+            node_type: "action".to_string(),
+        }];
+
+        let html = render_workflow_run_page(&templates, &version, &instance, &actions);
+
+        assert!(html.contains("action_workflow"));
+        assert!(html.contains("running"));
+        assert!(html.contains("my_module"));
+        assert!(html.contains("do_something"));
+        assert!(html.contains("action_0"));
+    }
+
+    #[test]
+    fn test_decode_dag_from_proto_empty() {
+        let nodes = decode_dag_from_proto(&[]);
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn test_decode_dag_from_proto_invalid() {
+        let nodes = decode_dag_from_proto(&[0xFF, 0xFE, 0x00]);
+        assert!(nodes.is_empty());
+    }
+
+    // ========================================================================
+    // HTTP Route Tests (require database)
+    // These tests require DATABASE_URL to be set and run with serial_test
+    // to avoid conflicts with other database tests.
+    // ========================================================================
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode as HttpStatusCode};
+    use serial_test::serial;
+    use tower::ServiceExt;
+
+    async fn test_db() -> Database {
+        dotenvy::dotenv().ok();
+        let url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for integration tests");
+        Database::connect(&url)
+            .await
+            .expect("failed to connect to database")
+    }
+
+    fn build_test_app(database: Arc<Database>) -> Router {
+        let templates = Arc::new(test_templates());
+        let state = WebappState { database, templates };
+
+        Router::new()
+            .route("/", get(list_workflows))
+            .route("/workflow/:workflow_version_id", get(workflow_detail))
+            .route(
+                "/workflow/:workflow_version_id/run/:instance_id",
+                get(workflow_run_detail),
+            )
+            .route("/healthz", get(healthz))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_route_healthz() {
+        let db = Arc::new(test_db().await);
+        let app = build_test_app(db);
+
+        let response = app
+            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["service"], "rappel-webapp");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_route_list_workflows() {
+        let db = Arc::new(test_db().await);
+        let app = build_test_app(db);
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        // Should render the home page
+        assert!(html.contains("Registered Workflow Versions"));
+        assert!(html.contains("<!DOCTYPE html>"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_route_workflow_detail_not_found() {
+        let db = Arc::new(test_db().await);
+        let app = build_test_app(db);
+
+        // Use a random UUID that won't exist
+        let fake_id = Uuid::new_v4();
+        let uri = format!("/workflow/{}", fake_id);
+
+        let response = app
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK); // Returns 200 with error page
+
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(html.contains("Workflow not found"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_route_workflow_run_not_found() {
+        let db = Arc::new(test_db().await);
+        let app = build_test_app(db);
+
+        let fake_version_id = Uuid::new_v4();
+        let fake_instance_id = Uuid::new_v4();
+        let uri = format!("/workflow/{}/run/{}", fake_version_id, fake_instance_id);
+
+        let response = app
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK); // Returns 200 with error page
+
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        // Should show workflow not found (version check fails first)
+        assert!(html.contains("not found"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_route_workflow_detail_with_data() {
+        let db = Arc::new(test_db().await);
+
+        // Create a test workflow version
+        let version_id = db
+            .upsert_workflow_version(
+                "webapp_test_workflow",
+                "test_hash_webapp",
+                b"test proto",
+                false,
+            )
+            .await
+            .expect("failed to create version");
+
+        let app = build_test_app(Arc::clone(&db));
+        let uri = format!("/workflow/{}", version_id.0);
+
+        let response = app
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(html.contains("webapp_test_workflow"));
+        assert!(html.contains("test_hash_we...")); // truncated hash
+        assert!(html.contains("Serial")); // not concurrent
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_route_workflow_run_with_data() {
+        let db = Arc::new(test_db().await);
+
+        // Create a test workflow version
+        let version_id = db
+            .upsert_workflow_version(
+                "webapp_run_test_workflow",
+                "run_test_hash",
+                b"test proto",
+                true,
+            )
+            .await
+            .expect("failed to create version");
+
+        // Create an instance
+        let instance_id = db
+            .create_instance("webapp_run_test_workflow", version_id, Some(b"{\"x\": 1}"))
+            .await
+            .expect("failed to create instance");
+
+        let app = build_test_app(Arc::clone(&db));
+        let uri = format!("/workflow/{}/run/{}", version_id.0, instance_id.0);
+
+        let response = app
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(html.contains("webapp_run_test_workflow"));
+        // Page should render successfully with instance data
+        assert!(html.contains("Run Created"));
+        assert!(html.contains("Status"));
     }
 }
