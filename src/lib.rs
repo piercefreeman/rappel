@@ -49,7 +49,7 @@ pub use db::{
 };
 
 // Worker infrastructure
-pub use messages::{MessageError, ast as ir_ast, proto};
+pub use messages::{MessageError, ast as ir_ast, proto, workflow_arguments_to_json};
 pub use server_worker::{WorkerBridgeChannels, WorkerBridgeServer};
 pub use worker::{
     ActionDispatchPayload, PythonWorker, PythonWorkerConfig, PythonWorkerPool, RoundTripMetrics,

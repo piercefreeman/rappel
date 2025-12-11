@@ -247,6 +247,12 @@ pub struct QueuedAction {
     pub node_id: Option<String>,
     /// Type of node: "action" or "barrier"
     pub node_type: String,
+    /// Result payload (set after completion)
+    pub result_payload: Option<Vec<u8>>,
+    /// Whether the action succeeded (set after completion)
+    pub success: Option<bool>,
+    /// Action status: pending, dispatched, completed, failed
+    pub status: String,
 }
 
 /// Record for completing an action
@@ -689,6 +695,9 @@ impl Database {
                 retry_kind: row.get("retry_kind"),
                 node_id: row.get("node_id"),
                 node_type: row.get("node_type"),
+                result_payload: None, // Not yet completed
+                success: None,
+                status: "dispatched".to_string(),
             })
             .collect();
 
@@ -781,6 +790,9 @@ impl Database {
                 retry_kind: row.get("retry_kind"),
                 node_id: row.get("node_id"),
                 node_type: row.get("node_type"),
+                result_payload: None, // Not yet completed
+                success: None,
+                status: "dispatched".to_string(),
             })
             .collect();
 
@@ -848,6 +860,9 @@ impl Database {
                 retry_kind: row.get("retry_kind"),
                 node_id: row.get("node_id"),
                 node_type: row.get("node_type"),
+                result_payload: None, // Not yet completed
+                success: None,
+                status: "dispatched".to_string(),
             })
             .collect();
 
@@ -972,7 +987,10 @@ impl Database {
                 timeout_retry_limit,
                 retry_kind,
                 node_id,
-                COALESCE(node_type, 'action') as node_type
+                COALESCE(node_type, 'action') as node_type,
+                result_payload,
+                success,
+                status
             FROM action_queue
             WHERE instance_id = $1
             ORDER BY action_seq
@@ -1000,6 +1018,9 @@ impl Database {
                 retry_kind: row.get("retry_kind"),
                 node_id: row.get("node_id"),
                 node_type: row.get("node_type"),
+                result_payload: row.get("result_payload"),
+                success: row.get("success"),
+                status: row.get("status"),
             })
             .collect();
 

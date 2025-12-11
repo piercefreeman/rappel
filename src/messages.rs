@@ -67,6 +67,97 @@ pub fn now_monotonic_ns() -> u64 {
     START.elapsed().as_nanos() as u64
 }
 
+/// Convert a WorkflowArgumentValue to a serde_json::Value
+pub fn workflow_argument_value_to_json(value: &proto::WorkflowArgumentValue) -> serde_json::Value {
+    use proto::workflow_argument_value::Kind;
+    use serde_json::json;
+
+    match &value.kind {
+        Some(Kind::Primitive(p)) => primitive_to_json(p),
+        Some(Kind::Basemodel(bm)) => {
+            let data = optional_workflow_dict_to_json(&bm.data);
+            json!({
+                "__type__": format!("{}.{}", bm.module, bm.name),
+                "data": data
+            })
+        }
+        Some(Kind::Exception(e)) => {
+            json!({
+                "__exception__": {
+                    "type": e.r#type,
+                    "module": e.module,
+                    "message": e.message,
+                    "traceback": e.traceback
+                }
+            })
+        }
+        Some(Kind::ListValue(list)) => {
+            let items: Vec<serde_json::Value> = list
+                .items
+                .iter()
+                .map(workflow_argument_value_to_json)
+                .collect();
+            serde_json::Value::Array(items)
+        }
+        Some(Kind::TupleValue(tuple)) => {
+            let items: Vec<serde_json::Value> = tuple
+                .items
+                .iter()
+                .map(workflow_argument_value_to_json)
+                .collect();
+            serde_json::Value::Array(items)
+        }
+        Some(Kind::DictValue(dict)) => workflow_dict_to_json(dict),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn primitive_to_json(p: &proto::PrimitiveWorkflowArgument) -> serde_json::Value {
+    use proto::primitive_workflow_argument::Kind;
+    use serde_json::json;
+
+    match &p.kind {
+        Some(Kind::StringValue(s)) => json!(s),
+        Some(Kind::DoubleValue(d)) => json!(d),
+        Some(Kind::IntValue(i)) => json!(i),
+        Some(Kind::BoolValue(b)) => json!(b),
+        Some(Kind::NullValue(_)) => serde_json::Value::Null,
+        None => serde_json::Value::Null,
+    }
+}
+
+fn workflow_dict_to_json(dict: &proto::WorkflowDictArgument) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for entry in &dict.entries {
+        if let Some(value) = &entry.value {
+            map.insert(entry.key.clone(), workflow_argument_value_to_json(value));
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+fn optional_workflow_dict_to_json(dict: &Option<proto::WorkflowDictArgument>) -> serde_json::Value {
+    match dict {
+        Some(d) => workflow_dict_to_json(d),
+        None => serde_json::Value::Object(serde_json::Map::new()),
+    }
+}
+
+/// Convert WorkflowArguments protobuf to a JSON object.
+/// Returns None if decoding fails.
+pub fn workflow_arguments_to_json(bytes: &[u8]) -> Option<serde_json::Value> {
+    let args: proto::WorkflowArguments = decode_message(bytes).ok()?;
+
+    let mut map = serde_json::Map::new();
+    for arg in &args.arguments {
+        if let Some(value) = &arg.value {
+            map.insert(arg.key.clone(), workflow_argument_value_to_json(value));
+        }
+    }
+
+    Some(serde_json::Value::Object(map))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

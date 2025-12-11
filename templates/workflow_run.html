@@ -6,13 +6,13 @@
 <section class="space-y-4">
     <a href="/workflow/{{ workflow.id }}" class="text-xs uppercase tracking-[0.4em] text-zinc-500 transition hover:text-zinc-300">&larr; Back to workflow detail</a>
     <div class="space-y-2">
-        <h1 class="text-3xl font-semibold tracking-tight text-white">Run {{ instance.id }}</h1>
+        <h1 class="text-3xl font-semibold tracking-tight text-white">Run {{ instance.id | truncate(length=8, end="...") }}</h1>
         <p class="text-sm text-zinc-400">{{ workflow.name }}</p>
     </div>
     <dl class="grid gap-4 rounded-2xl border border-zinc-900 bg-zinc-900/40 p-6 md:grid-cols-2 lg:grid-cols-4">
         <div>
             <dt class="text-xs uppercase tracking-[0.4em] text-zinc-500">Version ID</dt>
-            <dd class="text-lg font-semibold text-white">{{ workflow.id }}</dd>
+            <dd class="text-lg font-semibold text-white">{{ workflow.id | truncate(length=8, end="...") }}</dd>
         </div>
         <div>
             <dt class="text-xs uppercase tracking-[0.4em] text-zinc-500">Run Created</dt>
@@ -42,31 +42,269 @@
 
 <section class="space-y-3">
     <div>
+        <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Execution</p>
+        <h2 class="text-2xl font-semibold text-white">DAG Execution Status</h2>
+    </div>
+    <div id="execution-graph" class="relative min-h-[280px] overflow-hidden rounded-2xl border border-zinc-900 bg-gradient-to-br from-zinc-950 to-zinc-900">
+        <p id="graph-empty" class="p-6 text-sm text-zinc-400">No DAG nodes to display.</p>
+    </div>
+</section>
+
+<section class="space-y-3">
+    <div>
         <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Nodes</p>
         <h2 class="text-2xl font-semibold text-white">Execution Details</h2>
+        <p class="text-sm text-zinc-400">Click a node in the graph or list to view details</p>
     </div>
-    <div class="grid gap-4">
-        {% for node in nodes %}
-            <div class="rounded-2xl border border-zinc-900 bg-zinc-900/40 p-5">
-                <div class="flex flex-wrap items-center justify-between gap-2">
-                    <div>
-                        <p class="text-lg font-semibold text-white">{{ node.id }}</p>
-                        <p class="text-sm text-zinc-300">{{ node.action }} <span class="text-zinc-500">({{ node.module }})</span></p>
+    <div class="grid gap-6 lg:grid-cols-2">
+        <!-- Node list (left side) -->
+        <div class="space-y-3">
+            {% for node in nodes %}
+                <div id="node-list-{{ node.id }}"
+                     class="node-list-item cursor-pointer rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4 transition hover:border-zinc-700 hover:bg-zinc-900/60"
+                     data-node-id="{{ node.id }}"
+                     data-module="{{ node.module }}"
+                     data-action="{{ node.action }}"
+                     data-status="{{ node.status }}"
+                     data-request="{{ node.request_payload | escape }}"
+                     data-response="{{ node.response_payload | escape }}">
+                    <div class="flex items-center justify-between gap-2">
+                        <div class="min-w-0 flex-1">
+                            <p class="text-sm font-semibold text-white truncate">{{ node.id }}</p>
+                            <p class="text-xs text-zinc-400 truncate">{{ node.action }} <span class="text-zinc-500">({{ node.module }})</span></p>
+                        </div>
+                        <span class="shrink-0 rounded-full px-2 py-1 text-xs font-semibold uppercase tracking-wide
+                            {% if node.status == 'completed' %}bg-emerald-900/50 text-emerald-400
+                            {% elif node.status == 'failed' %}bg-red-900/50 text-red-400
+                            {% elif node.status == 'dispatched' %}bg-amber-900/50 text-amber-400
+                            {% else %}bg-zinc-800 text-zinc-400{% endif %}">
+                            {{ node.status }}
+                        </span>
                     </div>
-                    <span class="rounded-full bg-zinc-800 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-zinc-200">{{ node.status }}</span>
                 </div>
-                <div class="mt-4 grid gap-4 lg:grid-cols-2">
+            {% endfor %}
+            {% if nodes | length == 0 %}
+                <div class="rounded-2xl border border-dashed border-zinc-800 bg-zinc-900/40 p-6 text-sm text-zinc-400">
+                    No actions have been executed yet.
+                </div>
+            {% endif %}
+        </div>
+
+        <!-- Detail panel (right side) -->
+        <div id="detail-panel" class="rounded-2xl border border-zinc-900 bg-zinc-900/40 p-5 lg:sticky lg:top-6 lg:self-start">
+            <div id="detail-placeholder" class="text-center py-8 text-zinc-400">
+                <p class="text-sm">Select a node to view details</p>
+            </div>
+            <div id="detail-content" class="hidden space-y-4">
+                <div class="flex items-center justify-between gap-2">
                     <div>
-                        <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Request</p>
-                        <pre class="mt-2 overflow-x-auto whitespace-pre-wrap rounded-xl bg-zinc-950/70 p-3 text-xs text-zinc-200">{{ node.request_payload }}</pre>
+                        <p id="detail-node-id" class="text-lg font-semibold text-white"></p>
+                        <p id="detail-action-info" class="text-sm text-zinc-300"></p>
                     </div>
-                    <div>
-                        <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Response</p>
-                        <pre class="mt-2 overflow-x-auto whitespace-pre-wrap rounded-xl bg-zinc-950/70 p-3 text-xs text-zinc-200">{{ node.response_payload }}</pre>
-                    </div>
+                    <span id="detail-status" class="rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-wide"></span>
+                </div>
+                <div>
+                    <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Request</p>
+                    <pre id="detail-request" class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl bg-zinc-950/70 p-3 text-xs text-zinc-200"></pre>
+                </div>
+                <div>
+                    <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Response</p>
+                    <pre id="detail-response" class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl bg-zinc-950/70 p-3 text-xs text-zinc-200"></pre>
                 </div>
             </div>
-        {% endfor %}
+        </div>
     </div>
 </section>
 {% endblock content %}
+
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const graphData = {{ graph_data | json_encode | safe }};
+
+  // Status colors for graph nodes
+  const statusColors = {
+    'completed': { bg: 'rgba(16, 185, 129, 0.15)', border: '#10b981', text: '#6ee7b7' },
+    'failed': { bg: 'rgba(239, 68, 68, 0.15)', border: '#ef4444', text: '#fca5a5' },
+    'dispatched': { bg: 'rgba(245, 158, 11, 0.15)', border: '#f59e0b', text: '#fcd34d' },
+    'pending': { bg: 'rgba(63, 63, 70, 0.5)', border: '#3f3f46', text: '#a1a1aa' },
+    'queued': { bg: 'rgba(63, 63, 70, 0.5)', border: '#3f3f46', text: '#a1a1aa' },
+  };
+
+  // Build graph visualization
+  if (graphData && graphData.nodes && graphData.nodes.length) {
+    const placeholder = document.getElementById('graph-empty');
+    if (placeholder) placeholder.remove();
+
+    const container = document.getElementById('execution-graph');
+    if (!container) return;
+
+    const nodes = graphData.nodes;
+    const padding = 32;
+    const columnGap = 220;
+    const rowGap = 100;
+    const nodeWidth = 180;
+    const nodeHeight = 70;
+
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('class', 'absolute inset-0 h-full w-full pointer-events-none');
+    container.appendChild(svg);
+
+    const nodeMap = new Map(nodes.map((node) => [node.id, node]));
+    const depthCache = new Map();
+
+    const computeDepth = (nodeId, stack = new Set()) => {
+      if (depthCache.has(nodeId)) return depthCache.get(nodeId);
+      const node = nodeMap.get(nodeId);
+      if (!node || !node.depends_on.length) {
+        depthCache.set(nodeId, 0);
+        return 0;
+      }
+      if (stack.has(nodeId)) return 0;
+      stack.add(nodeId);
+      let depth = 0;
+      node.depends_on.forEach((dep) => {
+        depth = Math.max(depth, computeDepth(dep, stack) + 1);
+      });
+      stack.delete(nodeId);
+      depthCache.set(nodeId, depth);
+      return depth;
+    };
+
+    const levels = [];
+    nodes.forEach((node) => {
+      const depth = computeDepth(node.id);
+      if (!levels[depth]) levels[depth] = [];
+      levels[depth].push(node);
+    });
+
+    const normalizedLevels = Array.from({ length: levels.length }, (_, index) => levels[index] || []);
+    const positions = new Map();
+
+    normalizedLevels.forEach((levelNodes, depth) => {
+      levelNodes.forEach((node, index) => {
+        const left = padding + depth * columnGap;
+        const top = padding + index * rowGap;
+        const colors = statusColors[node.status] || statusColors['pending'];
+
+        const el = document.createElement('div');
+        el.className = 'absolute rounded-2xl px-3 py-2 shadow-lg cursor-pointer transition-all hover:scale-105';
+        el.style.left = `${left}px`;
+        el.style.top = `${top}px`;
+        el.style.width = `${nodeWidth}px`;
+        el.style.backgroundColor = colors.bg;
+        el.style.border = `2px solid ${colors.border}`;
+        el.dataset.nodeId = node.id;
+        el.innerHTML = `
+          <p class="text-[10px] font-mono uppercase tracking-wide" style="color: ${colors.text}">${node.id}</p>
+          <p class="text-sm font-semibold text-white truncate">${node.action}</p>
+          <p class="text-[10px] text-zinc-400 truncate">${node.module}</p>
+        `;
+        el.addEventListener('click', () => selectNode(node.id));
+        container.appendChild(el);
+
+        positions.set(node.id, {
+          x: left + nodeWidth / 2,
+          y: top + nodeHeight / 2,
+        });
+      });
+    });
+
+    const rowCounts = normalizedLevels.map((level) => Math.max(level.length, 1));
+    const maxRows = rowCounts.length ? Math.max(...rowCounts) : 1;
+    const totalWidth = padding * 2 + Math.max(normalizedLevels.length - 1, 0) * columnGap + nodeWidth;
+    const totalHeight = padding * 2 + (maxRows - 1) * rowGap + nodeHeight;
+    container.style.height = `${Math.max(totalHeight, 240)}px`;
+    svg.setAttribute('width', totalWidth);
+    svg.setAttribute('height', Math.max(totalHeight, 240));
+
+    // Draw edges
+    nodes.forEach((node) => {
+      node.depends_on.forEach((dependency) => {
+        const start = positions.get(dependency);
+        const end = positions.get(node.id);
+        if (!start || !end) return;
+
+        const connector = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        const midX = (start.x + end.x) / 2;
+        const d = `M${start.x},${start.y} C${midX},${start.y} ${midX},${end.y} ${end.x},${end.y}`;
+        connector.setAttribute('d', d);
+        connector.setAttribute('fill', 'none');
+        connector.setAttribute('stroke', '#4b5563');
+        connector.setAttribute('stroke-width', '2');
+        connector.setAttribute('stroke-linecap', 'round');
+        svg.appendChild(connector);
+      });
+    });
+  }
+
+  // Node selection handling
+  let selectedNodeId = null;
+
+  function selectNode(nodeId) {
+    // Clear previous selection
+    document.querySelectorAll('.node-list-item').forEach(el => {
+      el.classList.remove('border-indigo-500', 'bg-indigo-900/20');
+      el.classList.add('border-zinc-800');
+    });
+    document.querySelectorAll('#execution-graph [data-node-id]').forEach(el => {
+      el.classList.remove('ring-2', 'ring-indigo-500');
+    });
+
+    selectedNodeId = nodeId;
+
+    // Highlight selected node in list
+    const listItem = document.getElementById(`node-list-${nodeId}`);
+    if (listItem) {
+      listItem.classList.remove('border-zinc-800');
+      listItem.classList.add('border-indigo-500', 'bg-indigo-900/20');
+
+      // Update detail panel
+      const placeholder = document.getElementById('detail-placeholder');
+      const content = document.getElementById('detail-content');
+
+      placeholder.classList.add('hidden');
+      content.classList.remove('hidden');
+
+      document.getElementById('detail-node-id').textContent = listItem.dataset.nodeId;
+      document.getElementById('detail-action-info').textContent =
+        `${listItem.dataset.action} (${listItem.dataset.module})`;
+
+      const statusEl = document.getElementById('detail-status');
+      const status = listItem.dataset.status;
+      statusEl.textContent = status;
+      statusEl.className = 'rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-wide';
+      if (status === 'completed') {
+        statusEl.classList.add('bg-emerald-900/50', 'text-emerald-400');
+      } else if (status === 'failed') {
+        statusEl.classList.add('bg-red-900/50', 'text-red-400');
+      } else if (status === 'dispatched') {
+        statusEl.classList.add('bg-amber-900/50', 'text-amber-400');
+      } else {
+        statusEl.classList.add('bg-zinc-800', 'text-zinc-400');
+      }
+
+      document.getElementById('detail-request').textContent = listItem.dataset.request;
+      document.getElementById('detail-response').textContent = listItem.dataset.response;
+    }
+
+    // Highlight selected node in graph
+    const graphNode = document.querySelector(`#execution-graph [data-node-id="${nodeId}"]`);
+    if (graphNode) {
+      graphNode.classList.add('ring-2', 'ring-indigo-500');
+    }
+  }
+
+  // Add click handlers to list items
+  document.querySelectorAll('.node-list-item').forEach(el => {
+    el.addEventListener('click', () => selectNode(el.dataset.nodeId));
+  });
+
+  // Select first node by default if available
+  const firstNode = document.querySelector('.node-list-item');
+  if (firstNode) {
+    selectNode(firstNode.dataset.nodeId);
+  }
+});
+</script>
+{% endblock scripts %}

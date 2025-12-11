@@ -451,6 +451,25 @@ struct WorkflowRunPageContext {
     workflow: WorkflowDetailMetadata,
     instance: InstanceContext,
     nodes: Vec<NodeExecutionContext>,
+    /// Graph data for DAG visualization
+    graph_data: ExecutionGraphData,
+}
+
+/// Graph data for execution visualization (includes status)
+#[derive(Serialize)]
+struct ExecutionGraphData {
+    nodes: Vec<ExecutionGraphNode>,
+}
+
+/// A node in the execution graph with status information
+#[derive(Serialize)]
+struct ExecutionGraphNode {
+    id: String,
+    action: String,
+    module: String,
+    depends_on: Vec<String>,
+    /// Status: pending, dispatched, completed, failed
+    status: String,
 }
 
 #[derive(Serialize)]
@@ -506,15 +525,53 @@ fn render_workflow_run_page(
         result_payload: format_payload(&instance.result_payload),
     };
 
+    // Build a map of node_id -> status from the executed actions
+    let action_status: std::collections::HashMap<String, String> = actions
+        .iter()
+        .filter_map(|a| a.node_id.clone().map(|id| (id, a.status.clone())))
+        .collect();
+
+    // Decode the DAG from the workflow version
+    let dag = decode_dag_from_proto(&version.program_proto);
+
+    // Build execution graph data with status info
+    let graph_data = ExecutionGraphData {
+        nodes: dag
+            .iter()
+            .map(|node| ExecutionGraphNode {
+                id: node.id.clone(),
+                action: if node.action.is_empty() {
+                    "action".to_string()
+                } else {
+                    node.action.clone()
+                },
+                module: if node.module.is_empty() {
+                    "__internal__".to_string()
+                } else {
+                    node.module.clone()
+                },
+                depends_on: node.depends_on.clone(),
+                status: action_status
+                    .get(&node.id)
+                    .cloned()
+                    .unwrap_or_else(|| "pending".to_string()),
+            })
+            .collect(),
+    };
+
     let nodes: Vec<NodeExecutionContext> = actions
         .iter()
         .map(|a| NodeExecutionContext {
             id: a.node_id.clone().unwrap_or_else(|| a.id.to_string()),
             module: a.module_name.clone(),
             action: a.action_name.clone(),
-            status: a.node_type.clone(),
+            status: a.status.clone(),
             request_payload: format_binary_payload(&a.dispatch_payload),
-            response_payload: "(see result)".to_string(),
+            response_payload: a
+                .result_payload
+                .as_ref()
+                .map(|p| format_binary_payload(p))
+                .unwrap_or_else(|| "(pending)".to_string()),
         })
         .collect();
 
@@ -523,6 +580,7 @@ fn render_workflow_run_page(
         workflow,
         instance: instance_ctx,
         nodes,
+        graph_data,
     };
 
     render_template(templates, "workflow_run.html", &context)
@@ -641,7 +699,14 @@ fn format_payload(payload: &Option<Vec<u8>>) -> String {
 }
 
 fn format_binary_payload(bytes: &[u8]) -> String {
-    // Try to decode as UTF-8 first
+    // Try to decode as protobuf WorkflowArguments first
+    if let Some(json) = crate::messages::workflow_arguments_to_json(bytes) {
+        if let Ok(pretty) = serde_json::to_string_pretty(&json) {
+            return pretty;
+        }
+    }
+
+    // Try to decode as UTF-8
     if let Ok(s) = std::str::from_utf8(bytes) {
         // Try to pretty-print as JSON
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(s) {
@@ -652,7 +717,7 @@ fn format_binary_payload(bytes: &[u8]) -> String {
         return s.to_string();
     }
 
-    // Fall back to hex representation for binary data
+    // Fall back to byte count for binary data
     format!("({} bytes)", bytes.len())
 }
 
@@ -893,6 +958,9 @@ mod tests {
             retry_kind: "exponential".to_string(),
             node_id: Some("action_0".to_string()),
             node_type: "action".to_string(),
+            result_payload: Some(b"{\"result\": 42}".to_vec()),
+            success: Some(true),
+            status: "completed".to_string(),
         }];
 
         let html = render_workflow_run_page(&templates, &version, &instance, &actions);
