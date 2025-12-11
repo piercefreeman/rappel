@@ -52,6 +52,7 @@ async fn create_test_instance(db: &Database) -> Result<(WorkflowVersionId, Workf
 }
 
 /// Helper to insert an action directly with specific parameters for testing.
+#[allow(clippy::too_many_arguments)]
 async fn insert_test_action(
     db: &Database,
     instance_id: WorkflowInstanceId,
@@ -100,10 +101,7 @@ async fn get_action_state(db: &Database, action_id: Uuid) -> Result<(String, i32
 }
 
 /// Helper to get action scheduled_at.
-async fn get_action_scheduled_at(
-    db: &Database,
-    action_id: Uuid,
-) -> Result<chrono::DateTime<Utc>> {
+async fn get_action_scheduled_at(db: &Database, action_id: Uuid) -> Result<chrono::DateTime<Utc>> {
     let row = sqlx::query("SELECT scheduled_at FROM action_queue WHERE id = $1")
         .bind(action_id)
         .fetch_one(db.pool())
@@ -131,8 +129,8 @@ async fn test_process_timed_out_actions_requeues_with_retries_remaining() -> Res
         &db,
         instance_id,
         "dispatched",
-        0,               // attempt_number = 0
-        3,               // timeout_retry_limit = 3 (so 0 < 3, retries remaining)
+        0, // attempt_number = 0
+        3, // timeout_retry_limit = 3 (so 0 < 3, retries remaining)
         Some(past_deadline),
         "exponential",
         1000,
@@ -168,8 +166,8 @@ async fn test_process_timed_out_actions_permanently_fails_when_retries_exhausted
         &db,
         instance_id,
         "dispatched",
-        3,               // attempt_number = 3
-        3,               // timeout_retry_limit = 3 (so 3 >= 3, no retries remaining)
+        3, // attempt_number = 3
+        3, // timeout_retry_limit = 3 (so 3 >= 3, no retries remaining)
         Some(past_deadline),
         "exponential",
         1000,
@@ -184,8 +182,14 @@ async fn test_process_timed_out_actions_permanently_fails_when_retries_exhausted
 
     // Verify action state
     let (status, attempt_number) = get_action_state(&db, action_id).await?;
-    assert_eq!(status, "timed_out", "action should be permanently timed_out");
-    assert_eq!(attempt_number, 3, "attempt_number should NOT be incremented");
+    assert_eq!(
+        status, "timed_out",
+        "action should be permanently timed_out"
+    );
+    assert_eq!(
+        attempt_number, 3,
+        "attempt_number should NOT be incremented"
+    );
 
     Ok(())
 }
@@ -278,11 +282,11 @@ async fn test_process_timed_out_actions_applies_exponential_backoff() -> Result<
         &db,
         instance_id,
         "dispatched",
-        1,               // attempt_number = 1 (second attempt)
-        3,               // timeout_retry_limit = 3
+        1, // attempt_number = 1 (second attempt)
+        3, // timeout_retry_limit = 3
         Some(past_deadline),
         "exponential",
-        1000,            // base delay = 1000ms
+        1000, // base delay = 1000ms
     )
     .await?;
 
@@ -321,11 +325,11 @@ async fn test_process_timed_out_actions_applies_linear_backoff() -> Result<()> {
         &db,
         instance_id,
         "dispatched",
-        1,               // attempt_number = 1
-        3,               // timeout_retry_limit = 3
+        1, // attempt_number = 1
+        3, // timeout_retry_limit = 3
         Some(past_deadline),
         "linear",
-        1000,            // base delay = 1000ms
+        1000, // base delay = 1000ms
     )
     .await?;
 
@@ -366,7 +370,7 @@ async fn test_process_timed_out_actions_handles_no_backoff() -> Result<()> {
         0,
         3,
         Some(past_deadline),
-        "none",          // No backoff
+        "none", // No backoff
         1000,
     )
     .await?;
@@ -417,7 +421,10 @@ async fn test_process_timed_out_actions_clears_delivery_token() -> Result<()> {
         .fetch_one(db.pool())
         .await?;
     let initial_token: Option<Uuid> = row.get("delivery_token");
-    assert!(initial_token.is_some(), "delivery_token should be set initially");
+    assert!(
+        initial_token.is_some(),
+        "delivery_token should be set initially"
+    );
 
     // Process timed out actions
     db.process_timed_out_actions(100).await?;
@@ -451,8 +458,8 @@ async fn test_process_timed_out_actions_mixed_results() -> Result<()> {
         &db,
         instance_id,
         "dispatched",
-        0,  // attempt_number
-        3,  // timeout_retry_limit
+        0, // attempt_number
+        3, // timeout_retry_limit
         Some(past_deadline),
         "exponential",
         1000,
@@ -475,8 +482,8 @@ async fn test_process_timed_out_actions_mixed_results() -> Result<()> {
     .bind(instance_id.0)
     .bind(Vec::<u8>::new())
     .bind("dispatched")
-    .bind(3i32)  // attempt_number = 3 (exhausted)
-    .bind(3i32)  // timeout_retry_limit = 3
+    .bind(3i32) // attempt_number = 3 (exhausted)
+    .bind(3i32) // timeout_retry_limit = 3
     .bind(Some(past_deadline))
     .bind("exponential")
     .bind(1000i32)
@@ -532,7 +539,11 @@ async fn test_process_timed_out_actions_respects_limit() -> Result<()> {
     // Process with limit of 2
     let (requeued, permanently_failed) = db.process_timed_out_actions(2).await?;
 
-    assert_eq!(requeued + permanently_failed, 2, "should only process 2 actions");
+    assert_eq!(
+        requeued + permanently_failed,
+        2,
+        "should only process 2 actions"
+    );
 
     // Count remaining dispatched actions
     let row = sqlx::query("SELECT COUNT(*) as count FROM action_queue WHERE status = 'dispatched'")
@@ -732,10 +743,12 @@ async fn test_full_timeout_retry_cycle() -> Result<()> {
 
     // Simulate timeout again (repeat for all retries)
     for expected_attempt in 2..=3 {
-        sqlx::query("UPDATE action_queue SET deadline_at = NOW() - INTERVAL '1 minute' WHERE id = $1")
-            .bind(action_id)
-            .execute(db.pool())
-            .await?;
+        sqlx::query(
+            "UPDATE action_queue SET deadline_at = NOW() - INTERVAL '1 minute' WHERE id = $1",
+        )
+        .bind(action_id)
+        .execute(db.pool())
+        .await?;
 
         let (requeued, permanently_failed) = db.process_timed_out_actions(100).await?;
 

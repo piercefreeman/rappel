@@ -303,6 +303,7 @@ impl IntegrationHarness {
             max_slots_per_worker: 5,
             poll_interval_ms: 50,
             timeout_check_interval_ms: 1000,
+            timeout_check_batch_size: 100,
         };
         let runner = Arc::new(DAGRunner::new(
             runner_config,

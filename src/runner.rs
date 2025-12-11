@@ -1159,6 +1159,8 @@ pub struct RunnerConfig {
     pub poll_interval_ms: u64,
     /// Timeout check interval (milliseconds)
     pub timeout_check_interval_ms: u64,
+    /// Maximum actions to process per timeout check cycle
+    pub timeout_check_batch_size: i32,
 }
 
 impl Default for RunnerConfig {
@@ -1168,6 +1170,7 @@ impl Default for RunnerConfig {
             max_slots_per_worker: 10,
             poll_interval_ms: 100,
             timeout_check_interval_ms: 1000,
+            timeout_check_batch_size: 100,
         }
     }
 }
@@ -1234,6 +1237,13 @@ impl DAGRunner {
         let (completion_tx, mut completion_rx) =
             mpsc::channel::<(InFlightAction, RoundTripMetrics)>(1000);
 
+        // Interval for checking timed-out actions
+        let mut timeout_check_interval = tokio::time::interval(tokio::time::Duration::from_millis(
+            self.config.timeout_check_interval_ms,
+        ));
+        // Don't fire immediately on first tick
+        timeout_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 // Check for shutdown
@@ -1277,6 +1287,39 @@ impl DAGRunner {
                             }
                         }
                     });
+                }
+
+                // Check for timed-out actions periodically
+                // Uses SKIP LOCKED so multiple runner instances can safely run this concurrently
+                _ = timeout_check_interval.tick() => {
+                    let batch_size = self.config.timeout_check_batch_size;
+
+                    match self.completion_handler.db.process_timed_out_actions(batch_size).await {
+                        Ok((requeued, failed)) => {
+                            if requeued > 0 || failed > 0 {
+                                info!(
+                                    requeued = requeued,
+                                    permanently_failed = failed,
+                                    "processed timed-out actions"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to process timed-out actions: {}", e);
+                        }
+                    }
+
+                    // Also requeue any explicitly failed actions that have retries remaining
+                    match self.completion_handler.db.requeue_failed_actions(batch_size).await {
+                        Ok(count) => {
+                            if count > 0 {
+                                info!(requeued = count, "requeued failed actions");
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to requeue failed actions: {}", e);
+                        }
+                    }
                 }
 
                 // Fetch and dispatch work (delegated to WorkQueueHandler)
