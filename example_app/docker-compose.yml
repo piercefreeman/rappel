@@ -33,6 +33,10 @@ services:
       CARABINER_USER_MODULE: example_app.workflows
       CARABINER_WORKER_COUNT: 2
       RAPPEL_LOG_LEVEL: debug
+      CARABINER_WEBAPP_ENABLED: "true"
+      CARABINER_WEBAPP_PORT: 24119
+    ports:
+      - "24119:24119"
 
   webapp:
     build: *app-build
