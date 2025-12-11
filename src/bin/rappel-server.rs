@@ -12,7 +12,7 @@
 use anyhow::Result;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use rappel::{config::Config, server_client};
+use rappel::{get_config, server_client};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -25,8 +25,8 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Load configuration
-    let config = Config::from_env()?;
+    // Load configuration from global cache
+    let config = get_config();
 
     let server_config = server_client::ServerConfig {
         http_addr: config.http_addr,

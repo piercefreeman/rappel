@@ -16,7 +16,7 @@
 //! - RAPPEL_WEBAPP_ENABLED: Set to "true" or "1" to enable web dashboard
 //! - RAPPEL_WEBAPP_ADDR: Web dashboard address (default: 0.0.0.0:24119)
 
-use std::{env, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use tokio::{select, signal};
@@ -24,8 +24,8 @@ use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use rappel::{
-    Config, DAGRunner, Database, PythonWorkerConfig, PythonWorkerPool, RunnerConfig,
-    WebappConfig, WebappServer, WorkerBridgeServer,
+    DAGRunner, Database, PythonWorkerConfig, PythonWorkerPool, RunnerConfig, WebappServer,
+    WorkerBridgeServer, get_config,
 };
 
 #[tokio::main]
@@ -39,17 +39,14 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Load configuration
-    let config = Config::from_env()?;
-
-    // Get user module from environment
-    let user_module = env::var("RAPPEL_USER_MODULE").ok();
+    // Load configuration from global cache
+    let config = get_config();
 
     info!(
         worker_count = config.worker_count,
         batch_size = config.batch_size,
         poll_interval_ms = config.poll_interval_ms,
-        user_module = ?user_module,
+        user_module = ?config.user_module,
         "starting worker pool"
     );
 
@@ -62,12 +59,11 @@ async fn main() -> Result<()> {
     info!(addr = %worker_bridge.addr(), "worker bridge started");
 
     // Start webapp server if enabled
-    let webapp_config = WebappConfig::from_env();
-    let webapp_server = WebappServer::start(webapp_config, Arc::clone(&database)).await?;
+    let webapp_server = WebappServer::start(config.webapp.clone(), Arc::clone(&database)).await?;
 
     // Configure Python workers
     let mut worker_config = PythonWorkerConfig::new();
-    if let Some(module) = &user_module {
+    if let Some(module) = &config.user_module {
         worker_config = worker_config.with_user_module(module);
     }
 

@@ -1,7 +1,7 @@
 use clap::Parser;
 use prost::Message;
 use rappel::{
-    Database, EdgeType, WorkflowInstanceId, WorkflowVersionId,
+    Database, EdgeType, WorkflowInstanceId, WorkflowVersionId, get_config,
     ast::Program,
     completion::{InlineContext, analyze_subgraph, execute_inline_subgraph},
     convert_to_dag,
@@ -23,10 +23,9 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
-    // Connect to database
-    let database_url =
-        std::env::var("DATABASE_URL").expect("DATABASE_URL environment variable required");
-    let database = Database::connect(&database_url)
+    // Connect to database using centralized config
+    let config = get_config();
+    let database = Database::connect(&config.database_url)
         .await
         .expect("failed to connect to database");
 

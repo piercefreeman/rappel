@@ -37,7 +37,9 @@ pub mod server_worker;
 pub mod worker;
 
 // Configuration
-pub use config::Config;
+pub use config::{
+    Config, WebappConfig, get_config, try_get_config, DEFAULT_BASE_PORT, DEFAULT_WEBAPP_ADDR,
+};
 
 // Database
 pub use db::{
@@ -84,4 +86,4 @@ pub use completion::{
 };
 
 // Webapp server
-pub use server_webapp::{WebappConfig, WebappServer};
+pub use server_webapp::WebappServer;

@@ -23,52 +23,8 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use uuid::Uuid;
 
+use crate::config::WebappConfig;
 use crate::db::{Database, WorkflowVersionId, WorkflowVersionSummary};
-
-/// Default address for the webapp server
-pub const DEFAULT_WEBAPP_ADDR: &str = "0.0.0.0:24119";
-
-/// Webapp server configuration
-#[derive(Debug, Clone)]
-pub struct WebappConfig {
-    /// Whether the webapp is enabled
-    pub enabled: bool,
-    /// Address to bind to (host:port)
-    pub addr: SocketAddr,
-}
-
-impl Default for WebappConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            addr: DEFAULT_WEBAPP_ADDR.parse().unwrap(),
-        }
-    }
-}
-
-impl WebappConfig {
-    /// Load configuration from environment variables
-    ///
-    /// - `RAPPEL_WEBAPP_ENABLED`: Set to "true" or "1" to enable
-    /// - `RAPPEL_WEBAPP_ADDR`: Address to bind to (default: 0.0.0.0:24119)
-    pub fn from_env() -> Self {
-        let enabled = std::env::var("RAPPEL_WEBAPP_ENABLED")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
-
-        let addr = std::env::var("RAPPEL_WEBAPP_ADDR")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| DEFAULT_WEBAPP_ADDR.parse().unwrap());
-
-        Self { enabled, addr }
-    }
-
-    /// Get the socket address to bind to
-    pub fn bind_addr(&self) -> SocketAddr {
-        self.addr
-    }
-}
 
 /// Webapp server handle
 pub struct WebappServer {
@@ -703,13 +659,6 @@ fn format_binary_payload(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_webapp_config_default() {
-        let config = WebappConfig::default();
-        assert!(!config.enabled);
-        assert_eq!(config.addr, DEFAULT_WEBAPP_ADDR.parse::<SocketAddr>().unwrap());
-    }
 
     #[test]
     fn test_truncate_hash() {
