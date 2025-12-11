@@ -38,7 +38,7 @@ pub mod worker;
 
 // Configuration
 pub use config::{
-    Config, WebappConfig, get_config, try_get_config, DEFAULT_BASE_PORT, DEFAULT_WEBAPP_ADDR,
+    Config, DEFAULT_BASE_PORT, DEFAULT_WEBAPP_ADDR, WebappConfig, get_config, try_get_config,
 };
 
 // Database

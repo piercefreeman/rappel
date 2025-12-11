@@ -453,6 +453,8 @@ struct WorkflowRunPageContext {
     nodes: Vec<NodeExecutionContext>,
     /// Graph data for DAG visualization
     graph_data: ExecutionGraphData,
+    /// JSON-encoded node data for client-side use (avoids HTML entity escaping)
+    nodes_json: String,
 }
 
 /// Graph data for execution visualization (includes status)
@@ -575,12 +577,16 @@ fn render_workflow_run_page(
         })
         .collect();
 
+    // Serialize nodes to JSON for client-side use (avoids HTML entity escaping issues)
+    let nodes_json = serde_json::to_string(&nodes).unwrap_or_else(|_| "[]".to_string());
+
     let context = WorkflowRunPageContext {
         title: format!("Run {} - {}", instance.id, version.workflow_name),
         workflow,
         instance: instance_ctx,
         nodes,
         graph_data,
+        nodes_json,
     };
 
     render_template(templates, "workflow_run.html", &context)
@@ -651,7 +657,9 @@ fn decode_dag_from_proto(proto_bytes: &[u8]) -> Vec<SimpleDagNode> {
             let depends_on: Vec<String> = dag
                 .edges
                 .iter()
-                .filter(|e| e.target == node.id && e.edge_type == crate::dag::EdgeType::StateMachine)
+                .filter(|e| {
+                    e.target == node.id && e.edge_type == crate::dag::EdgeType::StateMachine
+                })
                 .map(|e| e.source.clone())
                 .collect();
 
@@ -667,7 +675,7 @@ fn decode_dag_from_proto(proto_bytes: &[u8]) -> Vec<SimpleDagNode> {
                 id: node.id.clone(),
                 module: node.module_name.clone().unwrap_or_default(),
                 action: node.action_name.clone().unwrap_or_default(),
-                guard: node.guard_expr.as_ref().map(|e| crate::print_expr(e)),
+                guard: node.guard_expr.as_ref().map(crate::print_expr),
                 depends_on,
                 waits_for,
             }
@@ -700,19 +708,19 @@ fn format_payload(payload: &Option<Vec<u8>>) -> String {
 
 fn format_binary_payload(bytes: &[u8]) -> String {
     // Try to decode as protobuf WorkflowArguments first
-    if let Some(json) = crate::messages::workflow_arguments_to_json(bytes) {
-        if let Ok(pretty) = serde_json::to_string_pretty(&json) {
-            return pretty;
-        }
+    if let Some(json) = crate::messages::workflow_arguments_to_json(bytes)
+        && let Ok(pretty) = serde_json::to_string_pretty(&json)
+    {
+        return pretty;
     }
 
     // Try to decode as UTF-8
     if let Ok(s) = std::str::from_utf8(bytes) {
         // Try to pretty-print as JSON
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(s) {
-            if let Ok(pretty) = serde_json::to_string_pretty(&json) {
-                return pretty;
-            }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(s)
+            && let Ok(pretty) = serde_json::to_string_pretty(&json)
+        {
+            return pretty;
         }
         return s.to_string();
     }
@@ -1006,7 +1014,10 @@ mod tests {
 
     fn build_test_app(database: Arc<Database>) -> Router {
         let templates = Arc::new(test_templates());
-        let state = WebappState { database, templates };
+        let state = WebappState {
+            database,
+            templates,
+        };
 
         Router::new()
             .route("/", get(list_workflows))
@@ -1026,7 +1037,12 @@ mod tests {
         let app = build_test_app(db);
 
         let response = app
-            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 

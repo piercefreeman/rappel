@@ -1,11 +1,12 @@
 use clap::Parser;
 use prost::Message;
 use rappel::{
-    Database, EdgeType, WorkflowInstanceId, WorkflowVersionId, get_config,
+    Database, EdgeType, WorkflowInstanceId, WorkflowVersionId,
     ast::Program,
     completion::{InlineContext, analyze_subgraph, execute_inline_subgraph},
     convert_to_dag,
     dag_state::DAGHelper,
+    get_config,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};

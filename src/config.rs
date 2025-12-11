@@ -231,12 +231,11 @@ pub fn try_get_config() -> Result<Config> {
 #[cfg(test)]
 pub fn reset_config() {
     // OnceLock doesn't support reset, so we use RwLock to allow updating the inner value
-    if let Some(lock) = CONFIG.get() {
-        if let Ok(new_config) = Config::from_env() {
-            if let Ok(mut guard) = lock.write() {
-                *guard = new_config;
-            }
-        }
+    if let Some(lock) = CONFIG.get()
+        && let Ok(new_config) = Config::from_env()
+        && let Ok(mut guard) = lock.write()
+    {
+        *guard = new_config;
     }
 }
 

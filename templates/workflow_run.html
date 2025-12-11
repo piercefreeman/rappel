@@ -43,57 +43,22 @@
 <section class="space-y-3">
     <div>
         <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Execution</p>
-        <h2 class="text-2xl font-semibold text-zinc-900 dark:text-white">DAG Execution Status</h2>
-    </div>
-    <div id="execution-graph" class="relative min-h-[280px] overflow-hidden rounded-2xl border border-zinc-200 dark:border-zinc-900 bg-gradient-to-br from-zinc-100 to-white dark:from-zinc-950 dark:to-zinc-900">
-        <p id="graph-empty" class="p-6 text-sm text-zinc-600 dark:text-zinc-400">No DAG nodes to display.</p>
-    </div>
-</section>
-
-<section class="space-y-3">
-    <div>
-        <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Nodes</p>
         <h2 class="text-2xl font-semibold text-zinc-900 dark:text-white">Execution Details</h2>
-        <p class="text-sm text-zinc-600 dark:text-zinc-400">Click a node in the graph or list to view details</p>
+        <p class="text-sm text-zinc-600 dark:text-zinc-400">Click a node in the graph to view details</p>
     </div>
     <div class="grid gap-6 lg:grid-cols-2">
-        <!-- Node list (left side) -->
-        <div class="space-y-3">
-            {% for node in nodes %}
-                <div id="node-list-{{ node.id }}"
-                     class="node-list-item cursor-pointer rounded-2xl border border-zinc-300 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900/40 p-4 transition hover:border-zinc-400 dark:hover:border-zinc-700 hover:bg-zinc-200/60 dark:hover:bg-zinc-900/60"
-                     data-node-id="{{ node.id }}"
-                     data-module="{{ node.module }}"
-                     data-action="{{ node.action }}"
-                     data-status="{{ node.status }}"
-                     data-request="{{ node.request_payload | escape }}"
-                     data-response="{{ node.response_payload | escape }}">
-                    <div class="flex items-center justify-between gap-2">
-                        <div class="min-w-0 flex-1">
-                            <p class="text-sm font-semibold text-zinc-900 dark:text-white truncate">{{ node.id }}</p>
-                            <p class="text-xs text-zinc-600 dark:text-zinc-400 truncate">{{ node.action }} <span class="text-zinc-500">({{ node.module }})</span></p>
-                        </div>
-                        <span class="shrink-0 rounded-full px-2 py-1 text-xs font-semibold uppercase tracking-wide
-                            {% if node.status == 'completed' %}bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-400
-                            {% elif node.status == 'failed' %}bg-red-100 dark:bg-red-900/50 text-red-700 dark:text-red-400
-                            {% elif node.status == 'dispatched' %}bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-400
-                            {% else %}bg-zinc-200 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400{% endif %}">
-                            {{ node.status }}
-                        </span>
-                    </div>
-                </div>
-            {% endfor %}
-            {% if nodes | length == 0 %}
-                <div class="rounded-2xl border border-dashed border-zinc-300 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900/40 p-6 text-sm text-zinc-600 dark:text-zinc-400">
-                    No actions have been executed yet.
-                </div>
-            {% endif %}
+        <!-- Vertical DAG (left side) -->
+        <div id="execution-graph" class="relative min-h-[400px] max-h-[600px] overflow-auto rounded-2xl border border-zinc-200 dark:border-zinc-900 bg-gradient-to-b from-zinc-50 to-zinc-100 dark:from-zinc-950 dark:to-zinc-900 p-4">
+            <p id="graph-empty" class="p-6 text-sm text-zinc-600 dark:text-zinc-400">No DAG nodes to display.</p>
         </div>
 
         <!-- Detail panel (right side) -->
-        <div id="detail-panel" class="rounded-2xl border border-zinc-200 dark:border-zinc-900 bg-zinc-100 dark:bg-zinc-900/40 p-5 lg:sticky lg:top-6 lg:self-start">
-            <div id="detail-placeholder" class="text-center py-8 text-zinc-600 dark:text-zinc-400">
-                <p class="text-sm">Select a node to view details</p>
+        <div id="detail-panel" class="rounded-2xl border border-zinc-200 dark:border-zinc-900 bg-zinc-100 dark:bg-zinc-900/40 p-5 lg:sticky lg:top-6 lg:self-start max-h-[600px] overflow-auto">
+            <div id="detail-placeholder" class="text-center py-12 text-zinc-600 dark:text-zinc-400">
+                <svg class="mx-auto h-12 w-12 text-zinc-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122" />
+                </svg>
+                <p class="mt-4 text-sm">Select a node to view details</p>
             </div>
             <div id="detail-content" class="hidden space-y-4">
                 <div class="flex items-center justify-between gap-2">
@@ -105,11 +70,11 @@
                 </div>
                 <div>
                     <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Request</p>
-                    <pre id="detail-request" class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl bg-zinc-200/70 dark:bg-zinc-950/70 p-3 text-xs text-zinc-800 dark:text-zinc-200"></pre>
+                    <pre id="detail-request" class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl bg-zinc-200/70 dark:bg-zinc-950/70 p-3 text-xs text-zinc-800 dark:text-zinc-200 font-mono"></pre>
                 </div>
                 <div>
                     <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Response</p>
-                    <pre id="detail-response" class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl bg-zinc-200/70 dark:bg-zinc-950/70 p-3 text-xs text-zinc-800 dark:text-zinc-200"></pre>
+                    <pre id="detail-response" class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl bg-zinc-200/70 dark:bg-zinc-950/70 p-3 text-xs text-zinc-800 dark:text-zinc-200 font-mono"></pre>
                 </div>
             </div>
         </div>
@@ -119,51 +84,88 @@
 
 {% block scripts %}
 <script>
-document.addEventListener('DOMContentLoaded', () => {
-  const graphData = {{ graph_data | json_encode | safe }};
+// Pass node data as JSON to avoid HTML entity escaping issues
+const nodeData = {{ nodes_json | safe }};
+const graphData = {{ graph_data | json_encode | safe }};
 
-  // Status colors for graph nodes
-  const statusColors = {
-    'completed': { bg: 'rgba(16, 185, 129, 0.15)', border: '#10b981', text: '#6ee7b7' },
-    'failed': { bg: 'rgba(239, 68, 68, 0.15)', border: '#ef4444', text: '#fca5a5' },
-    'dispatched': { bg: 'rgba(245, 158, 11, 0.15)', border: '#f59e0b', text: '#fcd34d' },
-    'pending': { bg: 'rgba(63, 63, 70, 0.5)', border: '#3f3f46', text: '#a1a1aa' },
-    'queued': { bg: 'rgba(63, 63, 70, 0.5)', border: '#3f3f46', text: '#a1a1aa' },
-  };
+/**
+ * DAGLayout - Reusable class for rendering DAG visualizations
+ * Supports both horizontal and vertical orientations
+ */
+class DAGLayout {
+  constructor(container, options = {}) {
+    this.container = container;
+    this.options = {
+      orientation: options.orientation || 'horizontal', // 'horizontal' or 'vertical'
+      nodeWidth: options.nodeWidth || 160,
+      nodeHeight: options.nodeHeight || 64,
+      padding: options.padding || 24,
+      gap: options.gap || 140,
+      rowGap: options.rowGap || 80,
+      onNodeClick: options.onNodeClick || null,
+      isDark: document.documentElement.classList.contains('dark'),
+    };
+    this.positions = new Map();
+    this.nodeElements = new Map();
+  }
 
-  // Build graph visualization
-  if (graphData && graphData.nodes && graphData.nodes.length) {
-    const placeholder = document.getElementById('graph-empty');
-    if (placeholder) placeholder.remove();
+  // Status colors for nodes (opaque backgrounds)
+  getStatusColors(status) {
+    const isDark = document.documentElement.classList.contains('dark');
+    const colors = {
+      'completed': {
+        bg: isDark ? '#064e3b' : '#d1fae5',
+        border: '#10b981',
+        text: isDark ? '#6ee7b7' : '#059669',
+        label: isDark ? '#a7f3d0' : '#047857'
+      },
+      'failed': {
+        bg: isDark ? '#7f1d1d' : '#fee2e2',
+        border: '#ef4444',
+        text: isDark ? '#fca5a5' : '#dc2626',
+        label: isDark ? '#fecaca' : '#b91c1c'
+      },
+      'dispatched': {
+        bg: isDark ? '#78350f' : '#fef3c7',
+        border: '#f59e0b',
+        text: isDark ? '#fcd34d' : '#d97706',
+        label: isDark ? '#fde68a' : '#b45309'
+      },
+      'pending': {
+        bg: isDark ? '#27272a' : '#f4f4f5',
+        border: isDark ? '#52525b' : '#a1a1aa',
+        text: isDark ? '#a1a1aa' : '#71717a',
+        label: isDark ? '#d4d4d8' : '#52525b'
+      },
+      'queued': {
+        bg: isDark ? '#27272a' : '#f4f4f5',
+        border: isDark ? '#52525b' : '#a1a1aa',
+        text: isDark ? '#a1a1aa' : '#71717a',
+        label: isDark ? '#d4d4d8' : '#52525b'
+      }
+    };
+    return colors[status] || colors['pending'];
+  }
 
-    const container = document.getElementById('execution-graph');
-    if (!container) return;
+  render(nodes) {
+    if (!nodes || !nodes.length) return;
 
-    const nodes = graphData.nodes;
-    const padding = 32;
-    const columnGap = 220;
-    const rowGap = 100;
-    const nodeWidth = 180;
-    const nodeHeight = 70;
+    this.container.innerHTML = '';
 
-    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    svg.setAttribute('class', 'absolute inset-0 h-full w-full pointer-events-none');
-    container.appendChild(svg);
-
-    const nodeMap = new Map(nodes.map((node) => [node.id, node]));
+    const nodeMap = new Map(nodes.map(n => [n.id, n]));
     const depthCache = new Map();
 
     const computeDepth = (nodeId, stack = new Set()) => {
       if (depthCache.has(nodeId)) return depthCache.get(nodeId);
       const node = nodeMap.get(nodeId);
-      if (!node || !node.depends_on.length) {
+      if (!node || !node.depends_on || !node.depends_on.length) {
         depthCache.set(nodeId, 0);
         return 0;
       }
       if (stack.has(nodeId)) return 0;
       stack.add(nodeId);
       let depth = 0;
-      node.depends_on.forEach((dep) => {
+      node.depends_on.forEach(dep => {
         depth = Math.max(depth, computeDepth(dep, stack) + 1);
       });
       stack.delete(nodeId);
@@ -172,138 +174,219 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     const levels = [];
-    nodes.forEach((node) => {
+    nodes.forEach(node => {
       const depth = computeDepth(node.id);
       if (!levels[depth]) levels[depth] = [];
       levels[depth].push(node);
     });
 
-    const normalizedLevels = Array.from({ length: levels.length }, (_, index) => levels[index] || []);
-    const positions = new Map();
+    const normalizedLevels = Array.from({ length: levels.length }, (_, i) => levels[i] || []);
+    const { nodeWidth, nodeHeight, padding, gap, rowGap, orientation } = this.options;
 
+    // Calculate total dimensions first
+    const maxDepth = normalizedLevels.length;
+    const maxNodesInLevel = Math.max(...normalizedLevels.map(l => l.length), 1);
+
+    let totalWidth, totalHeight;
+    if (orientation === 'vertical') {
+      totalWidth = padding * 2 + maxNodesInLevel * nodeWidth + (maxNodesInLevel - 1) * (rowGap / 2);
+      totalHeight = padding * 2 + maxDepth * gap + nodeHeight;
+    } else {
+      totalWidth = padding * 2 + maxDepth * (nodeWidth + gap);
+      totalHeight = padding * 2 + maxNodesInLevel * rowGap + nodeHeight;
+    }
+
+    // Create wrapper that defines the full scrollable area
+    const wrapper = document.createElement('div');
+    wrapper.style.cssText = `position: relative; width: ${totalWidth}px; height: ${Math.max(totalHeight, 300)}px;`;
+    this.container.appendChild(wrapper);
+
+    // Create SVG sized to full content
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.style.cssText = 'position: absolute; top: 0; left: 0; pointer-events: none;';
+    svg.setAttribute('width', totalWidth);
+    svg.setAttribute('height', Math.max(totalHeight, 300));
+    wrapper.appendChild(svg);
+
+    // Create node elements
     normalizedLevels.forEach((levelNodes, depth) => {
       levelNodes.forEach((node, index) => {
-        const left = padding + depth * columnGap;
-        const top = padding + index * rowGap;
-        const colors = statusColors[node.status] || statusColors['pending'];
+        let left, top;
+        if (orientation === 'vertical') {
+          left = padding + index * (nodeWidth + rowGap / 2);
+          top = padding + depth * gap;
+        } else {
+          left = padding + depth * (nodeWidth + gap);
+          top = padding + index * rowGap;
+        }
 
-        const el = document.createElement('div');
-        el.className = 'absolute rounded-2xl px-3 py-2 shadow-lg cursor-pointer transition-all hover:scale-105';
-        el.style.left = `${left}px`;
-        el.style.top = `${top}px`;
-        el.style.width = `${nodeWidth}px`;
-        el.style.backgroundColor = colors.bg;
-        el.style.border = `2px solid ${colors.border}`;
-        el.dataset.nodeId = node.id;
-        el.innerHTML = `
-          <p class="text-[10px] font-mono uppercase tracking-wide" style="color: ${colors.text}">${node.id}</p>
-          <p class="text-sm font-semibold text-zinc-900 dark:text-white truncate">${node.action}</p>
-          <p class="text-[10px] text-zinc-600 dark:text-zinc-400 truncate">${node.module}</p>
-        `;
-        el.addEventListener('click', () => selectNode(node.id));
-        container.appendChild(el);
-
-        positions.set(node.id, {
+        this.positions.set(node.id, {
           x: left + nodeWidth / 2,
           y: top + nodeHeight / 2,
+          left, top
         });
+
+        const el = this.createNodeElement(node, left, top);
+        wrapper.appendChild(el);
+        this.nodeElements.set(node.id, el);
       });
     });
 
-    const rowCounts = normalizedLevels.map((level) => Math.max(level.length, 1));
-    const maxRows = rowCounts.length ? Math.max(...rowCounts) : 1;
-    const totalWidth = padding * 2 + Math.max(normalizedLevels.length - 1, 0) * columnGap + nodeWidth;
-    const totalHeight = padding * 2 + (maxRows - 1) * rowGap + nodeHeight;
-    container.style.height = `${Math.max(totalHeight, 240)}px`;
-    svg.setAttribute('width', totalWidth);
-    svg.setAttribute('height', Math.max(totalHeight, 240));
-
     // Draw edges
-    nodes.forEach((node) => {
-      node.depends_on.forEach((dependency) => {
-        const start = positions.get(dependency);
-        const end = positions.get(node.id);
+    const isDark = document.documentElement.classList.contains('dark');
+    const strokeColor = isDark ? '#52525b' : '#d4d4d8';
+
+    nodes.forEach(node => {
+      if (!node.depends_on) return;
+      node.depends_on.forEach(depId => {
+        const start = this.positions.get(depId);
+        const end = this.positions.get(node.id);
         if (!start || !end) return;
 
-        const connector = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-        const midX = (start.x + end.x) / 2;
-        const d = `M${start.x},${start.y} C${midX},${start.y} ${midX},${end.y} ${end.x},${end.y}`;
-        connector.setAttribute('d', d);
-        connector.setAttribute('fill', 'none');
-        connector.setAttribute('stroke', document.documentElement.classList.contains('dark') ? '#4b5563' : '#d4d4d8');
-        connector.setAttribute('stroke-width', '2');
-        connector.setAttribute('stroke-linecap', 'round');
-        svg.appendChild(connector);
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        let d;
+        if (orientation === 'vertical') {
+          const midY = (start.y + end.y) / 2;
+          d = `M${start.x},${start.y + nodeHeight/2} C${start.x},${midY} ${end.x},${midY} ${end.x},${end.y - nodeHeight/2}`;
+        } else {
+          const midX = (start.x + end.x) / 2;
+          d = `M${start.x + nodeWidth/2},${start.y} C${midX},${start.y} ${midX},${end.y} ${end.x - nodeWidth/2},${end.y}`;
+        }
+        path.setAttribute('d', d);
+        path.setAttribute('fill', 'none');
+        path.setAttribute('stroke', strokeColor);
+        path.setAttribute('stroke-width', '2');
+        path.setAttribute('stroke-linecap', 'round');
+        svg.appendChild(path);
       });
     });
   }
+
+  createNodeElement(node, left, top) {
+    const { nodeWidth, nodeHeight } = this.options;
+    const colors = this.getStatusColors(node.status);
+
+    const el = document.createElement('div');
+    el.className = 'absolute rounded-xl px-3 py-2 cursor-pointer transition-all duration-150 hover:scale-[1.02] hover:shadow-lg';
+    el.style.cssText = `
+      left: ${left}px;
+      top: ${top}px;
+      width: ${nodeWidth}px;
+      min-height: ${nodeHeight}px;
+      background: ${colors.bg};
+      border: 2px solid ${colors.border};
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    `;
+    el.dataset.nodeId = node.id;
+
+    el.innerHTML = `
+      <p class="text-[10px] font-mono font-medium uppercase tracking-wider" style="color: ${colors.label}">${node.id}</p>
+      <p class="text-sm font-semibold truncate mt-0.5" style="color: ${colors.text}">${node.action}</p>
+      <p class="text-[10px] truncate opacity-70" style="color: ${colors.text}">${node.module}</p>
+    `;
+
+    if (this.options.onNodeClick) {
+      el.addEventListener('click', () => this.options.onNodeClick(node.id));
+    }
+
+    return el;
+  }
+
+  selectNode(nodeId) {
+    // Clear previous selection
+    this.nodeElements.forEach(el => {
+      el.classList.remove('ring-2', 'ring-indigo-500', 'ring-offset-2');
+    });
+
+    // Highlight selected node
+    const el = this.nodeElements.get(nodeId);
+    if (el) {
+      el.classList.add('ring-2', 'ring-indigo-500', 'ring-offset-2');
+    }
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  const container = document.getElementById('execution-graph');
+  if (!container) return;
+
+  // Build node lookup from nodeData for payloads
+  const nodeLookup = {};
+  nodeData.forEach(n => {
+    nodeLookup[n.id] = n;
+  });
+
+  // Merge status info from graphData into nodes for the DAG
+  const nodes = graphData?.nodes || [];
+  nodes.forEach(n => {
+    if (nodeLookup[n.id]) {
+      n.module = nodeLookup[n.id].module;
+      n.action = nodeLookup[n.id].action;
+    }
+  });
+
+  if (!nodes.length) return;
+
+  // Remove empty placeholder
+  const placeholder = document.getElementById('graph-empty');
+  if (placeholder) placeholder.remove();
+
+  // Create vertical DAG layout
+  const dag = new DAGLayout(container, {
+    orientation: 'vertical',
+    nodeWidth: 160,
+    nodeHeight: 64,
+    padding: 24,
+    gap: 100,
+    rowGap: 40,
+    onNodeClick: selectNode
+  });
+
+  dag.render(nodes);
 
   // Node selection handling
   let selectedNodeId = null;
 
   function selectNode(nodeId) {
-    // Clear previous selection
-    document.querySelectorAll('.node-list-item').forEach(el => {
-      el.classList.remove('border-indigo-500', 'bg-indigo-100', 'dark:bg-indigo-900/20');
-      el.classList.add('border-zinc-300', 'dark:border-zinc-800');
-    });
-    document.querySelectorAll('#execution-graph [data-node-id]').forEach(el => {
-      el.classList.remove('ring-2', 'ring-indigo-500');
-    });
-
     selectedNodeId = nodeId;
+    dag.selectNode(nodeId);
 
-    // Highlight selected node in list
-    const listItem = document.getElementById(`node-list-${nodeId}`);
-    if (listItem) {
-      listItem.classList.remove('border-zinc-300', 'dark:border-zinc-800');
-      listItem.classList.add('border-indigo-500', 'bg-indigo-100', 'dark:bg-indigo-900/20');
+    const node = nodeLookup[nodeId];
+    if (!node) return;
 
-      // Update detail panel
-      const placeholder = document.getElementById('detail-placeholder');
-      const content = document.getElementById('detail-content');
+    // Update detail panel
+    const placeholder = document.getElementById('detail-placeholder');
+    const content = document.getElementById('detail-content');
 
-      placeholder.classList.add('hidden');
-      content.classList.remove('hidden');
+    placeholder.classList.add('hidden');
+    content.classList.remove('hidden');
 
-      document.getElementById('detail-node-id').textContent = listItem.dataset.nodeId;
-      document.getElementById('detail-action-info').textContent =
-        `${listItem.dataset.action} (${listItem.dataset.module})`;
+    document.getElementById('detail-node-id').textContent = node.id;
+    document.getElementById('detail-action-info').textContent = `${node.action} (${node.module})`;
 
-      const statusEl = document.getElementById('detail-status');
-      const status = listItem.dataset.status;
-      statusEl.textContent = status;
-      statusEl.className = 'rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-wide';
-      if (status === 'completed') {
-        statusEl.classList.add('bg-emerald-100', 'dark:bg-emerald-900/50', 'text-emerald-700', 'dark:text-emerald-400');
-      } else if (status === 'failed') {
-        statusEl.classList.add('bg-red-100', 'dark:bg-red-900/50', 'text-red-700', 'dark:text-red-400');
-      } else if (status === 'dispatched') {
-        statusEl.classList.add('bg-amber-100', 'dark:bg-amber-900/50', 'text-amber-700', 'dark:text-amber-400');
-      } else {
-        statusEl.classList.add('bg-zinc-200', 'dark:bg-zinc-800', 'text-zinc-600', 'dark:text-zinc-400');
-      }
+    const statusEl = document.getElementById('detail-status');
+    statusEl.textContent = node.status;
+    statusEl.className = 'rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-wide';
 
-      document.getElementById('detail-request').textContent = listItem.dataset.request;
-      document.getElementById('detail-response').textContent = listItem.dataset.response;
+    const isDark = document.documentElement.classList.contains('dark');
+    if (node.status === 'completed') {
+      statusEl.classList.add(isDark ? 'bg-emerald-900/50' : 'bg-emerald-100', isDark ? 'text-emerald-400' : 'text-emerald-700');
+    } else if (node.status === 'failed') {
+      statusEl.classList.add(isDark ? 'bg-red-900/50' : 'bg-red-100', isDark ? 'text-red-400' : 'text-red-700');
+    } else if (node.status === 'dispatched') {
+      statusEl.classList.add(isDark ? 'bg-amber-900/50' : 'bg-amber-100', isDark ? 'text-amber-400' : 'text-amber-700');
+    } else {
+      statusEl.classList.add(isDark ? 'bg-zinc-800' : 'bg-zinc-200', isDark ? 'text-zinc-400' : 'text-zinc-600');
     }
 
-    // Highlight selected node in graph
-    const graphNode = document.querySelector(`#execution-graph [data-node-id="${nodeId}"]`);
-    if (graphNode) {
-      graphNode.classList.add('ring-2', 'ring-indigo-500');
-    }
+    // Display payloads directly (no HTML entity issues since it's JSON)
+    document.getElementById('detail-request').textContent = node.request_payload || '{}';
+    document.getElementById('detail-response').textContent = node.response_payload || '{}';
   }
 
-  // Add click handlers to list items
-  document.querySelectorAll('.node-list-item').forEach(el => {
-    el.addEventListener('click', () => selectNode(el.dataset.nodeId));
-  });
-
-  // Select first node by default if available
-  const firstNode = document.querySelector('.node-list-item');
-  if (firstNode) {
-    selectNode(firstNode.dataset.nodeId);
+  // Select first node by default
+  if (nodes.length > 0) {
+    selectNode(nodes[0].id);
   }
 });
 </script>
