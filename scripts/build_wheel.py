@@ -27,14 +27,12 @@ class EntryPoint:
 
 
 ENTRYPOINTS: Sequence[EntryPoint] = (
-    EntryPoint("rappel-server", "rappel-server"),
+    EntryPoint("rappel-bridge", "rappel-bridge"),
     EntryPoint("boot-rappel-singleton", "boot-rappel-singleton"),
-    EntryPoint("start_workers", "start_workers"),
+    EntryPoint("start-workers", "start-workers"),
 )
 
-SCRIPT_ALIASES: dict[str, tuple[str, ...]] = {
-    "start_workers": ("start-workers",),
-}
+SCRIPT_ALIASES: dict[str, tuple[str, ...]] = {}
 
 console = Console()
 

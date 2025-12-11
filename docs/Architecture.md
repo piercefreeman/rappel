@@ -26,7 +26,7 @@ Key runtime data:
 
 ## Workers
 
-The `start_workers` binary polls for the work to be done. Launch this a single
+The `start-workers` binary polls for the work to be done. Launch this a single
 time for each physical worker node you have in your cluster. Worker processes read their
 configuration from `DATABASE_URL` plus optional `RAPPEL_*` environment
 variables (poll interval, batch size, worker count, etc.) so the loop can be

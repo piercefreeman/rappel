@@ -131,10 +131,10 @@ async fn spawn_server(base_port: u16) -> Result<u16> {
     let http_addr = format!("127.0.0.1:{base_port}");
     let grpc_addr = format!("127.0.0.1:{}", base_port + 1);
 
-    // Find the rappel-server binary
+    // Find the rappel-bridge binary
     let server_bin = find_server_binary()?;
 
-    info!(?server_bin, "spawning rappel-server");
+    info!(?server_bin, "spawning rappel-bridge");
 
     // Spawn the server process
     let mut cmd = Command::new(&server_bin);
@@ -151,7 +151,7 @@ async fn spawn_server(base_port: u16) -> Result<u16> {
         cmd.process_group(0);
     }
 
-    let _child = cmd.spawn().context("failed to spawn rappel-server")?;
+    let _child = cmd.spawn().context("failed to spawn rappel-bridge")?;
 
     // Wait for server to start
     let client = reqwest::Client::builder().timeout(HEALTH_TIMEOUT).build()?;
@@ -183,9 +183,9 @@ fn find_server_binary() -> Result<PathBuf> {
         .context("failed to get parent directory")?;
 
     let binary_name = if cfg!(windows) {
-        "rappel-server.exe"
+        "rappel-bridge.exe"
     } else {
-        "rappel-server"
+        "rappel-bridge"
     };
 
     let candidate = parent.join(binary_name);
@@ -202,7 +202,7 @@ fn find_server_binary() -> Result<PathBuf> {
         }
     }
 
-    bail!("could not find rappel-server binary")
+    bail!("could not find rappel-bridge binary")
 }
 
 fn write_port_file(port_file: &Option<PathBuf>, port: u16) -> Result<()> {
