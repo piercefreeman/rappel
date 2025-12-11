@@ -145,8 +145,8 @@ The main rappel configuration is done through env vars, which is what you'll typ
 | Environment Variable | Description | Default | Example |
 |---------------------|-------------|---------|---------|
 | `DATABASE_URL` | PostgreSQL connection string for the rappel server | (required) | `postgresql://user:pass@localhost:5433/rappel` |
-| `RAPPEL_HTTP_ADDR` | HTTP bind address for `rappel-server` | `127.0.0.1:24117` | `0.0.0.0:24117` |
-| `RAPPEL_GRPC_ADDR` | gRPC bind address for `rappel-server` | HTTP port + 1 | `0.0.0.0:24118` |
+| `RAPPEL_HTTP_ADDR` | HTTP bind address for `rappel-bridge` | `127.0.0.1:24117` | `0.0.0.0:24117` |
+| `RAPPEL_GRPC_ADDR` | gRPC bind address for `rappel-bridge` | HTTP port + 1 | `0.0.0.0:24118` |
 | `RAPPEL_WORKER_COUNT` | Number of Python worker processes | `num_cpus` | `8` |
 | `RAPPEL_MAX_CONCURRENT` | Max concurrent actions across all workers | `32` | `64` |
 | `RAPPEL_USER_MODULE` | Python module preloaded into each worker | none | `my_app.actions` |
@@ -208,11 +208,11 @@ Open source solutions like RabbitMQ have been battle tested over decades & large
 
 ## Worker Pool
 
-`start_workers` is the main invocation point to boot your worker cluster on a new node. It launches the gRPC bridge plus a polling dispatcher that streams
+`start-workers` is the main invocation point to boot your worker cluster on a new node. It launches the gRPC bridge plus a polling dispatcher that streams
 queued actions from Postgres into the Python workers. You should use this as your docker entrypoint:
 
 ```bash
-$ cargo run --bin start_workers
+$ cargo run --bin start-workers
 ```
 
 ## Development
@@ -227,15 +227,15 @@ $ uv run scripts/build_wheel.py --out-dir target/wheels
 ```
 
 The script compiles every Rust binary (release profile), stages the required entrypoints
-(`rappel-server`, `boot-rappel-singleton`) inside the Python package, and invokes
+(`rappel-bridge`, `boot-rappel-singleton`) inside the Python package, and invokes
 `uv build --wheel` to produce an artifact suitable for publishing to PyPI.
 
 ### Local Server Runtime
 
-The Rust runtime exposes both HTTP and gRPC APIs via the `rappel-server` binary:
+The Rust runtime exposes both HTTP and gRPC APIs via the `rappel-bridge` binary:
 
 ```bash
-$ cargo run --bin rappel-server
+$ cargo run --bin rappel-bridge
 ```
 
 Developers can either launch it directly or rely on the `boot-rappel-singleton` helper which finds (or starts) a single shared instance on

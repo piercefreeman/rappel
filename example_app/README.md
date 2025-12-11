@@ -6,8 +6,8 @@
 rappel workflow. This is intended to show in miniature what it would take to actually deploy a background task cluster to production:
 
 `docker-compose.yml` starts Postgres, a `daemons` container (running
-`start_workers`), and a `webapp` container that serves the FastAPI UI and boots
-its own `rappel-server` automatically via the Python client bridge.
+`start-workers`), and a `webapp` container that serves the FastAPI UI and boots
+its own `rappel-bridge` automatically via the Python client bridge.
 
 Our Dockerfile is a bit more complicated than you would need, because we actually run it against our locally build rappel wheel. In your project you can accomplish this by just `uv add rappel`.
 
@@ -32,7 +32,7 @@ Environment notes:
 - `webapp` relies on the default rappel behavior of booting a singleton server
   inside the container whenever a workflow is invoked, so no extra env vars are
   required.
-- `daemons` runs `start_workers` with `RAPPEL_USER_MODULE=example_app.workflows`
+- `daemons` runs `start-workers` with `RAPPEL_USER_MODULE=example_app.workflows`
   so the worker dispatcher preloads the module that defines the sample actions.
 
 ## Tests
