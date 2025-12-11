@@ -1159,6 +1159,8 @@ pub struct RunnerConfig {
     pub poll_interval_ms: u64,
     /// Timeout check interval (milliseconds)
     pub timeout_check_interval_ms: u64,
+    /// Maximum actions to process per timeout check cycle
+    pub timeout_check_batch_size: i32,
 }
 
 impl Default for RunnerConfig {
@@ -1168,6 +1170,7 @@ impl Default for RunnerConfig {
             max_slots_per_worker: 10,
             poll_interval_ms: 100,
             timeout_check_interval_ms: 1000,
+            timeout_check_batch_size: 100,
         }
     }
 }
@@ -1234,6 +1237,13 @@ impl DAGRunner {
         let (completion_tx, mut completion_rx) =
             mpsc::channel::<(InFlightAction, RoundTripMetrics)>(1000);
 
+        // Interval for checking timed-out actions
+        let mut timeout_check_interval = tokio::time::interval(tokio::time::Duration::from_millis(
+            self.config.timeout_check_interval_ms,
+        ));
+        // Don't fire immediately on first tick
+        timeout_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 // Check for shutdown
@@ -1277,6 +1287,55 @@ impl DAGRunner {
                             }
                         }
                     });
+                }
+
+                // Check for timed-out and failed actions periodically.
+                // Uses SKIP LOCKED so multiple runner instances can safely run this concurrently.
+                //
+                // Two-phase approach:
+                // 1. mark_timed_out_actions: Marks overdue dispatched actions as 'failed' with retry_kind='timeout'
+                // 2. requeue_failed_actions: Handles ALL failed actions (both timeouts and explicit failures),
+                //    applying backoff logic and retry limits in one place
+                //
+                // If we process a full batch, we immediately re-run without waiting for the
+                // next interval tick. This allows us to quickly drain large backlogs (e.g.,
+                // 10k actions that all timed out simultaneously) without being throttled by
+                // the sleep interval.
+                _ = timeout_check_interval.tick() => {
+                    let batch_size = self.config.timeout_check_batch_size;
+                    let mut should_continue = true;
+
+                    while should_continue {
+                        should_continue = false;
+
+                        // Phase 1: Mark timed-out actions as failed (with retry_kind='timeout')
+                        match self.completion_handler.db.mark_timed_out_actions(batch_size).await {
+                            Ok(count) => {
+                                // If we hit the batch limit, there may be more to process
+                                if count >= batch_size as i64 {
+                                    should_continue = true;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to mark timed-out actions: {}", e);
+                            }
+                        }
+
+                        // Phase 2: Requeue all failed actions (both timeouts and explicit failures)
+                        // This is the single place where retry/backoff logic is applied
+                        match self.completion_handler.db.requeue_failed_actions(batch_size).await {
+                            Ok((requeued, permanently_failed)) => {
+                                let total = requeued + permanently_failed;
+                                // If we hit the batch limit, there may be more to process
+                                if total >= batch_size as i64 {
+                                    should_continue = true;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to requeue failed actions: {}", e);
+                            }
+                        }
+                    }
                 }
 
                 // Fetch and dispatch work (delegated to WorkQueueHandler)

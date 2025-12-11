@@ -687,6 +687,7 @@ async fn main() -> Result<()> {
         max_slots_per_worker: 10,
         poll_interval_ms: 10,
         timeout_check_interval_ms: 1000,
+        timeout_check_batch_size: 100,
     };
 
     let runner = Arc::new(rappel::DAGRunner::new(
