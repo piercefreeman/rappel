@@ -1200,6 +1200,43 @@ impl DAGConverter {
             ));
         }
 
+        // Build reachability map for checking if one node can reach another via "normal" state
+        // machine edges (excluding exception edges). This is needed to correctly handle try/except
+        // where modifications on exception paths should not block data flow propagation on the
+        // success path. Exception edges are conditional (only taken when an exception occurs),
+        // so for data flow purposes, a modification reachable only via exception edges is
+        // effectively on a parallel branch.
+        let reachable_via_normal_edges: HashMap<String, HashSet<String>> = {
+            let mut result: HashMap<String, HashSet<String>> = HashMap::new();
+            // Build adjacency list from state machine edges, excluding loop-back AND exception edges
+            let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+            for edge in dag.get_state_machine_edges() {
+                // Skip loop-back edges and exception edges
+                if edge.is_loop_back || edge.exception_types.is_some() {
+                    continue;
+                }
+                adj.entry(edge.source.clone())
+                    .or_default()
+                    .push(edge.target.clone());
+            }
+            // For each node, compute all reachable nodes via BFS (normal edges only)
+            for start in dag.nodes.keys() {
+                let mut reachable = HashSet::new();
+                let mut queue = vec![start.clone()];
+                while let Some(node) = queue.pop() {
+                    if let Some(neighbors) = adj.get(&node) {
+                        for neighbor in neighbors {
+                            if reachable.insert(neighbor.clone()) {
+                                queue.push(neighbor.clone());
+                            }
+                        }
+                    }
+                }
+                result.insert(start.clone(), reachable);
+            }
+            result
+        };
+
         for (var_name, modifications) in var_modifications {
             // Sort modifications in topological order for deterministic edges.
             let mut mods = modifications.clone();
@@ -1212,6 +1249,20 @@ impl DAGConverter {
                     continue;
                 };
                 let next_mod = mods.get(i + 1);
+
+                // Check if the next modification is reachable via normal (non-exception) edges.
+                // If it's only reachable via exception edges (e.g., in an except handler),
+                // we should continue propagating data flow to nodes after the join point,
+                // since the exception path is conditional and the success path needs the
+                // original value.
+                let next_mod_reachable = next_mod
+                    .map(|next| {
+                        reachable_via_normal_edges
+                            .get(mod_node)
+                            .map(|r| r.contains(next))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
 
                 for (pos, node_id) in order.iter().enumerate() {
                     if pos <= mod_pos {
@@ -1248,7 +1299,12 @@ impl DAGConverter {
                                     }
                                 }
                             }
-                            break;
+                            // Only break if the next modification is reachable from this one.
+                            // If they're on parallel branches (e.g., try success vs except handler),
+                            // we need to continue propagating to nodes after the join point.
+                            if next_mod_reachable {
+                                break;
+                            }
                         }
                     }
 
@@ -5511,5 +5567,678 @@ fn run(input: [items], output: [final]):
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    // ==================================================================================
+    // Try/Except DataFlow Edge Tests
+    //
+    // These tests verify that variables initialized before a try block properly flow
+    // to nodes after the try/except join, even when the variable is also modified
+    // in the exception handler. This is critical because:
+    // 1. Exception paths are conditional (only taken when an exception occurs)
+    // 2. The success path needs the original value from before the try block
+    // 3. Both paths merge at a join node, and both values should be available
+    // ==================================================================================
+
+    /// Test: Variable initialized before try block flows to action after try/except
+    ///
+    /// Pattern:
+    ///   recovered = False
+    ///   try:
+    ///       result = @risky_action()
+    ///   except SomeError:
+    ///       recovered = True
+    ///   @final_action(recovered=recovered)
+    ///
+    /// Expected: DataFlow edge from initial assignment to final_action for 'recovered'
+    #[test]
+    fn test_try_except_variable_initialized_before_flows_to_after() {
+        let source = r#"
+fn __try_body__(input: [x], output: [result]):
+    result = @risky_action(x=x)
+    return result
+
+fn __except_handler__(input: [recovered], output: [recovered]):
+    recovered = True
+    return recovered
+
+fn run(input: [x], output: []):
+    recovered = False
+    try:
+        result = __try_body__(x=x)
+    except SomeError:
+        recovered = __except_handler__(recovered=recovered)
+    final = @final_action(recovered=recovered)
+    return final
+"#;
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        // Find the initial assignment node for 'recovered'
+        let initial_assign = dag
+            .nodes
+            .values()
+            .find(|n| {
+                n.node_type == "assignment"
+                    && n.target.as_ref() == Some(&"recovered".to_string())
+                    && n.function_name.as_ref() == Some(&"run".to_string())
+            })
+            .expect("should have initial assignment for 'recovered'");
+
+        // Find the final_action node
+        let final_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_ref() == Some(&"final_action".to_string()))
+            .expect("should have final_action node");
+
+        // Check that there's a DataFlow edge from initial assignment to final_action
+        let has_edge_from_initial = dag.edges.iter().any(|e| {
+            e.edge_type == EdgeType::DataFlow
+                && e.source == initial_assign.id
+                && e.target == final_action.id
+                && e.variable.as_ref() == Some(&"recovered".to_string())
+        });
+
+        assert!(
+            has_edge_from_initial,
+            "Should have DataFlow edge from initial 'recovered' assignment ({}) to final_action ({}). \
+             This is required for the success path where no exception occurs. \
+             Existing DataFlow edges to final_action: {:?}",
+            initial_assign.id,
+            final_action.id,
+            dag.edges
+                .iter()
+                .filter(|e| e.edge_type == EdgeType::DataFlow && e.target == final_action.id)
+                .map(|e| (&e.source, &e.variable))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Test: Exception handler modification also has DataFlow edge to action after join
+    ///
+    /// Both the initial value AND the exception handler's modification should flow
+    /// to the action after the try/except, since we don't know at DAG construction
+    /// time which path will be taken.
+    #[test]
+    fn test_try_except_exception_handler_modification_flows_to_after() {
+        let source = r#"
+fn __try_body__(input: [x], output: [result]):
+    result = @risky_action(x=x)
+    return result
+
+fn __except_handler__(input: [recovered], output: [recovered]):
+    recovered = True
+    return recovered
+
+fn run(input: [x], output: []):
+    recovered = False
+    try:
+        result = __try_body__(x=x)
+    except SomeError:
+        recovered = __except_handler__(recovered=recovered)
+    final = @final_action(recovered=recovered)
+    return final
+"#;
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        // Find the exception handler's assignment node for 'recovered'
+        let handler_assign = dag
+            .nodes
+            .values()
+            .find(|n| {
+                n.node_type == "assignment"
+                    && n.target.as_ref() == Some(&"recovered".to_string())
+                    && n.function_name
+                        .as_ref()
+                        .map(|f| f.contains("except_handler"))
+                        .unwrap_or(false)
+            })
+            .expect("should have exception handler assignment for 'recovered'");
+
+        // Find the final_action node
+        let final_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_ref() == Some(&"final_action".to_string()))
+            .expect("should have final_action node");
+
+        // Check that there's a DataFlow edge from handler assignment to final_action
+        let has_edge_from_handler = dag.edges.iter().any(|e| {
+            e.edge_type == EdgeType::DataFlow
+                && e.source == handler_assign.id
+                && e.target == final_action.id
+                && e.variable.as_ref() == Some(&"recovered".to_string())
+        });
+
+        assert!(
+            has_edge_from_handler,
+            "Should have DataFlow edge from exception handler 'recovered' assignment ({}) to final_action ({}). \
+             This is required for the exception path. \
+             Existing DataFlow edges to final_action: {:?}",
+            handler_assign.id,
+            final_action.id,
+            dag.edges
+                .iter()
+                .filter(|e| e.edge_type == EdgeType::DataFlow && e.target == final_action.id)
+                .map(|e| (&e.source, &e.variable))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Test: Multiple variables with different modification patterns in try/except
+    ///
+    /// Pattern:
+    ///   status = "pending"      # modified in both paths
+    ///   error_msg = ""          # only modified in except
+    ///   attempt_count = 0       # only modified in try (success)
+    ///   try:
+    ///       status = "success"
+    ///       attempt_count = 1
+    ///   except:
+    ///       status = "failed"
+    ///       error_msg = "error occurred"
+    ///   @report(status=status, error_msg=error_msg, attempts=attempt_count)
+    #[test]
+    fn test_try_except_multiple_variables_different_patterns() {
+        let source = r#"
+fn __try_body__(input: [status, attempt_count], output: [status, attempt_count]):
+    status = "success"
+    attempt_count = 1
+    return [status, attempt_count]
+
+fn __except_handler__(input: [status, error_msg], output: [status, error_msg]):
+    status = "failed"
+    error_msg = "error occurred"
+    return [status, error_msg]
+
+fn run(input: [], output: []):
+    status = "pending"
+    error_msg = ""
+    attempt_count = 0
+    try:
+        status, attempt_count = __try_body__(status=status, attempt_count=attempt_count)
+    except SomeError:
+        status, error_msg = __except_handler__(status=status, error_msg=error_msg)
+    result = @report(status=status, error_msg=error_msg, attempts=attempt_count)
+    return result
+"#;
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        // Find the report action node
+        let report_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_ref() == Some(&"report".to_string()))
+            .expect("should have report action node");
+
+        // Collect all DataFlow edges to the report action
+        let edges_to_report: Vec<_> = dag
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::DataFlow && e.target == report_action.id)
+            .collect();
+
+        // Check that we have edges for all three variables
+        let vars_with_edges: HashSet<_> = edges_to_report
+            .iter()
+            .filter_map(|e| e.variable.as_ref())
+            .collect();
+
+        assert!(
+            vars_with_edges.contains(&"status".to_string()),
+            "Should have DataFlow edge for 'status' to report action"
+        );
+        assert!(
+            vars_with_edges.contains(&"error_msg".to_string()),
+            "Should have DataFlow edge for 'error_msg' to report action"
+        );
+        assert!(
+            vars_with_edges.contains(&"attempt_count".to_string()),
+            "Should have DataFlow edge for 'attempt_count' to report action"
+        );
+
+        // Verify that 'status' has edges from BOTH the initial assignment AND exception handler
+        // (since it's modified in both paths)
+        let status_edge_sources: Vec<_> = edges_to_report
+            .iter()
+            .filter(|e| e.variable.as_ref() == Some(&"status".to_string()))
+            .map(|e| &e.source)
+            .collect();
+
+        assert!(
+            status_edge_sources.len() >= 2,
+            "Should have at least 2 DataFlow edges for 'status' (from initial and at least one modification). \
+             Found sources: {:?}",
+            status_edge_sources
+        );
+    }
+
+    /// Test: Nested try/except blocks preserve DataFlow correctly
+    ///
+    /// Pattern:
+    ///   outer_flag = False
+    ///   try:
+    ///       inner_flag = False
+    ///       try:
+    ///           result = @inner_action()
+    ///       except InnerError:
+    ///           inner_flag = True
+    ///   except OuterError:
+    ///       outer_flag = True
+    ///   @final(outer=outer_flag, inner=inner_flag)
+    #[test]
+    fn test_try_except_nested_dataflow() {
+        let source = r#"
+fn __inner_try__(input: [], output: [result]):
+    result = @inner_action()
+    return result
+
+fn __inner_except__(input: [inner_flag], output: [inner_flag]):
+    inner_flag = True
+    return inner_flag
+
+fn __outer_try__(input: [], output: [inner_flag, result]):
+    inner_flag = False
+    try:
+        result = __inner_try__()
+    except InnerError:
+        inner_flag = __inner_except__(inner_flag=inner_flag)
+    return [inner_flag, result]
+
+fn __outer_except__(input: [outer_flag], output: [outer_flag]):
+    outer_flag = True
+    return outer_flag
+
+fn run(input: [], output: []):
+    outer_flag = False
+    try:
+        inner_flag, result = __outer_try__()
+    except OuterError:
+        outer_flag = __outer_except__(outer_flag=outer_flag)
+    final = @final_action(outer=outer_flag, inner=inner_flag)
+    return final
+"#;
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        // Find the final_action node
+        let final_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_ref() == Some(&"final_action".to_string()))
+            .expect("should have final_action node");
+
+        // Check that outer_flag has DataFlow edge from initial assignment
+        let outer_flag_initial = dag.nodes.values().find(|n| {
+            n.node_type == "assignment"
+                && n.target.as_ref() == Some(&"outer_flag".to_string())
+                && n.function_name.as_ref() == Some(&"run".to_string())
+        });
+
+        if let Some(initial) = outer_flag_initial {
+            let has_edge = dag.edges.iter().any(|e| {
+                e.edge_type == EdgeType::DataFlow
+                    && e.source == initial.id
+                    && e.target == final_action.id
+                    && e.variable.as_ref() == Some(&"outer_flag".to_string())
+            });
+
+            assert!(
+                has_edge,
+                "Should have DataFlow edge for 'outer_flag' from initial assignment to final_action"
+            );
+        }
+    }
+
+    /// Test: Exception edges don't block DataFlow propagation
+    ///
+    /// This test specifically verifies the fix: when building the reachability map
+    /// for DataFlow edges, exception edges should be excluded. Otherwise, a variable
+    /// modification in an exception handler would incorrectly block the DataFlow
+    /// from the initial assignment.
+    #[test]
+    fn test_exception_edges_excluded_from_dataflow_reachability() {
+        let source = r#"
+fn __try_body__(input: [], output: [result]):
+    result = @risky()
+    return result
+
+fn __except__(input: [flag], output: [flag]):
+    flag = True
+    return flag
+
+fn run(input: [], output: []):
+    flag = False
+    try:
+        result = __try_body__()
+    except Error:
+        flag = __except__(flag=flag)
+    out = @use_flag(flag=flag)
+    return out
+"#;
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        // Get all state machine edges
+        let state_machine_edges: Vec<_> = dag.get_state_machine_edges();
+
+        // Find exception edges (edges with exception_types set)
+        let exception_edges: Vec<_> = state_machine_edges
+            .iter()
+            .filter(|e| e.exception_types.is_some())
+            .collect();
+
+        // Verify exception edges exist (sanity check that try/except is set up correctly)
+        assert!(
+            !exception_edges.is_empty(),
+            "Should have exception edges in the DAG for try/except handling"
+        );
+
+        // Find the initial flag assignment and the use_flag action
+        let initial_assign = dag
+            .nodes
+            .values()
+            .find(|n| {
+                n.node_type == "assignment"
+                    && n.target.as_ref() == Some(&"flag".to_string())
+                    && n.function_name.as_ref() == Some(&"run".to_string())
+            })
+            .expect("should have initial assignment");
+
+        let use_flag_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_ref() == Some(&"use_flag".to_string()))
+            .expect("should have use_flag action");
+
+        // The critical assertion: initial assignment should have DataFlow to use_flag
+        let has_correct_edge = dag.edges.iter().any(|e| {
+            e.edge_type == EdgeType::DataFlow
+                && e.source == initial_assign.id
+                && e.target == use_flag_action.id
+                && e.variable.as_ref() == Some(&"flag".to_string())
+        });
+
+        assert!(
+            has_correct_edge,
+            "Initial 'flag' assignment ({}) must have DataFlow edge to use_flag action ({}). \
+             Exception edges should NOT block this propagation. \
+             Exception edges found: {:?}",
+            initial_assign.id,
+            use_flag_action.id,
+            exception_edges
+                .iter()
+                .map(|e| (&e.source, &e.target, &e.exception_types))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Test: DataFlow works correctly when exception handler uses but doesn't modify variable
+    ///
+    /// Pattern:
+    ///   count = 5
+    ///   try:
+    ///       result = @action()
+    ///   except:
+    ///       @log_error(count=count)  # Uses count but doesn't modify it
+    ///   @final(count=count)
+    #[test]
+    fn test_try_except_handler_uses_but_does_not_modify() {
+        let source = r#"
+fn __try_body__(input: [], output: [result]):
+    result = @action()
+    return result
+
+fn __except__(input: [count], output: []):
+    logged = @log_error(count=count)
+    return logged
+
+fn run(input: [], output: []):
+    count = 5
+    try:
+        result = __try_body__()
+    except Error:
+        __except__(count=count)
+    final = @final_action(count=count)
+    return final
+"#;
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        // Find the initial count assignment and final_action
+        let initial_assign = dag
+            .nodes
+            .values()
+            .find(|n| {
+                n.node_type == "assignment"
+                    && n.target.as_ref() == Some(&"count".to_string())
+                    && n.function_name.as_ref() == Some(&"run".to_string())
+            })
+            .expect("should have initial count assignment");
+
+        let final_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_ref() == Some(&"final_action".to_string()))
+            .expect("should have final_action");
+
+        // Since exception handler doesn't modify 'count', there should be only one
+        // modification source, and it should have a DataFlow edge to final_action
+        let count_edges_to_final: Vec<_> = dag
+            .edges
+            .iter()
+            .filter(|e| {
+                e.edge_type == EdgeType::DataFlow
+                    && e.target == final_action.id
+                    && e.variable.as_ref() == Some(&"count".to_string())
+            })
+            .collect();
+
+        assert!(
+            count_edges_to_final
+                .iter()
+                .any(|e| e.source == initial_assign.id),
+            "Should have DataFlow edge from initial 'count' assignment to final_action"
+        );
+    }
+
+    /// Test: Variable only used in exception handler still gets DataFlow
+    ///
+    /// Pattern:
+    ///   error_handler = @get_handler()  # Only used in except block
+    ///   try:
+    ///       result = @risky()
+    ///   except:
+    ///       @handle(handler=error_handler)
+    #[test]
+    fn test_try_except_variable_only_used_in_handler() {
+        let source = r#"
+fn __try_body__(input: [], output: [result]):
+    result = @risky()
+    return result
+
+fn __except__(input: [error_handler], output: []):
+    handled = @handle(handler=error_handler)
+    return handled
+
+fn run(input: [], output: []):
+    error_handler = @get_handler()
+    try:
+        result = __try_body__()
+    except Error:
+        __except__(error_handler=error_handler)
+    return result
+"#;
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        // Find the action that defines error_handler
+        let _get_handler_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_ref() == Some(&"get_handler".to_string()))
+            .expect("should have get_handler action");
+
+        // Find the handle action in the exception handler
+        let _handle_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_ref() == Some(&"handle".to_string()))
+            .expect("should have handle action");
+
+        // Check for DataFlow edge (may be via the fn_call boundary)
+        let has_handler_dataflow = dag.edges.iter().any(|e| {
+            e.edge_type == EdgeType::DataFlow
+                && e.variable.as_ref() == Some(&"error_handler".to_string())
+        });
+
+        assert!(
+            has_handler_dataflow,
+            "Should have DataFlow edge for 'error_handler'. \
+             The variable defined before try should flow to the exception handler."
+        );
+    }
+
+    /// Test: Verify join node doesn't create false modifications
+    ///
+    /// Join nodes merge control flow but shouldn't be treated as variable definitions.
+    /// This test ensures that join nodes are properly excluded from var_modifications.
+    #[test]
+    fn test_join_node_not_treated_as_variable_modification() {
+        let source = r#"
+fn __try_body__(input: [], output: [result]):
+    result = @action()
+    return result
+
+fn __except__(input: [], output: []):
+    logged = @log_error()
+    return logged
+
+fn run(input: [], output: []):
+    value = 42
+    try:
+        result = __try_body__()
+    except Error:
+        __except__()
+    final = @use_value(value=value)
+    return final
+"#;
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        // Find all join nodes
+        let join_nodes: Vec<_> = dag
+            .nodes
+            .values()
+            .filter(|n| n.node_type == "join")
+            .collect();
+
+        assert!(
+            !join_nodes.is_empty(),
+            "Should have join nodes for try/except"
+        );
+
+        // Verify that join nodes don't have 'value' as a target
+        for join_node in &join_nodes {
+            assert!(
+                join_node.target.as_ref() != Some(&"value".to_string()),
+                "Join node {} should not have 'value' as target",
+                join_node.id
+            );
+            if let Some(ref targets) = join_node.targets {
+                assert!(
+                    !targets.contains(&"value".to_string()),
+                    "Join node {} should not have 'value' in targets",
+                    join_node.id
+                );
+            }
+        }
+
+        // Verify DataFlow edge exists from initial assignment to use_value
+        let initial_assign = dag
+            .nodes
+            .values()
+            .find(|n| {
+                n.node_type == "assignment" && n.target.as_ref() == Some(&"value".to_string())
+            })
+            .expect("should have initial assignment");
+
+        let use_value_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_ref() == Some(&"use_value".to_string()))
+            .expect("should have use_value action");
+
+        let has_edge = dag.edges.iter().any(|e| {
+            e.edge_type == EdgeType::DataFlow
+                && e.source == initial_assign.id
+                && e.target == use_value_action.id
+                && e.variable.as_ref() == Some(&"value".to_string())
+        });
+
+        assert!(
+            has_edge,
+            "Should have DataFlow edge from initial 'value' assignment to use_value action"
+        );
+    }
+
+    /// Test: Try/except with catch-all handler
+    ///
+    /// Pattern:
+    ///   flag = False
+    ///   try:
+    ///       result = @risky()
+    ///   except:  # No specific exception type - catches all
+    ///       flag = True
+    ///   @final(flag=flag)
+    #[test]
+    fn test_try_except_catch_all_handler() {
+        let source = r#"
+fn __try_body__(input: [], output: [result]):
+    result = @risky()
+    return result
+
+fn __except__(input: [flag], output: [flag]):
+    flag = True
+    return flag
+
+fn run(input: [], output: []):
+    flag = False
+    try:
+        result = __try_body__()
+    except:
+        flag = __except__(flag=flag)
+    final = @final_action(flag=flag)
+    return final
+"#;
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        let final_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_ref() == Some(&"final_action".to_string()))
+            .expect("should have final_action");
+
+        // Both initial assignment and exception handler should have edges to final_action
+        let flag_edges: Vec<_> = dag
+            .edges
+            .iter()
+            .filter(|e| {
+                e.edge_type == EdgeType::DataFlow
+                    && e.target == final_action.id
+                    && e.variable.as_ref() == Some(&"flag".to_string())
+            })
+            .collect();
+
+        assert!(
+            flag_edges.len() >= 2,
+            "Should have at least 2 DataFlow edges for 'flag' to final_action \
+             (from initial and from exception handler). Found: {:?}",
+            flag_edges.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
     }
 }
