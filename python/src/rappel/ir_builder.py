@@ -20,6 +20,8 @@ The IR builder proactively detects unsupported Python patterns and raises
 UnsupportedPatternError with clear recommendations for how to rewrite the code.
 """
 
+from __future__ import annotations
+
 import ast
 import copy
 import inspect
