@@ -14,7 +14,7 @@
 //! - RAPPEL_BATCH_SIZE: Actions per poll cycle (default: 100)
 //! - RAPPEL_POLL_INTERVAL_MS: Poll interval in ms (default: 100)
 //! - CARABINER_WEBAPP_ENABLED: Set to "true" or "1" to enable web dashboard
-//! - CARABINER_WEBAPP_PORT: Web dashboard port (default: 24119)
+//! - CARABINER_WEBAPP_ADDR: Web dashboard address (default: 0.0.0.0:24119)
 
 use std::{env, sync::Arc};
 

@@ -34,7 +34,7 @@ services:
       CARABINER_WORKER_COUNT: 2
       RAPPEL_LOG_LEVEL: debug
       CARABINER_WEBAPP_ENABLED: "true"
-      CARABINER_WEBAPP_PORT: 24119
+      CARABINER_WEBAPP_ADDR: "0.0.0.0:24119"
     ports:
       - "24119:24119"
 

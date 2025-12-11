@@ -25,45 +25,48 @@ use uuid::Uuid;
 
 use crate::db::{Database, WorkflowVersionId, WorkflowVersionSummary};
 
-/// Default port for the webapp server
-pub const DEFAULT_WEBAPP_PORT: u16 = 24119;
+/// Default address for the webapp server
+pub const DEFAULT_WEBAPP_ADDR: &str = "0.0.0.0:24119";
 
 /// Webapp server configuration
 #[derive(Debug, Clone)]
 pub struct WebappConfig {
     /// Whether the webapp is enabled
     pub enabled: bool,
-    /// Port to bind to
-    pub port: u16,
+    /// Address to bind to (host:port)
+    pub addr: SocketAddr,
 }
 
 impl Default for WebappConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            port: DEFAULT_WEBAPP_PORT,
+            addr: DEFAULT_WEBAPP_ADDR.parse().unwrap(),
         }
     }
 }
 
 impl WebappConfig {
     /// Load configuration from environment variables
+    ///
+    /// - `CARABINER_WEBAPP_ENABLED`: Set to "true" or "1" to enable
+    /// - `CARABINER_WEBAPP_ADDR`: Address to bind to (default: 0.0.0.0:24119)
     pub fn from_env() -> Self {
         let enabled = std::env::var("CARABINER_WEBAPP_ENABLED")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
 
-        let port = std::env::var("CARABINER_WEBAPP_PORT")
+        let addr = std::env::var("CARABINER_WEBAPP_ADDR")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_WEBAPP_PORT);
+            .unwrap_or_else(|| DEFAULT_WEBAPP_ADDR.parse().unwrap());
 
-        Self { enabled, port }
+        Self { enabled, addr }
     }
 
     /// Get the socket address to bind to
     pub fn bind_addr(&self) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], self.port))
+        self.addr
     }
 }
 
@@ -705,7 +708,7 @@ mod tests {
     fn test_webapp_config_default() {
         let config = WebappConfig::default();
         assert!(!config.enabled);
-        assert_eq!(config.port, DEFAULT_WEBAPP_PORT);
+        assert_eq!(config.addr, DEFAULT_WEBAPP_ADDR.parse::<SocketAddr>().unwrap());
     }
 
     #[test]
