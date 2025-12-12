@@ -24,7 +24,7 @@ async def get_result() -> int:
 class DataclassDefaultsWorkflow(Workflow):
     """Workflow that uses dataclass with defaults."""
 
-    async def run(self) -> dict:
+    async def run(self) -> StatusResult:
         value = await get_result()
         # Only provide 'value', defaults should be applied
         result = StatusResult(value=value)

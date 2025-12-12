@@ -23,7 +23,7 @@ async def compute_value() -> int:
 class PydanticDefaultsWorkflow(Workflow):
     """Workflow that uses Pydantic model with defaults."""
 
-    async def run(self) -> dict:
+    async def run(self) -> ResultWithDefaults:
         value = await compute_value()
         # Only provide 'value', defaults should be applied
         result = ResultWithDefaults(value=value)

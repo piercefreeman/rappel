@@ -22,7 +22,7 @@ async def get_value() -> int:
 class PydanticSimpleWorkflow(Workflow):
     """Workflow that creates a Pydantic model instance."""
 
-    async def run(self) -> dict:
+    async def run(self) -> SimpleResult:
         value = await get_value()
         result = SimpleResult(value=value, message="success")
         return result

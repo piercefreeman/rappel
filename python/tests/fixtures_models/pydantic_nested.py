@@ -29,7 +29,7 @@ async def get_coordinates() -> dict:
 class PydanticNestedWorkflow(Workflow):
     """Workflow with nested model construction."""
 
-    async def run(self) -> dict:
+    async def run(self) -> OuterModel:
         coords = await get_coordinates()
         # Inner is passed as dict
         result = OuterModel(name="test", inner=coords)

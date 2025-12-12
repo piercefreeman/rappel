@@ -28,7 +28,7 @@ async def get_y() -> int:
 class DataclassPositionalWorkflow(Workflow):
     """Workflow that creates dataclass with positional args."""
 
-    async def run(self) -> dict:
+    async def run(self) -> Point:
         x = await get_x()
         y = await get_y()
         # Use positional arguments

@@ -1004,7 +1004,7 @@ class IRBuilder(ast.NodeVisitor):
         # Check for Pydantic model or dataclass constructor calls
         # These are converted to dict expressions
         model_name = self._is_model_constructor(node.value)
-        if model_name:
+        if model_name and isinstance(node.value, ast.Call):
             value_expr = self._convert_model_constructor_to_dict(node.value, model_name)
             assign = ir.Assignment(targets=targets, value=value_expr)
             stmt.assignment.CopyFrom(assign)

@@ -56,8 +56,9 @@ def _coerce_dict_to_model(value: Any, target_type: type) -> Any:
 
     if _is_pydantic_model(target_type):
         # Use model_validate for Pydantic v2, fall back to direct instantiation
-        if hasattr(target_type, "model_validate"):
-            return target_type.model_validate(value)
+        model_validate = getattr(target_type, "model_validate", None)
+        if model_validate is not None:
+            return model_validate(value)
         return target_type(**value)
 
     if _is_dataclass_type(target_type):

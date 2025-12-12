@@ -23,7 +23,7 @@ async def fetch_value() -> int:
 class DataclassSimpleWorkflow(Workflow):
     """Workflow that creates a dataclass instance."""
 
-    async def run(self) -> dict:
+    async def run(self) -> DataResult:
         value = await fetch_value()
         result = DataResult(value=value, message="done")
         return result
