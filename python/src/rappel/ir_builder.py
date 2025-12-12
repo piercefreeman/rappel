@@ -2119,9 +2119,7 @@ class IRBuilder(ast.NodeVisitor):
 
         return None
 
-    def _convert_model_constructor_to_dict(
-        self, node: ast.Call, model_name: str
-    ) -> ir.Expr:
+    def _convert_model_constructor_to_dict(self, node: ast.Call, model_name: str) -> ir.Expr:
         """Convert a Pydantic model or dataclass constructor call to a dict expression.
 
         For example:

@@ -2695,9 +2695,7 @@ class TestValidPatterns:
 class TestPydanticModelSupport:
     """Test that Pydantic models can be instantiated in workflow code."""
 
-    def _find_dict_assignment(
-        self, program: ir.Program
-    ) -> tuple[ir.DictExpr, list[str]] | None:
+    def _find_dict_assignment(self, program: ir.Program) -> tuple[ir.DictExpr, list[str]] | None:
         """Find an assignment with a dict expression.
 
         Returns tuple of (DictExpr, targets) where targets are assignment variables.
@@ -2720,9 +2718,7 @@ class TestPydanticModelSupport:
                 keys.append(entry.key.literal.string_value)
         return keys
 
-    def _get_dict_entry_value(
-        self, dict_expr: ir.DictExpr, key: str
-    ) -> ir.Expr | None:
+    def _get_dict_entry_value(self, dict_expr: ir.DictExpr, key: str) -> ir.Expr | None:
         """Get the value for a specific key in a dict expression."""
         for entry in dict_expr.entries:
             if (
@@ -2801,9 +2797,7 @@ class TestPydanticModelSupport:
 class TestDataclassSupport:
     """Test that dataclasses can be instantiated in workflow code."""
 
-    def _find_dict_assignment(
-        self, program: ir.Program
-    ) -> tuple[ir.DictExpr, list[str]] | None:
+    def _find_dict_assignment(self, program: ir.Program) -> tuple[ir.DictExpr, list[str]] | None:
         """Find an assignment with a dict expression."""
         for fn in program.functions:
             for stmt in fn.body.statements:
@@ -2823,9 +2817,7 @@ class TestDataclassSupport:
                 keys.append(entry.key.literal.string_value)
         return keys
 
-    def _get_dict_entry_value(
-        self, dict_expr: ir.DictExpr, key: str
-    ) -> ir.Expr | None:
+    def _get_dict_entry_value(self, dict_expr: ir.DictExpr, key: str) -> ir.Expr | None:
         """Get the value for a specific key in a dict expression."""
         for entry in dict_expr.entries:
             if (
