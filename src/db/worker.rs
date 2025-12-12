@@ -542,7 +542,7 @@ impl Database {
     /// - Actions with retry_kind='timeout' (timed out) using timeout_retry_limit
     ///
     /// Actions that have exhausted their retries are marked with terminal status
-    /// ('failed' or 'timed_out' respectively).
+    /// ('exhausted' or 'timed_out' respectively).
     ///
     /// Uses SKIP LOCKED for multi-host safety.
     ///
@@ -603,7 +603,7 @@ impl Database {
             UPDATE action_queue aq
             SET status = CASE
                     WHEN exhausted.retry_kind = 'timeout' THEN 'timed_out'
-                    ELSE 'failed'
+                    ELSE 'exhausted'
                 END
             FROM exhausted
             WHERE aq.id = exhausted.id
@@ -634,9 +634,8 @@ impl Database {
     pub async fn fail_instances_with_exhausted_actions(&self, limit: i32) -> DbResult<i64> {
         // Find workflow instances that:
         // 1. Are still 'running'
-        // 2. Have at least one action that has exhausted its retries
-        //    (status = 'failed' with attempt_number >= max_retries, or
-        //     status = 'timed_out' with attempt_number >= timeout_retry_limit)
+        // 2. Have at least one action in a terminal failure state
+        //    (status = 'exhausted' or status = 'timed_out')
         let result = sqlx::query(
             r#"
             WITH instances_to_fail AS (
@@ -644,11 +643,7 @@ impl Database {
                 FROM workflow_instances wi
                 JOIN action_queue aq ON aq.instance_id = wi.id
                 WHERE wi.status = 'running'
-                  AND (
-                      (aq.status = 'failed' AND aq.retry_kind = 'failure' AND aq.attempt_number >= aq.max_retries)
-                      OR
-                      (aq.status = 'timed_out' AND aq.retry_kind = 'timeout' AND aq.attempt_number >= aq.timeout_retry_limit)
-                  )
+                  AND aq.status IN ('exhausted', 'timed_out')
                 LIMIT $1
             )
             UPDATE workflow_instances wi
