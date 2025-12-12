@@ -642,6 +642,7 @@ impl ExpressionEvaluator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     // Helper to create a literal expression
     fn int_literal(value: i64) -> ast::Expr {
@@ -1294,6 +1295,41 @@ mod tests {
         let expr = dot_access(variable("obj"), "x");
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
         assert_eq!(result, JsonValue::Number(10.into()));
+    }
+
+    #[test]
+    fn test_eval_dot_access_pydantic_model() {
+        // Test that dot access works on Pydantic model structures
+        // Pydantic models are stored as {"__type__": "module.ClassName", "field1": ..., "field2": ...}
+        // (flattened structure with __type__ alongside the data fields)
+        let mut scope = Scope::new();
+
+        // Create a flattened Pydantic model structure
+        let model: serde_json::Map<String, JsonValue> = [
+            (
+                "__type__".to_string(),
+                JsonValue::String("mymodule.MyModel".to_string()),
+            ),
+            (
+                "archive_s3_urls".to_string(),
+                json!(["url1", "url2", "url3"]),
+            ),
+            ("count".to_string(), JsonValue::Number(42.into())),
+        ]
+        .into_iter()
+        .collect();
+
+        scope.insert("response".to_string(), JsonValue::Object(model));
+
+        // Access field directly (no nested "data" wrapper)
+        let expr = dot_access(variable("response"), "archive_s3_urls");
+        let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
+        assert_eq!(result, json!(["url1", "url2", "url3"]));
+
+        // Access another field
+        let expr = dot_access(variable("response"), "count");
+        let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
+        assert_eq!(result, JsonValue::Number(42.into()));
     }
 
     // ========================================================================

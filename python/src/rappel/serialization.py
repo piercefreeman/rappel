@@ -1,3 +1,4 @@
+import dataclasses
 import importlib
 import traceback
 from typing import Any
@@ -68,6 +69,17 @@ def _to_argument_value(value: Any) -> pb2.WorkflowArgumentValue:
         argument.basemodel.name = model_class.__qualname__
         # Serialize as dict to preserve types (Struct converts all numbers to float)
         for key, item in model_data.items():
+            entry = argument.basemodel.data.entries.add()
+            entry.key = key
+            entry.value.CopyFrom(_to_argument_value(item))
+        return argument
+    if _is_dataclass_instance(value):
+        # Dataclasses use the same basemodel serialization path as Pydantic models
+        dc_class = value.__class__
+        dc_data = dataclasses.asdict(value)
+        argument.basemodel.module = dc_class.__module__
+        argument.basemodel.name = dc_class.__qualname__
+        for key, item in dc_data.items():
             entry = argument.basemodel.data.entries.add()
             entry.key = key
             entry.value.CopyFrom(_to_argument_value(item))
@@ -176,6 +188,11 @@ def _instantiate_serialized_model(module: str, name: str, model_data: dict[str, 
 
 def _is_base_model(value: Any) -> bool:
     return isinstance(value, BaseModel)
+
+
+def _is_dataclass_instance(value: Any) -> bool:
+    """Check if value is a dataclass instance (not a class)."""
+    return dataclasses.is_dataclass(value) and not isinstance(value, type)
 
 
 def _import_symbol(module: str, qualname: str) -> Any:

@@ -2941,7 +2941,9 @@ class TestPydanticModelAsActionArgument:
         # The kwarg should be a dict expression (converted from Pydantic model)
         # NOT a function_call expression
         request_kwarg = kwargs[0]
-        assert request_kwarg.name == "request", f"Expected 'request' kwarg, got {request_kwarg.name}"
+        assert request_kwarg.name == "request", (
+            f"Expected 'request' kwarg, got {request_kwarg.name}"
+        )
 
         # The value should be a dict expression, not a function call
         value = request_kwarg.value
@@ -2951,5 +2953,59 @@ class TestPydanticModelAsActionArgument:
         # If it's still a function_call, the fix is needed
         assert value.HasField("dict"), (
             f"Expected Pydantic model constructor to be converted to dict expression, "
+            f"but got: {value.WhichOneof('kind')}"
+        )
+
+
+class TestDataclassAsActionArgument:
+    """Test that dataclasses passed directly as action arguments are converted to dicts.
+
+    This tests the case where a dataclass constructor is passed directly
+    as an argument to an action call:
+
+        await self.run_action(my_action(MyDataclass(field=value)))
+
+    The dataclass constructor should be converted to a dict expression in the IR,
+    not left as a FunctionCall (which Rust can't evaluate).
+    """
+
+    def _find_action_call_kwargs(
+        self, program: ir.Program, action_name: str
+    ) -> list[ir.Kwarg] | None:
+        """Find kwargs for an action call in the program."""
+        for fn in program.functions:
+            for stmt in fn.body.statements:
+                if stmt.HasField("action_call"):
+                    if stmt.action_call.action_name == action_name:
+                        return list(stmt.action_call.kwargs)
+                if stmt.HasField("assignment"):
+                    if stmt.assignment.value.HasField("action_call"):
+                        action = stmt.assignment.value.action_call
+                        if action.action_name == action_name:
+                            return list(action.kwargs)
+        return None
+
+    def test_dataclass_as_action_arg_is_dict(self) -> None:
+        """Test: Dataclass passed as action argument should become dict in IR."""
+        from tests.fixtures_models.dataclass_action_arg import DataclassActionArgWorkflow
+
+        program = DataclassActionArgWorkflow.workflow_ir()
+        assert program is not None
+
+        kwargs = self._find_action_call_kwargs(program, "process_data")
+        assert kwargs is not None, "Expected to find process_data action call"
+        assert len(kwargs) == 1, f"Expected 1 kwarg (request), got {len(kwargs)}"
+
+        request_kwarg = kwargs[0]
+        assert request_kwarg.name == "request", (
+            f"Expected 'request' kwarg, got {request_kwarg.name}"
+        )
+
+        value = request_kwarg.value
+        assert value is not None, "Expected kwarg to have a value"
+
+        # Key assertion: dataclass constructor should be converted to dict
+        assert value.HasField("dict"), (
+            f"Expected dataclass constructor to be converted to dict expression, "
             f"but got: {value.WhichOneof('kind')}"
         )

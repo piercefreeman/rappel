@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 from pydantic import BaseModel
 
 from rappel.actions import (
@@ -9,6 +11,12 @@ from rappel.actions import (
 
 class SampleModel(BaseModel):
     payload: str
+
+
+@dataclass
+class SampleDataclass:
+    payload: str
+    count: int
 
 
 def test_result_round_trip_with_basemodel() -> None:
@@ -52,3 +60,13 @@ def test_primitives_preserve_types() -> None:
     assert result["ratio"] == 2.5
     assert result["flag"] is True
     assert result["missing"] is None
+
+
+def test_result_round_trip_with_dataclass() -> None:
+    """Test that dataclasses can be serialized and deserialized like Pydantic models."""
+    payload = serialize_result_payload(SampleDataclass(payload="world", count=42))
+    decoded = deserialize_result_payload(payload)
+    assert decoded.error is None
+    assert isinstance(decoded.result, SampleDataclass)
+    assert decoded.result.payload == "world"
+    assert decoded.result.count == 42

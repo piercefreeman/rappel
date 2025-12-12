@@ -75,11 +75,16 @@ pub fn workflow_argument_value_to_json(value: &proto::WorkflowArgumentValue) -> 
     match &value.kind {
         Some(Kind::Primitive(p)) => primitive_to_json(p),
         Some(Kind::Basemodel(bm)) => {
-            let data = optional_workflow_dict_to_json(&bm.data);
-            json!({
-                "__type__": format!("{}.{}", bm.module, bm.name),
-                "data": data
-            })
+            // Flatten the basemodel: put __type__ alongside fields, not in a nested "data" wrapper
+            let mut obj = match optional_workflow_dict_to_json(&bm.data) {
+                serde_json::Value::Object(map) => map,
+                _ => serde_json::Map::new(),
+            };
+            obj.insert(
+                "__type__".to_string(),
+                json!(format!("{}.{}", bm.module, bm.name)),
+            );
+            serde_json::Value::Object(obj)
         }
         Some(Kind::Exception(e)) => {
             json!({
