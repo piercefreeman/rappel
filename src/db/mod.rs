@@ -539,4 +539,43 @@ mod tests {
         let s = id.to_string();
         assert!(!s.is_empty());
     }
+
+    #[test]
+    fn test_schedule_type_roundtrip() {
+        assert_eq!(
+            ScheduleType::parse(ScheduleType::Cron.as_str()),
+            Some(ScheduleType::Cron)
+        );
+        assert_eq!(
+            ScheduleType::parse(ScheduleType::Interval.as_str()),
+            Some(ScheduleType::Interval)
+        );
+        assert_eq!(ScheduleType::parse("invalid"), None);
+    }
+
+    #[test]
+    fn test_schedule_status_roundtrip() {
+        assert_eq!(
+            ScheduleStatus::parse(ScheduleStatus::Active.as_str()),
+            Some(ScheduleStatus::Active)
+        );
+        assert_eq!(
+            ScheduleStatus::parse(ScheduleStatus::Paused.as_str()),
+            Some(ScheduleStatus::Paused)
+        );
+        assert_eq!(
+            ScheduleStatus::parse(ScheduleStatus::Deleted.as_str()),
+            Some(ScheduleStatus::Deleted)
+        );
+        assert_eq!(ScheduleStatus::parse("invalid"), None);
+    }
+
+    #[test]
+    fn test_schedule_id_display() {
+        let id = ScheduleId::new();
+        let s = id.to_string();
+        assert!(!s.is_empty());
+        // Verify it's a valid UUID format
+        assert!(uuid::Uuid::parse_str(&s).is_ok());
+    }
 }
