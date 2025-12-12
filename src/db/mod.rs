@@ -135,6 +135,8 @@ pub enum ActionStatus {
     Completed,
     Failed,
     TimedOut,
+    /// Terminal status for actions that exhausted all retries due to failures
+    Exhausted,
 }
 
 impl ActionStatus {
@@ -145,6 +147,7 @@ impl ActionStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::TimedOut => "timed_out",
+            Self::Exhausted => "exhausted",
         }
     }
 
@@ -155,6 +158,7 @@ impl ActionStatus {
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
             "timed_out" => Some(Self::TimedOut),
+            "exhausted" => Some(Self::Exhausted),
             _ => None,
         }
     }
@@ -412,6 +416,10 @@ mod tests {
         assert_eq!(
             ActionStatus::parse(ActionStatus::TimedOut.as_str()),
             Some(ActionStatus::TimedOut)
+        );
+        assert_eq!(
+            ActionStatus::parse(ActionStatus::Exhausted.as_str()),
+            Some(ActionStatus::Exhausted)
         );
     }
 

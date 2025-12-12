@@ -415,13 +415,13 @@ async fn test_requeue_failed_actions_permanently_fails_exhausted_failure() -> Re
     assert_eq!(requeued, 0, "should have 0 requeued");
     assert_eq!(permanently_failed, 1, "should have 1 permanently failed");
 
-    // Verify it's still failed (terminal state for failure type)
+    // Verify it's marked as 'exhausted' (terminal state for failure type)
     let row = sqlx::query("SELECT status FROM action_queue WHERE instance_id = $1")
         .bind(instance_id.0)
         .fetch_one(db.pool())
         .await?;
     let status: String = row.get("status");
-    assert_eq!(status, "failed");
+    assert_eq!(status, "exhausted");
 
     Ok(())
 }
@@ -804,7 +804,7 @@ async fn get_instance_status(db: &Database, instance_id: WorkflowInstanceId) -> 
     Ok(row.get("status"))
 }
 
-/// Helper to insert a failed action with exhausted retries (failure kind).
+/// Helper to insert an action that has exhausted all failure retries (in 'exhausted' status).
 async fn insert_exhausted_failure_action(
     db: &Database,
     instance_id: WorkflowInstanceId,
@@ -817,7 +817,7 @@ async fn insert_exhausted_failure_action(
             dispatch_payload, status, attempt_number, max_retries,
             retry_kind, backoff_kind
         )
-        VALUES ($1, 0, 'test_module', 'test_action', $2, 'failed', $3, $3, 'failure', 'none')
+        VALUES ($1, 0, 'test_module', 'test_action', $2, 'exhausted', $3, $3, 'failure', 'none')
         RETURNING id
         "#,
     )
@@ -1120,6 +1120,17 @@ async fn test_full_retry_exhaustion_fails_workflow() -> Result<()> {
         }
     }
 
+    // Verify action is now in 'exhausted' state
+    let row = sqlx::query("SELECT status FROM action_queue WHERE instance_id = $1")
+        .bind(instance_id.0)
+        .fetch_one(db.pool())
+        .await?;
+    let action_status: String = row.get("status");
+    assert_eq!(
+        action_status, "exhausted",
+        "action should be in exhausted state"
+    );
+
     // Now fail the workflow instance
     let failed_count = db.fail_instances_with_exhausted_actions(100).await?;
     assert_eq!(failed_count, 1, "should fail the workflow instance");
@@ -1127,6 +1138,109 @@ async fn test_full_retry_exhaustion_fails_workflow() -> Result<()> {
     // Verify workflow is failed
     let status = get_instance_status(&db, instance_id).await?;
     assert_eq!(status, "failed", "workflow instance should be failed");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_exhausted_actions_not_reselected() -> Result<()> {
+    // Regression test: verify that exhausted actions are not repeatedly
+    // selected by requeue_failed_actions (fixes spammy log issue)
+    let Some(db) = setup_db().await else {
+        return Ok(());
+    };
+
+    let (_, instance_id) = create_test_instance(&db).await?;
+
+    // Create an action that has exhausted failure retries
+    sqlx::query(
+        r#"
+        INSERT INTO action_queue (
+            instance_id, action_seq, module_name, action_name,
+            dispatch_payload, status, retry_kind, attempt_number, max_retries,
+            backoff_kind, backoff_base_delay_ms
+        )
+        VALUES ($1, 0, 'test_module', 'test_action', $2, 'failed', 'failure', 3, 3, 'exponential', 1000)
+        "#,
+    )
+    .bind(instance_id.0)
+    .bind(Vec::<u8>::new())
+    .execute(db.pool())
+    .await?;
+
+    // First call should mark it as exhausted
+    let (requeued, permanently_failed) = db.requeue_failed_actions(100).await?;
+    assert_eq!(requeued, 0);
+    assert_eq!(permanently_failed, 1);
+
+    // Verify it's now in 'exhausted' status
+    let row = sqlx::query("SELECT status FROM action_queue WHERE instance_id = $1")
+        .bind(instance_id.0)
+        .fetch_one(db.pool())
+        .await?;
+    let status: String = row.get("status");
+    assert_eq!(status, "exhausted");
+
+    // Second call should NOT pick it up again (this was the bug - it kept selecting the same records)
+    let (requeued, permanently_failed) = db.requeue_failed_actions(100).await?;
+    assert_eq!(requeued, 0, "should not requeue exhausted action");
+    assert_eq!(
+        permanently_failed, 0,
+        "should not re-process already exhausted action"
+    );
+
+    // Third call - same thing
+    let (requeued, permanently_failed) = db.requeue_failed_actions(100).await?;
+    assert_eq!(requeued, 0);
+    assert_eq!(permanently_failed, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_timed_out_actions_not_reselected() -> Result<()> {
+    // Similar regression test for timed_out status
+    let Some(db) = setup_db().await else {
+        return Ok(());
+    };
+
+    let (_, instance_id) = create_test_instance(&db).await?;
+
+    // Create an action that has exhausted timeout retries
+    sqlx::query(
+        r#"
+        INSERT INTO action_queue (
+            instance_id, action_seq, module_name, action_name,
+            dispatch_payload, status, retry_kind, attempt_number, timeout_retry_limit,
+            backoff_kind, backoff_base_delay_ms
+        )
+        VALUES ($1, 0, 'test_module', 'test_action', $2, 'failed', 'timeout', 3, 3, 'exponential', 1000)
+        "#,
+    )
+    .bind(instance_id.0)
+    .bind(Vec::<u8>::new())
+    .execute(db.pool())
+    .await?;
+
+    // First call should mark it as timed_out
+    let (requeued, permanently_failed) = db.requeue_failed_actions(100).await?;
+    assert_eq!(requeued, 0);
+    assert_eq!(permanently_failed, 1);
+
+    // Verify it's now in 'timed_out' status
+    let row = sqlx::query("SELECT status FROM action_queue WHERE instance_id = $1")
+        .bind(instance_id.0)
+        .fetch_one(db.pool())
+        .await?;
+    let status: String = row.get("status");
+    assert_eq!(status, "timed_out");
+
+    // Second call should NOT pick it up again
+    let (requeued, permanently_failed) = db.requeue_failed_actions(100).await?;
+    assert_eq!(requeued, 0);
+    assert_eq!(permanently_failed, 0);
 
     Ok(())
 }
