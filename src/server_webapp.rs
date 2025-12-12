@@ -359,6 +359,8 @@ struct WorkflowNodeContext {
 struct WorkflowRunSummary {
     id: String,
     created_at: String,
+    created_at_iso: String,
+    created_at_relative: String,
     status: String,
     progress: String,
     url: String,
@@ -425,14 +427,48 @@ fn render_workflow_detail_page(
             .collect(),
     };
 
+    // Create a map of node sequence to action name from the DAG
+    // In the DAG, nodes are ordered by their topological order which corresponds to execution sequence
+    let action_names: Vec<String> = dag
+        .iter()
+        .map(|node| {
+            if node.action.is_empty() {
+                "action".to_string()
+            } else {
+                node.action.clone()
+            }
+        })
+        .collect();
+
     let recent_runs: Vec<WorkflowRunSummary> = instances
         .iter()
-        .map(|i| WorkflowRunSummary {
-            id: i.id.to_string(),
-            created_at: i.created_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-            status: i.status.clone(),
-            progress: format!("seq {}", i.next_action_seq),
-            url: format!("/workflow/{}/run/{}", version.id, i.id),
+        .map(|i| {
+            // Determine progress based on status and sequence
+            let progress = if i.status == "completed" {
+                "Done".to_string()
+            } else if i.status == "failed" {
+                "Failed".to_string()
+            } else if i.status == "pending" || i.next_action_seq == 0 {
+                "Queued".to_string()
+            } else {
+                // Show the current action being executed (seq is 0-based for the node index)
+                // next_action_seq is the NEXT action to dispatch, so current is seq - 1
+                let current_idx = (i.next_action_seq as usize).saturating_sub(1);
+                action_names
+                    .get(current_idx)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Step {}", i.next_action_seq))
+            };
+
+            WorkflowRunSummary {
+                id: i.id.to_string(),
+                created_at: i.created_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                created_at_iso: i.created_at.to_rfc3339(),
+                created_at_relative: format_relative_time(i.created_at),
+                status: i.status.clone(),
+                progress,
+                url: format!("/workflow/{}/run/{}", version.id, i.id),
+            }
         })
         .collect();
 
@@ -727,6 +763,64 @@ fn truncate_hash(hash: &str) -> String {
     }
 }
 
+/// Format a datetime as a human-readable relative time string
+fn format_relative_time(dt: chrono::DateTime<chrono::Utc>) -> String {
+    let now = chrono::Utc::now();
+    let duration = now.signed_duration_since(dt);
+
+    if duration.num_seconds() < 0 {
+        return "just now".to_string();
+    }
+
+    let seconds = duration.num_seconds();
+    let minutes = duration.num_minutes();
+    let hours = duration.num_hours();
+    let days = duration.num_days();
+
+    if seconds < 60 {
+        "just now".to_string()
+    } else if minutes < 60 {
+        if minutes == 1 {
+            "1 minute ago".to_string()
+        } else {
+            format!("{} minutes ago", minutes)
+        }
+    } else if hours < 24 {
+        if hours == 1 {
+            "1 hour ago".to_string()
+        } else {
+            format!("{} hours ago", hours)
+        }
+    } else if days < 7 {
+        if days == 1 {
+            "yesterday".to_string()
+        } else {
+            format!("{} days ago", days)
+        }
+    } else if days < 30 {
+        let weeks = days / 7;
+        if weeks == 1 {
+            "1 week ago".to_string()
+        } else {
+            format!("{} weeks ago", weeks)
+        }
+    } else if days < 365 {
+        let months = days / 30;
+        if months == 1 {
+            "1 month ago".to_string()
+        } else {
+            format!("{} months ago", months)
+        }
+    } else {
+        let years = days / 365;
+        if years == 1 {
+            "1 year ago".to_string()
+        } else {
+            format!("{} years ago", years)
+        }
+    }
+}
+
 fn format_dependencies(items: &[String]) -> String {
     if items.is_empty() {
         "None".to_string()
@@ -915,7 +1009,7 @@ mod tests {
         assert!(html.contains("my_workflow"));
         assert!(html.contains("Serial")); // not concurrent
         assert!(html.contains("completed"));
-        assert!(html.contains("seq 5"));
+        assert!(html.contains("Done")); // progress shows "Done" for completed status
     }
 
     #[test]
