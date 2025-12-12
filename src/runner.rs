@@ -1272,6 +1272,15 @@ impl DAGRunner {
                                 WorkflowInstanceId(instance_id),
                             ).await {
                                 error!("Unified completion processing failed: {}", e);
+
+                                // Handle the error: mark action complete and fail the instance
+                                Self::handle_completion_error(
+                                    &handler.db,
+                                    &in_flight,
+                                    &metrics,
+                                    WorkflowInstanceId(instance_id),
+                                    &e,
+                                ).await;
                             }
                         } else {
                             // Failed actions use old path for exception handling
@@ -1559,6 +1568,48 @@ impl DAGRunner {
         );
 
         Ok(result)
+    }
+
+    /// Handle errors that occur during completion processing.
+    ///
+    /// When an action executes successfully but the DAG completion processing fails
+    /// (e.g., WorkflowDeadEnd due to unreachable nodes), we must:
+    /// 1. Mark the action as complete (the action itself succeeded)
+    /// 2. Mark the workflow instance as failed (the DAG can't continue)
+    ///
+    /// This prevents actions from being retried indefinitely when the issue is
+    /// a DAG structure problem rather than an action execution problem.
+    async fn handle_completion_error(
+        db: &Database,
+        in_flight: &InFlightAction,
+        metrics: &RoundTripMetrics,
+        instance_id: WorkflowInstanceId,
+        error: &RunnerError,
+    ) {
+        // Mark the action as complete since it executed successfully.
+        // The error is in the DAG completion processing, not the action itself.
+        let completion_record = CompletionRecord {
+            action_id: ActionId(in_flight.action.id),
+            success: true, // Action succeeded, completion processing failed
+            result_payload: metrics.response_payload.clone(),
+            delivery_token: in_flight.action.delivery_token,
+            error_message: Some(format!("DAG completion failed: {}", error)),
+        };
+
+        if let Err(db_err) = db.complete_action(completion_record).await {
+            error!("Failed to mark action complete after DAG error: {}", db_err);
+        }
+
+        // Mark the workflow instance as failed since the DAG can't continue
+        if let Err(db_err) = db.fail_instance(instance_id).await {
+            error!("Failed to mark instance failed after DAG error: {}", db_err);
+        } else {
+            info!(
+                instance_id = %instance_id.0,
+                error = %error,
+                "Marked workflow instance as failed due to DAG completion error"
+            );
+        }
     }
 
     /// Process a barrier (aggregator) that has become ready.
