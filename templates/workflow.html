@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "macros.html" as macros %}
 
 {% block title %}{{ title }}{% endblock title %}
 
@@ -16,7 +17,7 @@
         </div>
         <div>
             <dt class="text-xs uppercase tracking-[0.4em] text-zinc-500">Created</dt>
-            <dd class="text-lg font-semibold text-zinc-900 dark:text-white">{{ workflow.created_at }}</dd>
+            <dd class="text-lg font-semibold text-zinc-900 dark:text-white">{{ macros::datetime(timestamp=workflow.created_at) }}</dd>
         </div>
         <div>
             <dt class="text-xs uppercase tracking-[0.4em] text-zinc-500">Hash</dt>
@@ -61,20 +62,8 @@
                         {% for run in recent_runs %}
                             <tr>
                                 <td class="px-4 py-3 font-mono text-xs text-zinc-700 dark:text-zinc-300">{{ run.id }}</td>
-                                <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">
-                                    <span class="relative-time cursor-help" data-timestamp="{{ run.created_at_iso }}" title="{{ run.created_at }}">{{ run.created_at_relative }}</span>
-                                </td>
-                                <td class="px-4 py-3">
-                                    {% if run.status == "failed" %}
-                                    <span class="rounded-full bg-red-100 dark:bg-red-900/50 px-2 py-1 text-xs font-semibold text-red-700 dark:text-red-400">{{ run.status }}</span>
-                                    {% elif run.status == "completed" %}
-                                    <span class="rounded-full bg-emerald-100 dark:bg-emerald-900/50 px-2 py-1 text-xs font-semibold text-emerald-700 dark:text-emerald-400">{{ run.status }}</span>
-                                    {% elif run.status == "running" or run.status == "dispatched" %}
-                                    <span class="rounded-full bg-amber-100 dark:bg-amber-900/50 px-2 py-1 text-xs font-semibold text-amber-700 dark:text-amber-400">{{ run.status }}</span>
-                                    {% else %}
-                                    <span class="rounded-full bg-zinc-200 dark:bg-zinc-800 px-2 py-1 text-xs font-semibold text-zinc-700 dark:text-zinc-300">{{ run.status }}</span>
-                                    {% endif %}
-                                </td>
+                                <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">{{ macros::datetime(timestamp=run.created_at) }}</td>
+                                <td class="px-4 py-3">{{ macros::status_badge(status=run.status) }}</td>
                                 <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">{{ run.progress }}</td>
                                 <td class="px-4 py-3 text-right">
                                     <a href="{{ run.url }}" class="text-sm font-semibold text-indigo-600 dark:text-indigo-400 transition hover:text-indigo-500 dark:hover:text-indigo-300">View &rarr;</a>

@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "macros.html" as macros %}
 
 {% block title %}{{ title }}{% endblock title %}
 
@@ -6,17 +7,17 @@
 <section class="space-y-4">
     <a href="/workflow/{{ workflow.id }}" class="text-xs uppercase tracking-[0.4em] text-zinc-500 transition hover:text-zinc-700 dark:hover:text-zinc-300">&larr; Back to workflow detail</a>
     <div class="space-y-2">
-        <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-white">Run {{ instance.id | truncate(length=8, end="...") }}</h1>
+        <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-white">Run {{ instance.id }}</h1>
         <p class="text-sm text-zinc-600 dark:text-zinc-400">{{ workflow.name }}</p>
     </div>
     <dl class="grid gap-4 rounded-2xl border border-zinc-200 dark:border-zinc-900 bg-zinc-100 dark:bg-zinc-900/40 p-6 md:grid-cols-2 lg:grid-cols-4">
         <div>
             <dt class="text-xs uppercase tracking-[0.4em] text-zinc-500">Version ID</dt>
-            <dd class="text-lg font-semibold text-zinc-900 dark:text-white">{{ workflow.id | truncate(length=8, end="...") }}</dd>
+            <dd class="text-lg font-semibold text-zinc-900 dark:text-white font-mono text-sm">{{ workflow.id }}</dd>
         </div>
         <div>
             <dt class="text-xs uppercase tracking-[0.4em] text-zinc-500">Run Created</dt>
-            <dd class="text-lg font-semibold text-zinc-900 dark:text-white">{{ instance.created_at }}</dd>
+            <dd class="text-lg font-semibold text-zinc-900 dark:text-white">{{ macros::datetime(timestamp=instance.created_at) }}</dd>
         </div>
         <div>
             <dt class="text-xs uppercase tracking-[0.4em] text-zinc-500">Status</dt>
