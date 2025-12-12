@@ -68,6 +68,24 @@
                     </div>
                     <span id="detail-status" class="rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-wide"></span>
                 </div>
+                <!-- Retry info section (shown when relevant) -->
+                <div id="detail-retry-info" class="hidden rounded-xl bg-amber-100/50 dark:bg-amber-900/20 border border-amber-300 dark:border-amber-700 p-3">
+                    <p class="text-xs uppercase tracking-[0.4em] text-amber-700 dark:text-amber-400 mb-2">Retry Status</p>
+                    <div class="grid grid-cols-2 gap-2 text-sm">
+                        <div>
+                            <span class="text-zinc-600 dark:text-zinc-400">Attempts:</span>
+                            <span id="detail-attempts" class="font-semibold text-zinc-900 dark:text-white"></span>
+                        </div>
+                        <div>
+                            <span class="text-zinc-600 dark:text-zinc-400">Max Retries:</span>
+                            <span id="detail-max-retries" class="font-semibold text-zinc-900 dark:text-white"></span>
+                        </div>
+                    </div>
+                    <div id="detail-scheduled-row" class="mt-2 hidden">
+                        <span class="text-zinc-600 dark:text-zinc-400 text-sm">Scheduled At:</span>
+                        <span id="detail-scheduled-at" class="font-semibold text-zinc-900 dark:text-white text-sm"></span>
+                    </div>
+                </div>
                 <div>
                     <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Request</p>
                     <pre id="detail-request" class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl bg-zinc-200/70 dark:bg-zinc-950/70 p-3 text-xs text-zinc-800 dark:text-zinc-200 font-mono"></pre>
@@ -382,6 +400,32 @@ document.addEventListener('DOMContentLoaded', () => {
     // Display payloads directly (no HTML entity issues since it's JSON)
     document.getElementById('detail-request').textContent = node.request_payload || '{}';
     document.getElementById('detail-response').textContent = node.response_payload || '{}';
+
+    // Update retry info section
+    const retryInfoEl = document.getElementById('detail-retry-info');
+    const scheduledRowEl = document.getElementById('detail-scheduled-row');
+    const maxRetries = node.retry_kind === 'timeout' ? node.timeout_retry_limit : node.max_retries;
+
+    // Show retry info if there have been retries or action is queued/failed with scheduled time
+    const showRetryInfo = node.attempt_number > 0 ||
+                          (node.status === 'queued' && node.scheduled_at) ||
+                          node.status === 'failed';
+
+    if (showRetryInfo) {
+      retryInfoEl.classList.remove('hidden');
+      document.getElementById('detail-attempts').textContent = `${node.attempt_number + 1} / ${maxRetries + 1}`;
+      document.getElementById('detail-max-retries').textContent = maxRetries;
+
+      // Show scheduled_at if present and action is queued
+      if (node.scheduled_at && node.status === 'queued') {
+        scheduledRowEl.classList.remove('hidden');
+        document.getElementById('detail-scheduled-at').textContent = node.scheduled_at;
+      } else {
+        scheduledRowEl.classList.add('hidden');
+      }
+    } else {
+      retryInfoEl.classList.add('hidden');
+    }
   }
 
   // Select first node by default

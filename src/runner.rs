@@ -1188,8 +1188,8 @@ pub struct DAGRunner {
     completion_handler: WorkCompletionHandler,
     /// DAG cache with DB-backed loading
     dag_cache: Arc<DAGCache>,
-    /// Placeholder for legacy compatibility (no longer used - inbox pattern replaces this)
-    #[allow(dead_code)]
+    /// Stores initial input scope per workflow instance.
+    /// Used to provide workflow input variables during inline evaluation.
     instance_contexts: Arc<RwLock<HashMap<Uuid, Scope>>>,
     /// Shutdown signal
     shutdown: Arc<tokio::sync::Notify>,
@@ -1333,6 +1333,19 @@ impl DAGRunner {
                             }
                             Err(e) => {
                                 error!("Failed to requeue failed actions: {}", e);
+                            }
+                        }
+
+                        // Phase 3: Fail workflow instances that have actions which exhausted retries
+                        // This propagates permanent action failures to the workflow level
+                        match self.completion_handler.db.fail_instances_with_exhausted_actions(batch_size).await {
+                            Ok(failed_instances) => {
+                                if failed_instances >= batch_size as i64 {
+                                    should_continue = true;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to fail instances with exhausted actions: {}", e);
                             }
                         }
                     }
@@ -2156,8 +2169,9 @@ impl DAGRunner {
                 exception_type = %exception_type,
                 "no exception handler found, exception will propagate"
             );
-            // For now, just return - the workflow will timeout
-            // TODO: Mark instance as failed
+            // Action stays marked as failed. The retry loop will eventually
+            // exhaust retries and fail_instances_with_exhausted_actions
+            // will mark the workflow as failed.
             return Ok(());
         }
 
@@ -3265,6 +3279,7 @@ mod tests {
             result_payload: None,
             success: None,
             status: "dispatched".to_string(),
+            scheduled_at: None,
         };
 
         tracker.add(action.clone(), 0);

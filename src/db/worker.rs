@@ -291,6 +291,7 @@ impl Database {
                 result_payload: None, // Not yet completed
                 success: None,
                 status: "dispatched".to_string(),
+                scheduled_at: None, // Already dispatched, scheduled time passed
             })
             .collect();
 
@@ -386,6 +387,7 @@ impl Database {
                 result_payload: None, // Not yet completed
                 success: None,
                 status: "dispatched".to_string(),
+                scheduled_at: None, // Already dispatched, scheduled time passed
             })
             .collect();
 
@@ -456,6 +458,7 @@ impl Database {
                 result_payload: None, // Not yet completed
                 success: None,
                 status: "dispatched".to_string(),
+                scheduled_at: None, // Already dispatched, scheduled time passed
             })
             .collect();
 
@@ -621,6 +624,55 @@ impl Database {
         }
 
         Ok((requeued_count, permanently_failed_count))
+    }
+
+    /// Fail workflow instances that have actions which exhausted all retries.
+    /// This should be called after requeue_failed_actions to propagate
+    /// permanent action failures to the workflow instance level.
+    ///
+    /// Returns the number of workflow instances that were marked as failed.
+    pub async fn fail_instances_with_exhausted_actions(&self, limit: i32) -> DbResult<i64> {
+        // Find workflow instances that:
+        // 1. Are still 'running'
+        // 2. Have at least one action that has exhausted its retries
+        //    (status = 'failed' with attempt_number >= max_retries, or
+        //     status = 'timed_out' with attempt_number >= timeout_retry_limit)
+        let result = sqlx::query(
+            r#"
+            WITH instances_to_fail AS (
+                SELECT DISTINCT wi.id
+                FROM workflow_instances wi
+                JOIN action_queue aq ON aq.instance_id = wi.id
+                WHERE wi.status = 'running'
+                  AND (
+                      (aq.status = 'failed' AND aq.retry_kind = 'failure' AND aq.attempt_number >= aq.max_retries)
+                      OR
+                      (aq.status = 'timed_out' AND aq.retry_kind = 'timeout' AND aq.attempt_number >= aq.timeout_retry_limit)
+                  )
+                LIMIT $1
+            )
+            UPDATE workflow_instances wi
+            SET status = 'failed',
+                completed_at = NOW()
+            FROM instances_to_fail
+            WHERE wi.id = instances_to_fail.id
+              AND wi.status = 'running'
+            "#,
+        )
+        .bind(limit)
+        .execute(&self.pool)
+        .await?;
+
+        let failed_count = result.rows_affected() as i64;
+
+        if failed_count > 0 {
+            tracing::info!(
+                failed_instances = failed_count,
+                "fail_instances_with_exhausted_actions"
+            );
+        }
+
+        Ok(failed_count)
     }
 
     // ========================================================================

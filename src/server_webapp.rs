@@ -511,6 +511,16 @@ struct NodeExecutionContext {
     status: String,
     request_payload: String,
     response_payload: String,
+    /// Current attempt number (0-based)
+    attempt_number: i32,
+    /// Maximum retries allowed for failures
+    max_retries: i32,
+    /// Maximum retries allowed for timeouts
+    timeout_retry_limit: i32,
+    /// Type of retry: "failure" or "timeout"
+    retry_kind: String,
+    /// When the action is scheduled to run (ISO 8601 format, or None)
+    scheduled_at: Option<String>,
 }
 
 fn render_workflow_run_page(
@@ -593,6 +603,13 @@ fn render_workflow_run_page(
                 .as_ref()
                 .map(|p| format_binary_payload(p))
                 .unwrap_or_else(|| "(pending)".to_string()),
+            attempt_number: a.attempt_number,
+            max_retries: a.max_retries,
+            timeout_retry_limit: a.timeout_retry_limit,
+            retry_kind: a.retry_kind.clone(),
+            scheduled_at: a
+                .scheduled_at
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string()),
         })
         .collect();
 
@@ -988,6 +1005,7 @@ mod tests {
             result_payload: Some(b"{\"result\": 42}".to_vec()),
             success: Some(true),
             status: "completed".to_string(),
+            scheduled_at: None,
         }];
 
         let html = render_workflow_run_page(&templates, &version, &instance, &actions);

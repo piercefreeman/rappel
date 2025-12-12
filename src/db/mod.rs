@@ -259,6 +259,8 @@ pub struct QueuedAction {
     pub success: Option<bool>,
     /// Action status: pending, dispatched, completed, failed
     pub status: String,
+    /// When the action is scheduled to run (for retries with backoff)
+    pub scheduled_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Record for completing an action

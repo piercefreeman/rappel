@@ -108,7 +108,8 @@ impl Database {
                 COALESCE(node_type, 'action') as node_type,
                 result_payload,
                 success,
-                status
+                status,
+                scheduled_at
             FROM action_queue
             WHERE instance_id = $1
             ORDER BY action_seq
@@ -139,6 +140,7 @@ impl Database {
                 result_payload: row.get("result_payload"),
                 success: row.get("success"),
                 status: row.get("status"),
+                scheduled_at: row.get("scheduled_at"),
             })
             .collect();
 

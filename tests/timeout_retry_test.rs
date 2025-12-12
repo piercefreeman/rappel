@@ -790,3 +790,343 @@ async fn test_full_timeout_retry_cycle() -> Result<()> {
 
     Ok(())
 }
+
+// =============================================================================
+// fail_instances_with_exhausted_actions Tests
+// =============================================================================
+
+/// Helper to get workflow instance status.
+async fn get_instance_status(db: &Database, instance_id: WorkflowInstanceId) -> Result<String> {
+    let row = sqlx::query("SELECT status FROM workflow_instances WHERE id = $1")
+        .bind(instance_id.0)
+        .fetch_one(db.pool())
+        .await?;
+    Ok(row.get("status"))
+}
+
+/// Helper to insert a failed action with exhausted retries (failure kind).
+async fn insert_exhausted_failure_action(
+    db: &Database,
+    instance_id: WorkflowInstanceId,
+    max_retries: i32,
+) -> Result<Uuid> {
+    let row = sqlx::query(
+        r#"
+        INSERT INTO action_queue (
+            instance_id, action_seq, module_name, action_name,
+            dispatch_payload, status, attempt_number, max_retries,
+            retry_kind, backoff_kind
+        )
+        VALUES ($1, 0, 'test_module', 'test_action', $2, 'failed', $3, $3, 'failure', 'none')
+        RETURNING id
+        "#,
+    )
+    .bind(instance_id.0)
+    .bind(Vec::<u8>::new())
+    .bind(max_retries)
+    .fetch_one(db.pool())
+    .await?;
+
+    Ok(row.get("id"))
+}
+
+/// Helper to insert a timed_out action with exhausted retries.
+async fn insert_exhausted_timeout_action(
+    db: &Database,
+    instance_id: WorkflowInstanceId,
+    timeout_retry_limit: i32,
+) -> Result<Uuid> {
+    let row = sqlx::query(
+        r#"
+        INSERT INTO action_queue (
+            instance_id, action_seq, module_name, action_name,
+            dispatch_payload, status, attempt_number, timeout_retry_limit,
+            retry_kind, backoff_kind
+        )
+        VALUES ($1, 0, 'test_module', 'test_action', $2, 'timed_out', $3, $3, 'timeout', 'none')
+        RETURNING id
+        "#,
+    )
+    .bind(instance_id.0)
+    .bind(Vec::<u8>::new())
+    .bind(timeout_retry_limit)
+    .fetch_one(db.pool())
+    .await?;
+
+    Ok(row.get("id"))
+}
+
+#[tokio::test]
+#[serial]
+async fn test_fail_instances_with_exhausted_failure_retries() -> Result<()> {
+    let Some(db) = setup_db().await else {
+        return Ok(());
+    };
+
+    let (_, instance_id) = create_test_instance(&db).await?;
+
+    // Verify instance starts as running
+    let status = get_instance_status(&db, instance_id).await?;
+    assert_eq!(status, "running");
+
+    // Insert an action that has exhausted failure retries (attempt_number >= max_retries)
+    insert_exhausted_failure_action(&db, instance_id, 3).await?;
+
+    // Call fail_instances_with_exhausted_actions
+    let failed_count = db.fail_instances_with_exhausted_actions(100).await?;
+    assert_eq!(failed_count, 1, "should have failed 1 instance");
+
+    // Verify instance is now failed
+    let status = get_instance_status(&db, instance_id).await?;
+    assert_eq!(status, "failed", "instance should be marked as failed");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_fail_instances_with_exhausted_timeout_retries() -> Result<()> {
+    let Some(db) = setup_db().await else {
+        return Ok(());
+    };
+
+    let (_, instance_id) = create_test_instance(&db).await?;
+
+    // Verify instance starts as running
+    let status = get_instance_status(&db, instance_id).await?;
+    assert_eq!(status, "running");
+
+    // Insert an action that has exhausted timeout retries
+    insert_exhausted_timeout_action(&db, instance_id, 3).await?;
+
+    // Call fail_instances_with_exhausted_actions
+    let failed_count = db.fail_instances_with_exhausted_actions(100).await?;
+    assert_eq!(failed_count, 1, "should have failed 1 instance");
+
+    // Verify instance is now failed
+    let status = get_instance_status(&db, instance_id).await?;
+    assert_eq!(status, "failed", "instance should be marked as failed");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_fail_instances_ignores_actions_with_retries_remaining() -> Result<()> {
+    let Some(db) = setup_db().await else {
+        return Ok(());
+    };
+
+    let (_, instance_id) = create_test_instance(&db).await?;
+
+    // Insert a failed action that still has retries remaining (attempt_number < max_retries)
+    sqlx::query(
+        r#"
+        INSERT INTO action_queue (
+            instance_id, action_seq, module_name, action_name,
+            dispatch_payload, status, attempt_number, max_retries,
+            retry_kind, backoff_kind
+        )
+        VALUES ($1, 0, 'test_module', 'test_action', $2, 'failed', 1, 3, 'failure', 'none')
+        "#,
+    )
+    .bind(instance_id.0)
+    .bind(Vec::<u8>::new())
+    .execute(db.pool())
+    .await?;
+
+    // Call fail_instances_with_exhausted_actions
+    let failed_count = db.fail_instances_with_exhausted_actions(100).await?;
+    assert_eq!(failed_count, 0, "should have failed 0 instances");
+
+    // Verify instance is still running
+    let status = get_instance_status(&db, instance_id).await?;
+    assert_eq!(status, "running", "instance should still be running");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_fail_instances_ignores_already_failed_instances() -> Result<()> {
+    let Some(db) = setup_db().await else {
+        return Ok(());
+    };
+
+    let (_, instance_id) = create_test_instance(&db).await?;
+
+    // Manually mark instance as failed first
+    sqlx::query("UPDATE workflow_instances SET status = 'failed' WHERE id = $1")
+        .bind(instance_id.0)
+        .execute(db.pool())
+        .await?;
+
+    // Insert an exhausted action
+    insert_exhausted_failure_action(&db, instance_id, 3).await?;
+
+    // Call fail_instances_with_exhausted_actions
+    let failed_count = db.fail_instances_with_exhausted_actions(100).await?;
+    assert_eq!(
+        failed_count, 0,
+        "should not re-fail already failed instance"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_fail_instances_respects_limit() -> Result<()> {
+    let Some(db) = setup_db().await else {
+        return Ok(());
+    };
+
+    // Create 3 instances with exhausted actions
+    let mut instance_ids = Vec::new();
+    for _ in 0..3 {
+        let (_, instance_id) = create_test_instance(&db).await?;
+        insert_exhausted_failure_action(&db, instance_id, 3).await?;
+        instance_ids.push(instance_id);
+    }
+
+    // Call with limit of 2
+    let failed_count = db.fail_instances_with_exhausted_actions(2).await?;
+    assert_eq!(failed_count, 2, "should have failed exactly 2 instances");
+
+    // Call again to get the remaining one
+    let failed_count = db.fail_instances_with_exhausted_actions(2).await?;
+    assert_eq!(
+        failed_count, 1,
+        "should have failed the remaining 1 instance"
+    );
+
+    // All instances should now be failed
+    for instance_id in instance_ids {
+        let status = get_instance_status(&db, instance_id).await?;
+        assert_eq!(status, "failed");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_fail_instances_sets_completed_at() -> Result<()> {
+    let Some(db) = setup_db().await else {
+        return Ok(());
+    };
+
+    let (_, instance_id) = create_test_instance(&db).await?;
+
+    // Verify completed_at is NULL initially
+    let row = sqlx::query("SELECT completed_at FROM workflow_instances WHERE id = $1")
+        .bind(instance_id.0)
+        .fetch_one(db.pool())
+        .await?;
+    let completed_at: Option<chrono::DateTime<Utc>> = row.get("completed_at");
+    assert!(
+        completed_at.is_none(),
+        "completed_at should be NULL initially"
+    );
+
+    // Insert exhausted action and fail instance
+    insert_exhausted_failure_action(&db, instance_id, 3).await?;
+    db.fail_instances_with_exhausted_actions(100).await?;
+
+    // Verify completed_at is now set
+    let row = sqlx::query("SELECT completed_at FROM workflow_instances WHERE id = $1")
+        .bind(instance_id.0)
+        .fetch_one(db.pool())
+        .await?;
+    let completed_at: Option<chrono::DateTime<Utc>> = row.get("completed_at");
+    assert!(
+        completed_at.is_some(),
+        "completed_at should be set after failure"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_full_retry_exhaustion_fails_workflow() -> Result<()> {
+    // Integration test: simulate the full flow of action failure -> retry exhaustion -> workflow failure
+    let Some(db) = setup_db().await else {
+        return Ok(());
+    };
+
+    let (_, instance_id) = create_test_instance(&db).await?;
+
+    // Create an action with max_retries=2
+    let action = NewAction {
+        instance_id,
+        module_name: "test_module".to_string(),
+        action_name: "test_action".to_string(),
+        dispatch_payload: vec![],
+        timeout_seconds: 30,
+        max_retries: 2,
+        backoff_kind: BackoffKind::None,
+        backoff_base_delay_ms: 0,
+        node_id: Some("action_0".to_string()),
+        node_type: Some("action".to_string()),
+    };
+    db.enqueue_action(action).await?;
+
+    // Simulate 3 failures (initial + 2 retries)
+    for i in 0..3 {
+        // Dispatch the action
+        let actions = db.dispatch_actions(10).await?;
+        assert_eq!(
+            actions.len(),
+            1,
+            "iteration {}: should dispatch 1 action",
+            i
+        );
+
+        // Mark it as failed
+        sqlx::query(
+            "UPDATE action_queue SET status = 'failed', retry_kind = 'failure' WHERE instance_id = $1 AND status = 'dispatched'",
+        )
+        .bind(instance_id.0)
+        .execute(db.pool())
+        .await?;
+
+        // Run requeue logic
+        let (requeued, permanently_failed) = db.requeue_failed_actions(100).await?;
+
+        if i < 2 {
+            // Should requeue
+            assert_eq!(requeued, 1, "iteration {}: should requeue", i);
+            assert_eq!(
+                permanently_failed, 0,
+                "iteration {}: should not permanently fail yet",
+                i
+            );
+
+            // Instance should still be running
+            let status = get_instance_status(&db, instance_id).await?;
+            assert_eq!(
+                status, "running",
+                "iteration {}: instance should still be running",
+                i
+            );
+        } else {
+            // Should permanently fail
+            assert_eq!(requeued, 0, "final iteration: should not requeue");
+            assert_eq!(
+                permanently_failed, 1,
+                "final iteration: should permanently fail action"
+            );
+        }
+    }
+
+    // Now fail the workflow instance
+    let failed_count = db.fail_instances_with_exhausted_actions(100).await?;
+    assert_eq!(failed_count, 1, "should fail the workflow instance");
+
+    // Verify workflow is failed
+    let status = get_instance_status(&db, instance_id).await?;
+    assert_eq!(status, "failed", "workflow instance should be failed");
+
+    Ok(())
+}
