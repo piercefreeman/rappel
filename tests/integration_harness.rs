@@ -208,7 +208,10 @@ impl proto::workflow_service_server::WorkflowService for TestWorkflowService {
                     status: status.into(),
                     next_run_at: format_opt_datetime(s.next_run_at),
                     last_run_at: format_opt_datetime(s.last_run_at),
-                    last_instance_id: s.last_instance_id.map(|id| id.to_string()).unwrap_or_default(),
+                    last_instance_id: s
+                        .last_instance_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_default(),
                     created_at: format_opt_datetime(Some(s.created_at)),
                     updated_at: format_opt_datetime(Some(s.updated_at)),
                 }

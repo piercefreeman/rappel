@@ -2,14 +2,13 @@
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
-from typing import List
-from unittest.mock import AsyncMock, MagicMock
+from datetime import timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 
 from proto import messages_pb2 as pb2
-from rappel import bridge, schedule as schedule_module
+from rappel import schedule as schedule_module
 from rappel.schedule import (
     ScheduleInfo,
     _parse_iso_datetime,
@@ -244,9 +243,7 @@ class TestScheduleWorkflow:
         response = pb2.RegisterScheduleResponse(schedule_id="schedule-123")
         mock_stub.RegisterSchedule.return_value = response
 
-        result = asyncio.run(
-            schedule_workflow(DemoScheduleWorkflow, schedule="0 * * * *")
-        )
+        result = asyncio.run(schedule_workflow(DemoScheduleWorkflow, schedule="0 * * * *"))
 
         assert result == "schedule-123"
         call_args = mock_stub.RegisterSchedule.call_args
@@ -262,9 +259,7 @@ class TestScheduleWorkflow:
         response = pb2.RegisterScheduleResponse(schedule_id="schedule-456")
         mock_stub.RegisterSchedule.return_value = response
 
-        result = asyncio.run(
-            schedule_workflow(DemoScheduleWorkflow, schedule=timedelta(minutes=5))
-        )
+        result = asyncio.run(schedule_workflow(DemoScheduleWorkflow, schedule=timedelta(minutes=5)))
 
         assert result == "schedule-456"
         call_args = mock_stub.RegisterSchedule.call_args
@@ -295,9 +290,7 @@ class TestScheduleWorkflow:
     def test_schedule_workflow_invalid_interval(self) -> None:
         """Test that non-positive intervals raise ValueError."""
         with pytest.raises(ValueError, match="Interval must be positive"):
-            asyncio.run(
-                schedule_workflow(DemoScheduleWorkflow, schedule=timedelta(seconds=0))
-            )
+            asyncio.run(schedule_workflow(DemoScheduleWorkflow, schedule=timedelta(seconds=0)))
 
     def test_schedule_workflow_invalid_type(self) -> None:
         """Test that invalid schedule types raise TypeError."""

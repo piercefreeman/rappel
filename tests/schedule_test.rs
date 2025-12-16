@@ -433,7 +433,10 @@ async fn test_list_schedules_grpc_endpoint() -> Result<()> {
         .iter()
         .find(|s| s.workflow_name == "cron_workflow")
         .expect("cron_workflow schedule should exist");
-    assert_eq!(cron_schedule.schedule_type, proto::ScheduleType::Cron as i32);
+    assert_eq!(
+        cron_schedule.schedule_type,
+        proto::ScheduleType::Cron as i32
+    );
     assert_eq!(cron_schedule.cron_expression, "0 0 * * *");
     assert_eq!(cron_schedule.status, proto::ScheduleStatus::Active as i32);
 
@@ -447,7 +450,10 @@ async fn test_list_schedules_grpc_endpoint() -> Result<()> {
         proto::ScheduleType::Interval as i32
     );
     assert_eq!(interval_schedule.interval_seconds, 300);
-    assert_eq!(interval_schedule.status, proto::ScheduleStatus::Paused as i32);
+    assert_eq!(
+        interval_schedule.status,
+        proto::ScheduleStatus::Paused as i32
+    );
 
     // Test 2: List only active schedules
     let response = client
