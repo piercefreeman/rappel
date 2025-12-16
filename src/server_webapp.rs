@@ -24,7 +24,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::config::WebappConfig;
-use crate::db::{Database, WorkflowVersionId, WorkflowVersionSummary};
+use crate::db::{Database, ScheduleId, WorkflowVersionId, WorkflowVersionSummary};
 
 /// Webapp server handle
 pub struct WebappServer {
@@ -88,6 +88,8 @@ const TEMPLATE_HOME: &str = include_str!("../templates/home.html");
 const TEMPLATE_ERROR: &str = include_str!("../templates/error.html");
 const TEMPLATE_WORKFLOW: &str = include_str!("../templates/workflow.html");
 const TEMPLATE_WORKFLOW_RUN: &str = include_str!("../templates/workflow_run.html");
+const TEMPLATE_SCHEDULED: &str = include_str!("../templates/scheduled.html");
+const TEMPLATE_SCHEDULE_DETAIL: &str = include_str!("../templates/schedule_detail.html");
 
 /// Initialize Tera templates from embedded strings
 fn init_templates() -> Result<Tera> {
@@ -106,6 +108,10 @@ fn init_templates() -> Result<Tera> {
         .context("failed to add workflow.html template")?;
     tera.add_raw_template("workflow_run.html", TEMPLATE_WORKFLOW_RUN)
         .context("failed to add workflow_run.html template")?;
+    tera.add_raw_template("scheduled.html", TEMPLATE_SCHEDULED)
+        .context("failed to add scheduled.html template")?;
+    tera.add_raw_template("schedule_detail.html", TEMPLATE_SCHEDULE_DETAIL)
+        .context("failed to add schedule_detail.html template")?;
 
     tera.autoescape_on(vec![".html", ".tera"]);
     Ok(tera)
@@ -126,6 +132,8 @@ async fn run_server(
     state: WebappState,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
+    use axum::routing::post;
+
     let app = Router::new()
         .route("/", get(list_workflows))
         .route("/workflow/:workflow_version_id", get(workflow_detail))
@@ -133,6 +141,11 @@ async fn run_server(
             "/workflow/:workflow_version_id/run/:instance_id",
             get(workflow_run_detail),
         )
+        .route("/scheduled", get(list_schedules))
+        .route("/scheduled/:schedule_id", get(schedule_detail))
+        .route("/scheduled/:schedule_id/pause", post(pause_schedule))
+        .route("/scheduled/:schedule_id/resume", post(resume_schedule))
+        .route("/scheduled/:schedule_id/delete", post(delete_schedule))
         .route("/healthz", get(healthz))
         .with_state(state);
 
@@ -257,6 +270,130 @@ async fn workflow_run_detail(
     ))
 }
 
+async fn list_schedules(State(state): State<WebappState>) -> impl IntoResponse {
+    match state.database.list_schedules(None).await {
+        Ok(schedules) => Html(render_scheduled_page(&state.templates, &schedules)),
+        Err(err) => {
+            error!(?err, "failed to load schedules");
+            Html(render_error_page(
+                &state.templates,
+                "Unable to load schedules",
+                "We couldn't fetch scheduled workflows. Please check the database connection.",
+            ))
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ScheduleDetailQuery {
+    page: Option<i64>,
+}
+
+async fn schedule_detail(
+    State(state): State<WebappState>,
+    Path(schedule_id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<ScheduleDetailQuery>,
+) -> impl IntoResponse {
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = 20i64;
+    let offset = (page - 1) * per_page;
+
+    // Load schedule
+    let schedule = match state
+        .database
+        .get_schedule_by_id(ScheduleId(schedule_id))
+        .await
+    {
+        Ok(s) => s,
+        Err(err) => {
+            error!(?err, %schedule_id, "failed to load schedule");
+            return Html(render_error_page(
+                &state.templates,
+                "Schedule not found",
+                "The requested schedule could not be located.",
+            ));
+        }
+    };
+
+    // Load invocations with pagination
+    let invocations = state
+        .database
+        .list_schedule_invocations(&schedule.workflow_name, per_page, offset)
+        .await
+        .unwrap_or_default();
+
+    // Get total count for pagination
+    let total_count = state
+        .database
+        .count_schedule_invocations(&schedule.workflow_name)
+        .await
+        .unwrap_or(0);
+
+    let total_pages = (total_count as f64 / per_page as f64).ceil() as i64;
+
+    Html(render_schedule_detail_page(
+        &state.templates,
+        &schedule,
+        &invocations,
+        page,
+        total_pages,
+    ))
+}
+
+async fn pause_schedule(
+    State(state): State<WebappState>,
+    Path(schedule_id): Path<Uuid>,
+) -> impl IntoResponse {
+    match state
+        .database
+        .update_schedule_status_by_id(ScheduleId(schedule_id), "paused")
+        .await
+    {
+        Ok(true) => axum::response::Redirect::to(&format!("/scheduled/{}", schedule_id)),
+        Ok(false) => axum::response::Redirect::to(&format!("/scheduled/{}", schedule_id)),
+        Err(err) => {
+            error!(?err, %schedule_id, "failed to pause schedule");
+            axum::response::Redirect::to(&format!("/scheduled/{}", schedule_id))
+        }
+    }
+}
+
+async fn resume_schedule(
+    State(state): State<WebappState>,
+    Path(schedule_id): Path<Uuid>,
+) -> impl IntoResponse {
+    match state
+        .database
+        .update_schedule_status_by_id(ScheduleId(schedule_id), "active")
+        .await
+    {
+        Ok(true) => axum::response::Redirect::to(&format!("/scheduled/{}", schedule_id)),
+        Ok(false) => axum::response::Redirect::to(&format!("/scheduled/{}", schedule_id)),
+        Err(err) => {
+            error!(?err, %schedule_id, "failed to resume schedule");
+            axum::response::Redirect::to(&format!("/scheduled/{}", schedule_id))
+        }
+    }
+}
+
+async fn delete_schedule(
+    State(state): State<WebappState>,
+    Path(schedule_id): Path<Uuid>,
+) -> impl IntoResponse {
+    match state
+        .database
+        .delete_schedule_by_id(ScheduleId(schedule_id))
+        .await
+    {
+        Ok(true) => axum::response::Redirect::to("/scheduled"),
+        Ok(false) => axum::response::Redirect::to(&format!("/scheduled/{}", schedule_id)),
+        Err(err) => {
+            error!(?err, %schedule_id, "failed to delete schedule");
+            axum::response::Redirect::to(&format!("/scheduled/{}", schedule_id))
+        }
+    }
+}
+
 // ============================================================================
 // Response Types
 // ============================================================================
@@ -298,6 +435,7 @@ impl IntoResponse for HttpError {
 #[derive(Serialize)]
 struct HomePageContext {
     title: String,
+    active_tab: String,
     workflow_groups: Vec<WorkflowGroup>,
 }
 
@@ -337,6 +475,7 @@ fn render_home_page(templates: &Tera, workflows: &[WorkflowVersionSummary]) -> S
 
     let context = HomePageContext {
         title: "Registered Workflow Versions".to_string(),
+        active_tab: "workflows".to_string(),
         workflow_groups,
     };
 
@@ -346,6 +485,7 @@ fn render_home_page(templates: &Tera, workflows: &[WorkflowVersionSummary]) -> S
 #[derive(Serialize)]
 struct WorkflowDetailPageContext {
     title: String,
+    active_tab: String,
     workflow: WorkflowDetailMetadata,
     nodes: Vec<WorkflowNodeContext>,
     has_nodes: bool,
@@ -502,6 +642,7 @@ fn render_workflow_detail_page(
 
     let context = WorkflowDetailPageContext {
         title: format!("{} - Workflow Detail", version.workflow_name),
+        active_tab: "workflows".to_string(),
         workflow,
         has_nodes: !nodes.is_empty(),
         nodes,
@@ -516,6 +657,7 @@ fn render_workflow_detail_page(
 #[derive(Serialize)]
 struct WorkflowRunPageContext {
     title: String,
+    active_tab: String,
     workflow: WorkflowDetailMetadata,
     instance: InstanceContext,
     nodes: Vec<NodeExecutionContext>,
@@ -690,6 +832,7 @@ fn render_workflow_run_page(
 
     let context = WorkflowRunPageContext {
         title: format!("Run {} - {}", instance.id, version.workflow_name),
+        active_tab: "workflows".to_string(),
         workflow,
         instance: instance_ctx,
         nodes,
@@ -703,15 +846,214 @@ fn render_workflow_run_page(
 #[derive(Serialize)]
 struct ErrorPageContext {
     title: String,
+    active_tab: String,
     message: String,
 }
 
 fn render_error_page(templates: &Tera, title: &str, message: &str) -> String {
     let context = ErrorPageContext {
         title: title.to_string(),
+        active_tab: "".to_string(),
         message: message.to_string(),
     };
     render_template(templates, "error.html", &context)
+}
+
+// ============================================================================
+// Schedule Template Context
+// ============================================================================
+
+#[derive(Serialize)]
+struct ScheduledPageContext {
+    title: String,
+    active_tab: String,
+    schedule_groups: Vec<ScheduleGroup>,
+}
+
+#[derive(Serialize)]
+struct ScheduleGroup {
+    schedule_type: String,
+    schedules: Vec<ScheduleBrief>,
+}
+
+#[derive(Serialize)]
+struct ScheduleBrief {
+    id: String,
+    workflow_name: String,
+    status: String,
+    schedule_expression: String,
+    next_run_at: Option<String>,
+    last_run_at: Option<String>,
+}
+
+fn render_scheduled_page(templates: &Tera, schedules: &[crate::db::WorkflowSchedule]) -> String {
+    // Group schedules by type
+    let mut cron_schedules = Vec::new();
+    let mut interval_schedules = Vec::new();
+
+    for s in schedules {
+        let schedule_expression = if s.schedule_type == "cron" {
+            s.cron_expression.clone().unwrap_or_default()
+        } else {
+            format_interval(s.interval_seconds)
+        };
+
+        let brief = ScheduleBrief {
+            id: s.id.to_string(),
+            workflow_name: s.workflow_name.clone(),
+            status: s.status.clone(),
+            schedule_expression,
+            next_run_at: s.next_run_at.map(|dt| dt.to_rfc3339()),
+            last_run_at: s.last_run_at.map(|dt| dt.to_rfc3339()),
+        };
+
+        if s.schedule_type == "cron" {
+            cron_schedules.push(brief);
+        } else {
+            interval_schedules.push(brief);
+        }
+    }
+
+    let mut schedule_groups = Vec::new();
+    if !cron_schedules.is_empty() {
+        schedule_groups.push(ScheduleGroup {
+            schedule_type: "cron".to_string(),
+            schedules: cron_schedules,
+        });
+    }
+    if !interval_schedules.is_empty() {
+        schedule_groups.push(ScheduleGroup {
+            schedule_type: "interval".to_string(),
+            schedules: interval_schedules,
+        });
+    }
+
+    let context = ScheduledPageContext {
+        title: "Scheduled Workflows".to_string(),
+        active_tab: "scheduled".to_string(),
+        schedule_groups,
+    };
+
+    render_template(templates, "scheduled.html", &context)
+}
+
+#[derive(Serialize)]
+struct ScheduleDetailPageContext {
+    title: String,
+    active_tab: String,
+    schedule: ScheduleDetailMetadata,
+    has_invocations: bool,
+    invocations: Vec<InvocationSummary>,
+    current_page: i64,
+    total_pages: i64,
+    has_pagination: bool,
+}
+
+#[derive(Serialize)]
+struct ScheduleDetailMetadata {
+    id: String,
+    workflow_name: String,
+    schedule_type: String,
+    schedule_expression: String,
+    status: String,
+    input_payload: Option<String>,
+    next_run_at: Option<String>,
+    last_run_at: Option<String>,
+    created_at: String,
+}
+
+#[derive(Serialize)]
+struct InvocationSummary {
+    id: String,
+    workflow_version_id: Option<String>,
+    created_at: String,
+    status: String,
+}
+
+fn render_schedule_detail_page(
+    templates: &Tera,
+    schedule: &crate::db::WorkflowSchedule,
+    instances: &[crate::db::WorkflowInstance],
+    current_page: i64,
+    total_pages: i64,
+) -> String {
+    let schedule_expression = if schedule.schedule_type == "cron" {
+        schedule.cron_expression.clone().unwrap_or_default()
+    } else {
+        format_interval(schedule.interval_seconds)
+    };
+
+    let input_payload = schedule
+        .input_payload
+        .as_ref()
+        .map(|p| format_binary_payload(p));
+
+    let schedule_metadata = ScheduleDetailMetadata {
+        id: schedule.id.to_string(),
+        workflow_name: schedule.workflow_name.clone(),
+        schedule_type: schedule.schedule_type.clone(),
+        schedule_expression,
+        status: schedule.status.clone(),
+        input_payload,
+        next_run_at: schedule.next_run_at.map(|dt| dt.to_rfc3339()),
+        last_run_at: schedule.last_run_at.map(|dt| dt.to_rfc3339()),
+        created_at: schedule.created_at.to_rfc3339(),
+    };
+
+    let invocations: Vec<InvocationSummary> = instances
+        .iter()
+        .map(|i| InvocationSummary {
+            id: i.id.to_string(),
+            workflow_version_id: i.workflow_version_id.map(|id| id.to_string()),
+            created_at: i.created_at.to_rfc3339(),
+            status: i.status.clone(),
+        })
+        .collect();
+
+    let context = ScheduleDetailPageContext {
+        title: format!("{} - Schedule", schedule.workflow_name),
+        active_tab: "scheduled".to_string(),
+        schedule: schedule_metadata,
+        has_invocations: !invocations.is_empty(),
+        invocations,
+        current_page,
+        total_pages,
+        has_pagination: total_pages > 1,
+    };
+
+    render_template(templates, "schedule_detail.html", &context)
+}
+
+/// Format interval seconds as a human-readable string
+fn format_interval(interval_seconds: Option<i64>) -> String {
+    match interval_seconds {
+        Some(secs) if secs >= 86400 && secs % 86400 == 0 => {
+            let days = secs / 86400;
+            if days == 1 {
+                "every day".to_string()
+            } else {
+                format!("every {} days", days)
+            }
+        }
+        Some(secs) if secs >= 3600 && secs % 3600 == 0 => {
+            let hours = secs / 3600;
+            if hours == 1 {
+                "every hour".to_string()
+            } else {
+                format!("every {} hours", hours)
+            }
+        }
+        Some(secs) if secs >= 60 && secs % 60 == 0 => {
+            let mins = secs / 60;
+            if mins == 1 {
+                "every minute".to_string()
+            } else {
+                format!("every {} minutes", mins)
+            }
+        }
+        Some(secs) => format!("every {} seconds", secs),
+        None => "not set".to_string(),
+    }
 }
 
 fn render_template<T: Serialize>(templates: &Tera, template: &str, data: &T) -> String {
@@ -1087,6 +1429,220 @@ mod tests {
     fn test_decode_dag_from_proto_invalid() {
         let nodes = decode_dag_from_proto(&[0xFF, 0xFE, 0x00]);
         assert!(nodes.is_empty());
+    }
+
+    // ========================================================================
+    // Schedule Template Tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_interval_seconds() {
+        assert_eq!(format_interval(Some(30)), "every 30 seconds");
+        assert_eq!(format_interval(Some(1)), "every 1 seconds");
+    }
+
+    #[test]
+    fn test_format_interval_minutes() {
+        assert_eq!(format_interval(Some(60)), "every minute");
+        assert_eq!(format_interval(Some(120)), "every 2 minutes");
+        assert_eq!(format_interval(Some(300)), "every 5 minutes");
+    }
+
+    #[test]
+    fn test_format_interval_hours() {
+        assert_eq!(format_interval(Some(3600)), "every hour");
+        assert_eq!(format_interval(Some(7200)), "every 2 hours");
+        assert_eq!(format_interval(Some(14400)), "every 4 hours");
+    }
+
+    #[test]
+    fn test_format_interval_days() {
+        assert_eq!(format_interval(Some(86400)), "every day");
+        assert_eq!(format_interval(Some(172800)), "every 2 days");
+        assert_eq!(format_interval(Some(604800)), "every 7 days");
+    }
+
+    #[test]
+    fn test_format_interval_none() {
+        assert_eq!(format_interval(None), "not set");
+    }
+
+    #[test]
+    fn test_render_scheduled_page_empty() {
+        let templates = test_templates();
+        let html = render_scheduled_page(&templates, &[]);
+
+        assert!(html.contains("Scheduled Workflows"));
+        assert!(html.contains("No scheduled workflows found"));
+    }
+
+    #[test]
+    fn test_render_scheduled_page_with_cron_schedule() {
+        let templates = test_templates();
+        let schedules = vec![crate::db::WorkflowSchedule {
+            id: Uuid::new_v4(),
+            workflow_name: "cron_workflow".to_string(),
+            schedule_type: "cron".to_string(),
+            cron_expression: Some("0 * * * *".to_string()),
+            interval_seconds: None,
+            input_payload: None,
+            status: "active".to_string(),
+            next_run_at: Some(chrono::Utc::now()),
+            last_run_at: None,
+            last_instance_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }];
+
+        let html = render_scheduled_page(&templates, &schedules);
+
+        assert!(html.contains("Scheduled Workflows"));
+        assert!(html.contains("cron_workflow"));
+        assert!(html.contains("0 * * * *"));
+        assert!(html.contains("Cron")); // group title
+    }
+
+    #[test]
+    fn test_render_scheduled_page_with_interval_schedule() {
+        let templates = test_templates();
+        let schedules = vec![crate::db::WorkflowSchedule {
+            id: Uuid::new_v4(),
+            workflow_name: "interval_workflow".to_string(),
+            schedule_type: "interval".to_string(),
+            cron_expression: None,
+            interval_seconds: Some(3600),
+            input_payload: None,
+            status: "paused".to_string(),
+            next_run_at: None,
+            last_run_at: Some(chrono::Utc::now()),
+            last_instance_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }];
+
+        let html = render_scheduled_page(&templates, &schedules);
+
+        assert!(html.contains("Scheduled Workflows"));
+        assert!(html.contains("interval_workflow"));
+        assert!(html.contains("every hour"));
+        assert!(html.contains("Interval")); // group title
+    }
+
+    #[test]
+    fn test_render_schedule_detail_page() {
+        let templates = test_templates();
+        let schedule = crate::db::WorkflowSchedule {
+            id: Uuid::new_v4(),
+            workflow_name: "detail_workflow".to_string(),
+            schedule_type: "cron".to_string(),
+            cron_expression: Some("*/5 * * * *".to_string()),
+            interval_seconds: None,
+            input_payload: Some(b"{\"key\": \"value\"}".to_vec()),
+            status: "active".to_string(),
+            next_run_at: Some(chrono::Utc::now()),
+            last_run_at: Some(chrono::Utc::now()),
+            last_instance_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let invocations: Vec<crate::db::WorkflowInstance> = vec![];
+
+        let html = render_schedule_detail_page(&templates, &schedule, &invocations, 1, 1);
+
+        assert!(html.contains("detail_workflow"));
+        // Tera HTML-escapes `/` as `&#x2F;` for security
+        assert!(
+            html.contains("*/5 * * * *") || html.contains("*&#x2F;5 * * * *"),
+            "Expected cron expression not found in HTML"
+        );
+        assert!(html.contains("active"));
+        assert!(html.contains("Input Payload"));
+        assert!(html.contains("key"));
+        assert!(html.contains("Pause Schedule")); // active schedule shows pause button
+    }
+
+    #[test]
+    fn test_render_schedule_detail_page_paused() {
+        let templates = test_templates();
+        let schedule = crate::db::WorkflowSchedule {
+            id: Uuid::new_v4(),
+            workflow_name: "paused_workflow".to_string(),
+            schedule_type: "interval".to_string(),
+            cron_expression: None,
+            interval_seconds: Some(300),
+            input_payload: None,
+            status: "paused".to_string(),
+            next_run_at: None,
+            last_run_at: None,
+            last_instance_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let invocations: Vec<crate::db::WorkflowInstance> = vec![];
+
+        let html = render_schedule_detail_page(&templates, &schedule, &invocations, 1, 1);
+
+        assert!(html.contains("paused_workflow"));
+        assert!(html.contains("every 5 minutes"));
+        assert!(html.contains("Resume Schedule")); // paused schedule shows resume button
+    }
+
+    #[test]
+    fn test_render_schedule_detail_page_with_invocations() {
+        let templates = test_templates();
+        let schedule_id = Uuid::new_v4();
+        let version_id = Uuid::new_v4();
+
+        let schedule = crate::db::WorkflowSchedule {
+            id: schedule_id,
+            workflow_name: "invoked_workflow".to_string(),
+            schedule_type: "cron".to_string(),
+            cron_expression: Some("0 0 * * *".to_string()),
+            interval_seconds: None,
+            input_payload: None,
+            status: "active".to_string(),
+            next_run_at: Some(chrono::Utc::now()),
+            last_run_at: Some(chrono::Utc::now()),
+            last_instance_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let invocations = vec![
+            crate::db::WorkflowInstance {
+                id: Uuid::new_v4(),
+                partition_id: 0,
+                workflow_name: "invoked_workflow".to_string(),
+                workflow_version_id: Some(version_id),
+                next_action_seq: 5,
+                input_payload: None,
+                result_payload: None,
+                status: "completed".to_string(),
+                created_at: chrono::Utc::now(),
+                completed_at: Some(chrono::Utc::now()),
+            },
+            crate::db::WorkflowInstance {
+                id: Uuid::new_v4(),
+                partition_id: 0,
+                workflow_name: "invoked_workflow".to_string(),
+                workflow_version_id: Some(version_id),
+                next_action_seq: 2,
+                input_payload: None,
+                result_payload: None,
+                status: "running".to_string(),
+                created_at: chrono::Utc::now(),
+                completed_at: None,
+            },
+        ];
+
+        let html = render_schedule_detail_page(&templates, &schedule, &invocations, 1, 3);
+
+        assert!(html.contains("invoked_workflow"));
+        assert!(html.contains("Recent Invocations"));
+        assert!(html.contains("completed"));
+        assert!(html.contains("running"));
+        assert!(html.contains("Page 1 of 3")); // pagination
+        assert!(html.contains("View")); // link to view run
     }
 
     // ========================================================================

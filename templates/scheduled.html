@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% import "macros.html" as macros %}
+
+{% block title %}{{ title }}{% endblock title %}
+
+{% block content %}
+<section class="space-y-2">
+    <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Overview</p>
+    <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-white">Scheduled Workflows</h1>
+    <p class="text-sm text-zinc-600 dark:text-zinc-400">These workflows are configured to run on a recurring schedule.</p>
+</section>
+
+{% if schedule_groups | length == 0 %}
+    <div class="rounded-2xl border border-dashed border-zinc-300 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900/40 p-6 text-center text-zinc-600 dark:text-zinc-400">
+        No scheduled workflows found. Register a schedule to see it appear here.
+    </div>
+{% else %}
+    <div class="space-y-6">
+        {% for group in schedule_groups %}
+            <div class="rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 overflow-hidden">
+                <div class="px-5 py-4 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/60">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <h2 class="text-lg font-semibold text-zinc-900 dark:text-white">{{ group.schedule_type | title }}</h2>
+                            <p class="text-xs text-zinc-500 dark:text-zinc-400">{{ group.schedules | length }} schedule{% if group.schedules | length != 1 %}s{% endif %}</p>
+                        </div>
+                        {{ macros::schedule_type_badge(schedule_type=group.schedule_type) }}
+                    </div>
+                </div>
+                <div class="divide-y divide-zinc-100 dark:divide-zinc-800">
+                    {% for schedule in group.schedules %}
+                        <a href="/scheduled/{{ schedule.id }}" class="flex items-center justify-between px-5 py-4 transition hover:bg-zinc-50 dark:hover:bg-zinc-800/50">
+                            <div class="flex-1 min-w-0">
+                                <div class="flex items-center gap-3">
+                                    <span class="font-semibold text-zinc-900 dark:text-white truncate">{{ schedule.workflow_name }}</span>
+                                    {{ macros::schedule_badge(status=schedule.status) }}
+                                </div>
+                                <div class="mt-1 flex items-center gap-4 text-sm text-zinc-500 dark:text-zinc-400">
+                                    {% if schedule.schedule_expression %}
+                                        <span class="font-mono text-xs">{{ schedule.schedule_expression }}</span>
+                                    {% endif %}
+                                    {% if schedule.next_run_at %}
+                                        <span>Next: {{ macros::datetime(timestamp=schedule.next_run_at) }}</span>
+                                    {% endif %}
+                                </div>
+                            </div>
+                            <div class="flex items-center gap-4">
+                                {% if schedule.last_run_at %}
+                                    <span class="text-sm text-zinc-500 dark:text-zinc-400">Last run: {{ macros::datetime(timestamp=schedule.last_run_at) }}</span>
+                                {% endif %}
+                                <svg class="h-5 w-5 text-zinc-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                                </svg>
+                            </div>
+                        </a>
+                    {% endfor %}
+                </div>
+            </div>
+        {% endfor %}
+    </div>
+{% endif %}
+{% endblock content %}
