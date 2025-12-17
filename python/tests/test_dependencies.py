@@ -1,5 +1,6 @@
 import asyncio
-from typing import Annotated, Any, AsyncIterator
+from contextlib import asynccontextmanager, contextmanager
+from typing import Annotated, Any, AsyncIterator, Iterator
 
 from rappel.dependencies import Depend, provide_dependencies
 
@@ -78,3 +79,92 @@ def test_provide_dependencies_supports_recursive_dependencies() -> None:
 
     result = asyncio.run(run())
     assert result == "one-base"
+
+
+def test_provide_dependencies_handles_async_function_dependency() -> None:
+    async def async_dependency() -> str:
+        return "async_value"
+
+    async def target(value: Annotated[str, Depend(async_dependency)]) -> str:
+        return value
+
+    async def run() -> str:
+        async with provide_dependencies(target) as kwargs:
+            return await target(**kwargs)
+
+    result = asyncio.run(run())
+    assert result == "async_value"
+
+
+def test_provide_dependencies_handles_sync_generator_dependency() -> None:
+    events: list[str] = []
+
+    def sync_generator_dependency() -> Iterator[str]:
+        events.append("enter")
+        try:
+            yield "sync_resource"
+        finally:
+            events.append("exit")
+
+    async def target(resource: Annotated[str, Depend(sync_generator_dependency)]) -> str:
+        return resource
+
+    async def run() -> str:
+        async with provide_dependencies(target) as kwargs:
+            return await target(**kwargs)
+
+    result = asyncio.run(run())
+    assert result == "sync_resource"
+    assert events == ["enter", "exit"]
+
+
+def test_provide_dependencies_handles_returned_async_context_manager() -> None:
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def create_async_resource() -> AsyncIterator[str]:
+        events.append("enter")
+        try:
+            yield "async_cm_resource"
+        finally:
+            events.append("exit")
+
+    def dependency_returning_async_cm() -> Any:
+        return create_async_resource()
+
+    async def target(resource: Annotated[str, Depend(dependency_returning_async_cm)]) -> str:
+        return resource
+
+    async def run() -> str:
+        async with provide_dependencies(target) as kwargs:
+            return await target(**kwargs)
+
+    result = asyncio.run(run())
+    assert result == "async_cm_resource"
+    assert events == ["enter", "exit"]
+
+
+def test_provide_dependencies_handles_returned_sync_context_manager() -> None:
+    events: list[str] = []
+
+    @contextmanager
+    def create_sync_resource() -> Iterator[str]:
+        events.append("enter")
+        try:
+            yield "sync_cm_resource"
+        finally:
+            events.append("exit")
+
+    def dependency_returning_sync_cm() -> Any:
+        return create_sync_resource()
+
+    async def target(resource: Annotated[str, Depend(dependency_returning_sync_cm)]) -> str:
+        return resource
+
+    async def run() -> str:
+        async with provide_dependencies(target) as kwargs:
+            return await target(**kwargs)
+
+    result = asyncio.run(run())
+    assert result == "sync_cm_resource"
+    assert events == ["enter", "exit"]
