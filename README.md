@@ -142,18 +142,25 @@ If you have a particular workflow that you think should be working but isn't yet
 
 The main rappel configuration is done through env vars, which is what you'll typically use in production when using a docker deployment pipeline. If we can't find an environment parameter we will fallback to looking for an .env that specifies it within your local filesystem.
 
+These are the primary environment parameters that you'll likely want to customize for your deployment:
+
 | Environment Variable | Description | Default | Example |
 |---------------------|-------------|---------|---------|
-| `DATABASE_URL` | PostgreSQL connection string for the rappel server | (required) | `postgresql://user:pass@localhost:5433/rappel` |
-| `RAPPEL_HTTP_ADDR` | HTTP bind address for `rappel-bridge` | `127.0.0.1:24117` | `0.0.0.0:24117` |
-| `RAPPEL_GRPC_ADDR` | gRPC bind address for `rappel-bridge` | HTTP port + 1 | `0.0.0.0:24118` |
+| `DATABASE_URL` | PostgreSQL connection string for the rappel server | (required on bridge &workers ) | `postgresql://user:pass@localhost:5433/rappel` |
 | `RAPPEL_WORKER_COUNT` | Number of Python worker processes | `num_cpus` | `8` |
 | `RAPPEL_CONCURRENT_PER_WORKER` | Max concurrent actions per worker | `10` | `20` |
 | `RAPPEL_USER_MODULE` | Python module preloaded into each worker | none | `my_app.actions` |
 | `RAPPEL_POLL_INTERVAL_MS` | Poll interval for the dispatch loop (ms) | `100` | `50` |
-| `RAPPEL_BATCH_SIZE` | Max actions fetched per poll | `workers * concurrent_per_worker` | `200` |
 | `RAPPEL_WEBAPP_ENABLED` | Enable the web dashboard | `false` | `true` |
 | `RAPPEL_WEBAPP_ADDR` | Web dashboard bind address | `0.0.0.0:24119` | `0.0.0.0:8080` |
+
+We expect that you won't need to modify the following env parameters, but we provide them for convenience:
+
+| Environment Variable | Description | Default | Example |
+|---------------------|-------------|---------|---------|
+| `RAPPEL_HTTP_ADDR` | HTTP bind address for `rappel-bridge` | `127.0.0.1:24117` | `0.0.0.0:24117` |
+| `RAPPEL_GRPC_ADDR` | gRPC bind address for `rappel-bridge` | HTTP port + 1 | `0.0.0.0:24118` |
+| `RAPPEL_BATCH_SIZE` | Max actions fetched per poll | `workers * concurrent_per_worker` | `200` |
 
 ## Philosophy
 
