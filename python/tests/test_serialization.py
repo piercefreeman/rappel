@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from uuid import UUID
 
 from pydantic import BaseModel
 
@@ -70,3 +71,46 @@ def test_result_round_trip_with_dataclass() -> None:
     assert isinstance(decoded.result, SampleDataclass)
     assert decoded.result.payload == "world"
     assert decoded.result.count == 42
+
+
+class ModelWithUUID(BaseModel):
+    id: UUID
+    name: str
+
+
+class ModelWithUUIDList(BaseModel):
+    ids: list[UUID]
+
+
+def test_uuid_serialization() -> None:
+    """Test that UUIDs are serialized as strings."""
+    test_uuid = UUID("12345678-1234-5678-1234-567812345678")
+    payload = serialize_result_payload({"user_id": test_uuid})
+    decoded = deserialize_result_payload(payload)
+    assert decoded.error is None
+    # UUID is serialized as string
+    assert decoded.result == {"user_id": str(test_uuid)}
+
+
+def test_uuid_in_pydantic_model() -> None:
+    """Test that UUIDs in Pydantic models round-trip correctly."""
+    test_uuid = UUID("12345678-1234-5678-1234-567812345678")
+    payload = serialize_result_payload(ModelWithUUID(id=test_uuid, name="test"))
+    decoded = deserialize_result_payload(payload)
+    assert decoded.error is None
+    assert isinstance(decoded.result, ModelWithUUID)
+    assert decoded.result.id == test_uuid
+    assert decoded.result.name == "test"
+
+
+def test_uuid_list_in_pydantic_model() -> None:
+    """Test that lists of UUIDs in Pydantic models round-trip correctly."""
+    test_uuids = [
+        UUID("12345678-1234-5678-1234-567812345678"),
+        UUID("87654321-4321-8765-4321-876543218765"),
+    ]
+    payload = serialize_result_payload(ModelWithUUIDList(ids=test_uuids))
+    decoded = deserialize_result_payload(payload)
+    assert decoded.error is None
+    assert isinstance(decoded.result, ModelWithUUIDList)
+    assert decoded.result.ids == test_uuids

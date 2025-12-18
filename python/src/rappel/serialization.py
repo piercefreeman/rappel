@@ -2,6 +2,7 @@ import dataclasses
 import importlib
 import traceback
 from typing import Any
+from uuid import UUID
 
 from google.protobuf import json_format, struct_pb2
 from pydantic import BaseModel
@@ -54,6 +55,10 @@ def _to_argument_value(value: Any) -> pb2.WorkflowArgumentValue:
     argument = pb2.WorkflowArgumentValue()
     if isinstance(value, PRIMITIVE_TYPES):
         argument.primitive.CopyFrom(_serialize_primitive(value))
+        return argument
+    if isinstance(value, UUID):
+        # Serialize UUID as string primitive
+        argument.primitive.CopyFrom(_serialize_primitive(str(value)))
         return argument
     if isinstance(value, BaseException):
         argument.exception.type = value.__class__.__name__
@@ -141,7 +146,7 @@ def _from_argument_value(argument: pb2.WorkflowArgumentValue) -> Any:
 
 def _serialize_model_data(model: BaseModel) -> dict[str, Any]:
     if hasattr(model, "model_dump"):
-        return model.model_dump(mode="python")  # type: ignore[attr-defined]
+        return model.model_dump(mode="json")  # type: ignore[attr-defined]
     if hasattr(model, "dict"):
         return model.dict()  # type: ignore[attr-defined]
     return model.__dict__
