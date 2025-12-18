@@ -1,6 +1,11 @@
 import dataclasses
 import importlib
 import traceback
+from base64 import b64encode
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal
+from enum import Enum
+from pathlib import PurePath
 from typing import Any
 from uuid import UUID
 
@@ -59,6 +64,44 @@ def _to_argument_value(value: Any) -> pb2.WorkflowArgumentValue:
     if isinstance(value, UUID):
         # Serialize UUID as string primitive
         argument.primitive.CopyFrom(_serialize_primitive(str(value)))
+        return argument
+    if isinstance(value, datetime):
+        # Serialize datetime as ISO format string
+        argument.primitive.CopyFrom(_serialize_primitive(value.isoformat()))
+        return argument
+    if isinstance(value, date):
+        # Serialize date as ISO format string (must come after datetime check)
+        argument.primitive.CopyFrom(_serialize_primitive(value.isoformat()))
+        return argument
+    if isinstance(value, time):
+        # Serialize time as ISO format string
+        argument.primitive.CopyFrom(_serialize_primitive(value.isoformat()))
+        return argument
+    if isinstance(value, timedelta):
+        # Serialize timedelta as total seconds
+        argument.primitive.CopyFrom(_serialize_primitive(value.total_seconds()))
+        return argument
+    if isinstance(value, Decimal):
+        # Serialize Decimal as string to preserve precision
+        argument.primitive.CopyFrom(_serialize_primitive(str(value)))
+        return argument
+    if isinstance(value, Enum):
+        # Serialize Enum as its value
+        return _to_argument_value(value.value)
+    if isinstance(value, bytes):
+        # Serialize bytes as base64 string
+        argument.primitive.CopyFrom(_serialize_primitive(b64encode(value).decode("ascii")))
+        return argument
+    if isinstance(value, PurePath):
+        # Serialize Path as string
+        argument.primitive.CopyFrom(_serialize_primitive(str(value)))
+        return argument
+    if isinstance(value, (set, frozenset)):
+        # Serialize sets as lists
+        argument.list_value.SetInParent()
+        for item in value:
+            item_value = argument.list_value.items.add()
+            item_value.CopyFrom(_to_argument_value(item))
         return argument
     if isinstance(value, BaseException):
         argument.exception.type = value.__class__.__name__
