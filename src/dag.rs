@@ -1507,7 +1507,35 @@ impl DAGConverter {
 
         // Connect last body node to output
         if let Some(prev) = prev_node_id {
-            self.dag.add_edge(DAGEdge::state_machine(prev, output_id));
+            self.dag
+                .add_edge(DAGEdge::state_machine(prev, output_id.clone()));
+        }
+
+        // Connect ALL return nodes in this function to the output node.
+        // This handles early returns inside conditionals, loops, etc.
+        // which won't be reached by the normal "last node -> output" connection.
+        let return_nodes: Vec<String> = self
+            .dag
+            .nodes
+            .iter()
+            .filter(|(_, n)| {
+                n.node_type == "return"
+                    && n.function_name.as_ref() == Some(&fn_def.name)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for return_node_id in return_nodes {
+            // Check if this return node already has an edge to the output
+            let already_connected = self
+                .dag
+                .edges
+                .iter()
+                .any(|e| e.source == return_node_id && e.target == output_id);
+            if !already_connected {
+                self.dag
+                    .add_edge(DAGEdge::state_machine(return_node_id, output_id.clone()));
+            }
         }
 
         // Add data flow edges within this function
@@ -2590,13 +2618,29 @@ impl DAGConverter {
             ));
         }
 
-        // Connect branch ends to join
+        // Connect branch ends to join - but NOT if they end with a return statement.
+        // Return statements should flow to workflow output, not back to join.
+        // This is critical for early returns inside conditionals.
         if let Some(then) = then_last {
-            self.dag
-                .add_edge(DAGEdge::state_machine(then, join_id.clone()));
+            let is_return = self
+                .dag
+                .nodes
+                .get(&then)
+                .is_some_and(|n| n.node_type == "return");
+            if !is_return {
+                self.dag
+                    .add_edge(DAGEdge::state_machine(then, join_id.clone()));
+            }
         }
         if let Some(else_) = else_last {
-            self.dag.add_edge(DAGEdge::state_machine(else_, join_id));
+            let is_return = self
+                .dag
+                .nodes
+                .get(&else_)
+                .is_some_and(|n| n.node_type == "return");
+            if !is_return {
+                self.dag.add_edge(DAGEdge::state_machine(else_, join_id));
+            }
         }
 
         result_nodes
