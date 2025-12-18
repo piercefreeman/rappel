@@ -29,6 +29,32 @@ class ActionRegistry:
         self._actions: dict[str, _ActionEntry] = {}
         self._lock = RLock()
 
+    def _source_fingerprint(self, func: AsyncAction) -> tuple[str | None, str | None]:
+        func_any: Any = func
+        try:
+            code = func_any.__code__
+        except AttributeError:
+            return (None, None)
+        try:
+            qualname = func_any.__qualname__
+        except AttributeError:
+            qualname = None
+        filename = code.co_filename
+        if not isinstance(filename, str):
+            filename = None
+        if qualname is not None and not isinstance(qualname, str):
+            qualname = None
+        return (filename, qualname)
+
+    def _is_same_action_definition(self, existing: AsyncAction, new: AsyncAction) -> bool:
+        if existing is new:
+            return True
+        existing_fingerprint = self._source_fingerprint(existing)
+        new_fingerprint = self._source_fingerprint(new)
+        if existing_fingerprint == (None, None) or new_fingerprint == (None, None):
+            return False
+        return existing_fingerprint == new_fingerprint
+
     def register(self, module: str, name: str, func: AsyncAction) -> None:
         """Register an action with its module and name.
 
@@ -38,11 +64,16 @@ class ActionRegistry:
             func: The async function to execute.
 
         Raises:
-            ValueError: If an action with the same module:name is already registered.
+            ValueError: If an action with the same module:name is already registered
+                with a different implementation.
         """
         key = _make_key(module, name)
         with self._lock:
-            if key in self._actions:
+            existing = self._actions.get(key)
+            if existing is not None:
+                if self._is_same_action_definition(existing.func, func):
+                    self._actions[key] = _ActionEntry(module=module, name=name, func=func)
+                    return
                 raise ValueError(f"action '{module}:{name}' already registered")
             self._actions[key] = _ActionEntry(module=module, name=name, func=func)
 

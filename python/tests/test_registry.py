@@ -73,6 +73,27 @@ def test_registry_rejects_duplicate_in_same_module() -> None:
         action_registry.register("my_module", "duplicate", action_two)
 
 
+def test_registry_allows_reregistration_of_same_definition() -> None:
+    filename = "fake_module.py"
+    module_name = "fake_module"
+
+    source_one = "async def demo() -> int:\n    return 1\n"
+    globals_one: dict[str, Any] = {"__name__": module_name, "__file__": filename}
+    exec(compile(source_one, filename, "exec"), globals_one)
+    func_one = globals_one["demo"]
+
+    action_registry.register(module_name, "demo", func_one)
+
+    source_two = "async def demo() -> int:\n    return 2\n"
+    globals_two: dict[str, Any] = {"__name__": module_name, "__file__": filename}
+    exec(compile(source_two, filename, "exec"), globals_two)
+    func_two = globals_two["demo"]
+
+    assert func_one is not func_two
+    action_registry.register(module_name, "demo", func_two)
+    assert action_registry.get(module_name, "demo") is func_two
+
+
 def test_registry_get_returns_none_for_unknown() -> None:
     """Test that get returns None for unregistered actions."""
     assert action_registry.get("unknown_module", "unknown_action") is None
