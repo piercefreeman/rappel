@@ -295,6 +295,7 @@ impl Database {
                 success: None,
                 status: "dispatched".to_string(),
                 scheduled_at: None, // Already dispatched, scheduled time passed
+                last_error: None,
             })
             .collect();
 
@@ -391,6 +392,7 @@ impl Database {
                 success: None,
                 status: "dispatched".to_string(),
                 scheduled_at: None, // Already dispatched, scheduled time passed
+                last_error: None,
             })
             .collect();
 
@@ -462,6 +464,7 @@ impl Database {
                 success: None,
                 status: "dispatched".to_string(),
                 scheduled_at: None, // Already dispatched, scheduled time passed
+                last_error: None,
             })
             .collect();
 

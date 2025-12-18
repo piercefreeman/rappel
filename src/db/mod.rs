@@ -265,6 +265,8 @@ pub struct QueuedAction {
     pub status: String,
     /// When the action is scheduled to run (for retries with backoff)
     pub scheduled_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Error message if the action or workflow failed
+    pub last_error: Option<String>,
 }
 
 /// Record for completing an action

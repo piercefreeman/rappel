@@ -109,7 +109,8 @@ impl Database {
                 result_payload,
                 success,
                 status,
-                scheduled_at
+                scheduled_at,
+                last_error
             FROM action_queue
             WHERE instance_id = $1
             ORDER BY action_seq
@@ -141,6 +142,7 @@ impl Database {
                 success: row.get("success"),
                 status: row.get("status"),
                 scheduled_at: row.get("scheduled_at"),
+                last_error: row.get("last_error"),
             })
             .collect();
 

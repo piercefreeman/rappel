@@ -713,6 +713,8 @@ struct NodeExecutionContext {
     retry_kind: String,
     /// When the action is scheduled to run (ISO 8601 format, or None)
     scheduled_at: Option<String>,
+    /// Error message if the action or workflow failed
+    last_error: Option<String>,
 }
 
 fn render_workflow_run_page(
@@ -824,6 +826,7 @@ fn render_workflow_run_page(
             scheduled_at: a
                 .scheduled_at
                 .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string()),
+            last_error: a.last_error.clone(),
         })
         .collect();
 
@@ -1408,6 +1411,7 @@ mod tests {
             success: Some(true),
             status: "completed".to_string(),
             scheduled_at: None,
+            last_error: None,
         }];
 
         let html = render_workflow_run_page(&templates, &version, &instance, &actions);

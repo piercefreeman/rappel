@@ -3453,6 +3453,7 @@ mod tests {
             success: None,
             status: "dispatched".to_string(),
             scheduled_at: None,
+            last_error: None,
         };
 
         tracker.add(action.clone(), 0);
