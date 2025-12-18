@@ -2393,10 +2393,18 @@ impl DAGConverter {
         self.dag.add_node(incr_node);
         self.track_var_definition(&loop_i_var, &incr_id);
 
-        // Connect body (last) -> incr, or extract -> incr if no body
+        // Connect body (last) -> incr, or extract -> incr if no body.
+        // But NOT if body ends with a return - returns should flow to workflow output.
         if let Some(ref last) = body_last {
-            self.dag
-                .add_edge(DAGEdge::state_machine(last.clone(), incr_id.clone()));
+            let is_return = self
+                .dag
+                .nodes
+                .get(last)
+                .is_some_and(|n| n.node_type == "return");
+            if !is_return {
+                self.dag
+                    .add_edge(DAGEdge::state_machine(last.clone(), incr_id.clone()));
+            }
         } else {
             self.dag
                 .add_edge(DAGEdge::state_machine(extract_id.clone(), incr_id.clone()));

@@ -2614,6 +2614,66 @@ fn workflow(input: [items], output: [result]):
         }
     }
 
+    #[test]
+    fn test_return_directly_in_for_loop_body() {
+        // Test that a direct return in for loop body (not nested in if)
+        // completes the workflow and doesn't continue to loop increment
+        let source = r#"
+fn workflow(input: [items], output: [result]):
+    for item in items:
+        return item
+    final = @finalize(count=0)
+    return final
+"#;
+        let dag = dag_from_source(source);
+
+        // Verify the return node connects to output, not to loop increment
+        let return_nodes: Vec<_> = dag
+            .nodes
+            .values()
+            .filter(|n| n.node_type == "return")
+            .collect();
+
+        let output_node = dag
+            .nodes
+            .values()
+            .find(|n| n.is_output)
+            .expect("Should have output node");
+
+        // Find the loop increment node
+        let incr_nodes: Vec<_> = dag
+            .nodes
+            .values()
+            .filter(|n| n.id.contains("loop_incr"))
+            .collect();
+
+        for return_node in &return_nodes {
+            // Should have edge to output
+            let has_edge_to_output = dag
+                .edges
+                .iter()
+                .any(|e| e.source == return_node.id && e.target == output_node.id);
+            assert!(
+                has_edge_to_output,
+                "Return node {} should have edge to output",
+                return_node.id
+            );
+
+            // Should NOT have edge to loop increment
+            for incr_node in &incr_nodes {
+                let has_edge_to_incr = dag
+                    .edges
+                    .iter()
+                    .any(|e| e.source == return_node.id && e.target == incr_node.id);
+                assert!(
+                    !has_edge_to_incr,
+                    "Return node {} should NOT have edge to loop increment {}",
+                    return_node.id, incr_node.id
+                );
+            }
+        }
+    }
+
     // ========================================================================
     // Return Inside try/except Tests
     // ========================================================================
