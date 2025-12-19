@@ -264,7 +264,7 @@ parallel:
 
 - All branches that assign to a variable must assign to the same variable name
 - Guards are expressions that evaluate to boolean
-- Guards must not contain action calls
+- Guards must not contain action calls (they are evaluated inline by the runner). In Python workflows, `if await some_action(...):` is normalized by the compiler into `__cond = await some_action(...); if __cond:` so the guard itself contains no action call.
 
 ### For Loops
 
