@@ -49,11 +49,9 @@ use prost::Message;
 
 use crate::{
     ast_evaluator::{EvaluationError, ExpressionEvaluator, Scope},
-    completion::{
-        GuardResult, InlineContext, analyze_subgraph, evaluate_guard, execute_inline_subgraph,
-    },
+    completion::{GuardResult, InlineContext, analyze_subgraph, execute_inline_subgraph},
     dag::{DAG, DAGConverter, DAGNode, EdgeType},
-    dag_state::{DAGHelper, ExecutionMode},
+    dag_state::{DAGHelper, ExecutionMode, SuccessorInfo},
     db::{
         ActionId, BackoffKind, CompletionRecord, Database, NewAction, QueuedAction, ScheduleId,
         WorkflowInstanceId, WorkflowVersionId,
@@ -2257,6 +2255,47 @@ impl DAGRunner {
         }
     }
 
+    fn filter_successors_with_guards(
+        successors: Vec<SuccessorInfo>,
+        scope: &Scope,
+    ) -> Vec<SuccessorInfo> {
+        let mut selected = Vec::new();
+        let mut else_successors = Vec::new();
+        let mut has_guarded_edges = false;
+        let mut guard_passed = false;
+        let mut guard_error = false;
+
+        for successor in successors {
+            if successor.is_else {
+                else_successors.push(successor);
+                continue;
+            }
+
+            if let Some(ref guard) = successor.guard_expr {
+                has_guarded_edges = true;
+                match Self::evaluate_guard_for_scope(Some(guard), scope, &successor.node_id) {
+                    GuardResult::Pass => {
+                        guard_passed = true;
+                        selected.push(successor);
+                    }
+                    GuardResult::Fail => {}
+                    GuardResult::Error(_) => {
+                        guard_error = true;
+                    }
+                }
+                continue;
+            }
+
+            selected.push(successor);
+        }
+
+        if has_guarded_edges && !guard_passed && !guard_error {
+            selected.extend(else_successors);
+        }
+
+        selected
+    }
+
     /// Process successor nodes with optional condition result for branching.
     ///
     /// Uses BFS traversal to process inline nodes and their successors iteratively.
@@ -2363,23 +2402,11 @@ impl DAGRunner {
         let mut work_queue: VecDeque<(String, JsonValue)> = VecDeque::new();
 
         // Initialize queue with immediate successors from the starting node
-        for successor in helper.get_ready_successors(node_id, condition_result) {
-            // Evaluate guard at edge traversal time
-            match Self::evaluate_guard_for_scope(
-                successor.guard_expr.as_ref(),
-                inline_scope,
-                &successor.node_id,
-            ) {
-                GuardResult::Pass => {
-                    work_queue.push_back((successor.node_id, result.clone()));
-                }
-                GuardResult::Fail | GuardResult::Error(_) => {
-                    // Guard failed or had an error - skip this branch
-                    // Dead-end detection in execute_inline_subgraph will catch
-                    // cases where all branches are blocked
-                    continue;
-                }
-            }
+        for successor in Self::filter_successors_with_guards(
+            helper.get_ready_successors(node_id, condition_result),
+            inline_scope,
+        ) {
+            work_queue.push_back((successor.node_id, result.clone()));
         }
 
         // Process work queue iteratively (BFS)
@@ -2459,22 +2486,11 @@ impl DAGRunner {
                     };
 
                     // Add successors to work queue (instead of recursive call)
-                    for successor in helper.get_ready_successors(&current_node_id, None) {
-                        // Evaluate guard at edge traversal time
-                        match Self::evaluate_guard_for_scope(
-                            successor.guard_expr.as_ref(),
-                            inline_scope,
-                            &successor.node_id,
-                        ) {
-                            GuardResult::Pass => {
-                                work_queue
-                                    .push_back((successor.node_id, passthrough_result.clone()));
-                            }
-                            GuardResult::Fail | GuardResult::Error(_) => {
-                                // Guard failed or had an error - skip this branch
-                                continue;
-                            }
-                        }
+                    for successor in Self::filter_successors_with_guards(
+                        helper.get_ready_successors(&current_node_id, None),
+                        inline_scope,
+                    ) {
+                        work_queue.push_back((successor.node_id, passthrough_result.clone()));
                     }
                 }
                 ExecutionMode::Delegated => {
@@ -2847,20 +2863,7 @@ impl DAGRunner {
             successors = ?initial_successors.iter().map(|s| &s.node_id).collect::<Vec<_>>(),
             "input node successors"
         );
-        for successor in initial_successors {
-            // Evaluate guard if present - skip branch if guard fails or errors
-            if let Some(ref guard) = successor.guard_expr {
-                match evaluate_guard(Some(guard), &scope, &successor.node_id) {
-                    GuardResult::Pass => {}
-                    GuardResult::Fail | GuardResult::Error(_) => {
-                        debug!(
-                            successor_id = %successor.node_id,
-                            "skipping initial successor due to failed guard"
-                        );
-                        continue;
-                    }
-                }
-            }
+        for successor in Self::filter_successors_with_guards(initial_successors, &scope) {
             queue.push_back(successor.node_id);
         }
 
@@ -2998,20 +3001,8 @@ impl DAGRunner {
                         inline_successor_count = inline_successors.len(),
                         "continuing to successors after inline execution"
                     );
-                    for successor in inline_successors {
-                        // Evaluate guard if present - skip branch if guard fails or errors
-                        if let Some(ref guard) = successor.guard_expr {
-                            match evaluate_guard(Some(guard), &scope, &successor.node_id) {
-                                GuardResult::Pass => {}
-                                GuardResult::Fail | GuardResult::Error(_) => {
-                                    debug!(
-                                        successor_id = %successor.node_id,
-                                        "skipping successor due to failed guard during start_instance"
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
+                    for successor in Self::filter_successors_with_guards(inline_successors, &scope)
+                    {
                         if !visited.contains(&successor.node_id) {
                             queue.push_back(successor.node_id);
                         }

@@ -316,6 +316,25 @@ impl<'a> DAGHelper<'a> {
                 continue;
             }
 
+            // Handle default else edges for conditionals.
+            // These are evaluated by the runner based on prior guards.
+            if edge.is_else {
+                let target_node = match self.get_node(&edge.target) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let mode = self.get_execution_mode(target_node);
+                successors.push(SuccessorInfo {
+                    node_id: edge.target.clone(),
+                    execution_mode: mode,
+                    is_aggregator: target_node.is_aggregator,
+                    condition: edge.condition.clone(),
+                    guard_expr: None,
+                    is_else: true,
+                });
+                continue;
+            }
+
             // Handle guarded edges (conditional branches)
             // These have guard_expr set and should be evaluated by the runner
             // For now, we include them in successors and let the runner evaluate
@@ -332,6 +351,7 @@ impl<'a> DAGHelper<'a> {
                     is_aggregator: target_node.is_aggregator,
                     condition: edge.condition.clone(),
                     guard_expr: edge.guard_expr.clone(),
+                    is_else: false,
                 });
                 continue;
             }
@@ -379,6 +399,7 @@ impl<'a> DAGHelper<'a> {
                 is_aggregator: target_node.is_aggregator,
                 condition: edge.condition.clone(),
                 guard_expr: None,
+                is_else: false,
             });
         }
 
@@ -668,6 +689,8 @@ pub struct SuccessorInfo {
     pub condition: Option<String>,
     /// Guard expression for conditional edges (needs evaluation at runtime)
     pub guard_expr: Option<crate::parser::ast::Expr>,
+    /// Whether this successor is the default else branch.
+    pub is_else: bool,
 }
 
 /// Information about an except handler.
@@ -856,19 +879,13 @@ mod tests {
         // the runner evaluates them.
         let successors = helper.get_ready_successors(&branch_node_id.unwrap(), None);
 
-        // Should have 2 successors with guard expressions (one for each branch)
-        assert_eq!(
-            successors.len(),
-            2,
-            "Branch should have 2 guarded successors"
-        );
+        // Should have 2 successors: one guarded edge and one default else edge
+        assert_eq!(successors.len(), 2, "Branch should have 2 successors");
 
-        // Both should have guard expressions
         let guarded_count = successors.iter().filter(|s| s.guard_expr.is_some()).count();
-        assert_eq!(
-            guarded_count, 2,
-            "Both successors should have guard expressions"
-        );
+        let else_count = successors.iter().filter(|s| s.is_else).count();
+        assert_eq!(guarded_count, 1, "Expected one guarded successor");
+        assert_eq!(else_count, 1, "Expected one else successor");
     }
 
     #[test]

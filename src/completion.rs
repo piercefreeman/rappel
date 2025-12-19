@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::ast_evaluator::{EvaluationError, ExpressionEvaluator};
-use crate::dag::{DAG, DAGNode, EdgeType};
+use crate::dag::{DAG, DAGEdge, DAGNode, EdgeType};
 use crate::dag_state::DAGHelper;
 use crate::db::{ActionId, WorkflowInstanceId};
 use crate::parser::ast;
@@ -613,21 +613,12 @@ pub fn execute_inline_subgraph(
     // Use get_state_machine_successors to include loop-back edges (needed for for-loop iteration)
     let mut queue: VecDeque<(String, bool)> = VecDeque::new();
     let mut guard_errors: Vec<(String, String)> = Vec::new();
-    for edge in helper.get_state_machine_successors(completed_node_id) {
-        // Evaluate guard if present - skip branch if guard fails or errors
-        if let Some(ref guard) = edge.guard_expr {
-            match evaluate_guard(Some(guard), &inline_scope, &edge.target) {
-                GuardResult::Pass => {}
-                GuardResult::Fail => {
-                    continue;
-                }
-                GuardResult::Error(err) => {
-                    // Track guard errors but continue - we'll report if we hit a dead-end
-                    guard_errors.push((edge.target.clone(), err));
-                    continue;
-                }
-            }
-        }
+    let initial_edges = select_guarded_successors(
+        helper.get_state_machine_successors(completed_node_id),
+        &inline_scope,
+        &mut guard_errors,
+    );
+    for edge in initial_edges {
         queue.push_back((edge.target.clone(), edge.is_loop_back));
     }
 
@@ -720,35 +711,18 @@ pub fn execute_inline_subgraph(
 
             // Continue to successors, evaluating guards
             // Use get_state_machine_successors to include loop-back edges
-            for edge in helper.get_state_machine_successors(&node_id) {
+            let successor_edges = select_guarded_successors(
+                helper.get_state_machine_successors(&node_id),
+                &inline_scope,
+                &mut guard_errors,
+            );
+            for edge in successor_edges {
                 // Allow loop-back edges and their downstream nodes to re-visit (for inline loop execution)
                 // If we reached the current node via loop-back, we're in a loop iteration and need to
                 // allow re-visiting downstream nodes in the loop body too.
                 let is_loop_back_context = reached_via_loop_back || edge.is_loop_back;
                 if !is_loop_back_context && visited.contains(&edge.target) {
                     continue;
-                }
-
-                // Evaluate guard if present - skip branch if guard fails or errors
-                if let Some(ref guard) = edge.guard_expr {
-                    match evaluate_guard(Some(guard), &inline_scope, &edge.target) {
-                        GuardResult::Pass => {
-                            // Guard passed, continue to add to queue
-                        }
-                        GuardResult::Fail => {
-                            debug!(
-                                node_id = %node_id,
-                                successor_id = %edge.target,
-                                "guard failed, skipping branch"
-                            );
-                            continue;
-                        }
-                        GuardResult::Error(err) => {
-                            // Track guard errors but continue - we'll report if we hit a dead-end
-                            guard_errors.push((edge.target.clone(), err));
-                            continue;
-                        }
-                    }
                 }
 
                 // Propagate loop-back status: true if we already came via loop-back OR this edge is loop-back
@@ -1087,6 +1061,49 @@ pub enum GuardResult {
     Fail,
     /// Guard evaluation had an error - caller should decide how to handle.
     Error(String),
+}
+
+fn select_guarded_successors<'a>(
+    edges: Vec<&'a DAGEdge>,
+    scope: &InlineScope,
+    guard_errors: &mut Vec<(String, String)>,
+) -> Vec<&'a DAGEdge> {
+    let mut selected = Vec::new();
+    let mut else_edges = Vec::new();
+    let mut has_guarded_edges = false;
+    let mut guard_passed = false;
+    let mut guard_error = false;
+
+    for edge in edges {
+        if edge.is_else {
+            else_edges.push(edge);
+            continue;
+        }
+
+        if let Some(ref guard) = edge.guard_expr {
+            has_guarded_edges = true;
+            match evaluate_guard(Some(guard), scope, &edge.target) {
+                GuardResult::Pass => {
+                    guard_passed = true;
+                    selected.push(edge);
+                }
+                GuardResult::Fail => {}
+                GuardResult::Error(err) => {
+                    guard_errors.push((edge.target.clone(), err));
+                    guard_error = true;
+                }
+            }
+            continue;
+        }
+
+        selected.push(edge);
+    }
+
+    if has_guarded_edges && !guard_passed && !guard_error {
+        selected.extend(else_edges);
+    }
+
+    selected
 }
 
 /// Evaluate a guard expression to determine if a branch should be taken.
@@ -2165,9 +2182,8 @@ fn workflow(input: [x], output: [result]):
             instance_id,
         );
 
-        // THIS IS THE BUG: currently this fails with WorkflowDeadEnd
-        // because there's no continuation path when the if condition is false.
-        // It should succeed and have a readiness increment for 'finalize' action.
+        // This should succeed when the condition is false and continue to the
+        // finalize action via the default else path.
         assert!(
             result.is_ok(),
             "Should succeed when condition is false (continue to finalize), got: {:?}",

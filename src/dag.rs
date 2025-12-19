@@ -243,6 +243,8 @@ pub struct DAGEdge {
     /// If present, the edge is only followed when the guard evaluates to true.
     /// Used for conditional branches (if/elif/else) and exception handling.
     pub guard_expr: Option<ast::Expr>,
+    /// Whether this edge represents the default else branch for a conditional.
+    pub is_else: bool,
     /// Exception types that activate this edge (for except handlers).
     /// If present, this edge is followed when the source node fails with a matching exception.
     pub exception_types: Option<Vec<String>>,
@@ -262,6 +264,7 @@ impl DAGEdge {
             condition: None,
             variable: None,
             guard_expr: None,
+            is_else: false,
             exception_types: None,
             is_loop_back: false,
             guard_string: None,
@@ -277,6 +280,7 @@ impl DAGEdge {
             condition: Some(condition.to_string()),
             variable: None,
             guard_expr: None,
+            is_else: false,
             exception_types: None,
             is_loop_back: false,
             guard_string: None,
@@ -292,6 +296,23 @@ impl DAGEdge {
             condition: Some("guarded".to_string()),
             variable: None,
             guard_expr: Some(guard),
+            is_else: false,
+            exception_types: None,
+            is_loop_back: false,
+            guard_string: None,
+        }
+    }
+
+    /// Create a default else edge for a conditional branch.
+    pub fn state_machine_else(source: String, target: String) -> Self {
+        Self {
+            source,
+            target,
+            edge_type: EdgeType::StateMachine,
+            condition: Some("else".to_string()),
+            variable: None,
+            guard_expr: None,
+            is_else: true,
             exception_types: None,
             is_loop_back: false,
             guard_string: None,
@@ -316,6 +337,7 @@ impl DAGEdge {
             condition: Some(condition),
             variable: None,
             guard_expr: None,
+            is_else: false,
             exception_types: Some(exception_types),
             is_loop_back: false,
             guard_string: None,
@@ -331,6 +353,7 @@ impl DAGEdge {
             condition: Some("success".to_string()),
             variable: None,
             guard_expr: None,
+            is_else: false,
             exception_types: None,
             is_loop_back: false,
             guard_string: None,
@@ -346,6 +369,7 @@ impl DAGEdge {
             condition: None,
             variable: Some(variable.to_string()),
             guard_expr: None,
+            is_else: false,
             exception_types: None,
             is_loop_back: false,
             guard_string: None,
@@ -1311,6 +1335,7 @@ impl DAGConverter {
                                             condition: None,
                                             variable: Some(var_name.clone()),
                                             guard_expr: None,
+                                            is_else: false,
                                             exception_types: None,
                                             is_loop_back: false,
                                             guard_string: None,
@@ -1338,6 +1363,7 @@ impl DAGConverter {
                                     condition: None,
                                     variable: Some(var_name.clone()),
                                     guard_expr: None,
+                                    is_else: false,
                                     exception_types: None,
                                     is_loop_back: false,
                                     guard_string: None,
@@ -1417,6 +1443,7 @@ impl DAGConverter {
                                     condition: None,
                                     variable: Some(var_name.clone()),
                                     guard_expr: None,
+                                    is_else: false,
                                     exception_types: None,
                                     is_loop_back: false,
                                     guard_string: None,
@@ -1437,6 +1464,7 @@ impl DAGConverter {
                         condition: None,
                         variable: Some(var_name.clone()),
                         guard_expr: None,
+                        is_else: false,
                         exception_types: None,
                         is_loop_back: false,
                         guard_string: None,
@@ -2555,7 +2583,6 @@ impl DAGConverter {
         }
 
         // Missing else is an implicit empty else.
-        let else_guard = self.build_compound_guard(&prior_guards, None);
         let else_graph = cond
             .else_branch
             .as_ref()
@@ -2589,43 +2616,72 @@ impl DAGConverter {
             None
         };
 
-        let connect_branch = |converter: &mut Self,
-                              guard: ast::Expr,
-                              graph: &ConvertedSubgraph,
-                              join_id: Option<&String>| {
-            if graph.is_noop {
-                if let Some(join_target) = join_id {
+        let connect_guarded_branch =
+            |converter: &mut Self,
+             guard: ast::Expr,
+             graph: &ConvertedSubgraph,
+             join_id: Option<&String>| {
+                if graph.is_noop {
+                    if let Some(join_target) = join_id {
+                        converter.dag.add_edge(DAGEdge::state_machine_with_guard(
+                            branch_id.clone(),
+                            join_target.clone(),
+                            guard,
+                        ));
+                    }
+                    return;
+                }
+
+                if let Some(entry) = &graph.entry {
                     converter.dag.add_edge(DAGEdge::state_machine_with_guard(
                         branch_id.clone(),
-                        join_target.clone(),
+                        entry.clone(),
                         guard,
                     ));
                 }
-                return;
-            }
 
-            if let Some(entry) = &graph.entry {
-                converter.dag.add_edge(DAGEdge::state_machine_with_guard(
-                    branch_id.clone(),
-                    entry.clone(),
-                    guard,
-                ));
-            }
-
-            if let Some(join_target) = join_id {
-                for exit in &graph.exits {
-                    converter
-                        .dag
-                        .add_edge(DAGEdge::state_machine(exit.clone(), join_target.clone()));
+                if let Some(join_target) = join_id {
+                    for exit in &graph.exits {
+                        converter
+                            .dag
+                            .add_edge(DAGEdge::state_machine(exit.clone(), join_target.clone()));
+                    }
                 }
-            }
-        };
+            };
 
-        connect_branch(self, if_guard, &if_body_graph, join_id.as_ref());
+        let connect_else_branch =
+            |converter: &mut Self, graph: &ConvertedSubgraph, join_id: Option<&String>| {
+                if graph.is_noop {
+                    if let Some(join_target) = join_id {
+                        converter.dag.add_edge(DAGEdge::state_machine_else(
+                            branch_id.clone(),
+                            join_target.clone(),
+                        ));
+                    }
+                    return;
+                }
+
+                if let Some(entry) = &graph.entry {
+                    converter.dag.add_edge(DAGEdge::state_machine_else(
+                        branch_id.clone(),
+                        entry.clone(),
+                    ));
+                }
+
+                if let Some(join_target) = join_id {
+                    for exit in &graph.exits {
+                        converter
+                            .dag
+                            .add_edge(DAGEdge::state_machine(exit.clone(), join_target.clone()));
+                    }
+                }
+            };
+
+        connect_guarded_branch(self, if_guard, &if_body_graph, join_id.as_ref());
         for (guard, graph) in &elif_graphs {
-            connect_branch(self, guard.clone(), graph, join_id.as_ref());
+            connect_guarded_branch(self, guard.clone(), graph, join_id.as_ref());
         }
-        connect_branch(self, else_guard, &else_graph, join_id.as_ref());
+        connect_else_branch(self, &else_graph, join_id.as_ref());
 
         ConvertedSubgraph {
             entry: Some(branch_id),
