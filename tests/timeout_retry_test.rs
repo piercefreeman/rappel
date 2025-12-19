@@ -47,7 +47,7 @@ async fn create_test_instance(db: &Database) -> Result<(WorkflowVersionId, Workf
         .await?;
 
     let instance_id = db
-        .create_instance("test_workflow", version_id, None)
+        .create_instance("test_workflow", version_id, None, None)
         .await?;
 
     Ok((version_id, instance_id))

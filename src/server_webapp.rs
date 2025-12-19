@@ -318,14 +318,14 @@ async fn schedule_detail(
     // Load invocations with pagination
     let invocations = state
         .database
-        .list_schedule_invocations(&schedule.workflow_name, per_page, offset)
+        .list_schedule_invocations(ScheduleId(schedule.id), per_page, offset)
         .await
         .unwrap_or_default();
 
     // Get total count for pagination
     let total_count = state
         .database
-        .count_schedule_invocations(&schedule.workflow_name)
+        .count_schedule_invocations(ScheduleId(schedule.id))
         .await
         .unwrap_or(0);
 
@@ -882,7 +882,7 @@ struct ScheduleGroup {
 #[derive(Serialize)]
 struct ScheduleBrief {
     id: String,
-    workflow_name: String,
+    schedule_name: String,
     status: String,
     schedule_expression: String,
     next_run_at: Option<String>,
@@ -903,7 +903,7 @@ fn render_scheduled_page(templates: &Tera, schedules: &[crate::db::WorkflowSched
 
         let brief = ScheduleBrief {
             id: s.id.to_string(),
-            workflow_name: s.workflow_name.clone(),
+            schedule_name: s.schedule_name.clone(),
             status: s.status.clone(),
             schedule_expression,
             next_run_at: s.next_run_at.map(|dt| dt.to_rfc3339()),
@@ -955,7 +955,7 @@ struct ScheduleDetailPageContext {
 #[derive(Serialize)]
 struct ScheduleDetailMetadata {
     id: String,
-    workflow_name: String,
+    schedule_name: String,
     schedule_type: String,
     schedule_expression: String,
     status: String,
@@ -993,7 +993,7 @@ fn render_schedule_detail_page(
 
     let schedule_metadata = ScheduleDetailMetadata {
         id: schedule.id.to_string(),
-        workflow_name: schedule.workflow_name.clone(),
+        schedule_name: schedule.schedule_name.clone(),
         schedule_type: schedule.schedule_type.clone(),
         schedule_expression,
         status: schedule.status.clone(),
@@ -1014,7 +1014,7 @@ fn render_schedule_detail_page(
         .collect();
 
     let context = ScheduleDetailPageContext {
-        title: format!("{} - Schedule", schedule.workflow_name),
+        title: format!("{} - Schedule", schedule.schedule_name),
         active_tab: "scheduled".to_string(),
         schedule: schedule_metadata,
         has_invocations: !invocations.is_empty(),
@@ -1307,6 +1307,7 @@ mod tests {
             partition_id: 0,
             workflow_name: "my_workflow".to_string(),
             workflow_version_id: Some(version_id),
+            schedule_id: None,
             next_action_seq: 5,
             input_payload: None,
             result_payload: None,
@@ -1343,6 +1344,7 @@ mod tests {
             partition_id: 0,
             workflow_name: "test_workflow".to_string(),
             workflow_version_id: Some(version_id),
+            schedule_id: None,
             next_action_seq: 3,
             input_payload: Some(b"{\"arg\": 42}".to_vec()),
             result_payload: Some(b"{\"result\": 100}".to_vec()),
@@ -1383,6 +1385,7 @@ mod tests {
             partition_id: 0,
             workflow_name: "action_workflow".to_string(),
             workflow_version_id: Some(version_id),
+            schedule_id: None,
             next_action_seq: 2,
             input_payload: None,
             result_payload: None,
@@ -1486,7 +1489,7 @@ mod tests {
         let schedules = vec![crate::db::WorkflowSchedule {
             id: Uuid::new_v4(),
             workflow_name: "cron_workflow".to_string(),
-            schedule_name: "default".to_string(),
+            schedule_name: "cron_schedule".to_string(),
             schedule_type: "cron".to_string(),
             cron_expression: Some("0 * * * *".to_string()),
             interval_seconds: None,
@@ -1502,7 +1505,7 @@ mod tests {
         let html = render_scheduled_page(&templates, &schedules);
 
         assert!(html.contains("Scheduled Workflows"));
-        assert!(html.contains("cron_workflow"));
+        assert!(html.contains("cron_schedule"));
         assert!(html.contains("0 * * * *"));
         assert!(html.contains("Cron")); // group title
     }
@@ -1513,7 +1516,7 @@ mod tests {
         let schedules = vec![crate::db::WorkflowSchedule {
             id: Uuid::new_v4(),
             workflow_name: "interval_workflow".to_string(),
-            schedule_name: "default".to_string(),
+            schedule_name: "interval_schedule".to_string(),
             schedule_type: "interval".to_string(),
             cron_expression: None,
             interval_seconds: Some(3600),
@@ -1529,7 +1532,7 @@ mod tests {
         let html = render_scheduled_page(&templates, &schedules);
 
         assert!(html.contains("Scheduled Workflows"));
-        assert!(html.contains("interval_workflow"));
+        assert!(html.contains("interval_schedule"));
         assert!(html.contains("every hour"));
         assert!(html.contains("Interval")); // group title
     }
@@ -1540,7 +1543,7 @@ mod tests {
         let schedule = crate::db::WorkflowSchedule {
             id: Uuid::new_v4(),
             workflow_name: "detail_workflow".to_string(),
-            schedule_name: "default".to_string(),
+            schedule_name: "detail_schedule".to_string(),
             schedule_type: "cron".to_string(),
             cron_expression: Some("*/5 * * * *".to_string()),
             interval_seconds: None,
@@ -1556,7 +1559,7 @@ mod tests {
 
         let html = render_schedule_detail_page(&templates, &schedule, &invocations, 1, 1);
 
-        assert!(html.contains("detail_workflow"));
+        assert!(html.contains("detail_schedule"));
         // Tera HTML-escapes `/` as `&#x2F;` for security
         assert!(
             html.contains("*/5 * * * *") || html.contains("*&#x2F;5 * * * *"),
@@ -1574,7 +1577,7 @@ mod tests {
         let schedule = crate::db::WorkflowSchedule {
             id: Uuid::new_v4(),
             workflow_name: "paused_workflow".to_string(),
-            schedule_name: "default".to_string(),
+            schedule_name: "paused_schedule".to_string(),
             schedule_type: "interval".to_string(),
             cron_expression: None,
             interval_seconds: Some(300),
@@ -1590,7 +1593,7 @@ mod tests {
 
         let html = render_schedule_detail_page(&templates, &schedule, &invocations, 1, 1);
 
-        assert!(html.contains("paused_workflow"));
+        assert!(html.contains("paused_schedule"));
         assert!(html.contains("every 5 minutes"));
         assert!(html.contains("Resume Schedule")); // paused schedule shows resume button
     }
@@ -1604,7 +1607,7 @@ mod tests {
         let schedule = crate::db::WorkflowSchedule {
             id: schedule_id,
             workflow_name: "invoked_workflow".to_string(),
-            schedule_name: "default".to_string(),
+            schedule_name: "invoked_schedule".to_string(),
             schedule_type: "cron".to_string(),
             cron_expression: Some("0 0 * * *".to_string()),
             interval_seconds: None,
@@ -1623,6 +1626,7 @@ mod tests {
                 partition_id: 0,
                 workflow_name: "invoked_workflow".to_string(),
                 workflow_version_id: Some(version_id),
+                schedule_id: None,
                 next_action_seq: 5,
                 input_payload: None,
                 result_payload: None,
@@ -1635,6 +1639,7 @@ mod tests {
                 partition_id: 0,
                 workflow_name: "invoked_workflow".to_string(),
                 workflow_version_id: Some(version_id),
+                schedule_id: None,
                 next_action_seq: 2,
                 input_payload: None,
                 result_payload: None,
@@ -1646,7 +1651,7 @@ mod tests {
 
         let html = render_schedule_detail_page(&templates, &schedule, &invocations, 1, 3);
 
-        assert!(html.contains("invoked_workflow"));
+        assert!(html.contains("invoked_schedule"));
         assert!(html.contains("Recent Invocations"));
         assert!(html.contains("completed"));
         assert!(html.contains("running"));
@@ -1871,7 +1876,12 @@ mod tests {
 
         // Create an instance
         let instance_id = db
-            .create_instance("webapp_run_test_workflow", version_id, Some(b"{\"x\": 1}"))
+            .create_instance(
+                "webapp_run_test_workflow",
+                version_id,
+                Some(b"{\"x\": 1}"),
+                None,
+            )
             .await
             .expect("failed to create instance");
 

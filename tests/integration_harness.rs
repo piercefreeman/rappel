@@ -93,6 +93,7 @@ impl proto::workflow_service_server::WorkflowService for TestWorkflowService {
                 &registration.workflow_name,
                 version_id,
                 initial_input.as_deref(),
+                None,
             )
             .await
             .map_err(|e| tonic::Status::internal(format!("database error: {}", e)))?;
@@ -337,7 +338,7 @@ impl IntegrationHarness {
         // Find the instance that was created during registration
         let instances: Vec<rappel::WorkflowInstance> = sqlx::query_as(
             "SELECT id, partition_id, workflow_name, workflow_version_id, \
-             next_action_seq, input_payload, result_payload, status, \
+             schedule_id, next_action_seq, input_payload, result_payload, status, \
              created_at, completed_at \
              FROM workflow_instances WHERE workflow_version_id = $1 ORDER BY created_at DESC LIMIT 1"
         )

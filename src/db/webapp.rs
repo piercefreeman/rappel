@@ -44,7 +44,7 @@ impl Database {
         let instances = sqlx::query_as::<_, WorkflowInstance>(
             r#"
             SELECT id, partition_id, workflow_name, workflow_version_id,
-                   next_action_seq, input_payload, result_payload, status,
+                   schedule_id, next_action_seq, input_payload, result_payload, status,
                    created_at, completed_at
             FROM workflow_instances
             WHERE workflow_version_id = $1
@@ -65,7 +65,7 @@ impl Database {
         let instance = sqlx::query_as::<_, WorkflowInstance>(
             r#"
             SELECT id, partition_id, workflow_name, workflow_version_id,
-                   next_action_seq, input_payload, result_payload, status,
+                   schedule_id, next_action_seq, input_payload, result_payload, status,
                    created_at, completed_at
             FROM workflow_instances
             WHERE id = $1
@@ -176,22 +176,22 @@ impl Database {
     /// Returns paginated results with offset/limit.
     pub async fn list_schedule_invocations(
         &self,
-        workflow_name: &str,
+        schedule_id: ScheduleId,
         limit: i64,
         offset: i64,
     ) -> DbResult<Vec<WorkflowInstance>> {
         let instances = sqlx::query_as::<_, WorkflowInstance>(
             r#"
             SELECT id, partition_id, workflow_name, workflow_version_id,
-                   next_action_seq, input_payload, result_payload, status,
+                   schedule_id, next_action_seq, input_payload, result_payload, status,
                    created_at, completed_at
             FROM workflow_instances
-            WHERE workflow_name = $1
+            WHERE schedule_id = $1
             ORDER BY created_at DESC
             LIMIT $2 OFFSET $3
             "#,
         )
-        .bind(workflow_name)
+        .bind(schedule_id.0)
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -200,16 +200,16 @@ impl Database {
         Ok(instances)
     }
 
-    /// Count total instances for a workflow (for pagination)
-    pub async fn count_schedule_invocations(&self, workflow_name: &str) -> DbResult<i64> {
+    /// Count total instances for a schedule (for pagination)
+    pub async fn count_schedule_invocations(&self, schedule_id: ScheduleId) -> DbResult<i64> {
         let row = sqlx::query(
             r#"
             SELECT COUNT(*) as count
             FROM workflow_instances
-            WHERE workflow_name = $1
+            WHERE schedule_id = $1
             "#,
         )
-        .bind(workflow_name)
+        .bind(schedule_id.0)
         .fetch_one(&self.pool)
         .await?;
 

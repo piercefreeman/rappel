@@ -1463,6 +1463,7 @@ impl DAGRunner {
                     &schedule.workflow_name,
                     version_id,
                     schedule.input_payload.as_deref(),
+                    Some(ScheduleId(schedule.id)),
                 )
                 .await
                 .map_err(|e| RunnerError::Dag(format!("Failed to create instance: {}", e)))?;

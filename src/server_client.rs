@@ -152,6 +152,7 @@ impl proto::workflow_service_server::WorkflowService for WorkflowGrpcService {
                 &registration.workflow_name,
                 version_id,
                 initial_input.as_deref(),
+                None,
             )
             .await
             .map_err(|e| tonic::Status::internal(format!("database error: {e}")))?;

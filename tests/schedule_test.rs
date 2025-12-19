@@ -168,7 +168,7 @@ async fn test_schedule_database_operations() -> Result<()> {
 
     // Test 7: Mark schedule executed
     let instance_id = database
-        .create_instance("test_schedule_workflow", version_id, None)
+        .create_instance("test_schedule_workflow", version_id, None, None)
         .await?;
     let next_run = Utc::now() + chrono::Duration::seconds(300);
     database

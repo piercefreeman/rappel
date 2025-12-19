@@ -230,6 +230,7 @@ pub struct WorkflowInstance {
     pub partition_id: i32,
     pub workflow_name: String,
     pub workflow_version_id: Option<Uuid>,
+    pub schedule_id: Option<Uuid>,
     pub next_action_seq: i32,
     pub input_payload: Option<Vec<u8>>,
     pub result_payload: Option<Vec<u8>>,

@@ -78,17 +78,19 @@ impl Database {
         workflow_name: &str,
         version_id: WorkflowVersionId,
         input_payload: Option<&[u8]>,
+        schedule_id: Option<ScheduleId>,
     ) -> DbResult<WorkflowInstanceId> {
         let row = sqlx::query(
             r#"
-            INSERT INTO workflow_instances (workflow_name, workflow_version_id, input_payload)
-            VALUES ($1, $2, $3)
+            INSERT INTO workflow_instances (workflow_name, workflow_version_id, input_payload, schedule_id)
+            VALUES ($1, $2, $3, $4)
             RETURNING id
             "#,
         )
         .bind(workflow_name)
         .bind(version_id.0)
         .bind(input_payload)
+        .bind(schedule_id.map(|id| id.0))
         .fetch_one(&self.pool)
         .await?;
 
@@ -113,7 +115,7 @@ impl Database {
         let instances = sqlx::query_as::<_, WorkflowInstance>(
             r#"
             SELECT i.id, i.partition_id, i.workflow_name, i.workflow_version_id,
-                   i.next_action_seq, i.input_payload, i.result_payload, i.status,
+                   i.schedule_id, i.next_action_seq, i.input_payload, i.result_payload, i.status,
                    i.created_at, i.completed_at
             FROM workflow_instances i
             WHERE i.status = 'running'

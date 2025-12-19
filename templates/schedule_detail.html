@@ -8,7 +8,7 @@
     <a href="/scheduled" class="text-xs uppercase tracking-[0.4em] text-zinc-500 transition hover:text-zinc-700 dark:hover:text-zinc-300">&larr; Back to scheduled workflows</a>
     <div class="space-y-2">
         <div class="flex items-center gap-3">
-            <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-white">{{ schedule.workflow_name }}</h1>
+            <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-white">{{ schedule.schedule_name }}</h1>
             {{ macros::schedule_badge(status=schedule.status) }}
         </div>
         <p class="text-sm text-zinc-600 dark:text-zinc-400">Scheduled workflow configuration and execution history.</p>

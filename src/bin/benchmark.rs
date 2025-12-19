@@ -157,6 +157,7 @@ impl proto::workflow_service_server::WorkflowService for BenchmarkWorkflowServic
                 &registration.workflow_name,
                 version_id,
                 initial_input.as_deref(),
+                None,
             )
             .await
             .map_err(|e| tonic::Status::internal(format!("database error: {}", e)))?;
@@ -503,7 +504,7 @@ async fn main() -> Result<()> {
     // Get the initial instance (created during registration)
     let initial_instances: Vec<rappel::WorkflowInstance> = sqlx::query_as(
         "SELECT id, partition_id, workflow_name, workflow_version_id, \
-         next_action_seq, input_payload, result_payload, status, \
+         schedule_id, next_action_seq, input_payload, result_payload, status, \
          created_at, completed_at \
          FROM workflow_instances WHERE workflow_version_id = $1 ORDER BY created_at DESC LIMIT 1",
     )
@@ -520,7 +521,7 @@ async fn main() -> Result<()> {
     let mut instance_ids = vec![first_instance_id];
     for _ in 1..args.instances {
         let instance_id = database
-            .create_instance(&workflow_name, version_id, None)
+            .create_instance(&workflow_name, version_id, None, None)
             .await?;
         instance_ids.push(instance_id);
     }

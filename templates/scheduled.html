@@ -32,7 +32,7 @@
                         <a href="/scheduled/{{ schedule.id }}" class="flex items-center justify-between px-5 py-4 transition hover:bg-zinc-50 dark:hover:bg-zinc-800/50">
                             <div class="flex-1 min-w-0">
                                 <div class="flex items-center gap-3">
-                                    <span class="font-semibold text-zinc-900 dark:text-white truncate">{{ schedule.workflow_name }}</span>
+                                    <span class="font-semibold text-zinc-900 dark:text-white truncate">{{ schedule.schedule_name }}</span>
                                     {{ macros::schedule_badge(status=schedule.status) }}
                                 </div>
                                 <div class="mt-1 flex items-center gap-4 text-sm text-zinc-500 dark:text-zinc-400">
