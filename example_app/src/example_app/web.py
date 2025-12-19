@@ -25,6 +25,9 @@ from example_app.workflows import (
     ErrorHandlingWorkflow,
     ErrorRequest,
     ErrorResult,
+    LoopReturnRequest,
+    LoopReturnResult,
+    LoopReturnWorkflow,
     LoopProcessingWorkflow,
     LoopRequest,
     LoopResult,
@@ -93,6 +96,18 @@ async def run_loop_workflow(payload: LoopRequest) -> LoopResult:
     """Run the loop workflow demonstrating iteration."""
     workflow = LoopProcessingWorkflow()
     return await workflow.run(items=payload.items)
+
+
+# =============================================================================
+# Return Inside Loop
+# =============================================================================
+
+
+@app.post("/api/loop-return", response_model=LoopReturnResult)
+async def run_loop_return_workflow(payload: LoopReturnRequest) -> LoopReturnResult:
+    """Run the early-return workflow demonstrating return inside a for-loop."""
+    workflow = LoopReturnWorkflow()
+    return await workflow.run(items=payload.items, needle=payload.needle)
 
 
 # =============================================================================

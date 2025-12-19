@@ -662,8 +662,7 @@ class IRBuilder(ast.NodeVisitor):
         elif isinstance(node, ast.For):
             return self._visit_for(node)
         elif isinstance(node, ast.If):
-            result = self._visit_if(node)
-            return [result] if result else []
+            return self._visit_if(node)
         elif isinstance(node, ast.Try):
             return self._visit_try(node)
         elif isinstance(node, ast.Return):
@@ -1281,67 +1280,143 @@ class IRBuilder(ast.NodeVisitor):
 
         return vars_found
 
-    def _visit_if(self, node: ast.If) -> Optional[ir.Statement]:
-        """Convert if statement to an IR conditional with full block bodies."""
-        stmt = ir.Statement(span=_make_span(node))
+    def _visit_if(self, node: ast.If) -> List[ir.Statement]:
+        """Convert if statement to IR.
 
-        # Build if branch
-        condition = _expr_to_ir(node.test)
-        if not condition:
-            return None
+        Normalizes patterns like:
+            if await some_action(...):
+                ...
+        into:
+            __if_cond_n__ = await some_action(...)
+            if __if_cond_n__:
+                ...
+        """
 
-        body_stmts: List[ir.Statement] = []
-        for body_node in node.body:
-            stmts = self._visit_statement(body_node)
-            body_stmts.extend(stmts)
+        def normalize_condition(test: ast.expr) -> tuple[List[ir.Statement], Optional[ir.Expr]]:
+            action_call = self._extract_action_call(test)
+            if action_call is None:
+                return ([], _expr_to_ir(test))
 
-        if_branch = ir.IfBranch(
-            condition=condition,
-            block_body=ir.Block(statements=body_stmts, span=_make_span(node)),
-            span=_make_span(node),
-        )
+            if not isinstance(test, ast.Await):
+                line = getattr(test, "lineno", None)
+                col = getattr(test, "col_offset", None)
+                raise UnsupportedPatternError(
+                    "Action calls inside boolean expressions are not supported in if conditions",
+                    "Assign the awaited action result to a variable, then use the variable in the if condition.",
+                    line=line,
+                    col=col,
+                )
 
-        conditional = ir.Conditional(if_branch=if_branch)
+            cond_var = self._ctx.next_implicit_fn_name(prefix="if_cond")
+            assign_stmt = ir.Statement(span=_make_span(test))
+            assign_stmt.assignment.CopyFrom(
+                ir.Assignment(
+                    targets=[cond_var],
+                    value=ir.Expr(action_call=action_call, span=_make_span(test)),
+                )
+            )
+            cond_expr = ir.Expr(variable=ir.Variable(name=cond_var), span=_make_span(test))
+            return ([assign_stmt], cond_expr)
 
-        # Handle elif/else chains
+        def visit_body(nodes: list[ast.stmt]) -> List[ir.Statement]:
+            stmts: List[ir.Statement] = []
+            for body_node in nodes:
+                stmts.extend(self._visit_statement(body_node))
+            return stmts
+
+        # Collect if/elif branches as (test_expr, body_nodes)
+        branches: list[tuple[ast.expr, list[ast.stmt], ast.AST]] = [(node.test, node.body, node)]
         current = node
-        while current.orelse:
-            if len(current.orelse) == 1 and isinstance(current.orelse[0], ast.If):
-                # elif branch
-                elif_node = current.orelse[0]
-                elif_condition = _expr_to_ir(elif_node.test)
-                if elif_condition:
-                    elif_body: List[ir.Statement] = []
-                    for body_node in elif_node.body:
-                        stmts = self._visit_statement(body_node)
-                        elif_body.extend(stmts)
+        while current.orelse and len(current.orelse) == 1 and isinstance(current.orelse[0], ast.If):
+            elif_node = current.orelse[0]
+            branches.append((elif_node.test, elif_node.body, elif_node))
+            current = elif_node
 
-                    elif_branch = ir.ElifBranch(
-                        condition=elif_condition,
-                        block_body=ir.Block(statements=elif_body, span=_make_span(elif_node)),
-                        span=_make_span(elif_node),
-                    )
-                    conditional.elif_branches.append(elif_branch)
-                current = elif_node
-            else:
-                # else branch
-                else_body: List[ir.Statement] = []
-                for else_node in current.orelse:
-                    stmts = self._visit_statement(else_node)
-                    else_body.extend(stmts)
+        else_nodes = current.orelse
 
+        normalized: list[
+            tuple[List[ir.Statement], Optional[ir.Expr], List[ir.Statement], ast.AST]
+        ] = []
+        for test_expr, body_nodes, span_node in branches:
+            prefix, cond = normalize_condition(test_expr)
+            normalized.append((prefix, cond, visit_body(body_nodes), span_node))
+
+        else_body = visit_body(else_nodes) if else_nodes else []
+
+        # If any non-first branch needs normalization, preserve Python semantics by nesting.
+        requires_nested = any(prefix for prefix, _, _, _ in normalized[1:])
+
+        def build_conditional_stmt(
+            condition: ir.Expr,
+            then_body: List[ir.Statement],
+            else_body_statements: List[ir.Statement],
+            span_node: ast.AST,
+        ) -> ir.Statement:
+            conditional_stmt = ir.Statement(span=_make_span(span_node))
+            if_branch = ir.IfBranch(
+                condition=condition,
+                block_body=ir.Block(statements=then_body, span=_make_span(span_node)),
+                span=_make_span(span_node),
+            )
+            conditional = ir.Conditional(if_branch=if_branch)
+            if else_body_statements:
                 else_branch = ir.ElseBranch(
                     block_body=ir.Block(
-                        statements=else_body,
-                        span=_make_span(current.orelse[0]) if current.orelse else ir.Span(),
+                        statements=else_body_statements,
+                        span=_make_span(span_node),
                     ),
-                    span=_make_span(current.orelse[0]) if current.orelse else None,
+                    span=_make_span(span_node),
                 )
                 conditional.else_branch.CopyFrom(else_branch)
-                break
+            conditional_stmt.conditional.CopyFrom(conditional)
+            return conditional_stmt
 
-        stmt.conditional.CopyFrom(conditional)
-        return stmt
+        if requires_nested:
+            nested_else: List[ir.Statement] = else_body
+            for prefix, cond, then_body, span_node in reversed(normalized):
+                if cond is None:
+                    continue
+                nested_if_stmt = build_conditional_stmt(
+                    condition=cond,
+                    then_body=then_body,
+                    else_body_statements=nested_else,
+                    span_node=span_node,
+                )
+                nested_else = [*prefix, nested_if_stmt]
+            return nested_else
+
+        # Flat conditional with elif/else (original behavior), plus optional prefix for the if guard.
+        if_prefix, if_condition, if_body, if_span_node = normalized[0]
+        if if_condition is None:
+            return []
+
+        conditional_stmt = ir.Statement(span=_make_span(if_span_node))
+        if_branch = ir.IfBranch(
+            condition=if_condition,
+            block_body=ir.Block(statements=if_body, span=_make_span(if_span_node)),
+            span=_make_span(if_span_node),
+        )
+        conditional = ir.Conditional(if_branch=if_branch)
+
+        for _, elif_condition, elif_body, elif_span_node in normalized[1:]:
+            if elif_condition is None:
+                continue
+            elif_branch = ir.ElifBranch(
+                condition=elif_condition,
+                block_body=ir.Block(statements=elif_body, span=_make_span(elif_span_node)),
+                span=_make_span(elif_span_node),
+            )
+            conditional.elif_branches.append(elif_branch)
+
+        if else_body:
+            else_branch = ir.ElseBranch(
+                block_body=ir.Block(statements=else_body, span=_make_span(if_span_node)),
+                span=_make_span(if_span_node),
+            )
+            conditional.else_branch.CopyFrom(else_branch)
+
+        conditional_stmt.conditional.CopyFrom(conditional)
+        return [*if_prefix, conditional_stmt]
 
     def _collect_assigned_vars(self, stmts: List[ir.Statement]) -> set:
         """Collect all variable names assigned in a list of statements."""

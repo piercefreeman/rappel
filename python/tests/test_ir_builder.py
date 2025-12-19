@@ -2470,6 +2470,32 @@ class TestConditionalWithMultipleCalls:
         )
 
 
+class TestAwaitActionInIfCondition:
+    def test_if_await_action_condition_is_normalized(self) -> None:
+        from tests.fixtures_conditional.if_await_action_condition import (
+            IfAwaitActionConditionWorkflow,
+        )
+
+        program = IfAwaitActionConditionWorkflow.workflow_ir()
+
+        run_fn = next((fn for fn in program.functions if fn.name == "run"), None)
+        assert run_fn is not None, "Expected run() function"
+        assert len(run_fn.body.statements) >= 2, "Expected hoisted condition assignment + if"
+
+        assign_stmt = run_fn.body.statements[0]
+        assert assign_stmt.HasField("assignment"), "Expected assignment for condition action"
+        assert assign_stmt.assignment.value.HasField("action_call"), "Expected action_call RHS"
+        assert assign_stmt.assignment.value.action_call.action_name == "is_even"
+        assert len(assign_stmt.assignment.targets) == 1
+        cond_var = assign_stmt.assignment.targets[0]
+        assert cond_var.startswith("__if_cond_"), f"Unexpected condition var name: {cond_var}"
+
+        if_stmt = run_fn.body.statements[1]
+        assert if_stmt.HasField("conditional"), "Expected conditional after hoisted assignment"
+        assert if_stmt.conditional.if_branch.condition.HasField("variable")
+        assert if_stmt.conditional.if_branch.condition.variable.name == cond_var
+
+
 class TestTryExceptWithMultipleCalls:
     """Test try/except with multiple calls."""
 

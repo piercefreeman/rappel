@@ -6,8 +6,9 @@ This module contains example workflows demonstrating:
 2. Sequential chaining
 3. Conditional branching (if/else)
 4. Loop iteration
-5. Error handling with try/except
-6. Durable sleep
+5. Return inside a loop
+6. Error handling with try/except
+7. Durable sleep
 """
 
 import asyncio
@@ -74,6 +75,23 @@ class LoopRequest(BaseModel):
     items: list[str] = Field(
         min_length=1, max_length=5, description="Items to process in a loop"
     )
+
+
+class LoopReturnResult(BaseModel):
+    """Result from the early-return loop workflow."""
+
+    items: list[int]
+    needle: int
+    found: bool
+    value: int | None
+    checked: int
+
+
+class LoopReturnRequest(BaseModel):
+    items: list[int] = Field(
+        min_length=1, max_length=10, description="Items to search in a loop"
+    )
+    needle: int = Field(description="Value to search for (returns early when found)")
 
 
 class ErrorResult(BaseModel):
@@ -247,6 +265,32 @@ async def build_loop_result(items: list[str], processed: list[str]) -> LoopResul
     return LoopResult(items=items, processed=processed, count=len(processed))
 
 
+@action
+async def matches_needle(value: int, needle: int) -> bool:
+    """Check whether the current loop value matches the needle."""
+    await asyncio.sleep(0.05)
+    return value == needle
+
+
+@action
+async def build_loop_return_result(
+    items: list[int],
+    needle: int,
+    found: bool,
+    value: int | None,
+    checked: int,
+) -> LoopReturnResult:
+    """Build the early-return loop result."""
+    await asyncio.sleep(0)
+    return LoopReturnResult(
+        items=items,
+        needle=needle,
+        found=found,
+        value=value,
+        checked=checked,
+    )
+
+
 # =============================================================================
 # Actions - Error Handling Workflow
 # =============================================================================
@@ -403,6 +447,38 @@ class LoopProcessingWorkflow(Workflow):
 
         # Build the result in an action (constructors aren't supported in return)
         return await build_loop_result(items, processed)
+
+
+@workflow
+class LoopReturnWorkflow(Workflow):
+    """
+    Demonstrates returning from inside a for-loop.
+
+    Returns as soon as the needle is found in the input list.
+    """
+
+    async def run(self, items: list[int], needle: int) -> LoopReturnResult:
+        checked = 0
+        for value in items:
+            checked += 1
+            is_match = await matches_needle(value=value, needle=needle)
+            if is_match:
+                result = await build_loop_return_result(
+                    items=items,
+                    needle=needle,
+                    found=True,
+                    value=value,
+                    checked=checked,
+                )
+                return result
+
+        return await build_loop_return_result(
+            items=items,
+            needle=needle,
+            found=False,
+            value=None,
+            checked=checked,
+        )
 
 
 @workflow

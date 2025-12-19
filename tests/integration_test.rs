@@ -73,6 +73,7 @@ asyncio.run(main())
 const IMMEDIATE_CONDITIONAL_WORKFLOW_MODULE: &str =
     include_str!("fixtures/immediate_conditional_workflow.py");
 const CHAIN_WORKFLOW_MODULE: &str = include_str!("fixtures/chain_workflow.py");
+const LOOP_RETURN_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_loop_return.py");
 
 /// Registration script that imports and runs the workflow.
 /// This triggers the workflow decorator which registers the IR via gRPC.
@@ -1054,6 +1055,67 @@ async fn loop_workflow_executes_all_iterations() -> Result<()> {
     assert_eq!(
         message,
         Some("APPLE,BANANA,CHERRY".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Return Inside Loop Test
+// =============================================================================
+
+const REGISTER_LOOP_RETURN_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_loop_return import LoopReturnWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = LoopReturnWorkflow()
+    result = await wf.run(items=[1, 2, 3, 4, 5], needle=3)
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that returning from inside a for-loop completes the workflow.
+///
+/// This covers early return semantics within normalized loop DAGs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn return_inside_for_loop_completes_workflow() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("integration_loop_return.py", LOOP_RETURN_WORKFLOW_MODULE),
+            ("register.py", REGISTER_LOOP_RETURN_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "loopreturnworkflow",
+        user_module: "integration_loop_return",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("found:3 checked:3".to_string()),
         "unexpected workflow result"
     );
 
