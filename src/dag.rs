@@ -3934,10 +3934,15 @@ fn main(input: [], output: [result]):
             "Should have edges with guard expressions"
         );
 
-        // There should be at least 2 guarded edges (one for then, one for else)
+        // There should be one guarded edge (then) and one else edge
         assert!(
-            guarded_edges.len() >= 2,
-            "Should have guarded edges for both branches"
+            !guarded_edges.is_empty(),
+            "Should have guarded edges for the then branch"
+        );
+        let else_edges: Vec<_> = dag.edges.iter().filter(|e| e.is_else).collect();
+        assert!(
+            !else_edges.is_empty(),
+            "Should have an else edge for the default branch"
         );
     }
 
