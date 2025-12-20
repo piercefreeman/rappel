@@ -293,6 +293,17 @@ impl IntegrationHarness {
     ///
     /// Returns `None` if RAPPEL_DATABASE_URL is not set (skips test).
     pub async fn new(config: HarnessConfig<'_>) -> Result<Option<Self>> {
+        Self::new_internal(config, true).await
+    }
+
+    /// Create a new test harness without starting the workflow instance.
+    ///
+    /// Returns `None` if RAPPEL_DATABASE_URL is not set (skips test).
+    pub async fn new_without_start(config: HarnessConfig<'_>) -> Result<Option<Self>> {
+        Self::new_internal(config, false).await
+    }
+
+    async fn new_internal(config: HarnessConfig<'_>, start_instance: bool) -> Result<Option<Self>> {
         let database_url = match env::var("RAPPEL_DATABASE_URL") {
             Ok(url) => url,
             Err(_) => {
@@ -354,13 +365,6 @@ impl IntegrationHarness {
 
         info!(%instance_id, "found workflow instance");
 
-        // Parse the stored input_payload from registration (contains initial context)
-        let stored_inputs = if let Some(payload) = &instance.input_payload {
-            parse_input_payload(payload)?
-        } else {
-            HashMap::new()
-        };
-
         // Start worker pool
         let worker_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("python")
@@ -393,17 +397,26 @@ impl IntegrationHarness {
             Arc::clone(&worker_pool),
         ));
 
-        // Start the workflow instance using the DAGRunner
-        // Merge stored inputs from Python registration with harness-provided inputs
-        // (harness inputs override stored inputs if there's a conflict)
-        let mut initial_inputs = stored_inputs;
-        for (k, v) in build_initial_inputs(config.inputs) {
-            initial_inputs.insert(k, v);
+        if start_instance {
+            // Parse the stored input_payload from registration (contains initial context)
+            let stored_inputs = if let Some(payload) = &instance.input_payload {
+                parse_input_payload(payload)?
+            } else {
+                HashMap::new()
+            };
+
+            // Start the workflow instance using the DAGRunner
+            // Merge stored inputs from Python registration with harness-provided inputs
+            // (harness inputs override stored inputs if there's a conflict)
+            let mut initial_inputs = stored_inputs;
+            for (k, v) in build_initial_inputs(config.inputs) {
+                initial_inputs.insert(k, v);
+            }
+            runner
+                .start_instance(instance_id, initial_inputs)
+                .await
+                .context("failed to start workflow instance")?;
         }
-        runner
-            .start_instance(instance_id, initial_inputs)
-            .await
-            .context("failed to start workflow instance")?;
 
         Ok(Some(Self {
             database,
