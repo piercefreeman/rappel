@@ -270,9 +270,47 @@ async fn workflow_run_detail(
     ))
 }
 
-async fn list_schedules(State(state): State<WebappState>) -> impl IntoResponse {
-    match state.database.list_schedules(None).await {
-        Ok(schedules) => Html(render_scheduled_page(&state.templates, &schedules)),
+#[derive(Debug, serde::Deserialize)]
+struct ScheduleListQuery {
+    page: Option<i64>,
+    q: Option<String>,
+}
+
+async fn list_schedules(
+    State(state): State<WebappState>,
+    axum::extract::Query(query): axum::extract::Query<ScheduleListQuery>,
+) -> impl IntoResponse {
+    let per_page = 20i64;
+    let search = query.q.as_deref().filter(|value| !value.trim().is_empty());
+    let total_count = match state.database.count_schedules(search).await {
+        Ok(count) => count,
+        Err(err) => {
+            error!(?err, "failed to count schedules");
+            return Html(render_error_page(
+                &state.templates,
+                "Unable to load schedules",
+                "We couldn't fetch scheduled workflows. Please check the database connection.",
+            ));
+        }
+    };
+
+    let total_pages = (total_count as f64 / per_page as f64).ceil() as i64;
+    let current_page = query.page.unwrap_or(1).max(1).min(total_pages.max(1));
+    let offset = (current_page - 1) * per_page;
+
+    match state
+        .database
+        .list_schedules_page(search, per_page, offset)
+        .await
+    {
+        Ok(schedules) => Html(render_scheduled_page(
+            &state.templates,
+            &schedules,
+            current_page,
+            total_pages,
+            search.map(|value| value.to_string()),
+            total_count,
+        )),
         Err(err) => {
             error!(?err, "failed to load schedules");
             Html(render_error_page(
@@ -871,6 +909,11 @@ struct ScheduledPageContext {
     title: String,
     active_tab: String,
     schedule_groups: Vec<ScheduleGroup>,
+    current_page: i64,
+    total_pages: i64,
+    has_pagination: bool,
+    search_query: Option<String>,
+    total_count: i64,
 }
 
 #[derive(Serialize)]
@@ -883,13 +926,21 @@ struct ScheduleGroup {
 struct ScheduleBrief {
     id: String,
     schedule_name: String,
+    workflow_name: String,
     status: String,
     schedule_expression: String,
     next_run_at: Option<String>,
     last_run_at: Option<String>,
 }
 
-fn render_scheduled_page(templates: &Tera, schedules: &[crate::db::WorkflowSchedule]) -> String {
+fn render_scheduled_page(
+    templates: &Tera,
+    schedules: &[crate::db::WorkflowSchedule],
+    current_page: i64,
+    total_pages: i64,
+    search_query: Option<String>,
+    total_count: i64,
+) -> String {
     // Group schedules by type
     let mut cron_schedules = Vec::new();
     let mut interval_schedules = Vec::new();
@@ -904,6 +955,7 @@ fn render_scheduled_page(templates: &Tera, schedules: &[crate::db::WorkflowSched
         let brief = ScheduleBrief {
             id: s.id.to_string(),
             schedule_name: s.schedule_name.clone(),
+            workflow_name: s.workflow_name.clone(),
             status: s.status.clone(),
             schedule_expression,
             next_run_at: s.next_run_at.map(|dt| dt.to_rfc3339()),
@@ -935,6 +987,11 @@ fn render_scheduled_page(templates: &Tera, schedules: &[crate::db::WorkflowSched
         title: "Scheduled Workflows".to_string(),
         active_tab: "scheduled".to_string(),
         schedule_groups,
+        current_page,
+        total_pages,
+        has_pagination: total_pages > 1,
+        search_query,
+        total_count,
     };
 
     render_template(templates, "scheduled.html", &context)
@@ -1477,7 +1534,7 @@ mod tests {
     #[test]
     fn test_render_scheduled_page_empty() {
         let templates = test_templates();
-        let html = render_scheduled_page(&templates, &[]);
+        let html = render_scheduled_page(&templates, &[], 1, 1, None, 0);
 
         assert!(html.contains("Scheduled Workflows"));
         assert!(html.contains("No scheduled workflows found"));
@@ -1503,7 +1560,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
         }];
 
-        let html = render_scheduled_page(&templates, &schedules);
+        let html = render_scheduled_page(&templates, &schedules, 1, 1, None, 1);
 
         assert!(html.contains("Scheduled Workflows"));
         assert!(html.contains("cron_schedule"));
@@ -1531,7 +1588,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
         }];
 
-        let html = render_scheduled_page(&templates, &schedules);
+        let html = render_scheduled_page(&templates, &schedules, 1, 1, None, 1);
 
         assert!(html.contains("Scheduled Workflows"));
         assert!(html.contains("interval_schedule"));
