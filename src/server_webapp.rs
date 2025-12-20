@@ -90,6 +90,7 @@ const TEMPLATE_WORKFLOW: &str = include_str!("../templates/workflow.html");
 const TEMPLATE_WORKFLOW_RUN: &str = include_str!("../templates/workflow_run.html");
 const TEMPLATE_SCHEDULED: &str = include_str!("../templates/scheduled.html");
 const TEMPLATE_SCHEDULE_DETAIL: &str = include_str!("../templates/schedule_detail.html");
+const TEMPLATE_INVOCATIONS: &str = include_str!("../templates/invocations.html");
 
 /// Initialize Tera templates from embedded strings
 fn init_templates() -> Result<Tera> {
@@ -112,6 +113,8 @@ fn init_templates() -> Result<Tera> {
         .context("failed to add scheduled.html template")?;
     tera.add_raw_template("schedule_detail.html", TEMPLATE_SCHEDULE_DETAIL)
         .context("failed to add schedule_detail.html template")?;
+    tera.add_raw_template("invocations.html", TEMPLATE_INVOCATIONS)
+        .context("failed to add invocations.html template")?;
 
     tera.autoescape_on(vec![".html", ".tera"]);
     Ok(tera)
@@ -135,10 +138,12 @@ async fn run_server(
     use axum::routing::post;
 
     let app = Router::new()
-        .route("/", get(list_workflows))
-        .route("/workflow/:workflow_version_id", get(workflow_detail))
+        .route("/", get(list_invocations))
+        .route("/invocations", get(list_invocations))
+        .route("/workflows", get(list_workflows))
+        .route("/workflows/:workflow_version_id", get(workflow_detail))
         .route(
-            "/workflow/:workflow_version_id/run/:instance_id",
+            "/workflows/:workflow_version_id/run/:instance_id",
             get(workflow_run_detail),
         )
         .route("/scheduled", get(list_schedules))
@@ -270,9 +275,99 @@ async fn workflow_run_detail(
     ))
 }
 
-async fn list_schedules(State(state): State<WebappState>) -> impl IntoResponse {
-    match state.database.list_schedules(None).await {
-        Ok(schedules) => Html(render_scheduled_page(&state.templates, &schedules)),
+#[derive(Debug, serde::Deserialize)]
+struct InvocationListQuery {
+    page: Option<i64>,
+    q: Option<String>,
+}
+
+async fn list_invocations(
+    State(state): State<WebappState>,
+    axum::extract::Query(query): axum::extract::Query<InvocationListQuery>,
+) -> impl IntoResponse {
+    let per_page = 50i64;
+    let search = query.q.as_deref().filter(|value| !value.trim().is_empty());
+    let total_count = match state.database.count_invocations(search).await {
+        Ok(count) => count,
+        Err(err) => {
+            error!(?err, "failed to count invocations");
+            return Html(render_error_page(
+                &state.templates,
+                "Unable to load invocations",
+                "We couldn't fetch workflow invocations. Please check the database connection.",
+            ));
+        }
+    };
+
+    let total_pages = (total_count as f64 / per_page as f64).ceil() as i64;
+    let current_page = query.page.unwrap_or(1).max(1).min(total_pages.max(1));
+    let offset = (current_page - 1) * per_page;
+
+    match state
+        .database
+        .list_invocations_page(search, per_page, offset)
+        .await
+    {
+        Ok(invocations) => Html(render_invocations_page(
+            &state.templates,
+            &invocations,
+            current_page,
+            total_pages,
+            search.map(|value| value.to_string()),
+            total_count,
+        )),
+        Err(err) => {
+            error!(?err, "failed to load invocations");
+            Html(render_error_page(
+                &state.templates,
+                "Unable to load invocations",
+                "We couldn't fetch workflow invocations. Please check the database connection.",
+            ))
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ScheduleListQuery {
+    page: Option<i64>,
+    q: Option<String>,
+}
+
+async fn list_schedules(
+    State(state): State<WebappState>,
+    axum::extract::Query(query): axum::extract::Query<ScheduleListQuery>,
+) -> impl IntoResponse {
+    let per_page = 20i64;
+    let search = query.q.as_deref().filter(|value| !value.trim().is_empty());
+    let total_count = match state.database.count_schedules(search).await {
+        Ok(count) => count,
+        Err(err) => {
+            error!(?err, "failed to count schedules");
+            return Html(render_error_page(
+                &state.templates,
+                "Unable to load schedules",
+                "We couldn't fetch scheduled workflows. Please check the database connection.",
+            ));
+        }
+    };
+
+    let total_pages = (total_count as f64 / per_page as f64).ceil() as i64;
+    let current_page = query.page.unwrap_or(1).max(1).min(total_pages.max(1));
+    let offset = (current_page - 1) * per_page;
+
+    match state
+        .database
+        .list_schedules_page(search, per_page, offset)
+        .await
+    {
+        Ok(schedules) => Html(render_scheduled_page(
+            &state.templates,
+            &schedules,
+            current_page,
+            total_pages,
+            search.map(|value| value.to_string()),
+            total_count,
+        )),
         Err(err) => {
             error!(?err, "failed to load schedules");
             Html(render_error_page(
@@ -623,7 +718,7 @@ fn render_workflow_detail_page(
                 created_at: i.created_at.to_rfc3339(),
                 status: i.status.clone(),
                 progress,
-                url: format!("/workflow/{}/run/{}", version.id, i.id),
+                url: format!("/workflows/{}/run/{}", version.id, i.id),
             }
         })
         .collect();
@@ -863,6 +958,68 @@ fn render_error_page(templates: &Tera, title: &str, message: &str) -> String {
 }
 
 // ============================================================================
+// Invocation Template Context
+// ============================================================================
+
+#[derive(Serialize)]
+struct InvocationsPageContext {
+    title: String,
+    active_tab: String,
+    invocations: Vec<InvocationListItem>,
+    has_invocations: bool,
+    current_page: i64,
+    total_pages: i64,
+    has_pagination: bool,
+    search_query: Option<String>,
+    total_count: i64,
+}
+
+#[derive(Serialize)]
+struct InvocationListItem {
+    id: String,
+    workflow_name: String,
+    workflow_version_id: Option<String>,
+    created_at: String,
+    status: String,
+    input_preview: String,
+}
+
+fn render_invocations_page(
+    templates: &Tera,
+    instances: &[crate::db::WorkflowInstance],
+    current_page: i64,
+    total_pages: i64,
+    search_query: Option<String>,
+    total_count: i64,
+) -> String {
+    let invocations: Vec<InvocationListItem> = instances
+        .iter()
+        .map(|i| InvocationListItem {
+            id: i.id.to_string(),
+            workflow_name: i.workflow_name.clone(),
+            workflow_version_id: i.workflow_version_id.map(|id| id.to_string()),
+            created_at: i.created_at.to_rfc3339(),
+            status: i.status.clone(),
+            input_preview: truncate_payload(&i.input_payload, 240),
+        })
+        .collect();
+
+    let context = InvocationsPageContext {
+        title: "Workflow Invocations".to_string(),
+        active_tab: "invocations".to_string(),
+        invocations,
+        has_invocations: !instances.is_empty(),
+        current_page,
+        total_pages,
+        has_pagination: total_pages > 1,
+        search_query,
+        total_count,
+    };
+
+    render_template(templates, "invocations.html", &context)
+}
+
+// ============================================================================
 // Schedule Template Context
 // ============================================================================
 
@@ -871,6 +1028,11 @@ struct ScheduledPageContext {
     title: String,
     active_tab: String,
     schedule_groups: Vec<ScheduleGroup>,
+    current_page: i64,
+    total_pages: i64,
+    has_pagination: bool,
+    search_query: Option<String>,
+    total_count: i64,
 }
 
 #[derive(Serialize)]
@@ -883,13 +1045,21 @@ struct ScheduleGroup {
 struct ScheduleBrief {
     id: String,
     schedule_name: String,
+    workflow_name: String,
     status: String,
     schedule_expression: String,
     next_run_at: Option<String>,
     last_run_at: Option<String>,
 }
 
-fn render_scheduled_page(templates: &Tera, schedules: &[crate::db::WorkflowSchedule]) -> String {
+fn render_scheduled_page(
+    templates: &Tera,
+    schedules: &[crate::db::WorkflowSchedule],
+    current_page: i64,
+    total_pages: i64,
+    search_query: Option<String>,
+    total_count: i64,
+) -> String {
     // Group schedules by type
     let mut cron_schedules = Vec::new();
     let mut interval_schedules = Vec::new();
@@ -904,6 +1074,7 @@ fn render_scheduled_page(templates: &Tera, schedules: &[crate::db::WorkflowSched
         let brief = ScheduleBrief {
             id: s.id.to_string(),
             schedule_name: s.schedule_name.clone(),
+            workflow_name: s.workflow_name.clone(),
             status: s.status.clone(),
             schedule_expression,
             next_run_at: s.next_run_at.map(|dt| dt.to_rfc3339()),
@@ -935,6 +1106,11 @@ fn render_scheduled_page(templates: &Tera, schedules: &[crate::db::WorkflowSched
         title: "Scheduled Workflows".to_string(),
         active_tab: "scheduled".to_string(),
         schedule_groups,
+        current_page,
+        total_pages,
+        has_pagination: total_pages > 1,
+        search_query,
+        total_count,
     };
 
     render_template(templates, "scheduled.html", &context)
@@ -1148,6 +1324,17 @@ fn format_payload(payload: &Option<Vec<u8>>) -> String {
     match payload {
         Some(bytes) if !bytes.is_empty() => format_binary_payload(bytes),
         _ => "(empty)".to_string(),
+    }
+}
+
+fn truncate_payload(payload: &Option<Vec<u8>>, max_len: usize) -> String {
+    let formatted = format_payload(payload);
+    if formatted.len() > max_len {
+        let mut truncated = formatted.chars().take(max_len).collect::<String>();
+        truncated.push_str("...");
+        truncated
+    } else {
+        formatted
     }
 }
 
@@ -1438,6 +1625,40 @@ mod tests {
         assert!(nodes.is_empty());
     }
 
+    #[test]
+    fn test_render_invocations_page_empty() {
+        let templates = test_templates();
+        let html = render_invocations_page(&templates, &[], 1, 1, None, 0);
+
+        assert!(html.contains("Invocations"));
+        assert!(html.contains("No invocations recorded yet"));
+    }
+
+    #[test]
+    fn test_render_invocations_page_with_entries() {
+        let templates = test_templates();
+        let instances = vec![crate::db::WorkflowInstance {
+            id: Uuid::new_v4(),
+            partition_id: 0,
+            workflow_name: "example_workflow".to_string(),
+            workflow_version_id: Some(Uuid::new_v4()),
+            schedule_id: None,
+            next_action_seq: 1,
+            input_payload: Some(b"{\"search\": \"needle\"}".to_vec()),
+            result_payload: None,
+            status: "completed".to_string(),
+            created_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+        }];
+
+        let html = render_invocations_page(&templates, &instances, 1, 1, None, 1);
+
+        assert!(html.contains("Invocations"));
+        assert!(html.contains("example_workflow"));
+        assert!(html.contains("completed"));
+        assert!(html.contains("search"));
+    }
+
     // ========================================================================
     // Schedule Template Tests
     // ========================================================================
@@ -1477,7 +1698,7 @@ mod tests {
     #[test]
     fn test_render_scheduled_page_empty() {
         let templates = test_templates();
-        let html = render_scheduled_page(&templates, &[]);
+        let html = render_scheduled_page(&templates, &[], 1, 1, None, 0);
 
         assert!(html.contains("Scheduled Workflows"));
         assert!(html.contains("No scheduled workflows found"));
@@ -1503,7 +1724,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
         }];
 
-        let html = render_scheduled_page(&templates, &schedules);
+        let html = render_scheduled_page(&templates, &schedules, 1, 1, None, 1);
 
         assert!(html.contains("Scheduled Workflows"));
         assert!(html.contains("cron_schedule"));
@@ -1531,7 +1752,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
         }];
 
-        let html = render_scheduled_page(&templates, &schedules);
+        let html = render_scheduled_page(&templates, &schedules, 1, 1, None, 1);
 
         assert!(html.contains("Scheduled Workflows"));
         assert!(html.contains("interval_schedule"));
@@ -1693,10 +1914,12 @@ mod tests {
         };
 
         Router::new()
-            .route("/", get(list_workflows))
-            .route("/workflow/:workflow_version_id", get(workflow_detail))
+            .route("/", get(list_invocations))
+            .route("/invocations", get(list_invocations))
+            .route("/workflows", get(list_workflows))
+            .route("/workflows/:workflow_version_id", get(workflow_detail))
             .route(
-                "/workflow/:workflow_version_id/run/:instance_id",
+                "/workflows/:workflow_version_id/run/:instance_id",
                 get(workflow_run_detail),
             )
             .route("/healthz", get(healthz))
@@ -1736,7 +1959,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_route_list_workflows() {
+    async fn test_route_list_invocations() {
         let Some(db) = test_db().await else {
             return;
         };
@@ -1756,7 +1979,39 @@ mod tests {
             .to_bytes();
         let html = String::from_utf8(body.to_vec()).unwrap();
 
-        // Should render the home page
+        // Should render the invocations page
+        assert!(html.contains("Invocations"));
+        assert!(html.contains("<!DOCTYPE html>"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_route_list_workflows() {
+        let Some(db) = test_db().await else {
+            return;
+        };
+        let db = Arc::new(db);
+        let app = build_test_app(db);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/workflows")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        // Should render the workflows page
         assert!(html.contains("Registered Workflow Versions"));
         assert!(html.contains("<!DOCTYPE html>"));
     }
@@ -1772,7 +2027,7 @@ mod tests {
 
         // Use a random UUID that won't exist
         let fake_id = Uuid::new_v4();
-        let uri = format!("/workflow/{}", fake_id);
+        let uri = format!("/workflows/{}", fake_id);
 
         let response = app
             .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
@@ -1801,7 +2056,7 @@ mod tests {
 
         let fake_version_id = Uuid::new_v4();
         let fake_instance_id = Uuid::new_v4();
-        let uri = format!("/workflow/{}/run/{}", fake_version_id, fake_instance_id);
+        let uri = format!("/workflows/{}/run/{}", fake_version_id, fake_instance_id);
 
         let response = app
             .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
@@ -1840,7 +2095,7 @@ mod tests {
             .expect("failed to create version");
 
         let app = build_test_app(Arc::clone(&db));
-        let uri = format!("/workflow/{}", version_id.0);
+        let uri = format!("/workflows/{}", version_id.0);
 
         let response = app
             .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
@@ -1891,7 +2146,7 @@ mod tests {
             .expect("failed to create instance");
 
         let app = build_test_app(Arc::clone(&db));
-        let uri = format!("/workflow/{}/run/{}", version_id.0, instance_id.0);
+        let uri = format!("/workflows/{}/run/{}", version_id.0, instance_id.0);
 
         let response = app
             .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())

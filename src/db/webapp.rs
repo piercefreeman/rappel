@@ -5,6 +5,7 @@
 //! Adding features here will NOT impact worker performance.
 
 use sqlx::Row;
+use sqlx::{Postgres, QueryBuilder};
 
 use super::{
     Database, DbError, DbResult, QueuedAction, ScheduleId, WorkflowInstance, WorkflowInstanceId,
@@ -56,6 +57,65 @@ impl Database {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
+
+        Ok(instances)
+    }
+
+    fn append_invocation_search(query: &mut QueryBuilder<Postgres>, search: Option<&str>) {
+        let Some(value) = search.filter(|value| !value.trim().is_empty()) else {
+            return;
+        };
+
+        query.push(" AND workflow_name ILIKE ");
+        query.push_bind(like_pattern(value));
+    }
+
+    /// Count all workflow invocations for the invocations page.
+    pub async fn count_invocations(&self, search: Option<&str>) -> DbResult<i64> {
+        let mut query = QueryBuilder::<Postgres>::new(
+            r#"
+            SELECT COUNT(*) as count
+            FROM workflow_instances
+            WHERE 1=1
+            "#,
+        );
+
+        Self::append_invocation_search(&mut query, search);
+
+        let row = query.build().fetch_one(&self.pool).await?;
+
+        Ok(row.get::<i64, _>("count"))
+    }
+
+    /// List workflow invocations for the invocations page with pagination and search.
+    pub async fn list_invocations_page(
+        &self,
+        search: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> DbResult<Vec<WorkflowInstance>> {
+        let mut query = QueryBuilder::<Postgres>::new(
+            r#"
+            SELECT id, partition_id, workflow_name, workflow_version_id,
+                   schedule_id, next_action_seq, input_payload, result_payload, status,
+                   created_at, completed_at
+            FROM workflow_instances
+            WHERE 1=1
+            "#,
+        );
+
+        Self::append_invocation_search(&mut query, search);
+
+        query.push(" ORDER BY created_at DESC");
+        query.push(" LIMIT ");
+        query.push_bind(limit);
+        query.push(" OFFSET ");
+        query.push_bind(offset);
+
+        let instances = query
+            .build_query_as::<WorkflowInstance>()
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok(instances)
     }
@@ -152,6 +212,83 @@ impl Database {
     // ========================================================================
     // Webapp: Schedule Queries
     // ========================================================================
+
+    fn append_schedule_search(query: &mut QueryBuilder<Postgres>, search: Option<&str>) {
+        let terms = parse_schedule_search(search.unwrap_or_default());
+        if terms.is_empty() {
+            return;
+        }
+
+        query.push(" AND (");
+        for (idx, term) in terms.iter().enumerate() {
+            if idx > 0 {
+                match term.operator {
+                    SearchOperator::And => query.push(" AND "),
+                    SearchOperator::Or => query.push(" OR "),
+                };
+            }
+
+            query.push("(");
+            query.push("workflow_name ILIKE ");
+            query.push_bind(like_pattern(&term.value));
+            query.push(" OR schedule_name ILIKE ");
+            query.push_bind(like_pattern(&term.value));
+            query.push(" OR id::text ILIKE ");
+            query.push_bind(like_pattern(&term.value));
+            query.push(")");
+        }
+        query.push(")");
+    }
+
+    /// Count schedules for the scheduled workflows page.
+    pub async fn count_schedules(&self, search: Option<&str>) -> DbResult<i64> {
+        let mut query = QueryBuilder::<Postgres>::new(
+            r#"
+            SELECT COUNT(*) as count
+            FROM workflow_schedules
+            WHERE status != 'deleted'
+            "#,
+        );
+
+        Self::append_schedule_search(&mut query, search);
+
+        let row = query.build().fetch_one(&self.pool).await?;
+
+        Ok(row.get::<i64, _>("count"))
+    }
+
+    /// List schedules for the scheduled workflows page with pagination and search.
+    pub async fn list_schedules_page(
+        &self,
+        search: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> DbResult<Vec<WorkflowSchedule>> {
+        let mut query = QueryBuilder::<Postgres>::new(
+            r#"
+            SELECT id, workflow_name, schedule_name, schedule_type, cron_expression, interval_seconds, jitter_seconds,
+                   input_payload, status, next_run_at, last_run_at, last_instance_id,
+                   created_at, updated_at
+            FROM workflow_schedules
+            WHERE status != 'deleted'
+            "#,
+        );
+
+        Self::append_schedule_search(&mut query, search);
+
+        query.push(" ORDER BY workflow_name, schedule_name");
+        query.push(" LIMIT ");
+        query.push_bind(limit);
+        query.push(" OFFSET ");
+        query.push_bind(offset);
+
+        let schedules = query
+            .build_query_as::<WorkflowSchedule>()
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(schedules)
+    }
 
     /// Get a schedule by ID (for schedule detail page)
     pub async fn get_schedule_by_id(&self, id: ScheduleId) -> DbResult<WorkflowSchedule> {
@@ -252,4 +389,99 @@ impl Database {
 
         Ok(result.rows_affected() > 0)
     }
+}
+
+#[derive(Clone, Copy)]
+enum SearchOperator {
+    And,
+    Or,
+}
+
+struct SearchTerm {
+    operator: SearchOperator,
+    value: String,
+}
+
+fn parse_schedule_search(input: &str) -> Vec<SearchTerm> {
+    let tokens = tokenize_search(input);
+    let mut terms = Vec::new();
+    let mut pending_operator = None;
+    let mut saw_term = false;
+
+    for (token, quoted) in tokens {
+        if token.is_empty() {
+            continue;
+        }
+
+        if !quoted {
+            let token_lower = token.to_ascii_lowercase();
+            if token_lower == "and" {
+                pending_operator = Some(SearchOperator::And);
+                continue;
+            }
+            if token_lower == "or" {
+                pending_operator = Some(SearchOperator::Or);
+                continue;
+            }
+        }
+
+        let operator = if saw_term {
+            pending_operator.unwrap_or(SearchOperator::And)
+        } else {
+            SearchOperator::And
+        };
+        terms.push(SearchTerm {
+            operator,
+            value: token,
+        });
+        saw_term = true;
+        pending_operator = None;
+    }
+
+    terms
+}
+
+fn tokenize_search(input: &str) -> Vec<(String, bool)> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut current_quote: Option<char> = None;
+    let mut current_quoted = false;
+
+    for ch in input.chars() {
+        if let Some(quote) = current_quote {
+            if ch == quote {
+                current_quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+
+        if ch == '"' || ch == '\'' {
+            current_quote = Some(ch);
+            current_quoted = true;
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push((current.clone(), current_quoted));
+                current.clear();
+                current_quoted = false;
+            }
+            continue;
+        }
+
+        current.push(ch);
+    }
+
+    if !current.is_empty() {
+        tokens.push((current, current_quoted));
+    }
+
+    tokens
+}
+
+fn like_pattern(value: &str) -> String {
+    format!("%{}%", value.trim())
 }
