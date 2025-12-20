@@ -557,20 +557,27 @@ impl DAGConverter {
         let unexpanded = self.convert_with_pointers(program);
 
         // Phase 2: Expand into single global DAG
-        // Find the entry function - prefer "run", then "main", then first non-internal function
-        // This matches the runner's logic for finding the entry point
-        let entry_fn = self
-            .function_defs
-            .keys()
-            .find(|name| *name == "run")
-            .or_else(|| self.function_defs.keys().find(|name| *name == "main"))
+        // Find the entry function deterministically based on source order.
+        // Prefer "run", then "main", then "workflow", then first non-internal function.
+        let entry_fn = program
+            .functions
+            .iter()
+            .find(|func| func.name == "run")
+            .or_else(|| program.functions.iter().find(|func| func.name == "main"))
             .or_else(|| {
-                self.function_defs
-                    .keys()
-                    .find(|name| !name.starts_with("__"))
+                program
+                    .functions
+                    .iter()
+                    .find(|func| func.name == "workflow")
             })
-            .or_else(|| self.function_defs.keys().next())
-            .map(|s| s.as_str())
+            .or_else(|| {
+                program
+                    .functions
+                    .iter()
+                    .find(|func| !func.name.starts_with("__"))
+            })
+            .or_else(|| program.functions.first())
+            .map(|func| func.name.as_str())
             .unwrap_or("run");
 
         let mut dag = self.expand_functions(&unexpanded, entry_fn);
@@ -1383,6 +1390,15 @@ impl DAGConverter {
 
                 for node_id in &order {
                     if node_id == &mod_node {
+                        continue;
+                    }
+
+                    let reachable_from_mod = reachable_via_normal_edges
+                        .get(&mod_node)
+                        .map(|reachable| reachable.contains(node_id))
+                        .unwrap_or(false);
+                    let target_in_loop = nodes_in_loop.contains(node_id);
+                    if !target_in_loop && !reachable_from_mod {
                         continue;
                     }
 
@@ -4809,6 +4825,67 @@ fn run_internal(input: [user_id], output: []):
         assert!(
             user_id_to_check.is_some(),
             "Should have DATA_FLOW edge from bound user_id to check action"
+        );
+    }
+
+    #[test]
+    fn test_loop_binding_does_not_flow_to_pre_loop_nodes() {
+        let source = r#"fn run(input: [required_drafts], output: []):
+    users_response = @get_users(required_drafts=required_drafts)
+    for user in users_response.users:
+        run_internal(user.required_drafts)
+    summary = @summarize(required_drafts=required_drafts)
+    return summary
+
+fn run_internal(input: [required_drafts], output: []):
+    @check(required_drafts=required_drafts)
+    return"#;
+
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        let input_node = dag
+            .nodes
+            .values()
+            .find(|n| n.is_input && n.function_name.as_deref() == Some("run"))
+            .expect("Should have run input node");
+
+        let get_users_node = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("get_users"))
+            .expect("Should have get_users action node");
+
+        let bind_required_node = dag
+            .nodes
+            .values()
+            .find(|n| {
+                n.node_type == "assignment"
+                    && n.target.as_deref() == Some("required_drafts")
+                    && n.id.contains("bind_required_drafts")
+            })
+            .expect("Should have required_drafts binding assignment");
+
+        let input_to_get_users = dag.edges.iter().any(|edge| {
+            edge.edge_type == EdgeType::DataFlow
+                && edge.source == input_node.id
+                && edge.target == get_users_node.id
+                && edge.variable.as_deref() == Some("required_drafts")
+        });
+        assert!(
+            input_to_get_users,
+            "Expected input required_drafts to flow to get_users"
+        );
+
+        let bind_to_get_users = dag.edges.iter().any(|edge| {
+            edge.edge_type == EdgeType::DataFlow
+                && edge.source == bind_required_node.id
+                && edge.target == get_users_node.id
+                && edge.variable.as_deref() == Some("required_drafts")
+        });
+        assert!(
+            !bind_to_get_users,
+            "Binding required_drafts inside the loop should not feed get_users"
         );
     }
 

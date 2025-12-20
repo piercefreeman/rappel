@@ -9,6 +9,7 @@ use rappel::{
     get_config,
 };
 use serde_json::json;
+use sqlx::Row;
 use sqlx::postgres::PgPoolOptions;
 use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
@@ -25,13 +26,19 @@ struct Args {
     /// Focus on a single node ID for edge output
     #[arg(long)]
     node_id: Option<String>,
+    /// Workflow instance ID to simulate completion
+    #[arg(long)]
+    instance_id: Option<Uuid>,
+    /// Completed node ID to simulate completion
+    #[arg(long)]
+    completed_node_id: Option<String>,
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
 
-    let workflow_version = if let Some(database_url) = args.database_url.as_ref() {
+    let (workflow_version, pool) = if let Some(database_url) = args.database_url.as_ref() {
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect(database_url)
@@ -48,7 +55,7 @@ async fn main() {
         .fetch_one(&pool)
         .await
         .expect("failed to load workflow version");
-        row.0
+        (row.0, Some(pool))
     } else {
         // Connect to database using centralized config
         let config = get_config();
@@ -62,7 +69,7 @@ async fn main() {
             .get_workflow_version(version_id)
             .await
             .expect("failed to load workflow version");
-        workflow_version.program_proto
+        (workflow_version.program_proto, None)
     };
 
     let program = Program::decode(workflow_version.as_slice()).expect("decode program");
@@ -221,5 +228,207 @@ async fn main() {
             "is_direct_predecessor(pred, action_15): {}",
             is_direct_predecessor(&pred, "action_15", &dag)
         );
+    }
+
+    if let (Some(instance_id), Some(completed_node_id)) =
+        (args.instance_id.as_ref(), args.completed_node_id.as_ref())
+    {
+        let pool = match pool.as_ref() {
+            Some(pool) => pool,
+            None => {
+                eprintln!("--database-url is required to simulate completion");
+                return;
+            }
+        };
+
+        println!(
+            "\n=== Completion Simulation: instance_id={} completed_node_id={} ===",
+            instance_id, completed_node_id
+        );
+
+        let helper = DAGHelper::new(&dag);
+        let subgraph = analyze_subgraph(completed_node_id, &dag, &helper);
+
+        let node_ids: Vec<String> = subgraph.all_node_ids.iter().cloned().collect();
+        let inbox_rows = sqlx::query(
+            r#"
+            SELECT target_node_id, variable_name, value
+            FROM node_inputs
+            WHERE instance_id = $1
+              AND target_node_id = ANY($2)
+            "#,
+        )
+        .bind(instance_id)
+        .bind(&node_ids)
+        .fetch_all(pool)
+        .await
+        .expect("failed to fetch node_inputs");
+
+        let mut existing_inbox: HashMap<String, HashMap<String, serde_json::Value>> =
+            HashMap::new();
+        for row in inbox_rows {
+            let target: String = row.get("target_node_id");
+            let var_name: String = row.get("variable_name");
+            let value: serde_json::Value = row.get("value");
+            existing_inbox
+                .entry(target)
+                .or_default()
+                .insert(var_name, value);
+        }
+
+        let context_json: Option<serde_json::Value> = sqlx::query_scalar(
+            r#"
+            SELECT context_json
+            FROM instance_context
+            WHERE instance_id = $1
+            "#,
+        )
+        .bind(instance_id)
+        .fetch_optional(pool)
+        .await
+        .expect("failed to fetch instance_context");
+
+        let initial_scope: HashMap<String, serde_json::Value> = context_json
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+
+        let result_payload: Option<Vec<u8>> = sqlx::query_scalar(
+            r#"
+            SELECT result_payload
+            FROM action_queue
+            WHERE instance_id = $1
+              AND node_id = $2
+            ORDER BY completed_at DESC NULLS LAST
+            LIMIT 1
+            "#,
+        )
+        .bind(instance_id)
+        .bind(completed_node_id)
+        .fetch_optional(pool)
+        .await
+        .expect("failed to fetch action result payload");
+
+        let completed_result = decode_result_payload(result_payload.unwrap_or_default());
+
+        let ctx = InlineContext {
+            initial_scope: &initial_scope,
+            existing_inbox: &existing_inbox,
+            spread_index: None,
+        };
+
+        match execute_inline_subgraph(
+            completed_node_id,
+            completed_result,
+            ctx,
+            &subgraph,
+            &dag,
+            WorkflowInstanceId(*instance_id),
+        ) {
+            Ok(plan) => {
+                println!(
+                    "Completion plan: inbox_writes={} readiness_increments={} completion={}",
+                    plan.inbox_writes.len(),
+                    plan.readiness_increments.len(),
+                    plan.instance_completion.is_some()
+                );
+            }
+            Err(err) => {
+                println!("Completion error: {:?}", err);
+            }
+        }
+    }
+}
+
+fn decode_result_payload(payload: Vec<u8>) -> serde_json::Value {
+    if payload.is_empty() {
+        return serde_json::Value::Null;
+    }
+
+    match rappel::proto::WorkflowArguments::decode(&payload[..]) {
+        Ok(args) => args
+            .arguments
+            .iter()
+            .find(|arg| arg.key == "result")
+            .and_then(|arg| arg.value.as_ref())
+            .map(proto_value_to_json)
+            .unwrap_or(serde_json::Value::Null),
+        Err(_) => serde_json::from_slice(&payload).unwrap_or(serde_json::Value::Null),
+    }
+}
+
+fn proto_value_to_json(value: &rappel::proto::WorkflowArgumentValue) -> serde_json::Value {
+    use rappel::proto::primitive_workflow_argument::Kind as PrimitiveKind;
+    use rappel::proto::workflow_argument_value::Kind;
+
+    match &value.kind {
+        Some(Kind::Primitive(p)) => match &p.kind {
+            Some(PrimitiveKind::IntValue(i)) => serde_json::Value::Number((*i).into()),
+            Some(PrimitiveKind::DoubleValue(f)) => serde_json::Number::from_f64(*f)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            Some(PrimitiveKind::StringValue(s)) => serde_json::Value::String(s.clone()),
+            Some(PrimitiveKind::BoolValue(b)) => serde_json::Value::Bool(*b),
+            Some(PrimitiveKind::NullValue(_)) => serde_json::Value::Null,
+            None => serde_json::Value::Null,
+        },
+        Some(Kind::ListValue(list)) => {
+            let items: Vec<serde_json::Value> =
+                list.items.iter().map(proto_value_to_json).collect();
+            serde_json::Value::Array(items)
+        }
+        Some(Kind::DictValue(dict)) => {
+            let entries: serde_json::Map<String, serde_json::Value> = dict
+                .entries
+                .iter()
+                .filter_map(|arg| {
+                    arg.value
+                        .as_ref()
+                        .map(|v| (arg.key.clone(), proto_value_to_json(v)))
+                })
+                .collect();
+            serde_json::Value::Object(entries)
+        }
+        Some(Kind::TupleValue(tuple)) => {
+            let items: Vec<serde_json::Value> =
+                tuple.items.iter().map(proto_value_to_json).collect();
+            serde_json::Value::Array(items)
+        }
+        Some(Kind::Basemodel(model)) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "__class__".to_string(),
+                serde_json::Value::String(model.name.clone()),
+            );
+            obj.insert(
+                "__module__".to_string(),
+                serde_json::Value::String(model.module.clone()),
+            );
+            if let Some(data_dict) = &model.data {
+                for entry in &data_dict.entries {
+                    if let Some(v) = &entry.value {
+                        obj.insert(entry.key.clone(), proto_value_to_json(v));
+                    }
+                }
+            }
+            serde_json::Value::Object(obj)
+        }
+        Some(Kind::Exception(exc)) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("__exception__".to_string(), serde_json::Value::Bool(true));
+            obj.insert(
+                "type".to_string(),
+                serde_json::Value::String(exc.r#type.clone()),
+            );
+            obj.insert(
+                "module".to_string(),
+                serde_json::Value::String(exc.module.clone()),
+            );
+            obj.insert(
+                "message".to_string(),
+                serde_json::Value::String(exc.message.clone()),
+            );
+            serde_json::Value::Object(obj)
+        }
+        None => serde_json::Value::Null,
     }
 }
