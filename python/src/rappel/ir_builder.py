@@ -235,6 +235,16 @@ class ActionDefinition:
 
 
 @dataclass
+class ModuleContext:
+    """Cached IRBuilder context derived from a module."""
+
+    action_defs: Dict[str, ActionDefinition]
+    imported_names: Dict[str, "ImportedName"]
+    module_functions: Set[str]
+    model_defs: Dict[str, "ModelDefinition"]
+
+
+@dataclass
 class TransformContext:
     """Context for IR transformations."""
 
@@ -272,39 +282,104 @@ def build_workflow_ir(workflow_cls: type["Workflow"]) -> ir.Program:
     if module is None:
         raise ValueError(f"unable to locate module for workflow {workflow_cls!r}")
 
-    # Get the function source and parse it
-    function_source = textwrap.dedent(inspect.getsource(original_run))
-    tree = ast.parse(function_source)
+    module_contexts: Dict[str, ModuleContext] = {}
 
-    # Discover actions in the module
-    action_defs = _discover_action_names(module)
-
-    # Discover imports for built-in detection (e.g., from asyncio import sleep)
-    imported_names = _discover_module_imports(module)
-
-    # Discover all async function names in the module (for non-action detection)
-    module_functions = _discover_module_functions(module)
-
-    # Discover Pydantic models and dataclasses that can be used in workflows
-    model_defs = _discover_model_definitions(module)
+    def get_module_context(target_module: Any) -> ModuleContext:
+        module_name = target_module.__name__
+        if module_name not in module_contexts:
+            module_contexts[module_name] = ModuleContext(
+                action_defs=_discover_action_names(target_module),
+                imported_names=_discover_module_imports(target_module),
+                module_functions=_discover_module_functions(target_module),
+                model_defs=_discover_model_definitions(target_module),
+            )
+        return module_contexts[module_name]
 
     # Build the IR with transformation context
     ctx = TransformContext()
-    builder = IRBuilder(action_defs, ctx, imported_names, module_functions, model_defs)
-    builder.visit(tree)
-
-    # Create the Program with the main function and any implicit functions
     program = ir.Program()
+    function_defs: Dict[str, ir.FunctionDef] = {}
+
+    def parse_function(fn: Any) -> ast.AST:
+        function_source = textwrap.dedent(inspect.getsource(fn))
+        return ast.parse(function_source)
+
+    def add_function_def(fn: Any, fn_tree: ast.AST) -> None:
+        fn_module = inspect.getmodule(fn)
+        if fn_module is None:
+            raise ValueError(f"unable to locate module for function {fn!r}")
+
+        ctx_data = get_module_context(fn_module)
+        builder = IRBuilder(
+            ctx_data.action_defs,
+            ctx,
+            ctx_data.imported_names,
+            ctx_data.module_functions,
+            ctx_data.model_defs,
+        )
+        builder.visit(fn_tree)
+        if builder.function_def:
+            function_defs[builder.function_def.name] = builder.function_def
+
+    # Build the main run() function
+    run_tree = parse_function(original_run)
+    add_function_def(original_run, run_tree)
+
+    # Include helper methods reachable via self.method() calls
+    pending = list(_collect_self_method_calls(run_tree))
+    visited: Set[str] = set()
+    skip_methods = {"run_action"}
+
+    while pending:
+        method_name = pending.pop()
+        if method_name in visited or method_name == "run" or method_name in skip_methods:
+            continue
+        visited.add(method_name)
+
+        method = _find_workflow_method(workflow_cls, method_name)
+        if method is None:
+            continue
+
+        method_tree = parse_function(method)
+        add_function_def(method, method_tree)
+
+        pending.extend(_collect_self_method_calls(method_tree))
 
     # Add implicit functions first (they may be called by the main function)
     for implicit_fn in ctx.implicit_functions:
         program.functions.append(implicit_fn)
 
-    # Add the main function
-    if builder.function_def:
-        program.functions.append(builder.function_def)
+    # Add all function definitions (run + reachable helper methods)
+    for fn_def in function_defs.values():
+        program.functions.append(fn_def)
 
     return program
+
+
+def _collect_self_method_calls(tree: ast.AST) -> Set[str]:
+    """Collect self.method(...) call names from a parsed function AST."""
+    calls: Set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            if func.value.id == "self":
+                calls.add(func.attr)
+    return calls
+
+
+def _find_workflow_method(workflow_cls: type["Workflow"], name: str) -> Optional[Any]:
+    """Find a workflow method by name across the class MRO."""
+    for base in workflow_cls.__mro__:
+        if name not in base.__dict__:
+            continue
+        value = base.__dict__[name]
+        if isinstance(value, staticmethod) or isinstance(value, classmethod):
+            return value.__func__
+        if inspect.isfunction(value):
+            return value
+    return None
 
 
 def _discover_action_names(module: Any) -> Dict[str, ActionDefinition]:
@@ -2574,7 +2649,10 @@ class IRBuilder(ast.NodeVisitor):
                 current = current.value
             if isinstance(current, ast.Name):
                 parts.append(current.id)
-            return ".".join(reversed(parts))
+            name = ".".join(reversed(parts))
+            if name.startswith("self."):
+                return name[5:]
+            return name
         return None
 
     def _expr_to_ir_with_model_coercion(self, node: ast.expr) -> Optional[ir.Expr]:
@@ -2775,6 +2853,24 @@ def _expr_to_ir(expr: ast.AST) -> Optional[ir.Expr]:
             result.dot.CopyFrom(ir.DotAccess(object=obj, attribute=expr.attr))
             return result
 
+    if isinstance(expr, ast.Await) and isinstance(expr.value, ast.Call):
+        func_name = _get_func_name(expr.value.func)
+        if func_name:
+            args = [_expr_to_ir(a) for a in expr.value.args]
+            kwargs: List[ir.Kwarg] = []
+            for kw in expr.value.keywords:
+                if kw.arg:
+                    kw_expr = _expr_to_ir(kw.value)
+                    if kw_expr:
+                        kwargs.append(ir.Kwarg(name=kw.arg, value=kw_expr))
+            func_call = ir.FunctionCall(
+                name=func_name,
+                args=[a for a in args if a],
+                kwargs=kwargs,
+            )
+            result.function_call.CopyFrom(func_call)
+            return result
+
     if isinstance(expr, ast.Call):
         # Function call
         func_name = _get_func_name(expr.func)
@@ -2962,5 +3058,8 @@ def _get_func_name(func: ast.expr) -> Optional[str]:
             current = current.value
         if isinstance(current, ast.Name):
             parts.append(current.id)
-        return ".".join(reversed(parts))
+        name = ".".join(reversed(parts))
+        if name.startswith("self."):
+            return name[5:]
+        return name
     return None

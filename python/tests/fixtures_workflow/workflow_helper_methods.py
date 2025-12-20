@@ -29,7 +29,7 @@ class WorkflowWithHelperMethods(Workflow):
 
     def format_result(self, value: str) -> str:
         """Pure Python helper - formats the final result."""
-        return f"[RESULT: {value}]"
+        return "[RESULT: " + value + "]"
 
     async def run(self, key: str, base: int, factor: int) -> str:
         # Call an action
