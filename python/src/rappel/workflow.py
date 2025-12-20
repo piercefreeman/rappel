@@ -177,8 +177,12 @@ def workflow(cls: type[TWorkflow]) -> type[TWorkflow]:
             if i < len(params):
                 kwargs[params[i]] = arg
 
+        bound = sig.bind_partial(self, **kwargs)
+        bound.apply_defaults()
+        initial_kwargs = {key: value for key, value in bound.arguments.items() if key != "self"}
+
         # Serialize kwargs using common logic
-        initial_context = build_arguments_from_kwargs(kwargs)
+        initial_context = build_arguments_from_kwargs(initial_kwargs)
 
         payload = cls._build_registration_payload(initial_context)
         run_result = await bridge.run_instance(payload.SerializeToString())
