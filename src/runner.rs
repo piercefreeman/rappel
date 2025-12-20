@@ -2485,7 +2485,7 @@ impl DAGRunner {
                     // - Control-flow nodes (join, branch) pass through the incoming result
                     // - Value-producing nodes use their own inline_result
                     let passthrough_result = match succ_node.node_type.as_str() {
-                        "join" | "branch" => current_result.clone(),
+                        "join" | "branch" | "fn_call" => current_result.clone(),
                         _ => inline_result,
                     };
 
@@ -2858,6 +2858,7 @@ impl DAGRunner {
         let mut readiness_inits: Vec<ReadinessInit> = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let mut queue = std::collections::VecDeque::new();
+        let mut completion_payload: Option<Vec<u8>> = None;
 
         // Start from input node's successors
         let initial_successors = helper.get_ready_successors(&input_node.id, None);
@@ -2999,6 +3000,18 @@ impl DAGRunner {
                         }
                     }
 
+                    if node.node_type == "return" || node.is_output {
+                        let result_value = if node.node_type == "return" {
+                            inline_result
+                        } else {
+                            scope.get("result").cloned().unwrap_or(JsonValue::Null)
+                        };
+                        let mut result_map = HashMap::new();
+                        result_map.insert("result".to_string(), result_value);
+                        completion_payload = Some(Self::serialize_workflow_result(&result_map));
+                        break;
+                    }
+
                     let inline_successors = helper.get_ready_successors(&node_id, None);
                     debug!(
                         node_id = %node_id,
@@ -3027,6 +3040,15 @@ impl DAGRunner {
                 write.spread_index,
             )
             .await?;
+        }
+
+        if let Some(payload) = completion_payload {
+            db.complete_instance(instance_id, Some(&payload)).await?;
+            info!(
+                instance_id = %instance_id.0,
+                "completed workflow instance during start_instance"
+            );
+            return Ok(0);
         }
 
         // Initialize node_readiness for spread aggregators BEFORE enqueuing actions

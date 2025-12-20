@@ -4006,12 +4006,13 @@ fn main(input: [], output: [result]):
             .find(|(_, node)| node.node_type == "branch")
             .map(|(id, _)| id.clone())
             .expect("Should have branch node");
-        let return_id = dag
+        let return_ids: HashSet<_> = dag
             .nodes
             .iter()
-            .find(|(_, node)| node.node_type == "return")
+            .filter(|(_, node)| node.node_type == "return")
             .map(|(id, _)| id.clone())
-            .expect("Should have return node");
+            .collect();
+        assert!(!return_ids.is_empty(), "Should have return node");
 
         let has_branch_edge = dag.edges.iter().any(|edge| {
             edge.edge_type == EdgeType::StateMachine
@@ -4023,7 +4024,7 @@ fn main(input: [], output: [result]):
         let has_return_edge = dag.edges.iter().any(|edge| {
             edge.edge_type == EdgeType::StateMachine
                 && edge.source == fn_call_id
-                && edge.target == return_id
+                && return_ids.contains(&edge.target)
         });
         assert!(
             has_return_edge,
