@@ -417,9 +417,9 @@ impl<'a> DAGHelper<'a> {
             return ExecutionMode::Delegated;
         }
 
-        // Function calls (from parallel blocks) are delegated
+        // External function calls remain as fn_call nodes; treat them as inline no-ops.
         if node.is_fn_call {
-            return ExecutionMode::Delegated;
+            return ExecutionMode::Inline;
         }
 
         // For-loop nodes are delegated - they need to go through the runner
