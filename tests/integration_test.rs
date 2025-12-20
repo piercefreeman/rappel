@@ -72,15 +72,17 @@ asyncio.run(main())
 "#;
 const IMMEDIATE_CONDITIONAL_WORKFLOW_MODULE: &str =
     include_str!("fixtures/immediate_conditional_workflow.py");
-const REGISTER_IMMEDIATE_CONDITIONAL_MISSING_INPUT_SCRIPT: &str = r#"
+const IMMEDIATE_REQUIRED_INPUT_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/immediate_required_input_workflow.py");
+const REGISTER_IMMEDIATE_REQUIRED_INPUT_MISSING_INPUT_SCRIPT: &str = r#"
 import asyncio
 import os
 
-from immediate_conditional_workflow import ImmediateConditionalWorkflow
+from immediate_required_input_workflow import ImmediateRequiredInputWorkflow
 
 async def main():
     os.environ.pop("PYTEST_CURRENT_TEST", None)
-    wf = ImmediateConditionalWorkflow()
+    wf = ImmediateRequiredInputWorkflow()
     result = await wf.run()
     print(f"Registration result: {result}")
 
@@ -1035,24 +1037,24 @@ async fn immediate_conditional_workflow_low_branch() -> Result<()> {
 /// Ensure missing input parameters fail the workflow during startup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn immediate_conditional_workflow_missing_input_fails_start() -> Result<()> {
+async fn immediate_required_input_workflow_missing_input_fails_start() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let _ = dotenvy::dotenv();
 
     let Some(harness) = IntegrationHarness::new_without_start(HarnessConfig {
         files: &[
             (
-                "immediate_conditional_workflow.py",
-                IMMEDIATE_CONDITIONAL_WORKFLOW_MODULE,
+                "immediate_required_input_workflow.py",
+                IMMEDIATE_REQUIRED_INPUT_WORKFLOW_MODULE,
             ),
             (
                 "register.py",
-                REGISTER_IMMEDIATE_CONDITIONAL_MISSING_INPUT_SCRIPT,
+                REGISTER_IMMEDIATE_REQUIRED_INPUT_MISSING_INPUT_SCRIPT,
             ),
         ],
         entrypoint: "register.py",
-        workflow_name: "immediateconditionalworkflow",
-        user_module: "immediate_conditional_workflow",
+        workflow_name: "immediaterequiredinputworkflow",
+        user_module: "immediate_required_input_workflow",
         inputs: &[],
     })
     .await?
