@@ -6,8 +6,10 @@ from collections.abc import Iterator
 import pytest
 
 from proto import ast_pb2 as ir
+from proto import messages_pb2 as pb2
 from rappel import bridge
 from rappel.actions import action, serialize_result_payload
+from rappel.serialization import arguments_to_kwargs
 
 workflow_module = importlib.import_module("rappel.workflow")
 Workflow = workflow_module.Workflow
@@ -101,6 +103,82 @@ def test_workflow_registration_outside_pytest(monkeypatch: pytest.MonkeyPatch) -
     assert result_again == "second"
     assert len(calls) == 2
     assert wait_calls[-1] == "00000000-0000-0000-0000-000000000202"
+    os.environ["PYTEST_CURRENT_TEST"] = "true"
+
+
+def test_workflow_registration_applies_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    captured: list[bytes] = []
+
+    async def fake_run_instance(payload: bytes) -> bridge.RunInstanceResult:
+        captured.append(payload)
+        return bridge.RunInstanceResult(
+            workflow_version_id="00000000-0000-0000-0000-000000000199",
+            workflow_instance_id="00000000-0000-0000-0000-000000000299",
+        )
+
+    async def fake_wait_for_instance(*, instance_id: str, poll_interval_secs: float = 1.0) -> bytes:
+        _ = instance_id
+        _ = poll_interval_secs
+        payload = serialize_result_payload("ok")
+        return payload.SerializeToString()
+
+    monkeypatch.setattr(bridge, "run_instance", fake_run_instance)
+    monkeypatch.setattr(bridge, "wait_for_instance", fake_wait_for_instance)
+
+    @workflow_decorator
+    class DefaultArgWorkflow(Workflow):
+        async def run(self, count: int = 5, name: str = "demo") -> str:
+            return name
+
+    instance = DefaultArgWorkflow()
+    result = asyncio.run(instance.run())
+    assert result == "ok"
+    assert len(captured) == 1
+
+    registration = pb2.WorkflowRegistration()
+    registration.ParseFromString(captured[0])
+    inputs = arguments_to_kwargs(registration.initial_context)
+    assert inputs == {"count": 5, "name": "demo"}
+
+    os.environ["PYTEST_CURRENT_TEST"] = "true"
+
+
+def test_workflow_registration_overrides_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    captured: list[bytes] = []
+
+    async def fake_run_instance(payload: bytes) -> bridge.RunInstanceResult:
+        captured.append(payload)
+        return bridge.RunInstanceResult(
+            workflow_version_id="00000000-0000-0000-0000-000000000399",
+            workflow_instance_id="00000000-0000-0000-0000-000000000499",
+        )
+
+    async def fake_wait_for_instance(*, instance_id: str, poll_interval_secs: float = 1.0) -> bytes:
+        _ = instance_id
+        _ = poll_interval_secs
+        payload = serialize_result_payload("ok")
+        return payload.SerializeToString()
+
+    monkeypatch.setattr(bridge, "run_instance", fake_run_instance)
+    monkeypatch.setattr(bridge, "wait_for_instance", fake_wait_for_instance)
+
+    @workflow_decorator
+    class DefaultOverrideWorkflow(Workflow):
+        async def run(self, count: int = 5, name: str = "demo") -> str:
+            return name
+
+    instance = DefaultOverrideWorkflow()
+    result = asyncio.run(instance.run(count=9))
+    assert result == "ok"
+    assert len(captured) == 1
+
+    registration = pb2.WorkflowRegistration()
+    registration.ParseFromString(captured[0])
+    inputs = arguments_to_kwargs(registration.initial_context)
+    assert inputs == {"count": 9, "name": "demo"}
+
     os.environ["PYTEST_CURRENT_TEST"] = "true"
 
 

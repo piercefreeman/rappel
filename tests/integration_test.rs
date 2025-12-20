@@ -72,6 +72,22 @@ asyncio.run(main())
 "#;
 const IMMEDIATE_CONDITIONAL_WORKFLOW_MODULE: &str =
     include_str!("fixtures/immediate_conditional_workflow.py");
+const IMMEDIATE_REQUIRED_INPUT_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/immediate_required_input_workflow.py");
+const REGISTER_IMMEDIATE_REQUIRED_INPUT_MISSING_INPUT_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from immediate_required_input_workflow import ImmediateRequiredInputWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ImmediateRequiredInputWorkflow()
+    result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
 const CHAIN_WORKFLOW_MODULE: &str = include_str!("fixtures/chain_workflow.py");
 const LOOP_RETURN_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_loop_return.py");
 const DEAD_END_CONDITIONAL_WORKFLOW_MODULE: &str =
@@ -118,6 +134,24 @@ fn parse_result(payload: &[u8]) -> Result<Option<String>> {
         }
     }
     Err(anyhow::anyhow!("missing result in payload"))
+}
+
+fn parse_error(payload: &[u8]) -> Result<Option<String>> {
+    if payload.is_empty() {
+        return Ok(None);
+    }
+
+    let arguments = proto::WorkflowArguments::decode(payload)
+        .map_err(|err| anyhow::anyhow!("decode workflow arguments: {err}"))?;
+
+    for argument in arguments.arguments {
+        if argument.key == "error"
+            && let Some(value) = argument.value.as_ref()
+        {
+            return extract_string_from_value(value);
+        }
+    }
+    Err(anyhow::anyhow!("missing error in payload"))
 }
 
 fn extract_string_from_value(value: &proto::WorkflowArgumentValue) -> Result<Option<String>> {
@@ -994,6 +1028,57 @@ async fn immediate_conditional_workflow_low_branch() -> Result<()> {
         message,
         Some("low:10".to_string()),
         "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Ensure missing input parameters fail the workflow during startup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn immediate_required_input_workflow_missing_input_fails_start() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new_without_start(HarnessConfig {
+        files: &[
+            (
+                "immediate_required_input_workflow.py",
+                IMMEDIATE_REQUIRED_INPUT_WORKFLOW_MODULE,
+            ),
+            (
+                "register.py",
+                REGISTER_IMMEDIATE_REQUIRED_INPUT_MISSING_INPUT_SCRIPT,
+            ),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "immediaterequiredinputworkflow",
+        user_module: "immediate_required_input_workflow",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.run_to_completion(10).await?;
+
+    let instance = harness
+        .database()
+        .get_instance(harness.instance_id())
+        .await?;
+    assert_eq!(instance.status, "failed", "instance should be failed");
+
+    let payload = instance.result_payload.unwrap_or_default();
+    let error_message = parse_error(&payload)?.unwrap_or_default();
+    assert!(
+        error_message.contains("Guard evaluation failed during startup"),
+        "unexpected error message: {error_message}"
+    );
+    assert!(
+        error_message.contains("Variable not found"),
+        "unexpected error message: {error_message}"
     );
 
     harness.shutdown().await?;
