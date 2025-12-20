@@ -1656,6 +1656,8 @@ async fn chain_workflow_executes_all_steps() -> Result<()> {
 // =============================================================================
 
 const FOR_LOOP_WORKFLOW_MODULE: &str = include_str!("fixtures/for_loop_workflow.py");
+const FN_CALL_BINDING_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_fn_call_binding.py");
 
 const REGISTER_FOR_LOOP_SCRIPT: &str = r#"
 import asyncio
@@ -1667,6 +1669,21 @@ async def main():
     os.environ.pop("PYTEST_CURRENT_TEST", None)
     wf = ForLoopWorkflow()
     result = await wf.run(items=["apple", "banana", "cherry"])
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+const REGISTER_FN_CALL_BINDING_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_fn_call_binding import PredictWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = PredictWorkflow()
+    result = await wf.run(user={"user_id": "user-123"})
     print(f"Registration result: {result}")
 
 asyncio.run(main())
@@ -1713,6 +1730,54 @@ async fn for_loop_workflow_executes_all_iterations() -> Result<()> {
     assert_eq!(
         message,
         Some("APPLE,BANANA,CHERRY".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Fn Call Binding Workflow Test
+// =============================================================================
+
+/// Test that positional args passed into helper methods bind correctly and
+/// flow into action kwargs (including dot access).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn fn_call_binding_workflow_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_fn_call_binding.py",
+                FN_CALL_BINDING_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_FN_CALL_BINDING_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "predictworkflow",
+        user_module: "integration_fn_call_binding",
+        inputs: &[("user", r#"{"user_id":"user-123"}"#)],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("user-123".to_string()),
         "unexpected workflow result"
     );
 

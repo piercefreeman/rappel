@@ -2319,6 +2319,70 @@ fn workflow(input: [raw_id], output: [result]):
     }
 
     #[test]
+    fn test_helper_early_return_flows_to_caller() {
+        let source = r#"
+fn helper(input: [flag], output: [result]):
+    result = @check()
+    if flag:
+        return result
+    result = @work()
+    return result
+
+fn workflow(input: [flag], output: [result]):
+    helper(flag=flag)
+    result = @final_action()
+    return result
+"#;
+
+        let dag = dag_from_source(source);
+        let helper = DAGHelper::new(&dag);
+
+        let check_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("check"))
+            .expect("Should have check action node");
+
+        let subgraph = analyze_subgraph(&check_action.id, &dag, &helper);
+        let ctx = InlineContext {
+            initial_scope: &{
+                let mut scope = InlineScope::new();
+                scope.insert("flag".to_string(), JsonValue::Bool(true));
+                scope
+            },
+            existing_inbox: &HashMap::new(),
+            spread_index: None,
+        };
+
+        let result = execute_inline_subgraph(
+            &check_action.id,
+            JsonValue::Bool(true),
+            ctx,
+            &subgraph,
+            &dag,
+            WorkflowInstanceId(Uuid::nil()),
+        );
+
+        assert!(
+            result.is_ok(),
+            "Expected early return in helper to continue to caller, got: {:?}",
+            result
+        );
+
+        let plan = result.unwrap();
+        let action_names: Vec<_> = plan
+            .readiness_increments
+            .iter()
+            .filter_map(|r| r.action_name.as_ref())
+            .collect();
+        assert!(
+            action_names.iter().any(|n| *n == "final_action"),
+            "Expected final_action readiness, got: {:?}",
+            action_names
+        );
+    }
+
+    #[test]
     fn test_early_return_with_for_loop_early_return_taken() {
         // Test the case where early return IS taken (auth_session_id is null)
         let source = r#"

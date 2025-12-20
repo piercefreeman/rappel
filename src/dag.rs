@@ -680,7 +680,8 @@ impl DAGConverter {
     ///
     /// Returns (first_node_id, last_node_id) of the expanded function body.
     /// For the entry function (id_prefix = None), input/output nodes are kept.
-    /// For inlined functions (id_prefix = Some), input/output nodes are stripped.
+    /// For inlined functions (id_prefix = Some), input nodes are stripped.
+    /// Output/return nodes are preserved so early returns can flow to the caller.
     fn expand_function_recursive(
         &self,
         unexpanded: &DAG,
@@ -697,10 +698,9 @@ impl DAGConverter {
 
         // Find input and output nodes
         let input_node = fn_nodes.values().find(|n| n.is_input);
-        let output_node = fn_nodes.values().find(|n| n.is_output);
 
-        // For the entry function (no prefix), we keep input/output nodes
-        // For inlined functions, we strip them
+        // For the entry function (no prefix), we keep input/output nodes.
+        // For inlined functions, we strip input nodes only.
         let is_entry_function = id_prefix.is_none();
 
         // Build execution order for this function (using state machine edges)
@@ -710,7 +710,7 @@ impl DAGConverter {
         // Map from old node IDs to new node IDs (for cloned nodes)
         let mut id_map: HashMap<String, String> = HashMap::new();
 
-        // Track first and last "real" nodes (excluding input/output for inlined functions)
+        // Track first and last "real" nodes (excluding input for inlined functions)
         let mut first_real_node: Option<String> = None;
         let mut last_real_node: Option<String> = None;
 
@@ -721,11 +721,8 @@ impl DAGConverter {
                 None => continue,
             };
 
-            // For inlined functions, skip input/output boundary nodes and return nodes
-            // Return nodes in synthetic functions (try/except bodies, for loop bodies, etc.)
-            // are artifacts of the function wrapping and serve no purpose after expansion
-            if !is_entry_function && (node.is_input || node.is_output || node.node_type == "return")
-            {
+            // For inlined functions, skip input boundary nodes.
+            if !is_entry_function && node.is_input {
                 continue;
             }
 
@@ -771,9 +768,51 @@ impl DAGConverter {
                     visited_calls.remove(&call_key);
 
                     if let Some((child_first, child_last)) = expansion {
+                        let mut bind_ids = Vec::new();
+                        if let Some(fn_def) = self.function_defs.get(called_fn) {
+                            if let Some(io) = fn_def.io.as_ref() {
+                                if let Some(ref kwarg_exprs) = node.kwarg_exprs {
+                                    for (idx, input_name) in io.inputs.iter().enumerate() {
+                                        if let Some(expr) = kwarg_exprs.get(input_name) {
+                                            let bind_id = format!(
+                                                "{}:bind_{}_{}",
+                                                child_prefix, input_name, idx
+                                            );
+                                            let label = format!("{} = ...", input_name);
+                                            let bind_node = DAGNode::new(
+                                                bind_id.clone(),
+                                                "assignment".to_string(),
+                                                label,
+                                            )
+                                            .with_target(input_name)
+                                            .with_assign_expr(expr.clone())
+                                            .with_function_name(called_fn);
+                                            target.add_node(bind_node);
+                                            bind_ids.push(bind_id);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if !bind_ids.is_empty() {
+                            for idx in 1..bind_ids.len() {
+                                let prev = bind_ids[idx - 1].clone();
+                                let next = bind_ids[idx].clone();
+                                target.add_edge(DAGEdge::state_machine(prev, next));
+                            }
+                            if let Some(last_bind) = bind_ids.last() {
+                                target.add_edge(DAGEdge::state_machine(
+                                    last_bind.clone(),
+                                    child_first.clone(),
+                                ));
+                            }
+                        }
+
                         // Map this fn_call node to the expansion's first/last nodes
                         // For edge rewiring, we treat fn_call as expanding to child_first...child_last
-                        id_map.insert(old_id.clone(), child_first.clone());
+                        let call_entry = bind_ids.first().cloned().unwrap_or(child_first.clone());
+                        id_map.insert(old_id.clone(), call_entry.clone());
 
                         // Store the last node for later edge rewiring
                         // We'll need special handling for edges FROM this fn_call
@@ -829,7 +868,7 @@ impl DAGConverter {
                         }
 
                         if first_real_node.is_none() {
-                            first_real_node = Some(child_first);
+                            first_real_node = Some(call_entry);
                         }
                         last_real_node = Some(child_last);
                         continue;
@@ -860,7 +899,6 @@ impl DAGConverter {
 
         // Clone edges, remapping IDs and handling boundary nodes
         let input_id = input_node.map(|n| n.id.as_str());
-        let output_id = output_node.map(|n| n.id.as_str());
 
         for edge in &unexpanded.edges {
             // Skip edges where the source is not in this function
@@ -869,26 +907,12 @@ impl DAGConverter {
                 continue;
             }
 
-            // For inlined functions (not entry), skip edges to/from input/output/return nodes
+            // For inlined functions (not entry), skip edges from input nodes
             if !is_entry_function {
                 // Handle edges from input node - these become edges from predecessor (handled by caller)
                 if input_id == Some(edge.source.as_str()) {
                     // Skip - the caller will wire incoming edges
                     continue;
-                }
-
-                // Handle edges to output node - these become edges to successor (handled by caller)
-                if output_id == Some(edge.target.as_str()) {
-                    // Skip - the caller will wire outgoing edges
-                    continue;
-                }
-
-                // Handle edges to return nodes - return nodes are skipped during expansion
-                // (they're artifacts of function wrapping), so edges targeting them must also be skipped
-                if let Some(target_node) = unexpanded.nodes.get(&edge.target) {
-                    if target_node.node_type == "return" {
-                        continue;
-                    }
                 }
             }
 
@@ -1118,69 +1142,6 @@ impl DAGConverter {
 
         // Helper: does a node use a variable?
         let uses_var = |node: &DAGNode, var_name: &str| -> bool {
-            fn expr_uses_var(expr: &ast::Expr, var_name: &str) -> bool {
-                use ast::expr;
-
-                match &expr.kind {
-                    Some(expr::Kind::Variable(v)) => v.name == var_name,
-                    Some(expr::Kind::BinaryOp(b)) => {
-                        expr_uses_var(
-                            b.left
-                                .as_ref()
-                                .expect("binary op must have left expression"),
-                            var_name,
-                        ) || expr_uses_var(
-                            b.right
-                                .as_ref()
-                                .expect("binary op must have right expression"),
-                            var_name,
-                        )
-                    }
-                    Some(expr::Kind::UnaryOp(u)) => u
-                        .operand
-                        .as_ref()
-                        .map(|op| expr_uses_var(op, var_name))
-                        .unwrap_or(false),
-                    Some(expr::Kind::List(list)) => list
-                        .elements
-                        .iter()
-                        .any(|elem| expr_uses_var(elem, var_name)),
-                    Some(expr::Kind::Dict(dict)) => dict.entries.iter().any(|entry| {
-                        entry
-                            .key
-                            .as_ref()
-                            .map(|k| expr_uses_var(k, var_name))
-                            .unwrap_or(false)
-                            || entry
-                                .value
-                                .as_ref()
-                                .map(|v| expr_uses_var(v, var_name))
-                                .unwrap_or(false)
-                    }),
-                    Some(expr::Kind::Index(idx)) => {
-                        idx.object
-                            .as_ref()
-                            .map(|v| expr_uses_var(v, var_name))
-                            .unwrap_or(false)
-                            || idx
-                                .index
-                                .as_ref()
-                                .map(|i| expr_uses_var(i, var_name))
-                                .unwrap_or(false)
-                    }
-                    Some(expr::Kind::FunctionCall(call)) => {
-                        call.args.iter().any(|arg| expr_uses_var(arg, var_name))
-                            || call.kwargs.iter().any(|kw| {
-                                kw.value
-                                    .as_ref()
-                                    .map(|v| expr_uses_var(v, var_name))
-                                    .unwrap_or(false)
-                            })
-                    }
-                    _ => false,
-                }
-            }
-
             if let Some(ref kwargs) = node.kwargs {
                 for value in kwargs.values() {
                     if value == &format!("${}", var_name) {
@@ -1195,7 +1156,7 @@ impl DAGConverter {
             }
 
             if let Some(ref assign_expr) = node.assign_expr {
-                if expr_uses_var(assign_expr, var_name) {
+                if Self::expr_uses_var(assign_expr, var_name) {
                     tracing::trace!(
                         node_id = %node.id,
                         var_name = %var_name,
@@ -1209,7 +1170,7 @@ impl DAGConverter {
             // that uses the variable, the node needs that variable in scope
             if let Some(guards) = node_guard_exprs.get(&node.id) {
                 for guard in guards {
-                    if expr_uses_var(guard, var_name) {
+                    if Self::expr_uses_var(guard, var_name) {
                         tracing::trace!(
                             node_id = %node.id,
                             var_name = %var_name,
@@ -1223,7 +1184,7 @@ impl DAGConverter {
             // Check kwarg_exprs for variable references
             if let Some(ref kwarg_exprs) = node.kwarg_exprs {
                 for expr in kwarg_exprs.values() {
-                    if expr_uses_var(expr, var_name) {
+                    if Self::expr_uses_var(expr, var_name) {
                         tracing::trace!(
                             node_id = %node.id,
                             var_name = %var_name,
@@ -1797,9 +1758,8 @@ impl DAGConverter {
             format!("{}() -> {}", call.name, target)
         };
 
-        // Extract kwargs from the function call
-        let kwargs = self.extract_kwargs(&call.kwargs);
-        let kwarg_exprs = self.extract_kwarg_exprs(&call.kwargs);
+        // Extract kwargs from the function call (positional args mapped when possible)
+        let (kwargs, kwarg_exprs) = self.extract_fn_call_args(call);
 
         let mut node = DAGNode::new(node_id.clone(), "fn_call".to_string(), label)
             .with_fn_call(&call.name)
@@ -1891,6 +1851,36 @@ impl DAGConverter {
             }
         }
         result
+    }
+
+    /// Extract kwargs for function calls, mapping positional args to input names when possible.
+    fn extract_fn_call_args(
+        &self,
+        call: &ast::FunctionCall,
+    ) -> (HashMap<String, String>, HashMap<String, ast::Expr>) {
+        let mut kwargs = self.extract_kwargs(&call.kwargs);
+        let mut kwarg_exprs = self.extract_kwarg_exprs(&call.kwargs);
+
+        let input_names = self
+            .function_defs
+            .get(&call.name)
+            .and_then(|def| def.io.as_ref())
+            .map(|io| io.inputs.as_slice());
+
+        if let Some(inputs) = input_names {
+            for (idx, arg) in call.args.iter().enumerate() {
+                if let Some(param_name) = inputs.get(idx) {
+                    if !kwargs.contains_key(param_name) {
+                        kwargs.insert(param_name.clone(), self.expr_to_string(arg));
+                    }
+                    if !kwarg_exprs.contains_key(param_name) {
+                        kwarg_exprs.insert(param_name.clone(), arg.clone());
+                    }
+                }
+            }
+        }
+
+        (kwargs, kwarg_exprs)
     }
 
     /// Convert an expression to a string representation.
@@ -2197,8 +2187,11 @@ impl DAGConverter {
                     } else {
                         format!("{}() [{}]", func.name, i)
                     };
+                    let (kwargs, kwarg_exprs) = self.extract_fn_call_args(func);
                     let mut node = DAGNode::new(id.clone(), "fn_call".to_string(), label)
-                        .with_fn_call(&func.name);
+                        .with_fn_call(&func.name)
+                        .with_kwargs(kwargs)
+                        .with_kwarg_exprs(kwarg_exprs);
                     if let Some(ref t) = call_target {
                         node = node.with_target(t);
                     }
@@ -2903,8 +2896,7 @@ impl DAGConverter {
 
         if let Some(ast::expr::Kind::FunctionCall(func_call)) = &expr.kind {
             let node_id = self.next_id("fn_call");
-            let kwargs = self.extract_kwargs(&func_call.kwargs);
-            let kwarg_exprs = self.extract_kwarg_exprs(&func_call.kwargs);
+            let (kwargs, kwarg_exprs) = self.extract_fn_call_args(func_call);
             let mut node = DAGNode::new(
                 node_id.clone(),
                 "fn_call".to_string(),
@@ -3123,7 +3115,84 @@ impl DAGConverter {
             }
         }
 
+        if let Some(ref kwarg_exprs) = node.kwarg_exprs {
+            for expr in kwarg_exprs.values() {
+                if Self::expr_uses_var(expr, var_name) {
+                    return true;
+                }
+            }
+        }
+
         false
+    }
+
+    fn expr_uses_var(expr: &ast::Expr, var_name: &str) -> bool {
+        use ast::expr;
+
+        match &expr.kind {
+            Some(expr::Kind::Variable(v)) => v.name == var_name,
+            Some(expr::Kind::BinaryOp(bin)) => {
+                bin.left
+                    .as_ref()
+                    .map(|left| Self::expr_uses_var(left, var_name))
+                    .unwrap_or(false)
+                    || bin
+                        .right
+                        .as_ref()
+                        .map(|right| Self::expr_uses_var(right, var_name))
+                        .unwrap_or(false)
+            }
+            Some(expr::Kind::UnaryOp(unary)) => unary
+                .operand
+                .as_ref()
+                .map(|op| Self::expr_uses_var(op, var_name))
+                .unwrap_or(false),
+            Some(expr::Kind::List(list)) => list
+                .elements
+                .iter()
+                .any(|elem| Self::expr_uses_var(elem, var_name)),
+            Some(expr::Kind::Dict(dict)) => dict.entries.iter().any(|entry| {
+                entry
+                    .key
+                    .as_ref()
+                    .map(|key| Self::expr_uses_var(key, var_name))
+                    .unwrap_or(false)
+                    || entry
+                        .value
+                        .as_ref()
+                        .map(|value| Self::expr_uses_var(value, var_name))
+                        .unwrap_or(false)
+            }),
+            Some(expr::Kind::Index(index)) => {
+                index
+                    .object
+                    .as_ref()
+                    .map(|obj| Self::expr_uses_var(obj, var_name))
+                    .unwrap_or(false)
+                    || index
+                        .index
+                        .as_ref()
+                        .map(|idx| Self::expr_uses_var(idx, var_name))
+                        .unwrap_or(false)
+            }
+            Some(expr::Kind::Dot(dot)) => dot
+                .object
+                .as_ref()
+                .map(|obj| Self::expr_uses_var(obj, var_name))
+                .unwrap_or(false),
+            Some(expr::Kind::FunctionCall(call)) => {
+                call.args
+                    .iter()
+                    .any(|arg| Self::expr_uses_var(arg, var_name))
+                    || call.kwargs.iter().any(|kw| {
+                        kw.value
+                            .as_ref()
+                            .map(|value| Self::expr_uses_var(value, var_name))
+                            .unwrap_or(false)
+                    })
+            }
+            _ => false,
+        }
     }
 
     /// Get nodes in topological (execution) order for a subset of nodes
@@ -4667,6 +4736,83 @@ fn main(input: [], output: [result]):
     }
 
     #[test]
+    fn test_fn_call_binds_positional_args_with_dot_access() {
+        let source = r#"fn run(input: [user], output: []):
+    run_internal(user.user_id)
+    return
+
+fn run_internal(input: [user_id], output: []):
+    @check(request=CheckRequest(user_id=user_id))
+    return"#;
+
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program);
+
+        let bind_node = dag
+            .nodes
+            .values()
+            .find(|n| n.node_type == "assignment" && n.target.as_deref() == Some("user_id"))
+            .expect("Should have binding assignment for user_id");
+
+        let assign_expr = bind_node
+            .assign_expr
+            .as_ref()
+            .expect("Binding node should have an assignment expression");
+
+        match &assign_expr.kind {
+            Some(ast::expr::Kind::Dot(dot)) => {
+                let obj = dot
+                    .object
+                    .as_ref()
+                    .expect("Dot access should have an object");
+                match &obj.kind {
+                    Some(ast::expr::Kind::Variable(var)) => {
+                        assert_eq!(var.name, "user");
+                    }
+                    _ => panic!("Dot access should reference user variable"),
+                }
+            }
+            _ => panic!("Binding assignment should use dot access"),
+        }
+
+        assert!(
+            dag.nodes.values().any(|n| {
+                n.is_input
+                    && n.io_vars
+                        .as_ref()
+                        .is_some_and(|vars| vars.contains(&"user".to_string()))
+            }),
+            "Should have input node for user"
+        );
+
+        let user_to_bind = dag.edges.iter().find(|edge| {
+            edge.edge_type == EdgeType::DataFlow
+                && edge.variable.as_deref() == Some("user")
+                && edge.target == bind_node.id
+        });
+        assert!(
+            user_to_bind.is_some(),
+            "Should have DATA_FLOW edge for user to binding assignment"
+        );
+
+        let check_node = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("check"))
+            .expect("Should have check action node");
+
+        let user_id_to_check = dag.edges.iter().find(|edge| {
+            edge.edge_type == EdgeType::DataFlow
+                && edge.variable.as_deref() == Some("user_id")
+                && edge.target == check_node.id
+        });
+        assert!(
+            user_id_to_check.is_some(),
+            "Should have DATA_FLOW edge from bound user_id to check action"
+        );
+    }
+
+    #[test]
     fn test_dag_parallel_structure_for_aggregator() {
         // Test to visualize the full DAG structure for parallel workflow
         // This helps debug the aggregator synchronization issue
@@ -5707,17 +5853,34 @@ fn run(input: [items, threshold], output: []):
             "Should have success edge from try body"
         );
 
-        // Should have join node for try/except convergence
+        // Should have join node for try/except convergence.
+        // Inlined helper outputs can sit between risky/fallback and the join.
         let try_except_joins: Vec<_> = dag
             .nodes
             .values()
             .filter(|n| n.node_type == "join")
             .filter(|n| {
-                // Find joins that have the risky or fallback as predecessors
-                dag.edges.iter().any(|e| {
+                let has_direct = dag.edges.iter().any(|e| {
                     (e.source == risky.id || e.source == fallback.id)
                         && e.target == n.id
                         && e.edge_type == EdgeType::StateMachine
+                });
+                if has_direct {
+                    return true;
+                }
+                let output_predecessors: Vec<_> = dag
+                    .edges
+                    .iter()
+                    .filter(|e| e.target == n.id && e.edge_type == EdgeType::StateMachine)
+                    .filter_map(|e| dag.nodes.get(&e.source))
+                    .filter(|node| node.is_output)
+                    .collect();
+                output_predecessors.iter().any(|output_node| {
+                    dag.edges.iter().any(|e| {
+                        e.target == output_node.id
+                            && e.edge_type == EdgeType::StateMachine
+                            && (e.source == risky.id || e.source == fallback.id)
+                    })
                 })
             })
             .collect();
@@ -5733,19 +5896,28 @@ fn run(input: [items, threshold], output: []):
         let program = parse(COMPLETE_FEATURE_WORKFLOW_IR).expect("Should parse");
         let dag = convert_to_dag(&program);
 
-        // After expansion, there should be only ONE return node (from the main 'run' function)
-        // Synthetic function return nodes should be stripped during expansion
+        // After expansion, the main 'run' return node should still exist.
+        // Inlined helper returns are preserved to route early-return control flow.
         let return_nodes: Vec<_> = dag
             .nodes
             .values()
             .filter(|n| n.node_type == "return")
             .collect();
 
-        assert_eq!(
-            return_nodes.len(),
-            1,
-            "Should have exactly 1 return node after expansion. Found: {:?}",
+        assert!(
+            return_nodes
+                .iter()
+                .any(|n| n.function_name.as_deref() == Some("run")),
+            "Should have return node for main run function. Found: {:?}",
             return_nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+
+        assert!(
+            return_nodes.iter().all(|node| dag
+                .edges
+                .iter()
+                .any(|e| { e.source == node.id && e.edge_type == EdgeType::StateMachine })),
+            "Return nodes should have outgoing control flow edges"
         );
     }
 
@@ -6035,6 +6207,14 @@ fn run(input: [x], output: []):
                         .as_ref()
                         .map(|f| f.contains("except_handler"))
                         .unwrap_or(false)
+                    && n.assign_expr.as_ref().is_some_and(|expr| {
+                        matches!(
+                            expr.kind,
+                            Some(ast::expr::Kind::Literal(ast::Literal {
+                                value: Some(ast::literal::Value::BoolValue(true))
+                            }))
+                        )
+                    })
             })
             .expect("should have exception handler assignment for 'recovered'");
 
