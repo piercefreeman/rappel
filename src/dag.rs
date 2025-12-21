@@ -867,6 +867,26 @@ impl DAGConverter {
                             }
                         }
 
+                        if let Some(targets) = node.targets.as_ref() {
+                            let expanded_return_ids: Vec<_> = target
+                                .nodes
+                                .iter()
+                                .filter(|(id, n)| {
+                                    id.starts_with(&child_prefix)
+                                        && n.node_type == "return"
+                                        && n.function_name.as_ref() == Some(called_fn)
+                                })
+                                .map(|(id, _)| id.clone())
+                                .collect();
+
+                            for return_id in expanded_return_ids {
+                                if let Some(return_node) = target.nodes.get_mut(&return_id) {
+                                    return_node.targets = Some(targets.clone());
+                                    return_node.target = targets.first().cloned();
+                                }
+                            }
+                        }
+
                         if first_real_node.is_none() {
                             first_real_node = Some(call_entry);
                         }
@@ -1096,7 +1116,11 @@ impl DAGConverter {
         // actually define the variable. Including them in var_modifications causes
         // incorrect data flow edges due to topological ordering issues in loops.
         let mut var_modifications: HashMap<String, Vec<String>> = HashMap::new();
-        for (node_id, node) in dag.nodes.iter() {
+        for node_id in &order {
+            let node = match dag.nodes.get(node_id) {
+                Some(node) => node,
+                None => continue,
+            };
             // Skip join nodes - they don't define variables
             if node.node_type == "join" {
                 continue;
@@ -1112,13 +1136,18 @@ impl DAGConverter {
                 }
             }
             if let Some(ref target) = node.target {
-                var_modifications
-                    .entry(target.clone())
-                    .or_default()
-                    .push(node_id.clone());
+                if !(node.node_type == "return" && var_modifications.contains_key(target)) {
+                    var_modifications
+                        .entry(target.clone())
+                        .or_default()
+                        .push(node_id.clone());
+                }
             }
             if let Some(ref targets) = node.targets {
                 for t in targets {
+                    if node.node_type == "return" && var_modifications.contains_key(t) {
+                        continue;
+                    }
                     var_modifications
                         .entry(t.clone())
                         .or_default()
@@ -1773,7 +1802,8 @@ impl DAGConverter {
         let mut node = DAGNode::new(node_id.clone(), "fn_call".to_string(), label)
             .with_fn_call(&call.name)
             .with_kwargs(kwargs)
-            .with_kwarg_exprs(kwarg_exprs);
+            .with_kwarg_exprs(kwarg_exprs)
+            .with_targets(targets);
         if let Some(ref fn_name) = self.current_function {
             node = node.with_function_name(fn_name);
         }

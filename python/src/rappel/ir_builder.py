@@ -794,8 +794,7 @@ class IRBuilder(ast.NodeVisitor):
         elif isinstance(node, ast.Return):
             return self._visit_return(node)
         elif isinstance(node, ast.AugAssign):
-            result = self._visit_aug_assign(node)
-            return [result] if result else []
+            return self._visit_aug_assign(node)
         elif isinstance(node, ast.Pass):
             # Pass statements are fine, they just don't produce IR
             return []
@@ -1922,8 +1921,20 @@ class IRBuilder(ast.NodeVisitor):
 
                 return [assign_stmt, return_stmt]
 
-            # Regular return with expression (variable, literal, etc.)
+            # Normalize return of function calls into assignment + return
             expr = _expr_to_ir(node.value)
+            if expr and expr.HasField("function_call"):
+                tmp_var = self._ctx.next_implicit_fn_name(prefix="return_tmp")
+
+                assign_stmt = ir.Statement(span=_make_span(node))
+                assign_stmt.assignment.CopyFrom(ir.Assignment(targets=[tmp_var], value=expr))
+
+                return_stmt = ir.Statement(span=_make_span(node))
+                var_expr = ir.Expr(variable=ir.Variable(name=tmp_var), span=_make_span(node))
+                return_stmt.return_stmt.CopyFrom(ir.ReturnStmt(value=var_expr))
+                return [assign_stmt, return_stmt]
+
+            # Regular return with expression (variable, literal, etc.)
             if expr:
                 stmt = ir.Statement(span=_make_span(node))
                 return_stmt = ir.ReturnStmt(value=expr)
@@ -1935,7 +1946,7 @@ class IRBuilder(ast.NodeVisitor):
         stmt.return_stmt.CopyFrom(ir.ReturnStmt())
         return [stmt]
 
-    def _visit_aug_assign(self, node: ast.AugAssign) -> Optional[ir.Statement]:
+    def _visit_aug_assign(self, node: ast.AugAssign) -> List[ir.Statement]:
         """Convert augmented assignment (+=, -=, etc.) to IR."""
         # For now, we can represent this as a regular assignment with binary op
         # target op= value  ->  target = target op value
@@ -1947,6 +1958,31 @@ class IRBuilder(ast.NodeVisitor):
 
         left = _expr_to_ir(node.target)
         right = _expr_to_ir(node.value)
+        if right and right.HasField("function_call"):
+            tmp_var = self._ctx.next_implicit_fn_name(prefix="aug_tmp")
+
+            assign_tmp = ir.Statement(span=_make_span(node))
+            assign_tmp.assignment.CopyFrom(
+                ir.Assignment(
+                    targets=[tmp_var],
+                    value=ir.Expr(function_call=right.function_call, span=_make_span(node)),
+                )
+            )
+
+            if left:
+                op = _bin_op_to_ir(node.op)
+                if op:
+                    binary = ir.BinaryOp(
+                        left=left,
+                        op=op,
+                        right=ir.Expr(variable=ir.Variable(name=tmp_var)),
+                    )
+                    value = ir.Expr(binary_op=binary)
+                    assign = ir.Assignment(targets=targets, value=value)
+                    stmt.assignment.CopyFrom(assign)
+                    return [assign_tmp, stmt]
+            return [assign_tmp]
+
         if left and right:
             op = _bin_op_to_ir(node.op)
             if op:
@@ -1954,9 +1990,9 @@ class IRBuilder(ast.NodeVisitor):
                 value = ir.Expr(binary_op=binary)
                 assign = ir.Assignment(targets=targets, value=value)
                 stmt.assignment.CopyFrom(assign)
-                return stmt
+                return [stmt]
 
-        return None
+        return []
 
     def _check_constructor_in_return(self, node: ast.expr) -> None:
         """Check for constructor calls in return statements.
