@@ -478,6 +478,8 @@ pub struct WorkerSlotTracker {
     max_slots_per_worker: usize,
     /// Total available slots (cached)
     total_available: AtomicUsize,
+    /// Cursor for round-robin selection
+    cursor: AtomicUsize,
 }
 
 impl WorkerSlotTracker {
@@ -491,6 +493,7 @@ impl WorkerSlotTracker {
             worker_slots,
             max_slots_per_worker,
             total_available: AtomicUsize::new(num_workers * max_slots_per_worker),
+            cursor: AtomicUsize::new(0),
         }
     }
 
@@ -501,17 +504,40 @@ impl WorkerSlotTracker {
 
     /// Try to acquire a slot from any worker. Returns worker index if successful.
     pub fn acquire_slot(&self) -> Option<usize> {
-        for (idx, slots) in self.worker_slots.iter().enumerate() {
-            let current = slots.load(Ordering::SeqCst);
-            if current > 0 {
-                // Try to decrement
-                if slots
-                    .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    self.total_available.fetch_sub(1, Ordering::SeqCst);
-                    return Some(idx);
+        let worker_count = self.worker_slots.len();
+        if worker_count == 0 {
+            return None;
+        }
+
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % worker_count;
+        for _ in 0..worker_count {
+            let mut best_idx = None;
+            let mut best_slots = 0;
+
+            for offset in 0..worker_count {
+                let idx = (start + offset) % worker_count;
+                let current = self.worker_slots[idx].load(Ordering::SeqCst);
+                if current > best_slots {
+                    best_slots = current;
+                    best_idx = Some(idx);
                 }
+            }
+
+            let idx = best_idx?;
+
+            if best_slots == 0 {
+                return None;
+            }
+
+            let slots = &self.worker_slots[idx];
+            if slots
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    if current > 0 { Some(current - 1) } else { None }
+                })
+                .is_ok()
+            {
+                self.total_available.fetch_sub(1, Ordering::SeqCst);
+                return Some(idx);
             }
         }
         None
@@ -3651,6 +3677,37 @@ mod tests {
         // Should fail now
         assert!(tracker.acquire_slot().is_none());
         assert_eq!(tracker.available_slots(), 0);
+    }
+
+    #[test]
+    fn test_worker_slot_tracker_round_robin() {
+        let tracker = WorkerSlotTracker::new(3, 1);
+
+        let first = tracker.acquire_slot();
+        let second = tracker.acquire_slot();
+        let third = tracker.acquire_slot();
+
+        assert_eq!(first, Some(0));
+        assert_eq!(second, Some(1));
+        assert_eq!(third, Some(2));
+    }
+
+    #[test]
+    fn test_worker_slot_tracker_least_loaded_bias() {
+        let tracker = WorkerSlotTracker::new(3, 2);
+
+        assert_eq!(tracker.acquire_slot(), Some(0));
+        assert_eq!(tracker.acquire_slot(), Some(1));
+        assert_eq!(tracker.acquire_slot(), Some(2));
+        assert_eq!(tracker.acquire_slot(), Some(0));
+
+        assert_eq!(tracker.worker_available(0), 0);
+        assert_eq!(tracker.worker_available(1), 1);
+        assert_eq!(tracker.worker_available(2), 1);
+
+        assert_eq!(tracker.acquire_slot(), Some(1));
+        assert_eq!(tracker.acquire_slot(), Some(2));
+        assert_eq!(tracker.acquire_slot(), None);
     }
 
     #[test]
