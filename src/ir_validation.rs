@@ -297,7 +297,10 @@ fn validate_function_call(
     fn_name: &str,
     function_names: &HashSet<String>,
 ) -> Result<(), String> {
-    if !function_names.contains(&call.name) {
+    let is_global = ir_ast::GlobalFunction::try_from(call.global_function)
+        .unwrap_or(ir_ast::GlobalFunction::Unspecified)
+        != ir_ast::GlobalFunction::Unspecified;
+    if !is_global && !function_names.contains(&call.name) {
         return Err(format!(
             "Function '{name}' is not defined in workflow '{fn_name}'",
             name = call.name
@@ -387,6 +390,21 @@ mod tests {
         }
     }
 
+    fn global_function_call_expr(
+        name: &str,
+        global_function: ir_ast::GlobalFunction,
+    ) -> ir_ast::Expr {
+        ir_ast::Expr {
+            kind: Some(ir_ast::expr::Kind::FunctionCall(ir_ast::FunctionCall {
+                name: name.to_string(),
+                args: Vec::new(),
+                kwargs: Vec::new(),
+                global_function: global_function as i32,
+            })),
+            span: None,
+        }
+    }
+
     fn program_with_statements(
         inputs: Vec<&str>,
         statements: Vec<ir_ast::Statement>,
@@ -457,5 +475,20 @@ mod tests {
         let program = program_with_statements(vec![], vec![stmt]);
         let err = validate_program(&program).expect_err("expected undefined function error");
         assert!(err.contains("missing"));
+    }
+
+    #[test]
+    fn validate_program_accepts_global_function_call() {
+        let stmt = ir_ast::Statement {
+            kind: Some(ir_ast::statement::Kind::ExprStmt(ir_ast::ExprStmt {
+                expr: Some(global_function_call_expr(
+                    "len",
+                    ir_ast::GlobalFunction::Len,
+                )),
+            })),
+            span: None,
+        };
+        let program = program_with_statements(vec![], vec![stmt]);
+        assert!(validate_program(&program).is_ok());
     }
 }

@@ -306,15 +306,18 @@ impl ExpressionEvaluator {
         }
 
         // Built-in functions - support both positional and keyword args
-        match ast::GlobalFunction::try_from(call.global_function)
-            .unwrap_or(ast::GlobalFunction::Unspecified)
-        {
+        let global_function = ast::GlobalFunction::try_from(call.global_function)
+            .unwrap_or(ast::GlobalFunction::Unspecified);
+        match global_function {
             ast::GlobalFunction::Range => Self::builtin_range(&args, &kwargs),
             ast::GlobalFunction::Len => Self::builtin_len(&args, &kwargs),
             ast::GlobalFunction::Enumerate => Self::builtin_enumerate(&args, &kwargs),
-            ast::GlobalFunction::Unspecified => {
-                Err(EvaluationError::FunctionNotFound(call.name.clone()))
-            }
+            ast::GlobalFunction::Unspecified => match call.name.as_str() {
+                "range" => Self::builtin_range(&args, &kwargs),
+                "len" => Self::builtin_len(&args, &kwargs),
+                "enumerate" => Self::builtin_enumerate(&args, &kwargs),
+                _ => Err(EvaluationError::FunctionNotFound(call.name.clone())),
+            },
         }
     }
 
@@ -765,6 +768,24 @@ mod tests {
                     })
                     .collect(),
                 global_function: global_function_for_name(name) as i32,
+            })),
+            span: None,
+        }
+    }
+
+    fn function_call_without_global(name: &str, kwargs: Vec<(&str, ast::Expr)>) -> ast::Expr {
+        ast::Expr {
+            kind: Some(ast::expr::Kind::FunctionCall(ast::FunctionCall {
+                name: name.to_string(),
+                args: vec![],
+                kwargs: kwargs
+                    .into_iter()
+                    .map(|(k, v)| ast::Kwarg {
+                        name: k.to_string(),
+                        value: Some(v),
+                    })
+                    .collect(),
+                global_function: ast::GlobalFunction::Unspecified as i32,
             })),
             span: None,
         }
@@ -1418,6 +1439,20 @@ mod tests {
         let expr = function_call("len", vec![("items", string_literal("hello"))]);
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
         assert_eq!(result, WorkflowValue::Int(5.into()));
+    }
+
+    #[test]
+    fn test_builtin_len_without_global_function() {
+        let scope = Scope::new();
+        let expr = function_call_without_global(
+            "len",
+            vec![(
+                "items",
+                list_expr(vec![int_literal(1), int_literal(2), int_literal(3)]),
+            )],
+        );
+        let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
+        assert_eq!(result, WorkflowValue::Int(3.into()));
     }
 
     #[test]
