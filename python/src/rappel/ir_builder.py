@@ -90,6 +90,13 @@ RECOMMENDATIONS = {
         "    async def my_function(x: int) -> int:\n"
         "        return x * 2"
     ),
+    "undefined_variable": (
+        "A variable was referenced before it was defined in the workflow.\n"
+        "Define it in the run() signature or assign it before use.\n\n"
+        "Example:\n"
+        "    async def run(self, value: int):\n"
+        "        await my_action(value)"
+    ),
     "sync_function_call": (
         "Calling a synchronous function directly in workflow code is not supported.\n"
         "All computation must happen inside @action decorated async functions.\n\n"
@@ -724,10 +731,7 @@ class IRBuilder(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
         """Visit a function definition (the workflow's run method)."""
-        # Extract inputs from function parameters (skip 'self')
-        inputs: List[str] = []
-        for arg in node.args.args[1:]:  # Skip 'self'
-            inputs.append(arg.arg)
+        inputs = self._collect_function_inputs(node)
 
         # Create the function definition
         self.function_def = ir.FunctionDef(
@@ -744,13 +748,12 @@ class IRBuilder(ast.NodeVisitor):
 
         # Set the body
         self.function_def.body.CopyFrom(ir.Block(statements=self._statements))
+        self._validate_defined_variables(inputs, self._statements)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> Any:
         """Visit an async function definition (the workflow's run method)."""
         # Handle async the same way as sync for IR building
-        inputs: List[str] = []
-        for arg in node.args.args[1:]:  # Skip 'self'
-            inputs.append(arg.arg)
+        inputs = self._collect_function_inputs(node)
 
         self.function_def = ir.FunctionDef(
             name=node.name,
@@ -764,6 +767,7 @@ class IRBuilder(ast.NodeVisitor):
             self._statements.extend(ir_stmts)
 
         self.function_def.body.CopyFrom(ir.Block(statements=self._statements))
+        self._validate_defined_variables(inputs, self._statements)
 
     def _visit_statement(self, node: ast.stmt) -> List[ir.Statement]:
         """Convert a Python statement to IR Statement(s).
@@ -1387,10 +1391,9 @@ class IRBuilder(ast.NodeVisitor):
             for elem in expr.list.elements:
                 vars_found.update(self._collect_variables_from_expr(elem))
         elif expr.HasField("dict"):
-            for key in expr.dict.keys:
-                vars_found.update(self._collect_variables_from_expr(key))
-            for val in expr.dict.values:
-                vars_found.update(self._collect_variables_from_expr(val))
+            for entry in expr.dict.entries:
+                vars_found.update(self._collect_variables_from_expr(entry.key))
+                vars_found.update(self._collect_variables_from_expr(entry.value))
         elif expr.HasField("index"):
             vars_found.update(self._collect_variables_from_expr(expr.index.value))
             vars_found.update(self._collect_variables_from_expr(expr.index.index))
@@ -1993,6 +1996,190 @@ class IRBuilder(ast.NodeVisitor):
                 return [stmt]
 
         return []
+
+    def _collect_function_inputs(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> List[str]:
+        """Collect workflow inputs from function parameters, including kw-only args."""
+        args: List[str] = []
+        seen: set[str] = set()
+
+        ordered_args = list(node.args.posonlyargs) + list(node.args.args)
+        if ordered_args and ordered_args[0].arg == "self":
+            ordered_args = ordered_args[1:]
+
+        for arg in ordered_args:
+            if arg.arg not in seen:
+                args.append(arg.arg)
+                seen.add(arg.arg)
+
+        if node.args.vararg and node.args.vararg.arg not in seen:
+            args.append(node.args.vararg.arg)
+            seen.add(node.args.vararg.arg)
+
+        for arg in node.args.kwonlyargs:
+            if arg.arg not in seen:
+                args.append(arg.arg)
+                seen.add(arg.arg)
+
+        if node.args.kwarg and node.args.kwarg.arg not in seen:
+            args.append(node.args.kwarg.arg)
+            seen.add(node.args.kwarg.arg)
+
+        return args
+
+    def _validate_defined_variables(
+        self, inputs: List[str], statements: List[ir.Statement]
+    ) -> None:
+        """Fail fast if IR references variables that are not in scope."""
+        known_vars = set(inputs)
+        known_vars.add("self")
+        self._validate_block(statements, known_vars)
+
+    def _validate_block(self, statements: List[ir.Statement], known_vars: set[str]) -> set[str]:
+        current = set(known_vars)
+        for stmt in statements:
+            current = self._validate_statement(stmt, current)
+        return current
+
+    def _validate_statement(self, stmt: ir.Statement, known_vars: set[str]) -> set[str]:
+        current = set(known_vars)
+
+        if stmt.HasField("assignment"):
+            assign = stmt.assignment
+            self._validate_expr_variables(assign.value, current)
+            for target in assign.targets:
+                base_name = self._base_target_name(target)
+                if base_name and base_name not in current:
+                    self._raise_undefined_variable(base_name, assign.value)
+                if target.isidentifier():
+                    current.add(target)
+        elif stmt.HasField("expr_stmt"):
+            self._validate_expr_variables(stmt.expr_stmt.expr, current)
+        elif stmt.HasField("action_call"):
+            self._validate_action_call(stmt.action_call, current)
+        elif stmt.HasField("spread_action"):
+            spread = stmt.spread_action
+            self._validate_expr_variables(spread.collection, current)
+            spread_scope = set(current)
+            if spread.loop_var:
+                spread_scope.add(spread.loop_var)
+            self._validate_action_call(spread.action, spread_scope)
+        elif stmt.HasField("parallel_block"):
+            for call in stmt.parallel_block.calls:
+                if call.HasField("action"):
+                    self._validate_action_call(call.action, current)
+                elif call.HasField("function"):
+                    self._validate_function_call(call.function, current)
+        elif stmt.HasField("for_loop"):
+            loop = stmt.for_loop
+            self._validate_expr_variables(loop.iterable, current)
+            loop_vars = set(loop.loop_vars)
+            loop_scope = current | loop_vars
+            loop_scope = self._validate_block(list(loop.block_body.statements), loop_scope)
+            current |= loop_scope
+        elif stmt.HasField("conditional"):
+            cond = stmt.conditional
+            if cond.HasField("if_branch"):
+                self._validate_expr_variables(cond.if_branch.condition, current)
+            branch_scopes: List[set[str]] = []
+            if cond.HasField("if_branch") and cond.if_branch.HasField("block_body"):
+                branch_scopes.append(
+                    self._validate_block(list(cond.if_branch.block_body.statements), current)
+                )
+            for branch in cond.elif_branches:
+                self._validate_expr_variables(branch.condition, current)
+                if branch.HasField("block_body"):
+                    branch_scopes.append(
+                        self._validate_block(list(branch.block_body.statements), current)
+                    )
+            if cond.HasField("else_branch") and cond.else_branch.HasField("block_body"):
+                branch_scopes.append(
+                    self._validate_block(list(cond.else_branch.block_body.statements), current)
+                )
+            for scope in branch_scopes:
+                current |= scope
+        elif stmt.HasField("try_except"):
+            te = stmt.try_except
+            branch_scopes: List[set[str]] = []
+            if te.HasField("try_block"):
+                branch_scopes.append(self._validate_block(list(te.try_block.statements), current))
+            for handler in te.handlers:
+                if handler.HasField("block_body"):
+                    branch_scopes.append(
+                        self._validate_block(list(handler.block_body.statements), current)
+                    )
+            for scope in branch_scopes:
+                current |= scope
+        elif stmt.HasField("return_stmt"):
+            if stmt.return_stmt.HasField("value"):
+                self._validate_expr_variables(stmt.return_stmt.value, current)
+
+        return current
+
+    def _validate_expr_variables(self, expr: ir.Expr, known_vars: set[str]) -> None:
+        if expr.HasField("variable"):
+            name = expr.variable.name
+            if name not in known_vars:
+                self._raise_undefined_variable(name, expr)
+        elif expr.HasField("binary_op"):
+            self._validate_expr_variables(expr.binary_op.left, known_vars)
+            self._validate_expr_variables(expr.binary_op.right, known_vars)
+        elif expr.HasField("unary_op"):
+            self._validate_expr_variables(expr.unary_op.operand, known_vars)
+        elif expr.HasField("list"):
+            for elem in expr.list.elements:
+                self._validate_expr_variables(elem, known_vars)
+        elif expr.HasField("dict"):
+            for entry in expr.dict.entries:
+                self._validate_expr_variables(entry.key, known_vars)
+                self._validate_expr_variables(entry.value, known_vars)
+        elif expr.HasField("index"):
+            self._validate_expr_variables(expr.index.object, known_vars)
+            self._validate_expr_variables(expr.index.index, known_vars)
+        elif expr.HasField("dot"):
+            self._validate_expr_variables(expr.dot.object, known_vars)
+        elif expr.HasField("function_call"):
+            self._validate_function_call(expr.function_call, known_vars)
+        elif expr.HasField("action_call"):
+            self._validate_action_call(expr.action_call, known_vars)
+        elif expr.HasField("parallel_expr"):
+            for call in expr.parallel_expr.calls:
+                if call.HasField("action"):
+                    self._validate_action_call(call.action, known_vars)
+                elif call.HasField("function"):
+                    self._validate_function_call(call.function, known_vars)
+        elif expr.HasField("spread_expr"):
+            self._validate_expr_variables(expr.spread_expr.collection, known_vars)
+            spread_scope = set(known_vars)
+            if expr.spread_expr.loop_var:
+                spread_scope.add(expr.spread_expr.loop_var)
+            self._validate_action_call(expr.spread_expr.action, spread_scope)
+
+    def _validate_action_call(self, call: ir.ActionCall, known_vars: set[str]) -> None:
+        for kwarg in call.kwargs:
+            self._validate_expr_variables(kwarg.value, known_vars)
+
+    def _validate_function_call(self, call: ir.FunctionCall, known_vars: set[str]) -> None:
+        for arg in call.args:
+            self._validate_expr_variables(arg, known_vars)
+        for kwarg in call.kwargs:
+            self._validate_expr_variables(kwarg.value, known_vars)
+
+    def _base_target_name(self, target: str) -> Optional[str]:
+        if "[" in target:
+            return target.split("[", 1)[0]
+        if "." in target:
+            return target.split(".", 1)[0]
+        return None
+
+    def _raise_undefined_variable(self, name: str, expr: ir.Expr) -> None:
+        line = expr.span.start_line if expr.span.start_line else None
+        col = expr.span.start_col if expr.span.start_col else None
+        raise UnsupportedPatternError(
+            f"Variable '{name}' referenced before assignment",
+            RECOMMENDATIONS["undefined_variable"],
+            line=line,
+            col=col,
+        )
 
     def _check_constructor_in_return(self, node: ast.expr) -> None:
         """Check for constructor calls in return statements.
