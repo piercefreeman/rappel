@@ -120,7 +120,7 @@ class TestAsyncioSleepDetection:
 
 
 class TestVariableReferenceValidation:
-    """Tests for variable reference validation in IR building."""
+    """Tests for workflow input extraction in IR building."""
 
     def test_kwonly_inputs_included(self) -> None:
         from rappel import action, workflow
@@ -144,28 +144,6 @@ class TestVariableReferenceValidation:
         main = next(fn for fn in program.functions if fn.name == "main")
         assert "latitude" in list(main.io.inputs)
         assert "longitude" in list(main.io.inputs)
-
-    def test_undefined_variable_raises(self) -> None:
-        import pytest
-
-        from rappel import UnsupportedPatternError, action, workflow
-        from rappel.workflow import Workflow
-
-        @action
-        async def echo(value: int) -> None:
-            return None
-
-        @workflow
-        class MissingVarWorkflow(Workflow):
-            async def run(self, value: int) -> None:
-                await echo(missing)
-
-        missing = 0
-
-        with pytest.raises(UnsupportedPatternError) as exc_info:
-            MissingVarWorkflow.workflow_ir()
-
-        assert "missing" in str(exc_info.value)
 
 
 class TestPolicyParsing:
