@@ -56,12 +56,12 @@ use crate::{
     dag_state::{DAGHelper, ExecutionMode, SuccessorInfo},
     db::{
         ActionId, BackoffKind, CompletionRecord, Database, NewAction, QueuedAction, ScheduleId,
-        WorkflowInstanceId, WorkflowVersionId,
+        WorkerStatusUpdate, WorkflowInstanceId, WorkflowVersionId,
     },
     messages::proto,
     parser::ast,
     schedule::{apply_jitter, next_cron_run, next_interval_run},
-    worker::{ActionDispatchPayload, PythonWorkerPool, RoundTripMetrics},
+    worker::{ActionDispatchPayload, PythonWorkerPool, RoundTripMetrics, WorkerThroughputSnapshot},
 };
 
 // ============================================================================
@@ -759,6 +759,14 @@ impl WorkQueueHandler {
         self.slot_tracker.available_slots()
     }
 
+    pub(crate) fn worker_pool_id(&self) -> Uuid {
+        self.worker_pool.pool_id()
+    }
+
+    pub(crate) fn worker_throughput_snapshot(&self) -> Vec<WorkerThroughputSnapshot> {
+        self.worker_pool.throughput_snapshot()
+    }
+
     /// Fetch and dispatch a batch of runnable nodes (actions and barriers).
     ///
     /// - Actions are dispatched to Python workers
@@ -1074,10 +1082,12 @@ impl WorkQueueHandler {
         let delivery_token = action.delivery_token;
         let in_flight_tracker = Arc::clone(&self.in_flight);
         let slot_tracker = Arc::clone(&self.slot_tracker);
+        let worker_pool = Arc::clone(&self.worker_pool);
 
         tokio::spawn(async move {
             match worker.send_action(dispatch).await {
                 Ok(metrics) => {
+                    worker_pool.record_completion(worker_idx);
                     // Get in-flight info and release slot
                     let in_flight_action = {
                         let mut tracker = in_flight_tracker.lock().await;
@@ -1263,6 +1273,8 @@ pub struct RunnerConfig {
     pub schedule_check_interval_ms: u64,
     /// Maximum schedules to process per check cycle
     pub schedule_check_batch_size: i32,
+    /// Worker status upsert interval (milliseconds)
+    pub worker_status_interval_ms: u64,
 }
 
 impl Default for RunnerConfig {
@@ -1275,6 +1287,7 @@ impl Default for RunnerConfig {
             timeout_check_batch_size: 100,
             schedule_check_interval_ms: 10000, // 10 seconds
             schedule_check_batch_size: 100,
+            worker_status_interval_ms: 10000,
         }
     }
 }
@@ -1358,6 +1371,11 @@ impl DAGRunner {
             tokio::time::Duration::from_millis(self.config.schedule_check_interval_ms),
         );
         schedule_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        let mut worker_status_interval = tokio::time::interval(tokio::time::Duration::from_millis(
+            self.config.worker_status_interval_ms,
+        ));
+        worker_status_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -1489,6 +1507,31 @@ impl DAGRunner {
                 _ = schedule_check_interval.tick() => {
                     if let Err(e) = self.process_due_schedules().await {
                         error!("Failed to process due schedules: {}", e);
+                    }
+                }
+
+                _ = worker_status_interval.tick() => {
+                    let pool_id = self.work_handler.worker_pool_id();
+                    let snapshots = self.work_handler.worker_throughput_snapshot();
+                    if !snapshots.is_empty() {
+                        let updates: Vec<WorkerStatusUpdate> = snapshots
+                            .into_iter()
+                            .map(|snapshot| WorkerStatusUpdate {
+                                worker_id: snapshot.worker_id as i64,
+                                throughput_per_min: snapshot.throughput_per_min,
+                                total_completed: snapshot.total_completed as i64,
+                                last_action_at: snapshot.last_action_at,
+                            })
+                            .collect();
+
+                        if let Err(err) = self
+                            .completion_handler
+                            .db
+                            .upsert_worker_statuses(pool_id, &updates)
+                            .await
+                        {
+                            error!(?err, "failed to upsert worker status");
+                        }
                     }
                 }
 
