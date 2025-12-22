@@ -22,7 +22,7 @@ import copy
 import inspect
 import textwrap
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Union
 
 from proto import ast_pb2 as ir
 
@@ -1166,7 +1166,7 @@ class IRBuilder(ast.NodeVisitor):
             return stmt
 
         # Regular assignment (variables, literals, expressions)
-        value_expr = _expr_to_ir(node.value)
+        value_expr = self._expr_to_ir_with_model_coercion(node.value)
         if value_expr:
             assign = ir.Assignment(targets=targets, value=value_expr)
             stmt.assignment.CopyFrom(assign)
@@ -1218,7 +1218,7 @@ class IRBuilder(ast.NodeVisitor):
                 append_value = call.args[0]
                 # Create: list = list + [value]
                 list_var = ir.Expr(variable=ir.Variable(name=list_name), span=_make_span(node))
-                value_expr = _expr_to_ir(append_value)
+                value_expr = self._expr_to_ir_with_model_coercion(append_value)
                 if value_expr:
                     # Create [value] as a list literal
                     list_literal = ir.Expr(
@@ -1236,7 +1236,7 @@ class IRBuilder(ast.NodeVisitor):
                     return stmt
 
         # Regular expression
-        expr = _expr_to_ir(node.value)
+        expr = self._expr_to_ir_with_model_coercion(node.value)
         if expr:
             stmt.expr_stmt.CopyFrom(ir.ExprStmt(expr=expr))
             return stmt
@@ -1259,7 +1259,7 @@ class IRBuilder(ast.NodeVisitor):
                     loop_vars.append(elt.id)
 
         # Get iterable
-        iterable = _expr_to_ir(node.iter)
+        iterable = self._expr_to_ir_with_model_coercion(node.iter)
         if not iterable:
             return []
 
@@ -1428,7 +1428,7 @@ class IRBuilder(ast.NodeVisitor):
         def normalize_condition(test: ast.expr) -> tuple[List[ir.Statement], Optional[ir.Expr]]:
             action_call = self._extract_action_call(test)
             if action_call is None:
-                return ([], _expr_to_ir(test))
+                return ([], self._expr_to_ir_with_model_coercion(test))
 
             if not isinstance(test, ast.Await):
                 line = getattr(test, "lineno", None)
@@ -1930,7 +1930,7 @@ class IRBuilder(ast.NodeVisitor):
                 return [assign_stmt, return_stmt]
 
             # Normalize return of function calls into assignment + return
-            expr = _expr_to_ir(node.value)
+            expr = self._expr_to_ir_with_model_coercion(node.value)
             if expr and expr.HasField("function_call"):
                 tmp_var = self._ctx.next_implicit_fn_name(prefix="return_tmp")
 
@@ -1964,8 +1964,8 @@ class IRBuilder(ast.NodeVisitor):
         if isinstance(node.target, ast.Name):
             targets.append(node.target.id)
 
-        left = _expr_to_ir(node.target)
-        right = _expr_to_ir(node.value)
+        left = self._expr_to_ir_with_model_coercion(node.target)
+        right = self._expr_to_ir_with_model_coercion(node.value)
         if right and right.HasField("function_call"):
             tmp_var = self._ctx.next_implicit_fn_name(prefix="aug_tmp")
 
@@ -2174,7 +2174,7 @@ class IRBuilder(ast.NodeVisitor):
             key_literal.string_value = kw.arg
             key_expr.literal.CopyFrom(key_literal)
 
-            value_expr = _expr_to_ir(kw.value)
+            value_expr = self._expr_to_ir_with_model_coercion(kw.value)
             if value_expr is None:
                 # If we can't convert the value, we need to raise an error
                 line = getattr(node, "lineno", None)
@@ -2211,7 +2211,7 @@ class IRBuilder(ast.NodeVisitor):
                 key_literal.string_value = field_name
                 key_expr.literal.CopyFrom(key_literal)
 
-                value_expr = _expr_to_ir(arg)
+                value_expr = self._expr_to_ir_with_model_coercion(arg)
                 if value_expr is None:
                     line = getattr(node, "lineno", None)
                     col = getattr(node, "col_offset", None)
@@ -2530,14 +2530,14 @@ class IRBuilder(ast.NodeVisitor):
         # Extract duration argument (positional or keyword)
         if node.args:
             # asyncio.sleep(1) - positional
-            expr = _expr_to_ir(node.args[0])
+            expr = self._expr_to_ir_with_model_coercion(node.args[0])
             if expr:
                 action_call.kwargs.append(ir.Kwarg(name="duration", value=expr))
         elif node.keywords:
             # asyncio.sleep(seconds=1) - keyword (less common)
             for kw in node.keywords:
                 if kw.arg in ("seconds", "delay", "duration"):
-                    expr = _expr_to_ir(kw.value)
+                    expr = self._expr_to_ir_with_model_coercion(kw.value)
                     if expr:
                         action_call.kwargs.append(ir.Kwarg(name="duration", value=expr))
                     break
@@ -2672,7 +2672,7 @@ class IRBuilder(ast.NodeVisitor):
         loop_var = gen.target.id
 
         # Get the collection expression
-        collection_expr = _expr_to_ir(gen.iter)
+        collection_expr = self._expr_to_ir_with_model_coercion(gen.iter)
         if not collection_expr:
             line = getattr(listcomp, "lineno", None)
             col = getattr(listcomp, "col_offset", None)
@@ -2750,14 +2750,14 @@ class IRBuilder(ast.NodeVisitor):
 
         # Add positional args
         for arg in node.args:
-            expr = _expr_to_ir(arg)
+            expr = self._expr_to_ir_with_model_coercion(arg)
             if expr:
                 fn_call.args.append(expr)
 
         # Add keyword args
         for kw in node.keywords:
             if kw.arg:
-                expr = _expr_to_ir(kw.value)
+                expr = self._expr_to_ir_with_model_coercion(kw.value)
                 if expr:
                     fn_call.kwargs.append(ir.Kwarg(name=kw.arg, value=expr))
 
@@ -2782,24 +2782,15 @@ class IRBuilder(ast.NodeVisitor):
             return name
         return None
 
+    def _convert_model_constructor_if_needed(self, node: ast.Call) -> Optional[ir.Expr]:
+        model_name = self._is_model_constructor(node)
+        if model_name:
+            return self._convert_model_constructor_to_dict(node, model_name)
+        return None
+
     def _expr_to_ir_with_model_coercion(self, node: ast.expr) -> Optional[ir.Expr]:
-        """Convert an AST expression to IR, converting model constructors to dicts.
-
-        This is used for action arguments where Pydantic models or dataclass
-        constructors should be converted to dict expressions that Rust can evaluate.
-
-        If the expression is a model constructor (e.g., MyModel(field=value)),
-        it is converted to a dict expression. Otherwise, falls back to the
-        standard _expr_to_ir conversion.
-        """
-        # Check if this is a model constructor call
-        if isinstance(node, ast.Call):
-            model_name = self._is_model_constructor(node)
-            if model_name:
-                return self._convert_model_constructor_to_dict(node, model_name)
-
-        # Fall back to standard expression conversion
-        return _expr_to_ir(node)
+        """Convert an AST expression to IR, converting model constructors to dicts."""
+        return _expr_to_ir(node, model_converter=self._convert_model_constructor_if_needed)
 
     def _extract_action_call_from_awaitable(self, node: ast.expr) -> Optional[ir.ActionCall]:
         """Extract action call from an awaitable expression."""
@@ -2894,9 +2885,17 @@ def _make_span(node: ast.AST) -> ir.Span:
     )
 
 
-def _expr_to_ir(expr: ast.AST) -> Optional[ir.Expr]:
+def _expr_to_ir(
+    expr: ast.AST,
+    model_converter: Optional[Callable[[ast.Call], Optional[ir.Expr]]] = None,
+) -> Optional[ir.Expr]:
     """Convert Python AST expression to IR Expr."""
     result = ir.Expr(span=_make_span(expr))
+
+    if isinstance(expr, ast.Call) and model_converter:
+        converted = model_converter(expr)
+        if converted:
+            return converted
 
     if isinstance(expr, ast.Name):
         result.variable.CopyFrom(ir.Variable(name=expr.id))
@@ -2909,34 +2908,34 @@ def _expr_to_ir(expr: ast.AST) -> Optional[ir.Expr]:
             return result
 
     if isinstance(expr, ast.BinOp):
-        left = _expr_to_ir(expr.left)
-        right = _expr_to_ir(expr.right)
+        left = _expr_to_ir(expr.left, model_converter=model_converter)
+        right = _expr_to_ir(expr.right, model_converter=model_converter)
         op = _bin_op_to_ir(expr.op)
         if left and right and op:
             result.binary_op.CopyFrom(ir.BinaryOp(left=left, op=op, right=right))
             return result
 
     if isinstance(expr, ast.UnaryOp):
-        operand = _expr_to_ir(expr.operand)
+        operand = _expr_to_ir(expr.operand, model_converter=model_converter)
         op = _unary_op_to_ir(expr.op)
         if operand and op:
             result.unary_op.CopyFrom(ir.UnaryOp(op=op, operand=operand))
             return result
 
     if isinstance(expr, ast.Compare):
-        left = _expr_to_ir(expr.left)
+        left = _expr_to_ir(expr.left, model_converter=model_converter)
         if not left:
             return None
         # For simplicity, handle single comparison
         if expr.ops and expr.comparators:
             op = _cmp_op_to_ir(expr.ops[0])
-            right = _expr_to_ir(expr.comparators[0])
+            right = _expr_to_ir(expr.comparators[0], model_converter=model_converter)
             if op and right:
                 result.binary_op.CopyFrom(ir.BinaryOp(left=left, op=op, right=right))
                 return result
 
     if isinstance(expr, ast.BoolOp):
-        values = [_expr_to_ir(v) for v in expr.values]
+        values = [_expr_to_ir(v, model_converter=model_converter) for v in expr.values]
         if all(v for v in values):
             op = _bool_op_to_ir(expr.op)
             if op and len(values) >= 2:
@@ -2950,7 +2949,7 @@ def _expr_to_ir(expr: ast.AST) -> Optional[ir.Expr]:
                 return result_expr
 
     if isinstance(expr, ast.List):
-        elements = [_expr_to_ir(e) for e in expr.elts]
+        elements = [_expr_to_ir(e, model_converter=model_converter) for e in expr.elts]
         if all(e for e in elements):
             list_expr = ir.ListExpr(elements=[e for e in elements if e])
             result.list.CopyFrom(list_expr)
@@ -2960,22 +2959,26 @@ def _expr_to_ir(expr: ast.AST) -> Optional[ir.Expr]:
         entries: List[ir.DictEntry] = []
         for k, v in zip(expr.keys, expr.values, strict=False):
             if k:
-                key_expr = _expr_to_ir(k)
-                value_expr = _expr_to_ir(v)
+                key_expr = _expr_to_ir(k, model_converter=model_converter)
+                value_expr = _expr_to_ir(v, model_converter=model_converter)
                 if key_expr and value_expr:
                     entries.append(ir.DictEntry(key=key_expr, value=value_expr))
         result.dict.CopyFrom(ir.DictExpr(entries=entries))
         return result
 
     if isinstance(expr, ast.Subscript):
-        obj = _expr_to_ir(expr.value)
-        index = _expr_to_ir(expr.slice) if isinstance(expr.slice, ast.AST) else None
+        obj = _expr_to_ir(expr.value, model_converter=model_converter)
+        index = (
+            _expr_to_ir(expr.slice, model_converter=model_converter)
+            if isinstance(expr.slice, ast.AST)
+            else None
+        )
         if obj and index:
             result.index.CopyFrom(ir.IndexAccess(object=obj, index=index))
             return result
 
     if isinstance(expr, ast.Attribute):
-        obj = _expr_to_ir(expr.value)
+        obj = _expr_to_ir(expr.value, model_converter=model_converter)
         if obj:
             result.dot.CopyFrom(ir.DotAccess(object=obj, attribute=expr.attr))
             return result
@@ -2983,11 +2986,11 @@ def _expr_to_ir(expr: ast.AST) -> Optional[ir.Expr]:
     if isinstance(expr, ast.Await) and isinstance(expr.value, ast.Call):
         func_name = _get_func_name(expr.value.func)
         if func_name:
-            args = [_expr_to_ir(a) for a in expr.value.args]
+            args = [_expr_to_ir(a, model_converter=model_converter) for a in expr.value.args]
             kwargs: List[ir.Kwarg] = []
             for kw in expr.value.keywords:
                 if kw.arg:
-                    kw_expr = _expr_to_ir(kw.value)
+                    kw_expr = _expr_to_ir(kw.value, model_converter=model_converter)
                     if kw_expr:
                         kwargs.append(ir.Kwarg(name=kw.arg, value=kw_expr))
             func_call = ir.FunctionCall(
@@ -3025,11 +3028,11 @@ def _expr_to_ir(expr: ast.AST) -> Optional[ir.Expr]:
                 )
         func_name = _get_func_name(expr.func)
         if func_name:
-            args = [_expr_to_ir(a) for a in expr.args]
+            args = [_expr_to_ir(a, model_converter=model_converter) for a in expr.args]
             kwargs: List[ir.Kwarg] = []
             for kw in expr.keywords:
                 if kw.arg:
-                    kw_expr = _expr_to_ir(kw.value)
+                    kw_expr = _expr_to_ir(kw.value, model_converter=model_converter)
                     if kw_expr:
                         kwargs.append(ir.Kwarg(name=kw.arg, value=kw_expr))
             func_call = ir.FunctionCall(
@@ -3045,7 +3048,7 @@ def _expr_to_ir(expr: ast.AST) -> Optional[ir.Expr]:
 
     if isinstance(expr, ast.Tuple):
         # Handle tuple as list for now
-        elements = [_expr_to_ir(e) for e in expr.elts]
+        elements = [_expr_to_ir(e, model_converter=model_converter) for e in expr.elts]
         if all(e for e in elements):
             list_expr = ir.ListExpr(elements=[e for e in elements if e])
             result.list.CopyFrom(list_expr)
