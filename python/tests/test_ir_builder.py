@@ -3025,6 +3025,47 @@ class TestPydanticModelSupport:
                         )
         return None
 
+    def _find_dict_return(self, program: ir.Program) -> ir.DictExpr | None:
+        """Find a return statement with a dict expression."""
+        for fn in program.functions:
+            for stmt in fn.body.statements:
+                if stmt.HasField("return_stmt") and stmt.return_stmt.HasField("value"):
+                    value = stmt.return_stmt.value
+                    if value.HasField("dict"):
+                        return value.dict
+        return None
+
+    def _find_return_expr(self, program: ir.Program) -> ir.Expr | None:
+        """Find the first return expression in the program."""
+        for fn in program.functions:
+            for stmt in fn.body.statements:
+                if stmt.HasField("return_stmt") and stmt.return_stmt.HasField("value"):
+                    return stmt.return_stmt.value
+        return None
+
+    def _find_assignment_value(self, program: ir.Program, target: str) -> ir.Expr | None:
+        """Find an assignment value by target variable name."""
+        for fn in program.functions:
+            for stmt in fn.body.statements:
+                if stmt.HasField("assignment"):
+                    if target in list(stmt.assignment.targets):
+                        return stmt.assignment.value
+        return None
+
+    def _assert_list_elements_are_dicts(self, list_expr: ir.ListExpr) -> None:
+        assert list_expr.elements, "Expected list to have elements"
+        for element in list_expr.elements:
+            assert element.HasField("dict"), (
+                f"Expected list element to be dict, got {element.WhichOneof('kind')}"
+            )
+
+    def _assert_dict_values_are_dicts(self, dict_expr: ir.DictExpr) -> None:
+        assert dict_expr.entries, "Expected dict to have entries"
+        for entry in dict_expr.entries:
+            assert entry.value.HasField("dict"), (
+                f"Expected dict value to be dict, got {entry.value.WhichOneof('kind')}"
+            )
+
     def _get_dict_keys(self, dict_expr: ir.DictExpr) -> list[str]:
         """Extract string keys from a dict expression."""
         keys = []
@@ -3064,6 +3105,82 @@ class TestPydanticModelSupport:
         keys = self._get_dict_keys(dict_expr)
         assert "value" in keys, "Expected 'value' key in dict"
         assert "message" in keys, "Expected 'message' key in dict"
+
+    def test_pydantic_return_direct(self) -> None:
+        """Test: returning a Pydantic model constructor is converted to dict."""
+        from tests.fixtures_models.pydantic_return_direct import PydanticReturnDirectWorkflow
+
+        program = PydanticReturnDirectWorkflow.workflow_ir()
+        assert program is not None
+
+        dict_expr = self._find_dict_return(program)
+        assert dict_expr is not None, "Expected dict return from Pydantic model"
+
+        keys = self._get_dict_keys(dict_expr)
+        assert "value" in keys, "Expected 'value' key in dict"
+        assert "message" in keys, "Expected 'message' key in dict"
+
+    def test_pydantic_return_list(self) -> None:
+        """Test: returning list of Pydantic models converts elements to dicts."""
+        from tests.fixtures_models.pydantic_ast_variants import PydanticReturnListWorkflow
+
+        program = PydanticReturnListWorkflow.workflow_ir()
+        assert program is not None
+
+        expr = self._find_return_expr(program)
+        assert expr is not None, "Expected return expression"
+        assert expr.HasField("list"), f"Expected list return, got {expr.WhichOneof('kind')}"
+        self._assert_list_elements_are_dicts(expr.list)
+
+    def test_pydantic_return_dict(self) -> None:
+        """Test: returning dict of Pydantic models converts values to dicts."""
+        from tests.fixtures_models.pydantic_ast_variants import PydanticReturnDictWorkflow
+
+        program = PydanticReturnDictWorkflow.workflow_ir()
+        assert program is not None
+
+        expr = self._find_return_expr(program)
+        assert expr is not None, "Expected return expression"
+        assert expr.HasField("dict"), f"Expected dict return, got {expr.WhichOneof('kind')}"
+        self._assert_dict_values_are_dicts(expr.dict)
+
+    def test_pydantic_assignment_list(self) -> None:
+        """Test: assigning list of Pydantic models converts elements to dicts."""
+        from tests.fixtures_models.pydantic_ast_variants import PydanticAssignmentListWorkflow
+
+        program = PydanticAssignmentListWorkflow.workflow_ir()
+        assert program is not None
+
+        value = self._find_assignment_value(program, "items")
+        assert value is not None, "Expected assignment for items"
+        assert value.HasField("list"), f"Expected list assignment, got {value.WhichOneof('kind')}"
+        self._assert_list_elements_are_dicts(value.list)
+
+    def test_pydantic_assignment_dict(self) -> None:
+        """Test: assigning dict of Pydantic models converts values to dicts."""
+        from tests.fixtures_models.pydantic_ast_variants import PydanticAssignmentDictWorkflow
+
+        program = PydanticAssignmentDictWorkflow.workflow_ir()
+        assert program is not None
+
+        value = self._find_assignment_value(program, "payload")
+        assert value is not None, "Expected assignment for payload"
+        assert value.HasField("dict"), f"Expected dict assignment, got {value.WhichOneof('kind')}"
+        self._assert_dict_values_are_dicts(value.dict)
+
+    def test_pydantic_assignment_tuple(self) -> None:
+        """Test: assigning tuple of Pydantic models converts elements to dicts."""
+        from tests.fixtures_models.pydantic_ast_variants import PydanticAssignmentTupleWorkflow
+
+        program = PydanticAssignmentTupleWorkflow.workflow_ir()
+        assert program is not None
+
+        value = self._find_assignment_value(program, "pair")
+        assert value is not None, "Expected assignment for pair"
+        assert value.HasField("list"), (
+            f"Expected tuple to become list, got {value.WhichOneof('kind')}"
+        )
+        self._assert_list_elements_are_dicts(value.list)
 
     def test_pydantic_model_with_defaults(self) -> None:
         """Test: Pydantic model with defaults includes default values in dict."""
