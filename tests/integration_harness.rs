@@ -20,7 +20,6 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use prost::Message;
-use serde_json::Value as JsonValue;
 use tempfile::TempDir;
 use tokio::{
     net::TcpListener,
@@ -35,7 +34,7 @@ use tracing::info;
 
 use rappel::{
     DAGRunner, Database, PythonWorkerConfig, PythonWorkerPool, RunnerConfig, WorkerBridgeServer,
-    WorkflowInstanceId, WorkflowVersionId, proto, validate_program,
+    WorkflowInstanceId, WorkflowValue, WorkflowVersionId, proto, validate_program,
 };
 
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -550,91 +549,21 @@ impl IntegrationHarness {
 }
 
 /// Build initial inputs from string pairs.
-fn build_initial_inputs(pairs: &[(&str, &str)]) -> HashMap<String, JsonValue> {
+fn build_initial_inputs(pairs: &[(&str, &str)]) -> HashMap<String, WorkflowValue> {
     pairs
         .iter()
         .map(|(k, v)| {
-            let parsed = serde_json::from_str::<JsonValue>(v).unwrap_or_else(|_| {
+            let parsed = serde_json::from_str::<serde_json::Value>(v).unwrap_or_else(|_| {
                 // Fallback to string if not valid JSON literal
-                JsonValue::String((*v).to_string())
+                serde_json::Value::String((*v).to_string())
             });
-            ((*k).to_string(), parsed)
+            ((*k).to_string(), WorkflowValue::from_json(&parsed))
         })
         .collect()
 }
 
-/// Convert a protobuf WorkflowArgumentValue to a JSON Value.
-fn proto_value_to_json(value: &proto::WorkflowArgumentValue) -> JsonValue {
-    use proto::primitive_workflow_argument::Kind as PrimitiveKind;
-    use proto::workflow_argument_value::Kind;
-
-    match &value.kind {
-        Some(Kind::Primitive(p)) => match &p.kind {
-            Some(PrimitiveKind::IntValue(i)) => JsonValue::Number((*i).into()),
-            Some(PrimitiveKind::DoubleValue(f)) => serde_json::Number::from_f64(*f)
-                .map(JsonValue::Number)
-                .unwrap_or(JsonValue::Null),
-            Some(PrimitiveKind::StringValue(s)) => JsonValue::String(s.clone()),
-            Some(PrimitiveKind::BoolValue(b)) => JsonValue::Bool(*b),
-            Some(PrimitiveKind::NullValue(_)) => JsonValue::Null,
-            None => JsonValue::Null,
-        },
-        Some(Kind::ListValue(list)) => {
-            let items: Vec<JsonValue> = list.items.iter().map(proto_value_to_json).collect();
-            JsonValue::Array(items)
-        }
-        Some(Kind::DictValue(dict)) => {
-            let entries: serde_json::Map<String, JsonValue> = dict
-                .entries
-                .iter()
-                .filter_map(|arg| {
-                    arg.value
-                        .as_ref()
-                        .map(|v| (arg.key.clone(), proto_value_to_json(v)))
-                })
-                .collect();
-            JsonValue::Object(entries)
-        }
-        Some(Kind::TupleValue(tuple)) => {
-            let items: Vec<JsonValue> = tuple.items.iter().map(proto_value_to_json).collect();
-            JsonValue::Array(items)
-        }
-        Some(Kind::Basemodel(model)) => {
-            let mut obj = serde_json::Map::new();
-            obj.insert(
-                "__class__".to_string(),
-                JsonValue::String(model.name.clone()),
-            );
-            obj.insert(
-                "__module__".to_string(),
-                JsonValue::String(model.module.clone()),
-            );
-            if let Some(data_dict) = &model.data {
-                for entry in &data_dict.entries {
-                    if let Some(v) = &entry.value {
-                        obj.insert(entry.key.clone(), proto_value_to_json(v));
-                    }
-                }
-            }
-            JsonValue::Object(obj)
-        }
-        Some(Kind::Exception(exc)) => {
-            let mut obj = serde_json::Map::new();
-            obj.insert("__exception__".to_string(), JsonValue::Bool(true));
-            obj.insert("type".to_string(), JsonValue::String(exc.r#type.clone()));
-            obj.insert("module".to_string(), JsonValue::String(exc.module.clone()));
-            obj.insert(
-                "message".to_string(),
-                JsonValue::String(exc.message.clone()),
-            );
-            JsonValue::Object(obj)
-        }
-        None => JsonValue::Null,
-    }
-}
-
 /// Parse stored input_payload (protobuf WorkflowArguments) to HashMap.
-fn parse_input_payload(payload: &[u8]) -> Result<HashMap<String, JsonValue>> {
+fn parse_input_payload(payload: &[u8]) -> Result<HashMap<String, WorkflowValue>> {
     if payload.is_empty() {
         return Ok(HashMap::new());
     }
@@ -644,7 +573,7 @@ fn parse_input_payload(payload: &[u8]) -> Result<HashMap<String, JsonValue>> {
     let mut result = HashMap::new();
     for arg in arguments.arguments {
         if let Some(value) = arg.value {
-            result.insert(arg.key, proto_value_to_json(&value));
+            result.insert(arg.key, WorkflowValue::from_proto(&value));
         }
     }
     Ok(result)

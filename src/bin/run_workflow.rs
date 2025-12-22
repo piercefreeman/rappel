@@ -32,7 +32,7 @@ use tracing::{error, info, warn};
 
 use rappel::{
     Database, PythonWorkerConfig, PythonWorkerPool, WorkerBridgeServer, WorkflowInstanceId,
-    WorkflowVersionId, proto, validate_program,
+    WorkflowValue, WorkflowVersionId, proto, validate_program,
 };
 
 // ============================================================================
@@ -524,23 +524,20 @@ fn proto_value_to_json(value: &proto::WorkflowArgumentValue) -> JsonValue {
             JsonValue::Array(items)
         }
         Some(Kind::Basemodel(model)) => {
-            let mut obj = serde_json::Map::new();
-            obj.insert(
-                "__class__".to_string(),
-                JsonValue::String(model.name.clone()),
-            );
-            obj.insert(
-                "__module__".to_string(),
-                JsonValue::String(model.module.clone()),
-            );
             if let Some(data_dict) = &model.data {
-                for entry in &data_dict.entries {
-                    if let Some(v) = &entry.value {
-                        obj.insert(entry.key.clone(), proto_value_to_json(v));
-                    }
-                }
+                let entries: serde_json::Map<String, JsonValue> = data_dict
+                    .entries
+                    .iter()
+                    .filter_map(|arg| {
+                        arg.value
+                            .as_ref()
+                            .map(|v| (arg.key.clone(), proto_value_to_json(v)))
+                    })
+                    .collect();
+                JsonValue::Object(entries)
+            } else {
+                JsonValue::Object(serde_json::Map::new())
             }
-            JsonValue::Object(obj)
         }
         Some(Kind::Exception(exc)) => {
             let mut obj = serde_json::Map::new();
@@ -601,6 +598,10 @@ async fn main() -> Result<()> {
     // Parse input JSON
     let inputs: HashMap<String, JsonValue> = serde_json::from_str(&args.input)
         .context("Failed to parse input JSON. Expected format: '{\"key\": value}'")?;
+    let workflow_inputs: HashMap<String, WorkflowValue> = inputs
+        .iter()
+        .map(|(key, value)| (key.clone(), WorkflowValue::from_json(value)))
+        .collect();
 
     if args.verbose {
         info!(file = %args.workflow_file.display(), "Loading workflow");
@@ -740,7 +741,9 @@ async fn main() -> Result<()> {
 
     // Start the instance
     eprintln!("[run-workflow] Starting workflow instance...");
-    runner.start_instance(instance_id, inputs.clone()).await?;
+    runner
+        .start_instance(instance_id, workflow_inputs.clone())
+        .await?;
 
     // Spawn the runner
     eprintln!("[run-workflow] Executing workflow...");

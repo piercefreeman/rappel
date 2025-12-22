@@ -1,7 +1,7 @@
 use clap::Parser;
 use prost::Message;
 use rappel::{
-    Database, EdgeType, WorkflowInstanceId, WorkflowVersionId,
+    Database, EdgeType, WorkflowInstanceId, WorkflowValue, WorkflowVersionId,
     ast::Program,
     completion::{InlineContext, analyze_subgraph, execute_inline_subgraph},
     convert_to_dag,
@@ -175,14 +175,16 @@ async fn main() {
             .with_span_events(FmtSpan::CLOSE)
             .try_init();
 
+        let empty_scope: HashMap<String, WorkflowValue> = HashMap::new();
+        let empty_inbox: HashMap<String, HashMap<String, WorkflowValue>> = HashMap::new();
         let ctx = InlineContext {
-            initial_scope: &HashMap::new(),
-            existing_inbox: &HashMap::new(),
+            initial_scope: &empty_scope,
+            existing_inbox: &empty_inbox,
             spread_index: None,
         };
         let plan = execute_inline_subgraph(
             "aggregator_7",
-            json!(["hash1", "hash2"]),
+            WorkflowValue::from_json(&json!(["hash1", "hash2"])),
             ctx,
             &subgraph,
             &dag,
@@ -264,8 +266,7 @@ async fn main() {
         .await
         .expect("failed to fetch node_inputs");
 
-        let mut existing_inbox: HashMap<String, HashMap<String, serde_json::Value>> =
-            HashMap::new();
+        let mut existing_inbox: HashMap<String, HashMap<String, WorkflowValue>> = HashMap::new();
         for row in inbox_rows {
             let target: String = row.get("target_node_id");
             let var_name: String = row.get("variable_name");
@@ -273,7 +274,7 @@ async fn main() {
             existing_inbox
                 .entry(target)
                 .or_default()
-                .insert(var_name, value);
+                .insert(var_name, WorkflowValue::from_json(&value));
         }
 
         let context_json: Option<serde_json::Value> = sqlx::query_scalar(
@@ -288,9 +289,13 @@ async fn main() {
         .await
         .expect("failed to fetch instance_context");
 
-        let initial_scope: HashMap<String, serde_json::Value> = context_json
+        let initial_scope_json: HashMap<String, serde_json::Value> = context_json
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default();
+        let initial_scope: HashMap<String, WorkflowValue> = initial_scope_json
+            .into_iter()
+            .map(|(key, value)| (key, WorkflowValue::from_json(&value)))
+            .collect();
 
         let result_payload: Option<Vec<u8>> = sqlx::query_scalar(
             r#"
@@ -339,9 +344,9 @@ async fn main() {
     }
 }
 
-fn decode_result_payload(payload: Vec<u8>) -> serde_json::Value {
+fn decode_result_payload(payload: Vec<u8>) -> WorkflowValue {
     if payload.is_empty() {
-        return serde_json::Value::Null;
+        return WorkflowValue::Null;
     }
 
     match rappel::proto::WorkflowArguments::decode(&payload[..]) {
@@ -350,85 +355,10 @@ fn decode_result_payload(payload: Vec<u8>) -> serde_json::Value {
             .iter()
             .find(|arg| arg.key == "result")
             .and_then(|arg| arg.value.as_ref())
-            .map(proto_value_to_json)
-            .unwrap_or(serde_json::Value::Null),
-        Err(_) => serde_json::from_slice(&payload).unwrap_or(serde_json::Value::Null),
-    }
-}
-
-fn proto_value_to_json(value: &rappel::proto::WorkflowArgumentValue) -> serde_json::Value {
-    use rappel::proto::primitive_workflow_argument::Kind as PrimitiveKind;
-    use rappel::proto::workflow_argument_value::Kind;
-
-    match &value.kind {
-        Some(Kind::Primitive(p)) => match &p.kind {
-            Some(PrimitiveKind::IntValue(i)) => serde_json::Value::Number((*i).into()),
-            Some(PrimitiveKind::DoubleValue(f)) => serde_json::Number::from_f64(*f)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null),
-            Some(PrimitiveKind::StringValue(s)) => serde_json::Value::String(s.clone()),
-            Some(PrimitiveKind::BoolValue(b)) => serde_json::Value::Bool(*b),
-            Some(PrimitiveKind::NullValue(_)) => serde_json::Value::Null,
-            None => serde_json::Value::Null,
-        },
-        Some(Kind::ListValue(list)) => {
-            let items: Vec<serde_json::Value> =
-                list.items.iter().map(proto_value_to_json).collect();
-            serde_json::Value::Array(items)
-        }
-        Some(Kind::DictValue(dict)) => {
-            let entries: serde_json::Map<String, serde_json::Value> = dict
-                .entries
-                .iter()
-                .filter_map(|arg| {
-                    arg.value
-                        .as_ref()
-                        .map(|v| (arg.key.clone(), proto_value_to_json(v)))
-                })
-                .collect();
-            serde_json::Value::Object(entries)
-        }
-        Some(Kind::TupleValue(tuple)) => {
-            let items: Vec<serde_json::Value> =
-                tuple.items.iter().map(proto_value_to_json).collect();
-            serde_json::Value::Array(items)
-        }
-        Some(Kind::Basemodel(model)) => {
-            let mut obj = serde_json::Map::new();
-            obj.insert(
-                "__class__".to_string(),
-                serde_json::Value::String(model.name.clone()),
-            );
-            obj.insert(
-                "__module__".to_string(),
-                serde_json::Value::String(model.module.clone()),
-            );
-            if let Some(data_dict) = &model.data {
-                for entry in &data_dict.entries {
-                    if let Some(v) = &entry.value {
-                        obj.insert(entry.key.clone(), proto_value_to_json(v));
-                    }
-                }
-            }
-            serde_json::Value::Object(obj)
-        }
-        Some(Kind::Exception(exc)) => {
-            let mut obj = serde_json::Map::new();
-            obj.insert("__exception__".to_string(), serde_json::Value::Bool(true));
-            obj.insert(
-                "type".to_string(),
-                serde_json::Value::String(exc.r#type.clone()),
-            );
-            obj.insert(
-                "module".to_string(),
-                serde_json::Value::String(exc.module.clone()),
-            );
-            obj.insert(
-                "message".to_string(),
-                serde_json::Value::String(exc.message.clone()),
-            );
-            serde_json::Value::Object(obj)
-        }
-        None => serde_json::Value::Null,
+            .map(WorkflowValue::from_proto)
+            .unwrap_or(WorkflowValue::Null),
+        Err(_) => serde_json::from_slice::<serde_json::Value>(&payload)
+            .map(|value| WorkflowValue::from_json(&value))
+            .unwrap_or(WorkflowValue::Null),
     }
 }

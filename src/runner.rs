@@ -41,7 +41,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde_json::Value as JsonValue;
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, warn};
@@ -61,135 +60,35 @@ use crate::{
     messages::proto,
     parser::ast,
     schedule::{apply_jitter, next_cron_run, next_interval_run},
+    value::WorkflowValue,
     worker::{ActionDispatchPayload, PythonWorkerPool, RoundTripMetrics, WorkerThroughputSnapshot},
 };
 
 // ============================================================================
-// Proto Value Conversion
+// Workflow Value Conversion
 // ============================================================================
 
-/// Convert a protobuf WorkflowArgumentValue to a JSON Value.
-fn proto_value_to_json(value: &proto::WorkflowArgumentValue) -> JsonValue {
-    use proto::primitive_workflow_argument::Kind as PrimitiveKind;
-    use proto::workflow_argument_value::Kind;
-
-    match &value.kind {
-        Some(Kind::Primitive(p)) => match &p.kind {
-            Some(PrimitiveKind::IntValue(i)) => JsonValue::Number((*i).into()),
-            Some(PrimitiveKind::DoubleValue(f)) => serde_json::Number::from_f64(*f)
-                .map(JsonValue::Number)
-                .unwrap_or(JsonValue::Null),
-            Some(PrimitiveKind::StringValue(s)) => JsonValue::String(s.clone()),
-            Some(PrimitiveKind::BoolValue(b)) => JsonValue::Bool(*b),
-            Some(PrimitiveKind::NullValue(_)) => JsonValue::Null,
-            None => JsonValue::Null,
-        },
-        Some(Kind::ListValue(list)) => {
-            let items: Vec<JsonValue> = list.items.iter().map(proto_value_to_json).collect();
-            JsonValue::Array(items)
-        }
-        Some(Kind::DictValue(dict)) => {
-            let entries: serde_json::Map<String, JsonValue> = dict
-                .entries
-                .iter()
-                .filter_map(|arg| {
-                    arg.value
-                        .as_ref()
-                        .map(|v| (arg.key.clone(), proto_value_to_json(v)))
-                })
-                .collect();
-            JsonValue::Object(entries)
-        }
-        Some(Kind::TupleValue(tuple)) => {
-            // Convert tuple to JSON array
-            let items: Vec<JsonValue> = tuple.items.iter().map(proto_value_to_json).collect();
-            JsonValue::Array(items)
-        }
-        Some(Kind::Basemodel(model)) => {
-            // Convert basemodel - data contains the model fields
-            let mut obj = serde_json::Map::new();
-            obj.insert(
-                "__class__".to_string(),
-                JsonValue::String(model.name.clone()),
-            );
-            obj.insert(
-                "__module__".to_string(),
-                JsonValue::String(model.module.clone()),
-            );
-            // Convert data dict if present
-            if let Some(data_dict) = &model.data {
-                for entry in &data_dict.entries {
-                    if let Some(v) = &entry.value {
-                        obj.insert(entry.key.clone(), proto_value_to_json(v));
-                    }
-                }
-            }
-            JsonValue::Object(obj)
-        }
-        Some(Kind::Exception(exc)) => {
-            // Convert exception to JSON object
-            let mut obj = serde_json::Map::new();
-            obj.insert("__exception__".to_string(), JsonValue::Bool(true));
-            obj.insert("type".to_string(), JsonValue::String(exc.r#type.clone()));
-            obj.insert("module".to_string(), JsonValue::String(exc.module.clone()));
-            obj.insert(
-                "message".to_string(),
-                JsonValue::String(exc.message.clone()),
-            );
-            JsonValue::Object(obj)
-        }
-        None => JsonValue::Null,
-    }
+fn proto_value_to_workflow_value(value: &proto::WorkflowArgumentValue) -> WorkflowValue {
+    WorkflowValue::from_proto(value)
 }
 
-/// Convert a JSON Value to a protobuf WorkflowArgumentValue.
-fn json_to_proto_value(value: &JsonValue) -> proto::WorkflowArgumentValue {
-    use proto::workflow_argument_value::Kind;
+fn json_to_workflow_value(value: &serde_json::Value) -> WorkflowValue {
+    WorkflowValue::from_json(value)
+}
 
-    let kind = match value {
-        JsonValue::Null => Kind::Primitive(proto::PrimitiveWorkflowArgument {
-            kind: Some(proto::primitive_workflow_argument::Kind::NullValue(0)),
-        }),
-        JsonValue::Bool(b) => Kind::Primitive(proto::PrimitiveWorkflowArgument {
-            kind: Some(proto::primitive_workflow_argument::Kind::BoolValue(*b)),
-        }),
-        JsonValue::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                    kind: Some(proto::primitive_workflow_argument::Kind::IntValue(i)),
-                })
-            } else if let Some(f) = n.as_f64() {
-                Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                    kind: Some(proto::primitive_workflow_argument::Kind::DoubleValue(f)),
-                })
-            } else {
-                Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                    kind: Some(proto::primitive_workflow_argument::Kind::DoubleValue(0.0)),
-                })
-            }
-        }
-        JsonValue::String(s) => Kind::Primitive(proto::PrimitiveWorkflowArgument {
-            kind: Some(proto::primitive_workflow_argument::Kind::StringValue(
-                s.clone(),
-            )),
-        }),
-        JsonValue::Array(arr) => {
-            let items = arr.iter().map(json_to_proto_value).collect();
-            Kind::ListValue(proto::WorkflowListArgument { items })
-        }
-        JsonValue::Object(obj) => {
-            let entries = obj
-                .iter()
-                .map(|(k, v)| proto::WorkflowArgument {
-                    key: k.clone(),
-                    value: Some(json_to_proto_value(v)),
-                })
+fn inbox_json_to_workflow(
+    inbox: HashMap<String, HashMap<String, serde_json::Value>>,
+) -> HashMap<String, HashMap<String, WorkflowValue>> {
+    inbox
+        .into_iter()
+        .map(|(node_id, vars)| {
+            let converted = vars
+                .into_iter()
+                .map(|(name, value)| (name, json_to_workflow_value(&value)))
                 .collect();
-            Kind::DictValue(proto::WorkflowDictArgument { entries })
-        }
-    };
-
-    proto::WorkflowArgumentValue { kind: Some(kind) }
+            (node_id, converted)
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -233,67 +132,11 @@ pub type RunnerResult<T> = Result<T, RunnerError>;
 // ============================================================================
 
 /// Runtime value for expression evaluation.
-/// Uses serde_json::Value for JSON-compatible types.
-pub type Value = JsonValue;
+pub type Value = WorkflowValue;
 
 // ============================================================================
 // JSON to WorkflowArguments Conversion
 // ============================================================================
-
-/// Convert a JSON value to WorkflowArgumentValue.
-fn json_to_workflow_value(value: &JsonValue) -> proto::WorkflowArgumentValue {
-    let kind = match value {
-        JsonValue::Null => {
-            proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                kind: Some(proto::primitive_workflow_argument::Kind::NullValue(0)),
-            })
-        }
-        JsonValue::Bool(b) => {
-            proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                kind: Some(proto::primitive_workflow_argument::Kind::BoolValue(*b)),
-            })
-        }
-        JsonValue::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                    kind: Some(proto::primitive_workflow_argument::Kind::IntValue(i)),
-                })
-            } else if let Some(f) = n.as_f64() {
-                proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                    kind: Some(proto::primitive_workflow_argument::Kind::DoubleValue(f)),
-                })
-            } else {
-                proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                    kind: Some(proto::primitive_workflow_argument::Kind::DoubleValue(0.0)),
-                })
-            }
-        }
-        JsonValue::String(s) => {
-            proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                kind: Some(proto::primitive_workflow_argument::Kind::StringValue(
-                    s.clone(),
-                )),
-            })
-        }
-        JsonValue::Array(arr) => {
-            let items: Vec<proto::WorkflowArgumentValue> =
-                arr.iter().map(json_to_workflow_value).collect();
-            proto::workflow_argument_value::Kind::ListValue(proto::WorkflowListArgument { items })
-        }
-        JsonValue::Object(obj) => {
-            let entries: Vec<proto::WorkflowArgument> = obj
-                .iter()
-                .map(|(k, v)| proto::WorkflowArgument {
-                    key: k.clone(),
-                    value: Some(json_to_workflow_value(v)),
-                })
-                .collect();
-            proto::workflow_argument_value::Kind::DictValue(proto::WorkflowDictArgument { entries })
-        }
-    };
-
-    proto::WorkflowArgumentValue { kind: Some(kind) }
-}
 
 /// Convert JSON bytes (expected to be an object) to WorkflowArguments.
 ///
@@ -304,7 +147,7 @@ fn json_bytes_to_workflow_args(payload: &[u8]) -> proto::WorkflowArguments {
         return proto::WorkflowArguments { arguments: vec![] };
     }
 
-    let json: JsonValue = match serde_json::from_slice(payload) {
+    let json: serde_json::Value = match serde_json::from_slice(payload) {
         Ok(v) => v,
         Err(e) => {
             warn!("Failed to parse dispatch payload as JSON: {}", e);
@@ -313,12 +156,12 @@ fn json_bytes_to_workflow_args(payload: &[u8]) -> proto::WorkflowArguments {
     };
 
     match json {
-        JsonValue::Object(obj) => {
+        serde_json::Value::Object(obj) => {
             let arguments: Vec<proto::WorkflowArgument> = obj
                 .iter()
                 .map(|(k, v)| proto::WorkflowArgument {
                     key: k.clone(),
-                    value: Some(json_to_workflow_value(v)),
+                    value: Some(json_to_workflow_value(v).to_proto()),
                 })
                 .collect();
             proto::WorkflowArguments { arguments }
@@ -340,7 +183,7 @@ async fn load_initial_scope(db: &Database, instance_id: WorkflowInstanceId) -> R
             Ok(args) => {
                 for arg in args.arguments {
                     if let Some(value) = arg.value {
-                        scope.insert(arg.key, proto_value_to_json(&value));
+                        scope.insert(arg.key, proto_value_to_workflow_value(&value));
                     }
                 }
             }
@@ -906,15 +749,30 @@ impl WorkQueueHandler {
             .await?;
 
         // Aggregate results (already sorted by spread_index)
-        let aggregated = JsonValue::Array(spread_results.into_iter().map(|(_, v)| v).collect());
+        let aggregated = WorkflowValue::List(
+            spread_results
+                .into_iter()
+                .map(|(_, value)| json_to_workflow_value(&value))
+                .collect(),
+        );
 
         // Also read named variables from the barrier's inbox (for parallel blocks)
-        let barrier_inbox = self.db.read_inbox(instance_id, node_id).await?;
+        let barrier_inbox = self
+            .db
+            .read_inbox(instance_id, node_id)
+            .await?
+            .into_iter()
+            .map(|(key, value)| (key, json_to_workflow_value(&value)))
+            .collect::<HashMap<_, _>>();
         let inbox_us = inbox_start.elapsed().as_micros() as u64;
 
+        let result_count = match &aggregated {
+            WorkflowValue::List(items) => items.len(),
+            _ => 0,
+        };
         debug!(
             barrier_id = %node_id,
-            result_count = aggregated.as_array().map(|a| a.len()).unwrap_or(0),
+            result_count = result_count,
             named_vars = ?barrier_inbox.keys().collect::<Vec<_>>(),
             "aggregated barrier results"
         );
@@ -926,10 +784,11 @@ impl WorkQueueHandler {
 
         // Batch fetch inbox for all nodes in subgraph
         let batch_start = std::time::Instant::now();
-        let mut existing_inbox = self
-            .db
-            .batch_read_inbox(instance_id, &subgraph.all_node_ids)
-            .await?;
+        let mut existing_inbox = inbox_json_to_workflow(
+            self.db
+                .batch_read_inbox(instance_id, &subgraph.all_node_ids)
+                .await?,
+        );
         let batch_us = batch_start.elapsed().as_micros() as u64;
 
         // Merge barrier's named variables into the existing inbox so they're available
@@ -1022,16 +881,17 @@ impl WorkQueueHandler {
         let helper = DAGHelper::new(&dag);
 
         // Sleep actions return null - they're just for timing
-        let sleep_result = JsonValue::Null;
+        let sleep_result = WorkflowValue::Null;
 
         // Analyze subgraph from sleep node
         let subgraph = analyze_subgraph(node_id, &dag, &helper);
 
         // Batch fetch inbox for all nodes in subgraph
-        let existing_inbox = self
-            .db
-            .batch_read_inbox(instance_id, &subgraph.all_node_ids)
-            .await?;
+        let existing_inbox = inbox_json_to_workflow(
+            self.db
+                .batch_read_inbox(instance_id, &subgraph.all_node_ids)
+                .await?,
+        );
 
         // Execute inline subgraph and build completion plan
         let initial_scope = load_initial_scope(&self.db, instance_id).await?;
@@ -1201,7 +1061,7 @@ impl WorkCompletionHandler {
                     inbox_write.instance_id,
                     &inbox_write.target_node_id,
                     &inbox_write.variable_name,
-                    inbox_write.value,
+                    inbox_write.value.to_json(),
                     &inbox_write.source_node_id,
                     inbox_write.spread_index,
                 )
@@ -1247,7 +1107,7 @@ pub struct InboxWrite {
     pub instance_id: WorkflowInstanceId,
     pub target_node_id: String,
     pub variable_name: String,
-    pub value: JsonValue,
+    pub value: WorkflowValue,
     pub source_node_id: String,
     pub spread_index: Option<i32>,
 }
@@ -1753,8 +1613,8 @@ impl DAGRunner {
             .unwrap_or_default();
 
         // Parse result from response payload
-        let result: JsonValue = if metrics.response_payload.is_empty() {
-            JsonValue::Null
+        let result: WorkflowValue = if metrics.response_payload.is_empty() {
+            WorkflowValue::Null
         } else {
             match proto::WorkflowArguments::decode(&metrics.response_payload[..]) {
                 Ok(args) => args
@@ -1762,11 +1622,11 @@ impl DAGRunner {
                     .iter()
                     .find(|arg| arg.key == "result")
                     .and_then(|arg| arg.value.as_ref())
-                    .map(proto_value_to_json)
-                    .unwrap_or(JsonValue::Null),
-                Err(_) => {
-                    serde_json::from_slice(&metrics.response_payload).unwrap_or(JsonValue::Null)
-                }
+                    .map(proto_value_to_workflow_value)
+                    .unwrap_or(WorkflowValue::Null),
+                Err(_) => serde_json::from_slice::<serde_json::Value>(&metrics.response_payload)
+                    .map(|value| json_to_workflow_value(&value))
+                    .unwrap_or(WorkflowValue::Null),
             }
         };
 
@@ -1786,9 +1646,10 @@ impl DAGRunner {
 
         // Step 2: Batch fetch inbox for all nodes in subgraph
         let inbox_start = std::time::Instant::now();
-        let existing_inbox = db
-            .batch_read_inbox(instance_id, &subgraph.all_node_ids)
-            .await?;
+        let existing_inbox = inbox_json_to_workflow(
+            db.batch_read_inbox(instance_id, &subgraph.all_node_ids)
+                .await?,
+        );
         let inbox_ms = inbox_start.elapsed().as_micros() as u64;
 
         // DEBUG: Log full inbox state for completed node
@@ -1950,11 +1811,20 @@ impl DAGRunner {
         let spread_results = db.read_inbox_for_aggregator(instance_id, node_id).await?;
 
         // Aggregate results (already sorted by spread_index)
-        let aggregated = JsonValue::Array(spread_results.into_iter().map(|(_, v)| v).collect());
+        let aggregated = WorkflowValue::List(
+            spread_results
+                .into_iter()
+                .map(|(_, value)| json_to_workflow_value(&value))
+                .collect(),
+        );
 
+        let result_count = match &aggregated {
+            WorkflowValue::List(items) => items.len(),
+            _ => 0,
+        };
         debug!(
             barrier_id = %node_id,
-            result_count = aggregated.as_array().map(|a| a.len()).unwrap_or(0),
+            result_count = result_count,
             "processing ready barrier"
         );
 
@@ -1962,9 +1832,10 @@ impl DAGRunner {
         let subgraph = analyze_subgraph(node_id, &dag, &helper);
 
         // Batch fetch inbox
-        let existing_inbox = db
-            .batch_read_inbox(instance_id, &subgraph.all_node_ids)
-            .await?;
+        let existing_inbox = inbox_json_to_workflow(
+            db.batch_read_inbox(instance_id, &subgraph.all_node_ids)
+                .await?,
+        );
 
         // Execute inline subgraph
         let initial_scope = load_initial_scope(db, instance_id).await?;
@@ -2038,7 +1909,7 @@ impl DAGRunner {
 
             // Try to parse exception info from the response payload
             // Note: Python uses "error" key for exception payloads, not "result"
-            let maybe_exception: Option<JsonValue> = if !metrics.response_payload.is_empty() {
+            let maybe_exception: Option<WorkflowValue> = if !metrics.response_payload.is_empty() {
                 match proto::WorkflowArguments::decode(&metrics.response_payload[..]) {
                     Ok(args) => {
                         debug!(
@@ -2051,7 +1922,7 @@ impl DAGRunner {
                             .iter()
                             .find(|arg| arg.key == "error")
                             .and_then(|arg| arg.value.as_ref())
-                            .map(proto_value_to_json)
+                            .map(proto_value_to_workflow_value)
                     }
                     Err(e) => {
                         debug!(
@@ -2059,7 +1930,9 @@ impl DAGRunner {
                             error = %e,
                             "failed to decode WorkflowArguments, trying JSON"
                         );
-                        serde_json::from_slice(&metrics.response_payload).ok()
+                        serde_json::from_slice::<serde_json::Value>(&metrics.response_payload)
+                            .ok()
+                            .map(|value| json_to_workflow_value(&value))
                     }
                 }
             } else {
@@ -2196,7 +2069,7 @@ impl DAGRunner {
     fn collect_inbox_writes_for_node_with_spread(
         source_node_id: &str,
         variable_name: &str,
-        value: &JsonValue,
+        value: &WorkflowValue,
         dag: &DAG,
         instance_id: WorkflowInstanceId,
         spread_index: Option<usize>,
@@ -2223,7 +2096,7 @@ impl DAGRunner {
     fn collect_inbox_writes_for_node(
         source_node_id: &str,
         variable_name: &str,
-        value: &JsonValue,
+        value: &WorkflowValue,
         dag: &DAG,
         instance_id: WorkflowInstanceId,
         inbox_writes: &mut Vec<InboxWrite>,
@@ -2241,7 +2114,7 @@ impl DAGRunner {
 
     /// Seed inline scope and initial inbox writes from workflow inputs.
     fn seed_scope_and_inbox(
-        initial_inputs: &HashMap<String, JsonValue>,
+        initial_inputs: &HashMap<String, WorkflowValue>,
         dag: &DAG,
         source_node_id: &str,
         instance_id: WorkflowInstanceId,
@@ -2289,19 +2162,20 @@ impl DAGRunner {
 
         // Collect inbox writes that need to be committed atomically with the counter
         // These are writes from the current parallel action completion
-        let inbox_writes_for_tx: Vec<(String, String, JsonValue, String, Option<i32>)> = batch
-            .inbox_writes
-            .drain(..)
-            .map(|w| {
-                (
-                    w.target_node_id,
-                    w.variable_name,
-                    w.value,
-                    w.source_node_id,
-                    w.spread_index,
-                )
-            })
-            .collect();
+        let inbox_writes_for_tx: Vec<(String, String, serde_json::Value, String, Option<i32>)> =
+            batch
+                .inbox_writes
+                .drain(..)
+                .map(|w| {
+                    (
+                        w.target_node_id,
+                        w.variable_name,
+                        w.value.to_json(),
+                        w.source_node_id,
+                        w.spread_index,
+                    )
+                })
+                .collect();
 
         // Atomically write inbox entries, increment readiness counter, and enqueue
         // the barrier when the last precursor arrives.
@@ -2332,16 +2206,11 @@ impl DAGRunner {
     }
 
     /// Check if a result represents an exception.
-    fn is_exception_result(result: &JsonValue) -> Option<String> {
-        if let JsonValue::Object(obj) = result
-            && obj.get("__exception__").and_then(|v| v.as_bool()) == Some(true)
-        {
-            return obj
-                .get("type")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+    fn is_exception_result(result: &WorkflowValue) -> Option<String> {
+        match result {
+            WorkflowValue::Exception { exc_type, .. } => Some(exc_type.clone()),
+            _ => None,
         }
-        None
     }
 
     /// Find the fn_call node that encloses a node within a synthetic try body function.
@@ -2410,14 +2279,7 @@ impl DAGRunner {
 
         match ExpressionEvaluator::evaluate(guard, scope) {
             Ok(val) => {
-                let is_true = match &val {
-                    JsonValue::Bool(b) => *b,
-                    JsonValue::Null => false,
-                    JsonValue::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
-                    JsonValue::String(s) => !s.is_empty(),
-                    JsonValue::Array(a) => !a.is_empty(),
-                    JsonValue::Object(o) => !o.is_empty(),
-                };
+                let is_true = val.is_truthy();
                 debug!(
                     successor_id = %successor_id,
                     guard_expr = ?guard,
@@ -2492,7 +2354,7 @@ impl DAGRunner {
     #[allow(clippy::too_many_arguments)]
     async fn process_successors_with_condition(
         node_id: &str,
-        result: &JsonValue,
+        result: &WorkflowValue,
         dag: &DAG,
         helper: &DAGHelper<'_>,
         inline_scope: &mut Scope,
@@ -2588,7 +2450,7 @@ impl DAGRunner {
         // This replaces recursive calls with an iterative loop
         use std::collections::VecDeque;
 
-        let mut work_queue: VecDeque<(String, JsonValue)> = VecDeque::new();
+        let mut work_queue: VecDeque<(String, WorkflowValue)> = VecDeque::new();
 
         // Initialize queue with immediate successors from the starting node
         let mut guard_errors = Vec::new();
@@ -2689,7 +2551,12 @@ impl DAGRunner {
                 ExecutionMode::Delegated => {
                     // Read inbox for this node from database
                     // This includes data from ANY upstream node, not just the one that just completed
-                    let mut inbox = db.read_inbox(instance_id, &current_node_id).await?;
+                    let mut inbox = db
+                        .read_inbox(instance_id, &current_node_id)
+                        .await?
+                        .into_iter()
+                        .map(|(key, value)| (key, json_to_workflow_value(&value)))
+                        .collect::<HashMap<_, _>>();
 
                     // Merge pending inbox writes for this node (not yet committed to DB)
                     for pending_write in &batch.inbox_writes {
@@ -2726,7 +2593,7 @@ impl DAGRunner {
     #[allow(clippy::too_many_arguments)]
     async fn process_exception_handler(
         handler_node_id: &str,
-        _exception_result: &JsonValue,
+        _exception_result: &WorkflowValue,
         dag: &DAG,
         helper: &DAGHelper<'_>,
         inline_scope: &mut Scope,
@@ -2787,7 +2654,12 @@ impl DAGRunner {
             ExecutionMode::Delegated => {
                 // Handler is an action call - create action for it
                 // Read inbox for this node from database
-                let mut inbox = db.read_inbox(instance_id, handler_node_id).await?;
+                let mut inbox = db
+                    .read_inbox(instance_id, handler_node_id)
+                    .await?
+                    .into_iter()
+                    .map(|(key, value)| (key, json_to_workflow_value(&value)))
+                    .collect::<HashMap<_, _>>();
 
                 // Merge pending inbox writes
                 for pending_write in &batch.inbox_writes {
@@ -2816,14 +2688,14 @@ impl DAGRunner {
     }
 
     /// Serialize workflow result (inbox values) as protobuf WorkflowArguments.
-    fn serialize_workflow_result(inbox: &HashMap<String, JsonValue>) -> Vec<u8> {
+    fn serialize_workflow_result(inbox: &HashMap<String, WorkflowValue>) -> Vec<u8> {
         use prost::Message;
 
         let arguments: Vec<proto::WorkflowArgument> = inbox
             .iter()
             .map(|(key, value)| proto::WorkflowArgument {
                 key: key.clone(),
-                value: Some(json_to_proto_value(value)),
+                value: Some(value.to_proto()),
             })
             .collect();
 
@@ -2841,7 +2713,7 @@ impl DAGRunner {
     }
 
     /// Execute an inline node with in-memory scope (non-durable).
-    fn execute_inline_node(node: &DAGNode, scope: &mut Scope) -> RunnerResult<JsonValue> {
+    fn execute_inline_node(node: &DAGNode, scope: &mut Scope) -> RunnerResult<WorkflowValue> {
         match node.node_type.as_str() {
             "assignment" => {
                 // Evaluate the assignment expression
@@ -2867,11 +2739,11 @@ impl DAGRunner {
                                 error = %e,
                                 "failed to evaluate assignment expression"
                             );
-                            Ok(JsonValue::Null)
+                            Ok(WorkflowValue::Null)
                         }
                     }
                 } else {
-                    Ok(JsonValue::Null)
+                    Ok(WorkflowValue::Null)
                 }
             }
             "return" => {
@@ -2884,17 +2756,17 @@ impl DAGRunner {
                                 error = %e,
                                 "failed to evaluate return expression"
                             );
-                            Ok(JsonValue::Null)
+                            Ok(WorkflowValue::Null)
                         }
                     }
                 } else {
-                    Ok(JsonValue::Null)
+                    Ok(WorkflowValue::Null)
                 }
             }
-            "input" | "output" => Ok(JsonValue::Null),
-            "conditional" => Ok(JsonValue::Bool(true)),
-            "aggregator" => Ok(JsonValue::Array(vec![])),
-            _ => Ok(JsonValue::Null),
+            "input" | "output" => Ok(WorkflowValue::Null),
+            "conditional" => Ok(WorkflowValue::Bool(true)),
+            "aggregator" => Ok(WorkflowValue::List(vec![])),
+            _ => Ok(WorkflowValue::Null),
         }
     }
 
@@ -2925,7 +2797,7 @@ impl DAGRunner {
             let instance_id = WorkflowInstanceId(instance.id);
 
             // Parse initial inputs from the instance's input_payload
-            let initial_inputs: std::collections::HashMap<String, JsonValue> =
+            let initial_inputs: std::collections::HashMap<String, WorkflowValue> =
                 if let Some(payload) = &instance.input_payload {
                     // Try to decode as protobuf WorkflowArguments
                     match proto::WorkflowArguments::decode(&payload[..]) {
@@ -2935,7 +2807,7 @@ impl DAGRunner {
                             .filter_map(|arg| {
                                 arg.value
                                     .as_ref()
-                                    .map(|v| (arg.key.clone(), proto_value_to_json(v)))
+                                    .map(|v| (arg.key.clone(), proto_value_to_workflow_value(v)))
                             })
                             .collect(),
                         Err(e) => {
@@ -2971,7 +2843,7 @@ impl DAGRunner {
                     let mut error_payload = HashMap::new();
                     error_payload.insert(
                         "error".to_string(),
-                        JsonValue::String(error_message.clone()),
+                        WorkflowValue::String(error_message.clone()),
                     );
                     let result_payload = Self::serialize_workflow_result(&error_payload);
                     if let Err(db_err) = db
@@ -3016,7 +2888,7 @@ impl DAGRunner {
     pub async fn start_instance(
         &self,
         instance_id: WorkflowInstanceId,
-        initial_inputs: HashMap<String, JsonValue>,
+        initial_inputs: HashMap<String, WorkflowValue>,
     ) -> RunnerResult<usize> {
         // Load the DAG for this instance
         let dag = self
@@ -3210,19 +3082,27 @@ impl DAGRunner {
                         );
                     } else if let Some(ref targets) = node.targets
                         && targets.len() > 1
-                        && let Some(items) = inline_result.as_array()
                     {
-                        for (idx, target) in targets.iter().enumerate() {
-                            let value = items.get(idx).cloned().unwrap_or(JsonValue::Null);
-                            scope.insert(target.clone(), value.clone());
-                            Self::collect_inbox_writes_for_node(
-                                &node.id,
-                                target,
-                                &value,
-                                &dag,
-                                instance_id,
-                                &mut inbox_writes_to_commit,
-                            );
+                        let items = match &inline_result {
+                            WorkflowValue::List(values) | WorkflowValue::Tuple(values) => {
+                                Some(values)
+                            }
+                            _ => None,
+                        };
+
+                        if let Some(items) = items {
+                            for (idx, target) in targets.iter().enumerate() {
+                                let value = items.get(idx).cloned().unwrap_or(WorkflowValue::Null);
+                                scope.insert(target.clone(), value.clone());
+                                Self::collect_inbox_writes_for_node(
+                                    &node.id,
+                                    target,
+                                    &value,
+                                    &dag,
+                                    instance_id,
+                                    &mut inbox_writes_to_commit,
+                                );
+                            }
                         }
                     }
 
@@ -3230,7 +3110,7 @@ impl DAGRunner {
                         let result_value = if node.node_type == "return" {
                             inline_result
                         } else {
-                            scope.get("result").cloned().unwrap_or(JsonValue::Null)
+                            scope.get("result").cloned().unwrap_or(WorkflowValue::Null)
                         };
                         let mut result_map = HashMap::new();
                         result_map.insert("result".to_string(), result_value);
@@ -3264,7 +3144,7 @@ impl DAGRunner {
                 write.instance_id,
                 &write.target_node_id,
                 &write.variable_name,
-                write.value,
+                write.value.to_json(),
                 &write.source_node_id,
                 write.spread_index,
             )
@@ -3312,7 +3192,7 @@ impl DAGRunner {
     fn create_actions_for_node(
         node: &DAGNode,
         instance_id: WorkflowInstanceId,
-        inbox: &std::collections::HashMap<String, JsonValue>,
+        inbox: &std::collections::HashMap<String, WorkflowValue>,
         dag: &DAG,
     ) -> RunnerResult<NodeActionResult> {
         // Handle for_loop nodes - they create a special action for the runner
@@ -3390,7 +3270,7 @@ impl DAGRunner {
     fn create_spread_node_result(
         node: &DAGNode,
         instance_id: WorkflowInstanceId,
-        inbox: &std::collections::HashMap<String, JsonValue>,
+        inbox: &std::collections::HashMap<String, WorkflowValue>,
         _dag: &DAG,
     ) -> RunnerResult<NodeActionResult> {
         let actions = Self::create_actions_for_spread_node(node, instance_id, inbox)?;
@@ -3417,7 +3297,7 @@ impl DAGRunner {
     fn create_action_for_node_from_inbox(
         node: &DAGNode,
         instance_id: WorkflowInstanceId,
-        inbox: &std::collections::HashMap<String, JsonValue>,
+        inbox: &std::collections::HashMap<String, WorkflowValue>,
     ) -> RunnerResult<Option<NewAction>> {
         if node.node_type != "action_call" {
             return Ok(None);
@@ -3463,7 +3343,7 @@ impl DAGRunner {
     /// Build action payload from node kwargs, resolving variable references from inbox.
     fn build_action_payload_from_inbox(
         node: &DAGNode,
-        inbox: &std::collections::HashMap<String, JsonValue>,
+        inbox: &std::collections::HashMap<String, WorkflowValue>,
     ) -> RunnerResult<Vec<u8>> {
         let mut payload_map = serde_json::Map::new();
 
@@ -3472,11 +3352,11 @@ impl DAGRunner {
             for (key, value_str) in kwargs {
                 let expr = kwarg_exprs.and_then(|m| m.get(key));
                 let resolved = Self::resolve_kwarg_value_from_inbox(key, value_str, expr, inbox)?;
-                payload_map.insert(key.clone(), resolved);
+                payload_map.insert(key.clone(), resolved.to_json());
             }
         }
 
-        Ok(serde_json::to_vec(&JsonValue::Object(payload_map))?)
+        Ok(serde_json::to_vec(&serde_json::Value::Object(payload_map))?)
     }
 
     /// Resolve a kwarg value string to a JSON value using inbox.
@@ -3484,8 +3364,8 @@ impl DAGRunner {
         key: &str,
         value_str: &str,
         expr: Option<&ast::Expr>,
-        inbox: &std::collections::HashMap<String, JsonValue>,
-    ) -> RunnerResult<JsonValue> {
+        inbox: &std::collections::HashMap<String, WorkflowValue>,
+    ) -> RunnerResult<WorkflowValue> {
         if let Some(expr) = expr {
             match ExpressionEvaluator::evaluate(expr, inbox) {
                 Ok(value) => return Ok(value),
@@ -3496,7 +3376,7 @@ impl DAGRunner {
                         inbox_vars = ?inbox.keys().collect::<Vec<_>>(),
                         "kwarg variable not found in inbox, defaulting to null"
                     );
-                    return Ok(JsonValue::Null);
+                    return Ok(WorkflowValue::Null);
                 }
                 Err(err) => {
                     debug!(
@@ -3510,7 +3390,7 @@ impl DAGRunner {
 
         // Variable reference
         if let Some(var_name) = value_str.strip_prefix('$') {
-            let resolved = inbox.get(var_name).cloned().unwrap_or(JsonValue::Null);
+            let resolved = inbox.get(var_name).cloned().unwrap_or(WorkflowValue::Null);
             debug!(
                 var_name = %var_name,
                 resolved = ?resolved,
@@ -3522,8 +3402,8 @@ impl DAGRunner {
 
         // Normalize common Python bool literal casing
         match value_str {
-            "True" => return Ok(JsonValue::Bool(true)),
-            "False" => return Ok(JsonValue::Bool(false)),
+            "True" => return Ok(WorkflowValue::Bool(true)),
+            "False" => return Ok(WorkflowValue::Bool(false)),
             _ => {}
         }
 
@@ -3535,16 +3415,16 @@ impl DAGRunner {
 
         // Try to parse as JSON (handles numbers, booleans, strings, etc.)
         match serde_json::from_str(value_str) {
-            Ok(v) => Ok(v),
+            Ok(v) => Ok(WorkflowValue::from_json(&v)),
             Err(_) => {
                 // If not valid JSON, treat as raw string but normalize bool-like values
                 let lower = value_str.to_ascii_lowercase();
                 if lower == "true" {
-                    Ok(JsonValue::Bool(true))
+                    Ok(WorkflowValue::Bool(true))
                 } else if lower == "false" {
-                    Ok(JsonValue::Bool(false))
+                    Ok(WorkflowValue::Bool(false))
                 } else {
-                    Ok(JsonValue::String(value_str.to_string()))
+                    Ok(WorkflowValue::String(value_str.to_string()))
                 }
             }
         }
@@ -3561,7 +3441,7 @@ impl DAGRunner {
     fn create_actions_for_spread_node(
         node: &DAGNode,
         instance_id: WorkflowInstanceId,
-        inbox: &std::collections::HashMap<String, JsonValue>,
+        inbox: &std::collections::HashMap<String, WorkflowValue>,
     ) -> RunnerResult<Vec<NewAction>> {
         if !node.is_spread {
             return Ok(vec![]);
@@ -3582,10 +3462,10 @@ impl DAGRunner {
             Self::resolve_kwarg_value_from_inbox("spread_collection", collection_str, None, inbox)?;
 
         let items = match &collection {
-            JsonValue::Array(arr) => arr.clone(),
+            WorkflowValue::List(arr) | WorkflowValue::Tuple(arr) => arr.clone(),
             _ => {
                 return Err(EvaluationError::Evaluation(format!(
-                    "Spread collection '{}' is not an array: {:?}",
+                    "Spread collection '{}' is not a list or tuple: {:?}",
                     collection_str, collection
                 ))
                 .into());
@@ -3648,6 +3528,7 @@ impl DAGRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_worker_slot_tracker_basic() {
@@ -3662,6 +3543,38 @@ mod tests {
         // Release it
         tracker.release_slot(worker.unwrap());
         assert_eq!(tracker.available_slots(), 40);
+    }
+
+    #[test]
+    fn test_is_exception_result_accepts_bool_marker() {
+        let payload = WorkflowValue::from_json(&json!({
+            "__exception__": true,
+            "type": "ValueError",
+            "module": "builtins",
+            "message": "boom"
+        }));
+
+        assert_eq!(
+            DAGRunner::is_exception_result(&payload),
+            Some("ValueError".to_string())
+        );
+    }
+
+    #[test]
+    fn test_is_exception_result_accepts_nested_exception_object() {
+        let payload = WorkflowValue::from_json(&json!({
+            "__exception__": {
+                "type": "ValueError",
+                "module": "builtins",
+                "message": "boom",
+                "traceback": "Traceback..."
+            }
+        }));
+
+        assert_eq!(
+            DAGRunner::is_exception_result(&payload),
+            Some("ValueError".to_string())
+        );
     }
 
     #[test]
@@ -3761,7 +3674,7 @@ mod tests {
             span: None,
         };
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Number(42.into()));
+        assert_eq!(result, WorkflowValue::Int(42.into()));
 
         // String
         let expr = ast::Expr {
@@ -3771,7 +3684,7 @@ mod tests {
             span: None,
         };
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::String("hello".to_string()));
+        assert_eq!(result, WorkflowValue::String("hello".to_string()));
 
         // Boolean
         let expr = ast::Expr {
@@ -3781,13 +3694,13 @@ mod tests {
             span: None,
         };
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     #[test]
     fn test_expression_evaluator_variable() {
         let mut scope: Scope = HashMap::new();
-        scope.insert("x".to_string(), JsonValue::Number(10.into()));
+        scope.insert("x".to_string(), WorkflowValue::Int(10.into()));
 
         let expr = ast::Expr {
             kind: Some(ast::expr::Kind::Variable(ast::Variable {
@@ -3796,7 +3709,7 @@ mod tests {
             span: None,
         };
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Number(10.into()));
+        assert_eq!(result, WorkflowValue::Int(10.into()));
     }
 
     #[test]
@@ -3822,7 +3735,7 @@ mod tests {
             span: None,
         };
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Number(10.into()));
+        assert_eq!(result, WorkflowValue::Int(10.into()));
     }
 
     #[test]
@@ -3849,7 +3762,7 @@ mod tests {
             span: None,
         };
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     #[test]
@@ -3878,9 +3791,9 @@ mod tests {
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
         assert_eq!(
             result,
-            JsonValue::Array(vec![
-                JsonValue::Number(1.into()),
-                JsonValue::Number(2.into()),
+            WorkflowValue::List(vec![
+                WorkflowValue::Int(1.into()),
+                WorkflowValue::Int(2.into()),
             ])
         );
     }
@@ -3908,12 +3821,12 @@ mod tests {
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
         assert_eq!(
             result,
-            JsonValue::Array(vec![
-                JsonValue::Number(0.into()),
-                JsonValue::Number(1.into()),
-                JsonValue::Number(2.into()),
-                JsonValue::Number(3.into()),
-                JsonValue::Number(4.into()),
+            WorkflowValue::List(vec![
+                WorkflowValue::Int(0.into()),
+                WorkflowValue::Int(1.into()),
+                WorkflowValue::Int(2.into()),
+                WorkflowValue::Int(3.into()),
+                WorkflowValue::Int(4.into()),
             ])
         );
     }
@@ -3958,7 +3871,7 @@ mod tests {
             span: None,
         };
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Number(3.into()));
+        assert_eq!(result, WorkflowValue::Int(3.into()));
     }
 
     #[test]
@@ -3998,25 +3911,29 @@ mod tests {
         .with_kwargs(kwargs);
 
         // Create inbox with the expected variables
-        let mut inbox: HashMap<String, JsonValue> = HashMap::new();
-        inbox.insert("number".to_string(), JsonValue::Number(5.into()));
-        inbox.insert("factorial_value".to_string(), JsonValue::Number(120.into()));
-        inbox.insert("fib_value".to_string(), JsonValue::Number(5.into()));
+        let mut inbox: HashMap<String, WorkflowValue> = HashMap::new();
+        inbox.insert("number".to_string(), WorkflowValue::Int(5.into()));
+        inbox.insert(
+            "factorial_value".to_string(),
+            WorkflowValue::Int(120.into()),
+        );
+        inbox.insert("fib_value".to_string(), WorkflowValue::Int(5.into()));
 
         // Build payload
         let payload = DAGRunner::build_action_payload_from_inbox(&node, &inbox).unwrap();
-        let payload_json: JsonValue = serde_json::from_slice(&payload).unwrap();
+        let payload_json = serde_json::from_slice::<serde_json::Value>(&payload).unwrap();
+        let payload_value = WorkflowValue::from_json(&payload_json);
 
         // Verify all kwargs are resolved correctly
-        let obj = payload_json.as_object().expect("payload should be object");
-        assert_eq!(obj.get("input_number"), Some(&JsonValue::Number(5.into())));
+        let obj = payload_value.as_dict().expect("payload should be object");
+        assert_eq!(obj.get("input_number"), Some(&WorkflowValue::Int(5.into())));
         assert_eq!(
             obj.get("factorial_value"),
-            Some(&JsonValue::Number(120.into()))
+            Some(&WorkflowValue::Int(120.into()))
         );
         assert_eq!(
             obj.get("fibonacci_value"),
-            Some(&JsonValue::Number(5.into()))
+            Some(&WorkflowValue::Int(5.into()))
         );
     }
 
@@ -4037,11 +3954,13 @@ mod tests {
             .find(|n| n.action_name.as_deref() == Some("dummy"))
             .expect("Action node not found");
 
-        let inbox: HashMap<String, JsonValue> = HashMap::new();
+        let inbox: HashMap<String, WorkflowValue> = HashMap::new();
         let payload = DAGRunner::build_action_payload_from_inbox(action_node, &inbox).unwrap();
-        let payload_json: JsonValue = serde_json::from_slice(&payload).unwrap();
+        let payload_json = serde_json::from_slice::<serde_json::Value>(&payload).unwrap();
+        let payload_value = WorkflowValue::from_json(&payload_json);
+        let obj = payload_value.as_dict().expect("payload should be object");
 
-        assert_eq!(payload_json.get("flag"), Some(&JsonValue::Bool(true)));
+        assert_eq!(obj.get("flag"), Some(&WorkflowValue::Bool(true)));
     }
 
     #[test]
@@ -4065,28 +3984,32 @@ mod tests {
         .with_kwargs(kwargs);
 
         // Create inbox MISSING some variables - this simulates the bug
-        let mut inbox: HashMap<String, JsonValue> = HashMap::new();
-        inbox.insert("factorial_value".to_string(), JsonValue::Number(120.into()));
+        let mut inbox: HashMap<String, WorkflowValue> = HashMap::new();
+        inbox.insert(
+            "factorial_value".to_string(),
+            WorkflowValue::Int(120.into()),
+        );
         // fib_value and number are MISSING
 
         // Build payload
         let payload = DAGRunner::build_action_payload_from_inbox(&node, &inbox).unwrap();
-        let payload_json: JsonValue = serde_json::from_slice(&payload).unwrap();
+        let payload_json = serde_json::from_slice::<serde_json::Value>(&payload).unwrap();
+        let payload_value = WorkflowValue::from_json(&payload_json);
 
         // Missing variables should resolve to null (which will cause TypeError in Python!)
-        let obj = payload_json.as_object().expect("payload should be object");
+        let obj = payload_value.as_dict().expect("payload should be object");
         assert_eq!(
             obj.get("input_number"),
-            Some(&JsonValue::Null),
+            Some(&WorkflowValue::Null),
             "missing variable should be null"
         );
         assert_eq!(
             obj.get("factorial_value"),
-            Some(&JsonValue::Number(120.into()))
+            Some(&WorkflowValue::Int(120.into()))
         );
         assert_eq!(
             obj.get("fibonacci_value"),
-            Some(&JsonValue::Null),
+            Some(&WorkflowValue::Null),
             "missing variable should be null"
         );
     }
@@ -4156,7 +4079,7 @@ mod tests {
         DAGRunner::collect_inbox_writes_for_node(
             "main_input_1",
             "n",
-            &JsonValue::Number(42.into()),
+            &WorkflowValue::Int(42.into()),
             &dag,
             instance_id,
             &mut inbox_writes,
@@ -4170,7 +4093,7 @@ mod tests {
         );
         assert_eq!(inbox_writes[0].target_node_id, "action_5");
         assert_eq!(inbox_writes[0].variable_name, "n");
-        assert_eq!(inbox_writes[0].value, JsonValue::Number(42.into()));
+        assert_eq!(inbox_writes[0].value, WorkflowValue::Int(42.into()));
         assert_eq!(inbox_writes[0].source_node_id, "main_input_1");
     }
 
@@ -4208,7 +4131,7 @@ mod tests {
         ));
 
         let mut initial_inputs = HashMap::new();
-        initial_inputs.insert("n".to_string(), JsonValue::Number(7.into()));
+        initial_inputs.insert("n".to_string(), WorkflowValue::Int(7.into()));
 
         let instance_id = WorkflowInstanceId(Uuid::new_v4());
         let (scope, inbox_writes) =
@@ -4217,7 +4140,7 @@ mod tests {
         // Scope should preserve numeric types instead of stringifying JSON inputs.
         assert_eq!(
             scope.get("n"),
-            Some(&JsonValue::Number(7.into())),
+            Some(&WorkflowValue::Int(7.into())),
             "initial scope should keep the original numeric value"
         );
 
@@ -4225,7 +4148,7 @@ mod tests {
         assert_eq!(inbox_writes.len(), 1);
         assert_eq!(inbox_writes[0].target_node_id, "action_2");
         assert_eq!(inbox_writes[0].variable_name, "n");
-        assert_eq!(inbox_writes[0].value, JsonValue::Number(7.into()));
+        assert_eq!(inbox_writes[0].value, WorkflowValue::Int(7.into()));
         assert_eq!(inbox_writes[0].source_node_id, "main_input_1");
     }
 }

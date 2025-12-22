@@ -213,23 +213,20 @@ fn proto_value_to_json(value: &proto::WorkflowArgumentValue) -> serde_json::Valu
                 .collect::<Vec<_>>(),
         ),
         Some(Kind::Basemodel(model)) => {
-            let mut obj = serde_json::Map::new();
-            obj.insert(
-                "__class__".to_string(),
-                serde_json::Value::String(model.name.clone()),
-            );
-            obj.insert(
-                "__module__".to_string(),
-                serde_json::Value::String(model.module.clone()),
-            );
             if let Some(data_dict) = &model.data {
-                for entry in &data_dict.entries {
-                    if let Some(v) = &entry.value {
-                        obj.insert(entry.key.clone(), proto_value_to_json(v));
-                    }
-                }
+                let entries: serde_json::Map<String, serde_json::Value> = data_dict
+                    .entries
+                    .iter()
+                    .filter_map(|arg| {
+                        arg.value
+                            .as_ref()
+                            .map(|v| (arg.key.clone(), proto_value_to_json(v)))
+                    })
+                    .collect();
+                serde_json::Value::Object(entries)
+            } else {
+                serde_json::Value::Object(serde_json::Map::new())
             }
-            serde_json::Value::Object(obj)
         }
         Some(Kind::Exception(exc)) => {
             let mut obj = serde_json::Map::new();
@@ -720,8 +717,8 @@ async fn exception_with_success_workflow_handles_failure_branch() -> Result<()> 
 /// Reproduces the example_app error-handling workflow that returns a Pydantic model.
 ///
 /// With should_fail=True, risky_action raises, recovery_action runs, and the final
-/// build_error_result action returns an ErrorResult BaseModel. This ensures BaseModel
-/// serialization works end-to-end in failure branches.
+/// build_error_result action returns an ErrorResult BaseModel. We store it as a dict
+/// and allow Python to coerce it back into a model when needed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn error_handling_workflow_returns_basemodel_on_failure() -> Result<()> {
@@ -766,15 +763,13 @@ async fn error_handling_workflow_returns_basemodel_on_failure() -> Result<()> {
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("result is not an object: {result_value}"))?;
 
-    assert_eq!(
-        result_obj.get("__class__"),
-        Some(&serde_json::Value::String("ErrorResult".to_string()))
+    assert!(
+        !result_obj.contains_key("__class__"),
+        "unexpected __class__ metadata"
     );
-    assert_eq!(
-        result_obj.get("__module__"),
-        Some(&serde_json::Value::String(
-            "integration_error_handling".to_string()
-        ))
+    assert!(
+        !result_obj.contains_key("__module__"),
+        "unexpected __module__ metadata"
     );
     assert_eq!(
         result_obj.get("attempted"),
@@ -842,9 +837,9 @@ async fn error_handling_workflow_returns_basemodel_on_success() -> Result<()> {
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("result is not an object: {result_value}"))?;
 
-    assert_eq!(
-        result_obj.get("__class__"),
-        Some(&serde_json::Value::String("ErrorResult".to_string()))
+    assert!(
+        !result_obj.contains_key("__class__"),
+        "unexpected __class__ metadata"
     );
     assert_eq!(
         result_obj.get("recovered"),

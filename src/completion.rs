@@ -4,7 +4,6 @@
 //! where every node gets readiness tracking and is only enqueued when
 //! `completed_count == required_count`.
 
-use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::{debug, info, warn};
 
@@ -15,6 +14,7 @@ use crate::dag::{DAG, DAGEdge, DAGNode, EdgeType};
 use crate::dag_state::DAGHelper;
 use crate::db::{ActionId, WorkflowInstanceId};
 use crate::parser::ast;
+use crate::value::WorkflowValue;
 
 // ============================================================================
 // Subgraph Analysis Types
@@ -38,9 +38,9 @@ pub struct SubgraphAnalysis {
 /// Inline execution context for subgraph processing.
 pub struct InlineContext<'a> {
     /// Variables available prior to processing this completion (e.g., workflow inputs).
-    pub initial_scope: &'a HashMap<String, JsonValue>,
+    pub initial_scope: &'a HashMap<String, WorkflowValue>,
     /// Inbox data fetched from storage for nodes involved in this completion.
-    pub existing_inbox: &'a HashMap<String, HashMap<String, JsonValue>>,
+    pub existing_inbox: &'a HashMap<String, HashMap<String, WorkflowValue>>,
     /// Spread index for spread actions (if applicable).
     pub spread_index: Option<usize>,
 }
@@ -151,7 +151,7 @@ pub struct InboxWrite {
     pub instance_id: WorkflowInstanceId,
     pub target_node_id: String,
     pub variable_name: String,
-    pub value: JsonValue,
+    pub value: WorkflowValue,
     pub source_node_id: String,
     pub spread_index: Option<i32>,
 }
@@ -239,7 +239,7 @@ impl CompletionResult {
 
 /// Scope for inline node execution.
 /// Maps variable names to their JSON values.
-pub type InlineScope = HashMap<String, JsonValue>;
+pub type InlineScope = HashMap<String, WorkflowValue>;
 
 // ============================================================================
 // Subgraph Analysis Functions
@@ -509,7 +509,7 @@ pub enum CompletionError {
 /// Returns a CompletionPlan ready to be executed as a single transaction.
 pub fn execute_inline_subgraph(
     completed_node_id: &str,
-    completed_result: JsonValue,
+    completed_result: WorkflowValue,
     ctx: InlineContext<'_>,
     subgraph: &SubgraphAnalysis,
     dag: &DAG,
@@ -962,7 +962,7 @@ pub fn execute_inline_subgraph(
                             .get("result")
                             .or_else(|| output_inbox.values().next())
                             .cloned()
-                            .unwrap_or(JsonValue::Null)
+                            .unwrap_or(WorkflowValue::Null)
                     } else {
                         // No DataFlow edges - get result from inline scope
                         // Try "result" first (common convention from action target),
@@ -983,7 +983,7 @@ pub fn execute_inline_subgraph(
                             })
                             .or_else(|| inline_scope.values().next())
                             .cloned()
-                            .unwrap_or(JsonValue::Null)
+                            .unwrap_or(WorkflowValue::Null)
                     };
 
                     debug!(
@@ -1005,7 +1005,7 @@ pub fn execute_inline_subgraph(
 }
 
 /// Execute a single inline node and return its result.
-fn execute_inline_node(node: &DAGNode, scope: &InlineScope) -> JsonValue {
+fn execute_inline_node(node: &DAGNode, scope: &InlineScope) -> WorkflowValue {
     // Most inline nodes don't produce meaningful values themselves
     // The actual data flows through DataFlow edges from their predecessors
     match node.node_type.as_str() {
@@ -1020,11 +1020,11 @@ fn execute_inline_node(node: &DAGNode, scope: &InlineScope) -> JsonValue {
                             error = %e,
                             "failed to evaluate assignment expression in completion"
                         );
-                        JsonValue::Null
+                        WorkflowValue::Null
                     }
                 }
             } else {
-                JsonValue::Null
+                WorkflowValue::Null
             }
         }
         "return" => {
@@ -1037,18 +1037,18 @@ fn execute_inline_node(node: &DAGNode, scope: &InlineScope) -> JsonValue {
                             error = %e,
                             "failed to evaluate return expression in completion"
                         );
-                        JsonValue::Null
+                        WorkflowValue::Null
                     }
                 }
             } else {
-                JsonValue::Null
+                WorkflowValue::Null
             }
         }
-        "input" | "output" => JsonValue::Null,
-        "conditional" | "branch" => JsonValue::Bool(true),
-        "join" => JsonValue::Null,
-        "aggregator" => JsonValue::Array(vec![]),
-        _ => JsonValue::Null,
+        "input" | "output" => WorkflowValue::Null,
+        "conditional" | "branch" => WorkflowValue::Bool(true),
+        "join" => WorkflowValue::Null,
+        "aggregator" => WorkflowValue::List(vec![]),
+        _ => WorkflowValue::Null,
     }
 }
 
@@ -1124,14 +1124,7 @@ pub fn evaluate_guard(
 
     match ExpressionEvaluator::evaluate(guard, scope) {
         Ok(val) => {
-            let is_true = match &val {
-                JsonValue::Bool(b) => *b,
-                JsonValue::Null => false,
-                JsonValue::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
-                JsonValue::String(s) => !s.is_empty(),
-                JsonValue::Array(a) => !a.is_empty(),
-                JsonValue::Object(o) => !o.is_empty(),
-            };
+            let is_true = val.is_truthy();
             debug!(
                 successor_id = %successor_id,
                 guard_expr = ?guard,
@@ -1301,7 +1294,7 @@ fn merge_data_flow_into_inbox(
     target_node_id: &str,
     inline_scope: &InlineScope,
     dag: &DAG,
-    inbox: &mut HashMap<String, JsonValue>,
+    inbox: &mut HashMap<String, WorkflowValue>,
 ) {
     // Find all DataFlow edges to this target
     let df_edges: Vec<_> = dag
@@ -1342,7 +1335,7 @@ fn merge_data_flow_into_inbox(
 /// Build action dispatch payload from node kwargs and inbox.
 fn build_action_payload(
     node: &DAGNode,
-    inbox: &HashMap<String, JsonValue>,
+    inbox: &HashMap<String, WorkflowValue>,
 ) -> Result<Vec<u8>, CompletionError> {
     let mut payload_map = serde_json::Map::new();
 
@@ -1351,11 +1344,11 @@ fn build_action_payload(
         for (key, value_str) in kwargs {
             let expr = kwarg_exprs.and_then(|m| m.get(key));
             let resolved = resolve_kwarg_value(key, value_str, expr, inbox);
-            payload_map.insert(key.clone(), resolved);
+            payload_map.insert(key.clone(), resolved.to_json());
         }
     }
 
-    Ok(serde_json::to_vec(&JsonValue::Object(payload_map))?)
+    Ok(serde_json::to_vec(&serde_json::Value::Object(payload_map))?)
 }
 
 /// Resolve a kwarg value string to a JSON value.
@@ -1363,8 +1356,8 @@ fn resolve_kwarg_value(
     key: &str,
     value_str: &str,
     expr: Option<&ast::Expr>,
-    inbox: &HashMap<String, JsonValue>,
-) -> JsonValue {
+    inbox: &HashMap<String, WorkflowValue>,
+) -> WorkflowValue {
     if let Some(expr) = expr {
         match ExpressionEvaluator::evaluate(expr, inbox) {
             Ok(value) => return value,
@@ -1374,7 +1367,7 @@ fn resolve_kwarg_value(
                     missing_var = %var,
                     "kwarg variable not found in inbox"
                 );
-                return JsonValue::Null;
+                return WorkflowValue::Null;
             }
             Err(err) => {
                 debug!(
@@ -1388,92 +1381,42 @@ fn resolve_kwarg_value(
 
     // Variable reference
     if let Some(var_name) = value_str.strip_prefix('$') {
-        return inbox.get(var_name).cloned().unwrap_or(JsonValue::Null);
+        return inbox.get(var_name).cloned().unwrap_or(WorkflowValue::Null);
     }
 
     // Common bool literal casing from Python source (True/False)
     match value_str {
-        "True" | "true" => return JsonValue::Bool(true),
-        "False" | "false" => return JsonValue::Bool(false),
+        "True" | "true" => return WorkflowValue::Bool(true),
+        "False" | "false" => return WorkflowValue::Bool(false),
         _ => {}
     }
 
     // Try to parse as JSON
     match serde_json::from_str(value_str) {
-        Ok(v) => v,
+        Ok(v) => WorkflowValue::from_json(&v),
         Err(_) => {
             // If it's a string that looks like a bool, normalize to bool
             match value_str.to_ascii_lowercase().as_str() {
-                "true" => JsonValue::Bool(true),
-                "false" => JsonValue::Bool(false),
-                _ => JsonValue::String(value_str.to_string()),
+                "true" => WorkflowValue::Bool(true),
+                "false" => WorkflowValue::Bool(false),
+                _ => WorkflowValue::String(value_str.to_string()),
             }
         }
     }
 }
 
 /// Serialize workflow result as protobuf WorkflowArguments.
-fn serialize_workflow_result(result: &JsonValue) -> Result<Vec<u8>, CompletionError> {
+fn serialize_workflow_result(result: &WorkflowValue) -> Result<Vec<u8>, CompletionError> {
     use crate::messages::proto;
     use prost::Message;
 
     let arguments = vec![proto::WorkflowArgument {
         key: "result".to_string(),
-        value: Some(json_to_proto_value(result)),
+        value: Some(result.to_proto()),
     }];
 
     let workflow_args = proto::WorkflowArguments { arguments };
     Ok(workflow_args.encode_to_vec())
-}
-
-/// Convert JSON value to protobuf WorkflowArgumentValue.
-fn json_to_proto_value(value: &JsonValue) -> crate::messages::proto::WorkflowArgumentValue {
-    use crate::messages::proto::{self, workflow_argument_value::Kind};
-
-    let kind = match value {
-        JsonValue::Null => Kind::Primitive(proto::PrimitiveWorkflowArgument {
-            kind: Some(proto::primitive_workflow_argument::Kind::NullValue(0)),
-        }),
-        JsonValue::Bool(b) => Kind::Primitive(proto::PrimitiveWorkflowArgument {
-            kind: Some(proto::primitive_workflow_argument::Kind::BoolValue(*b)),
-        }),
-        JsonValue::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                    kind: Some(proto::primitive_workflow_argument::Kind::IntValue(i)),
-                })
-            } else if let Some(f) = n.as_f64() {
-                Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                    kind: Some(proto::primitive_workflow_argument::Kind::DoubleValue(f)),
-                })
-            } else {
-                Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                    kind: Some(proto::primitive_workflow_argument::Kind::DoubleValue(0.0)),
-                })
-            }
-        }
-        JsonValue::String(s) => Kind::Primitive(proto::PrimitiveWorkflowArgument {
-            kind: Some(proto::primitive_workflow_argument::Kind::StringValue(
-                s.clone(),
-            )),
-        }),
-        JsonValue::Array(arr) => {
-            let items = arr.iter().map(json_to_proto_value).collect();
-            Kind::ListValue(proto::WorkflowListArgument { items })
-        }
-        JsonValue::Object(obj) => {
-            let entries = obj
-                .iter()
-                .map(|(k, v)| proto::WorkflowArgument {
-                    key: k.clone(),
-                    value: Some(json_to_proto_value(v)),
-                })
-                .collect();
-            Kind::DictValue(proto::WorkflowDictArgument { entries })
-        }
-    };
-
-    proto::WorkflowArgumentValue { kind: Some(kind) }
 }
 
 #[cfg(test)]
@@ -1652,10 +1595,10 @@ fn main(input: [x], output: [result]):
         let subgraph = analyze_subgraph(&action_node.id, &dag, &helper);
 
         // Execute with a sample result
-        let result = serde_json::json!("hello world");
+        let result = WorkflowValue::String("hello world".to_string());
         let existing_inbox = HashMap::new();
         let instance_id = WorkflowInstanceId(Uuid::new_v4());
-        let initial_scope: HashMap<String, JsonValue> = HashMap::new();
+        let initial_scope: HashMap<String, WorkflowValue> = HashMap::new();
 
         let ctx = InlineContext {
             initial_scope: &initial_scope,
@@ -1773,7 +1716,7 @@ fn main(input: [x], output: [result]):
     #[test]
     fn test_evaluate_guard_pass_with_true_expression() {
         let mut scope: InlineScope = HashMap::new();
-        scope.insert("x".to_string(), JsonValue::Number(10.into()));
+        scope.insert("x".to_string(), WorkflowValue::Int(10.into()));
 
         // Create expression: x > 5
         let guard = make_binary_op(
@@ -1792,7 +1735,7 @@ fn main(input: [x], output: [result]):
     #[test]
     fn test_evaluate_guard_fail_with_false_expression() {
         let mut scope: InlineScope = HashMap::new();
-        scope.insert("x".to_string(), JsonValue::Number(3.into()));
+        scope.insert("x".to_string(), WorkflowValue::Int(3.into()));
 
         // Create expression: x > 5
         let guard = make_binary_op(
@@ -1887,7 +1830,7 @@ fn main(input: [x], output: [result]):
 
         // Create a scope where 'score' is NOT defined - this will cause guard evaluation to fail
         let initial_scope: InlineScope = HashMap::new();
-        let existing_inbox: HashMap<String, HashMap<String, JsonValue>> = HashMap::new();
+        let existing_inbox: HashMap<String, HashMap<String, WorkflowValue>> = HashMap::new();
         let instance_id = WorkflowInstanceId(uuid::Uuid::new_v4());
 
         let ctx = InlineContext {
@@ -1900,7 +1843,7 @@ fn main(input: [x], output: [result]):
         // The guards reference 'score' which won't be in scope, causing errors
         let result = execute_inline_subgraph(
             &score_action.id,
-            JsonValue::Number(75.into()), // Action returned 75
+            WorkflowValue::Int(75.into()), // Action returned 75
             ctx,
             &subgraph,
             &dag,
@@ -1999,9 +1942,9 @@ fn main(input: [x], output: [result]):
 
         // Create scope with 'score' already defined (simulating result being stored)
         let mut initial_scope: InlineScope = HashMap::new();
-        initial_scope.insert("x".to_string(), JsonValue::Number(10.into()));
+        initial_scope.insert("x".to_string(), WorkflowValue::Int(10.into()));
 
-        let existing_inbox: HashMap<String, HashMap<String, JsonValue>> = HashMap::new();
+        let existing_inbox: HashMap<String, HashMap<String, WorkflowValue>> = HashMap::new();
         let instance_id = WorkflowInstanceId(uuid::Uuid::new_v4());
 
         let ctx = InlineContext {
@@ -2013,7 +1956,7 @@ fn main(input: [x], output: [result]):
         // Execute with score = 75 (should take the high_action branch)
         let result = execute_inline_subgraph(
             &score_action.id,
-            JsonValue::Number(75.into()),
+            WorkflowValue::Int(75.into()),
             ctx,
             &subgraph,
             &dag,
@@ -2076,7 +2019,7 @@ fn main(input: [x], output: [result]):
         );
 
         let initial_scope: InlineScope = HashMap::new();
-        let existing_inbox: HashMap<String, HashMap<String, JsonValue>> = HashMap::new();
+        let existing_inbox: HashMap<String, HashMap<String, WorkflowValue>> = HashMap::new();
         let instance_id = WorkflowInstanceId(uuid::Uuid::new_v4());
 
         let ctx = InlineContext {
@@ -2088,7 +2031,7 @@ fn main(input: [x], output: [result]):
         // Execute with response = ["item1"] (truthy - should take the if branch)
         let result = execute_inline_subgraph(
             &get_items_action.id,
-            JsonValue::Array(vec![JsonValue::String("item1".to_string())]),
+            WorkflowValue::List(vec![WorkflowValue::String("item1".to_string())]),
             ctx,
             &subgraph,
             &dag,
@@ -2163,7 +2106,7 @@ fn main(input: [x], output: [result]):
         }
 
         let initial_scope: InlineScope = HashMap::new();
-        let existing_inbox: HashMap<String, HashMap<String, JsonValue>> = HashMap::new();
+        let existing_inbox: HashMap<String, HashMap<String, WorkflowValue>> = HashMap::new();
         let instance_id = WorkflowInstanceId(uuid::Uuid::new_v4());
 
         let ctx = InlineContext {
@@ -2175,7 +2118,7 @@ fn main(input: [x], output: [result]):
         // Execute with response = [] (falsy empty array - should SKIP the if branch)
         let result = execute_inline_subgraph(
             &get_items_action.id,
-            JsonValue::Array(vec![]), // Empty array is falsy
+            WorkflowValue::List(vec![]), // Empty array is falsy
             ctx,
             &subgraph,
             &dag,
@@ -2263,7 +2206,7 @@ fn main(input: [raw_id], output: [result]):
         let subgraph = analyze_subgraph(&parse_action.id, &dag, &helper);
 
         let initial_scope: InlineScope = HashMap::new();
-        let existing_inbox: HashMap<String, HashMap<String, JsonValue>> = HashMap::new();
+        let existing_inbox: HashMap<String, HashMap<String, WorkflowValue>> = HashMap::new();
         let instance_id = WorkflowInstanceId(uuid::Uuid::new_v4());
 
         let ctx = InlineContext {
@@ -2279,10 +2222,10 @@ fn main(input: [raw_id], output: [result]):
         // Expected: Should continue to validate_posts action
         let result = execute_inline_subgraph(
             &parse_action.id,
-            serde_json::json!({
+            WorkflowValue::from_json(&serde_json::json!({
                 "auth_session_id": "session-123",
                 "new_post_ids": []
-            }),
+            })),
             ctx,
             &subgraph,
             &dag,
@@ -2347,7 +2290,7 @@ fn main(input: [flag], output: [result]):
         let ctx = InlineContext {
             initial_scope: &{
                 let mut scope = InlineScope::new();
-                scope.insert("flag".to_string(), JsonValue::Bool(true));
+                scope.insert("flag".to_string(), WorkflowValue::Bool(true));
                 scope
             },
             existing_inbox: &HashMap::new(),
@@ -2356,7 +2299,7 @@ fn main(input: [flag], output: [result]):
 
         let result = execute_inline_subgraph(
             &check_action.id,
-            JsonValue::Bool(true),
+            WorkflowValue::Bool(true),
             ctx,
             &subgraph,
             &dag,
@@ -2407,7 +2350,7 @@ fn main(input: [raw_id], output: [result]):
         let subgraph = analyze_subgraph(&parse_action.id, &dag, &helper);
 
         let initial_scope: InlineScope = HashMap::new();
-        let existing_inbox: HashMap<String, HashMap<String, JsonValue>> = HashMap::new();
+        let existing_inbox: HashMap<String, HashMap<String, WorkflowValue>> = HashMap::new();
         let instance_id = WorkflowInstanceId(uuid::Uuid::new_v4());
 
         let ctx = InlineContext {
@@ -2420,10 +2363,10 @@ fn main(input: [raw_id], output: [result]):
         // - auth_session_id = null (falsy, so early return IS taken)
         let result = execute_inline_subgraph(
             &parse_action.id,
-            serde_json::json!({
+            WorkflowValue::from_json(&serde_json::json!({
                 "auth_session_id": null,
                 "new_post_ids": ["post-1", "post-2"]
-            }),
+            })),
             ctx,
             &subgraph,
             &dag,
@@ -2488,7 +2431,7 @@ fn main(input: [raw_id], output: [result]):
         let subgraph = analyze_subgraph(&parse_action.id, &dag, &helper);
 
         let initial_scope: InlineScope = HashMap::new();
-        let existing_inbox: HashMap<String, HashMap<String, JsonValue>> = HashMap::new();
+        let existing_inbox: HashMap<String, HashMap<String, WorkflowValue>> = HashMap::new();
         let instance_id = WorkflowInstanceId(uuid::Uuid::new_v4());
 
         let ctx = InlineContext {
@@ -2502,10 +2445,10 @@ fn main(input: [raw_id], output: [result]):
         // - new_post_ids = ["post-1"] (non-empty, for loop should iterate)
         let result = execute_inline_subgraph(
             &parse_action.id,
-            serde_json::json!({
+            WorkflowValue::from_json(&serde_json::json!({
                 "auth_session_id": "session-123",
                 "new_post_ids": ["post-1"]
-            }),
+            })),
             ctx,
             &subgraph,
             &dag,
@@ -2570,7 +2513,7 @@ fn main(input: [x], output: [result]):
         let subgraph = analyze_subgraph(&get_value_action.id, &dag, &helper);
 
         let initial_scope: InlineScope = HashMap::new();
-        let existing_inbox: HashMap<String, HashMap<String, JsonValue>> = HashMap::new();
+        let existing_inbox: HashMap<String, HashMap<String, WorkflowValue>> = HashMap::new();
         let instance_id = WorkflowInstanceId(uuid::Uuid::new_v4());
 
         let ctx = InlineContext {
@@ -2582,10 +2525,10 @@ fn main(input: [x], output: [result]):
         // Execute with status = "medium" (should take elif branch and return)
         let result = execute_inline_subgraph(
             &get_value_action.id,
-            serde_json::json!({
+            WorkflowValue::from_json(&serde_json::json!({
                 "status": "medium",
                 "data": "test"
-            }),
+            })),
             ctx,
             &subgraph,
             &dag,
@@ -2649,10 +2592,10 @@ fn main(input: [items], output: [result]):
         // items = [{"found": true, "value": "first"}]
         initial_scope.insert(
             "items".to_string(),
-            serde_json::json!([{"found": true, "value": "first"}]),
+            WorkflowValue::from_json(&serde_json::json!([{"found": true, "value": "first"}])),
         );
 
-        let existing_inbox: HashMap<String, HashMap<String, JsonValue>> = HashMap::new();
+        let existing_inbox: HashMap<String, HashMap<String, WorkflowValue>> = HashMap::new();
         let instance_id = WorkflowInstanceId(uuid::Uuid::new_v4());
 
         let ctx = InlineContext {
@@ -2664,7 +2607,7 @@ fn main(input: [items], output: [result]):
         // Execute from input (with items that should trigger early return)
         let result = execute_inline_subgraph(
             &input_node.id,
-            JsonValue::Null, // Input node doesn't have a result
+            WorkflowValue::Null, // Input node doesn't have a result
             ctx,
             &subgraph,
             &dag,
@@ -2787,7 +2730,7 @@ fn main(input: [x], output: [result]):
         let subgraph = analyze_subgraph(&get_value_action.id, &dag, &helper);
 
         let initial_scope: InlineScope = HashMap::new();
-        let existing_inbox: HashMap<String, HashMap<String, JsonValue>> = HashMap::new();
+        let existing_inbox: HashMap<String, HashMap<String, WorkflowValue>> = HashMap::new();
         let instance_id = WorkflowInstanceId(uuid::Uuid::new_v4());
 
         let ctx = InlineContext {
@@ -2799,7 +2742,7 @@ fn main(input: [x], output: [result]):
         // Execute with successful result
         let result = execute_inline_subgraph(
             &get_value_action.id,
-            serde_json::json!({"success": true, "data": "result"}),
+            WorkflowValue::from_json(&serde_json::json!({"success": true, "data": "result"})),
             ctx,
             &subgraph,
             &dag,

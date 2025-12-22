@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use serde_json::Value as JsonValue;
+use crate::value::WorkflowValue;
 use thiserror::Error;
 
 use crate::parser::ast;
@@ -38,7 +38,7 @@ pub type EvaluationResult<T> = Result<T, EvaluationError>;
 
 /// Scope for inline expression evaluation.
 /// This is a simple in-memory variable map used during inline node execution.
-pub type Scope = HashMap<String, JsonValue>;
+pub type Scope = HashMap<String, WorkflowValue>;
 
 // ============================================================================
 // Expression Evaluator
@@ -49,7 +49,7 @@ pub struct ExpressionEvaluator;
 
 impl ExpressionEvaluator {
     /// Evaluate an expression to a runtime value.
-    pub fn evaluate(expr: &ast::Expr, scope: &Scope) -> EvaluationResult<JsonValue> {
+    pub fn evaluate(expr: &ast::Expr, scope: &Scope) -> EvaluationResult<WorkflowValue> {
         let kind = expr
             .kind
             .as_ref()
@@ -77,25 +77,23 @@ impl ExpressionEvaluator {
         }
     }
 
-    fn eval_literal(lit: &ast::Literal) -> EvaluationResult<JsonValue> {
+    fn eval_literal(lit: &ast::Literal) -> EvaluationResult<WorkflowValue> {
         let value = lit
             .value
             .as_ref()
             .ok_or_else(|| EvaluationError::Evaluation("Empty literal".to_string()))?;
 
         Ok(match value {
-            ast::literal::Value::IntValue(i) => JsonValue::Number((*i).into()),
-            ast::literal::Value::FloatValue(f) => JsonValue::Number(
-                serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0)),
-            ),
-            ast::literal::Value::StringValue(s) => JsonValue::String(s.clone()),
-            ast::literal::Value::BoolValue(b) => JsonValue::Bool(*b),
-            ast::literal::Value::IsNone(true) => JsonValue::Null,
-            ast::literal::Value::IsNone(false) => JsonValue::Null,
+            ast::literal::Value::IntValue(i) => WorkflowValue::Int(*i),
+            ast::literal::Value::FloatValue(f) => WorkflowValue::Float(*f),
+            ast::literal::Value::StringValue(s) => WorkflowValue::String(s.clone()),
+            ast::literal::Value::BoolValue(b) => WorkflowValue::Bool(*b),
+            ast::literal::Value::IsNone(true) => WorkflowValue::Null,
+            ast::literal::Value::IsNone(false) => WorkflowValue::Null,
         })
     }
 
-    fn eval_variable(var: &ast::Variable, scope: &Scope) -> EvaluationResult<JsonValue> {
+    fn eval_variable(var: &ast::Variable, scope: &Scope) -> EvaluationResult<WorkflowValue> {
         let value = scope
             .get(&var.name)
             .cloned()
@@ -112,7 +110,7 @@ impl ExpressionEvaluator {
         Ok(value)
     }
 
-    fn eval_binary_op(op: &ast::BinaryOp, scope: &Scope) -> EvaluationResult<JsonValue> {
+    fn eval_binary_op(op: &ast::BinaryOp, scope: &Scope) -> EvaluationResult<WorkflowValue> {
         let left_expr = op
             .left
             .as_ref()
@@ -132,8 +130,8 @@ impl ExpressionEvaluator {
             ast::BinaryOperator::BinaryOpSub => Self::apply_sub(&left, &right),
             ast::BinaryOperator::BinaryOpMul => Self::apply_mul(&left, &right),
             ast::BinaryOperator::BinaryOpDiv => Self::apply_div(&left, &right),
-            ast::BinaryOperator::BinaryOpEq => Ok(JsonValue::Bool(left == right)),
-            ast::BinaryOperator::BinaryOpNe => Ok(JsonValue::Bool(left != right)),
+            ast::BinaryOperator::BinaryOpEq => Ok(WorkflowValue::Bool(left == right)),
+            ast::BinaryOperator::BinaryOpNe => Ok(WorkflowValue::Bool(left != right)),
             ast::BinaryOperator::BinaryOpLt => Self::apply_lt(&left, &right),
             ast::BinaryOperator::BinaryOpLe => Self::apply_le(&left, &right),
             ast::BinaryOperator::BinaryOpGt => Self::apply_gt(&left, &right),
@@ -143,7 +141,8 @@ impl ExpressionEvaluator {
             ast::BinaryOperator::BinaryOpIn => Self::apply_in(&left, &right),
             ast::BinaryOperator::BinaryOpNotIn => {
                 let result = Self::apply_in(&left, &right)?;
-                Ok(JsonValue::Bool(!result.as_bool().unwrap_or(false)))
+                let is_in = matches!(result, WorkflowValue::Bool(true));
+                Ok(WorkflowValue::Bool(!is_in))
             }
             _ => Err(EvaluationError::Evaluation(
                 "Unknown binary operator".to_string(),
@@ -151,7 +150,7 @@ impl ExpressionEvaluator {
         }
     }
 
-    fn eval_unary_op(op: &ast::UnaryOp, scope: &Scope) -> EvaluationResult<JsonValue> {
+    fn eval_unary_op(op: &ast::UnaryOp, scope: &Scope) -> EvaluationResult<WorkflowValue> {
         let operand_expr = op
             .operand
             .as_ref()
@@ -162,42 +161,30 @@ impl ExpressionEvaluator {
         match ast::UnaryOperator::try_from(op.op).unwrap_or(ast::UnaryOperator::UnaryOpUnspecified)
         {
             ast::UnaryOperator::UnaryOpNeg => match &operand {
-                JsonValue::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        Ok(JsonValue::Number((-i).into()))
-                    } else if let Some(f) = n.as_f64() {
-                        Ok(JsonValue::Number(
-                            serde_json::Number::from_f64(-f)
-                                .unwrap_or_else(|| serde_json::Number::from(0)),
-                        ))
-                    } else {
-                        Err(EvaluationError::Evaluation(
-                            "Cannot negate non-numeric value".to_string(),
-                        ))
-                    }
-                }
+                WorkflowValue::Int(i) => Ok(WorkflowValue::Int(-i)),
+                WorkflowValue::Float(f) => Ok(WorkflowValue::Float(-f)),
                 _ => Err(EvaluationError::Evaluation(
                     "Cannot negate non-numeric value".to_string(),
                 )),
             },
-            ast::UnaryOperator::UnaryOpNot => Ok(JsonValue::Bool(!Self::is_truthy(&operand))),
+            ast::UnaryOperator::UnaryOpNot => Ok(WorkflowValue::Bool(!Self::is_truthy(&operand))),
             _ => Err(EvaluationError::Evaluation(
                 "Unknown unary operator".to_string(),
             )),
         }
     }
 
-    fn eval_list(list: &ast::ListExpr, scope: &Scope) -> EvaluationResult<JsonValue> {
-        let elements: Result<Vec<JsonValue>, _> = list
+    fn eval_list(list: &ast::ListExpr, scope: &Scope) -> EvaluationResult<WorkflowValue> {
+        let elements: Result<Vec<WorkflowValue>, _> = list
             .elements
             .iter()
             .map(|e| Self::evaluate(e, scope))
             .collect();
-        Ok(JsonValue::Array(elements?))
+        Ok(WorkflowValue::List(elements?))
     }
 
-    fn eval_dict(dict: &ast::DictExpr, scope: &Scope) -> EvaluationResult<JsonValue> {
-        let mut map = serde_json::Map::new();
+    fn eval_dict(dict: &ast::DictExpr, scope: &Scope) -> EvaluationResult<WorkflowValue> {
+        let mut map = HashMap::new();
         for entry in &dict.entries {
             let key_expr = entry
                 .key
@@ -212,15 +199,15 @@ impl ExpressionEvaluator {
             let val = Self::evaluate(val_expr, scope)?;
 
             let key_str = match key {
-                JsonValue::String(s) => s,
-                other => other.to_string(),
+                WorkflowValue::String(s) => s,
+                other => other.to_key_string(),
             };
             map.insert(key_str, val);
         }
-        Ok(JsonValue::Object(map))
+        Ok(WorkflowValue::Dict(map))
     }
 
-    fn eval_index(idx: &ast::IndexAccess, scope: &Scope) -> EvaluationResult<JsonValue> {
+    fn eval_index(idx: &ast::IndexAccess, scope: &Scope) -> EvaluationResult<WorkflowValue> {
         let obj_expr = idx
             .object
             .as_ref()
@@ -241,23 +228,35 @@ impl ExpressionEvaluator {
         );
 
         match (&obj, &index) {
-            (JsonValue::Array(arr), JsonValue::Number(n)) => {
-                let i = n.as_i64().unwrap_or(0) as usize;
-                arr.get(i).cloned().ok_or_else(|| {
-                    EvaluationError::Evaluation(format!("Index {} out of bounds", i))
+            (WorkflowValue::List(arr), WorkflowValue::Int(i)) => {
+                let idx = *i as usize;
+                arr.get(idx).cloned().ok_or_else(|| {
+                    EvaluationError::Evaluation(format!("Index {} out of bounds", idx))
                 })
             }
-            (JsonValue::Object(map), JsonValue::String(key)) => map
+            (WorkflowValue::Tuple(arr), WorkflowValue::Int(i)) => {
+                let idx = *i as usize;
+                arr.get(idx).cloned().ok_or_else(|| {
+                    EvaluationError::Evaluation(format!("Index {} out of bounds", idx))
+                })
+            }
+            (WorkflowValue::Dict(map), WorkflowValue::String(key)) => map
                 .get(key)
                 .cloned()
                 .ok_or_else(|| EvaluationError::Evaluation(format!("Key '{}' not found", key))),
-            (JsonValue::String(s), JsonValue::Number(n)) => {
-                let i = n.as_i64().unwrap_or(0) as usize;
+            (WorkflowValue::Dict(map), other) => {
+                let key = other.to_key_string();
+                map.get(&key)
+                    .cloned()
+                    .ok_or_else(|| EvaluationError::Evaluation(format!("Key '{}' not found", key)))
+            }
+            (WorkflowValue::String(s), WorkflowValue::Int(i)) => {
+                let idx = *i as usize;
                 s.chars()
-                    .nth(i)
-                    .map(|c| JsonValue::String(c.to_string()))
+                    .nth(idx)
+                    .map(|c| WorkflowValue::String(c.to_string()))
                     .ok_or_else(|| {
-                        EvaluationError::Evaluation(format!("Index {} out of bounds", i))
+                        EvaluationError::Evaluation(format!("Index {} out of bounds", idx))
                     })
             }
             _ => Err(EvaluationError::Evaluation(
@@ -266,7 +265,7 @@ impl ExpressionEvaluator {
         }
     }
 
-    fn eval_dot(dot: &ast::DotAccess, scope: &Scope) -> EvaluationResult<JsonValue> {
+    fn eval_dot(dot: &ast::DotAccess, scope: &Scope) -> EvaluationResult<WorkflowValue> {
         let obj_expr = dot
             .object
             .as_ref()
@@ -275,7 +274,7 @@ impl ExpressionEvaluator {
         let obj = Self::evaluate(obj_expr, scope)?;
 
         match &obj {
-            JsonValue::Object(map) => map.get(&dot.attribute).cloned().ok_or_else(|| {
+            WorkflowValue::Dict(map) => map.get(&dot.attribute).cloned().ok_or_else(|| {
                 EvaluationError::Evaluation(format!("Attribute '{}' not found", dot.attribute))
             }),
             _ => Err(EvaluationError::Evaluation(
@@ -284,7 +283,10 @@ impl ExpressionEvaluator {
         }
     }
 
-    fn eval_function_call(call: &ast::FunctionCall, scope: &Scope) -> EvaluationResult<JsonValue> {
+    fn eval_function_call(
+        call: &ast::FunctionCall,
+        scope: &Scope,
+    ) -> EvaluationResult<WorkflowValue> {
         // Evaluate positional args
         let mut args = Vec::new();
         for arg_expr in &call.args {
@@ -313,29 +315,23 @@ impl ExpressionEvaluator {
     }
 
     // Helper methods for operators
-    fn apply_add(left: &JsonValue, right: &JsonValue) -> EvaluationResult<JsonValue> {
+    fn apply_add(left: &WorkflowValue, right: &WorkflowValue) -> EvaluationResult<WorkflowValue> {
         match (left, right) {
-            (JsonValue::Number(a), JsonValue::Number(b)) => {
-                if let (Some(ai), Some(bi)) = (a.as_i64(), b.as_i64()) {
-                    Ok(JsonValue::Number((ai + bi).into()))
-                } else if let (Some(af), Some(bf)) = (a.as_f64(), b.as_f64()) {
-                    Ok(JsonValue::Number(
-                        serde_json::Number::from_f64(af + bf)
-                            .unwrap_or_else(|| serde_json::Number::from(0)),
-                    ))
-                } else {
-                    Err(EvaluationError::Evaluation(
-                        "Cannot add incompatible numbers".to_string(),
-                    ))
-                }
+            (WorkflowValue::Int(a), WorkflowValue::Int(b)) => Ok(WorkflowValue::Int(a + b)),
+            (WorkflowValue::Int(a), WorkflowValue::Float(b)) => {
+                Ok(WorkflowValue::Float(*a as f64 + b))
             }
-            (JsonValue::String(a), JsonValue::String(b)) => {
-                Ok(JsonValue::String(format!("{}{}", a, b)))
+            (WorkflowValue::Float(a), WorkflowValue::Int(b)) => {
+                Ok(WorkflowValue::Float(a + *b as f64))
             }
-            (JsonValue::Array(a), JsonValue::Array(b)) => {
+            (WorkflowValue::Float(a), WorkflowValue::Float(b)) => Ok(WorkflowValue::Float(a + b)),
+            (WorkflowValue::String(a), WorkflowValue::String(b)) => {
+                Ok(WorkflowValue::String(format!("{a}{b}")))
+            }
+            (WorkflowValue::List(a), WorkflowValue::List(b)) => {
                 let mut result = a.clone();
                 result.extend(b.clone());
-                Ok(JsonValue::Array(result))
+                Ok(WorkflowValue::List(result))
             }
             _ => Err(EvaluationError::Evaluation(
                 "Cannot add incompatible types".to_string(),
@@ -343,189 +339,178 @@ impl ExpressionEvaluator {
         }
     }
 
-    fn apply_sub(left: &JsonValue, right: &JsonValue) -> EvaluationResult<JsonValue> {
+    fn apply_sub(left: &WorkflowValue, right: &WorkflowValue) -> EvaluationResult<WorkflowValue> {
         match (left, right) {
-            (JsonValue::Number(a), JsonValue::Number(b)) => {
-                if let (Some(ai), Some(bi)) = (a.as_i64(), b.as_i64()) {
-                    Ok(JsonValue::Number((ai - bi).into()))
-                } else if let (Some(af), Some(bf)) = (a.as_f64(), b.as_f64()) {
-                    Ok(JsonValue::Number(
-                        serde_json::Number::from_f64(af - bf)
-                            .unwrap_or_else(|| serde_json::Number::from(0)),
-                    ))
-                } else {
-                    Err(EvaluationError::Evaluation(
-                        "Cannot subtract incompatible numbers".to_string(),
-                    ))
-                }
+            (WorkflowValue::Int(a), WorkflowValue::Int(b)) => Ok(WorkflowValue::Int(a - b)),
+            (WorkflowValue::Int(a), WorkflowValue::Float(b)) => {
+                Ok(WorkflowValue::Float(*a as f64 - b))
             }
+            (WorkflowValue::Float(a), WorkflowValue::Int(b)) => {
+                Ok(WorkflowValue::Float(a - *b as f64))
+            }
+            (WorkflowValue::Float(a), WorkflowValue::Float(b)) => Ok(WorkflowValue::Float(a - b)),
             _ => Err(EvaluationError::Evaluation(
                 "Cannot subtract non-numbers".to_string(),
             )),
         }
     }
 
-    fn apply_mul(left: &JsonValue, right: &JsonValue) -> EvaluationResult<JsonValue> {
+    fn apply_mul(left: &WorkflowValue, right: &WorkflowValue) -> EvaluationResult<WorkflowValue> {
         match (left, right) {
-            (JsonValue::Number(a), JsonValue::Number(b)) => {
-                if let (Some(ai), Some(bi)) = (a.as_i64(), b.as_i64()) {
-                    Ok(JsonValue::Number((ai * bi).into()))
-                } else if let (Some(af), Some(bf)) = (a.as_f64(), b.as_f64()) {
-                    Ok(JsonValue::Number(
-                        serde_json::Number::from_f64(af * bf)
-                            .unwrap_or_else(|| serde_json::Number::from(0)),
-                    ))
-                } else {
-                    Err(EvaluationError::Evaluation(
-                        "Cannot multiply incompatible numbers".to_string(),
-                    ))
-                }
+            (WorkflowValue::Int(a), WorkflowValue::Int(b)) => Ok(WorkflowValue::Int(a * b)),
+            (WorkflowValue::Int(a), WorkflowValue::Float(b)) => {
+                Ok(WorkflowValue::Float(*a as f64 * b))
             }
+            (WorkflowValue::Float(a), WorkflowValue::Int(b)) => {
+                Ok(WorkflowValue::Float(a * *b as f64))
+            }
+            (WorkflowValue::Float(a), WorkflowValue::Float(b)) => Ok(WorkflowValue::Float(a * b)),
             _ => Err(EvaluationError::Evaluation(
                 "Cannot multiply non-numbers".to_string(),
             )),
         }
     }
 
-    fn apply_div(left: &JsonValue, right: &JsonValue) -> EvaluationResult<JsonValue> {
-        match (left, right) {
-            (JsonValue::Number(a), JsonValue::Number(b)) => {
-                let af = a.as_f64().unwrap_or(0.0);
-                let bf = b.as_f64().unwrap_or(1.0);
-                if bf == 0.0 {
-                    Err(EvaluationError::Evaluation("Division by zero".to_string()))
-                } else {
-                    Ok(JsonValue::Number(
-                        serde_json::Number::from_f64(af / bf)
-                            .unwrap_or_else(|| serde_json::Number::from(0)),
-                    ))
-                }
-            }
-            _ => Err(EvaluationError::Evaluation(
+    fn apply_div(left: &WorkflowValue, right: &WorkflowValue) -> EvaluationResult<WorkflowValue> {
+        let Some(af) = left.as_f64() else {
+            return Err(EvaluationError::Evaluation(
                 "Cannot divide non-numbers".to_string(),
-            )),
+            ));
+        };
+        let Some(bf) = right.as_f64() else {
+            return Err(EvaluationError::Evaluation(
+                "Cannot divide non-numbers".to_string(),
+            ));
+        };
+        if bf == 0.0 {
+            return Err(EvaluationError::Evaluation("Division by zero".to_string()));
         }
+        Ok(WorkflowValue::Float(af / bf))
     }
 
-    fn apply_lt(left: &JsonValue, right: &JsonValue) -> EvaluationResult<JsonValue> {
+    fn apply_lt(left: &WorkflowValue, right: &WorkflowValue) -> EvaluationResult<WorkflowValue> {
         match (left, right) {
-            (JsonValue::Number(a), JsonValue::Number(b)) => {
-                let af = a.as_f64().unwrap_or(0.0);
-                let bf = b.as_f64().unwrap_or(0.0);
-                Ok(JsonValue::Bool(af < bf))
+            (WorkflowValue::String(a), WorkflowValue::String(b)) => Ok(WorkflowValue::Bool(a < b)),
+            _ => {
+                let (Some(af), Some(bf)) = (left.as_f64(), right.as_f64()) else {
+                    return Err(EvaluationError::Evaluation(
+                        "Cannot compare incompatible types".to_string(),
+                    ));
+                };
+                Ok(WorkflowValue::Bool(af < bf))
             }
-            (JsonValue::String(a), JsonValue::String(b)) => Ok(JsonValue::Bool(a < b)),
-            _ => Err(EvaluationError::Evaluation(
-                "Cannot compare incompatible types".to_string(),
-            )),
         }
     }
 
-    fn apply_le(left: &JsonValue, right: &JsonValue) -> EvaluationResult<JsonValue> {
+    fn apply_le(left: &WorkflowValue, right: &WorkflowValue) -> EvaluationResult<WorkflowValue> {
         match (left, right) {
-            (JsonValue::Number(a), JsonValue::Number(b)) => {
-                let af = a.as_f64().unwrap_or(0.0);
-                let bf = b.as_f64().unwrap_or(0.0);
-                Ok(JsonValue::Bool(af <= bf))
+            (WorkflowValue::String(a), WorkflowValue::String(b)) => Ok(WorkflowValue::Bool(a <= b)),
+            _ => {
+                let (Some(af), Some(bf)) = (left.as_f64(), right.as_f64()) else {
+                    return Err(EvaluationError::Evaluation(
+                        "Cannot compare incompatible types".to_string(),
+                    ));
+                };
+                Ok(WorkflowValue::Bool(af <= bf))
             }
-            (JsonValue::String(a), JsonValue::String(b)) => Ok(JsonValue::Bool(a <= b)),
-            _ => Err(EvaluationError::Evaluation(
-                "Cannot compare incompatible types".to_string(),
-            )),
         }
     }
 
-    fn apply_gt(left: &JsonValue, right: &JsonValue) -> EvaluationResult<JsonValue> {
+    fn apply_gt(left: &WorkflowValue, right: &WorkflowValue) -> EvaluationResult<WorkflowValue> {
         match (left, right) {
-            (JsonValue::Number(a), JsonValue::Number(b)) => {
-                let af = a.as_f64().unwrap_or(0.0);
-                let bf = b.as_f64().unwrap_or(0.0);
-                Ok(JsonValue::Bool(af > bf))
+            (WorkflowValue::String(a), WorkflowValue::String(b)) => Ok(WorkflowValue::Bool(a > b)),
+            _ => {
+                let (Some(af), Some(bf)) = (left.as_f64(), right.as_f64()) else {
+                    return Err(EvaluationError::Evaluation(
+                        "Cannot compare incompatible types".to_string(),
+                    ));
+                };
+                Ok(WorkflowValue::Bool(af > bf))
             }
-            (JsonValue::String(a), JsonValue::String(b)) => Ok(JsonValue::Bool(a > b)),
-            _ => Err(EvaluationError::Evaluation(
-                "Cannot compare incompatible types".to_string(),
-            )),
         }
     }
 
-    fn apply_ge(left: &JsonValue, right: &JsonValue) -> EvaluationResult<JsonValue> {
+    fn apply_ge(left: &WorkflowValue, right: &WorkflowValue) -> EvaluationResult<WorkflowValue> {
         match (left, right) {
-            (JsonValue::Number(a), JsonValue::Number(b)) => {
-                let af = a.as_f64().unwrap_or(0.0);
-                let bf = b.as_f64().unwrap_or(0.0);
-                Ok(JsonValue::Bool(af >= bf))
+            (WorkflowValue::String(a), WorkflowValue::String(b)) => Ok(WorkflowValue::Bool(a >= b)),
+            _ => {
+                let (Some(af), Some(bf)) = (left.as_f64(), right.as_f64()) else {
+                    return Err(EvaluationError::Evaluation(
+                        "Cannot compare incompatible types".to_string(),
+                    ));
+                };
+                Ok(WorkflowValue::Bool(af >= bf))
             }
-            (JsonValue::String(a), JsonValue::String(b)) => Ok(JsonValue::Bool(a >= b)),
-            _ => Err(EvaluationError::Evaluation(
-                "Cannot compare incompatible types".to_string(),
-            )),
         }
     }
 
-    fn apply_and(left: &JsonValue, right: &JsonValue) -> EvaluationResult<JsonValue> {
-        Ok(JsonValue::Bool(
+    fn apply_and(left: &WorkflowValue, right: &WorkflowValue) -> EvaluationResult<WorkflowValue> {
+        Ok(WorkflowValue::Bool(
             Self::is_truthy(left) && Self::is_truthy(right),
         ))
     }
 
-    fn apply_or(left: &JsonValue, right: &JsonValue) -> EvaluationResult<JsonValue> {
-        Ok(JsonValue::Bool(
+    fn apply_or(left: &WorkflowValue, right: &WorkflowValue) -> EvaluationResult<WorkflowValue> {
+        Ok(WorkflowValue::Bool(
             Self::is_truthy(left) || Self::is_truthy(right),
         ))
     }
 
-    fn apply_in(left: &JsonValue, right: &JsonValue) -> EvaluationResult<JsonValue> {
+    fn apply_in(left: &WorkflowValue, right: &WorkflowValue) -> EvaluationResult<WorkflowValue> {
         match right {
-            JsonValue::Array(arr) => Ok(JsonValue::Bool(arr.contains(left))),
-            JsonValue::Object(map) => {
-                let key = match left {
-                    JsonValue::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                Ok(JsonValue::Bool(map.contains_key(&key)))
+            WorkflowValue::List(arr) | WorkflowValue::Tuple(arr) => {
+                Ok(WorkflowValue::Bool(arr.contains(left)))
             }
-            JsonValue::String(s) => {
-                let needle = match left {
-                    JsonValue::String(n) => n.clone(),
-                    other => other.to_string(),
+            WorkflowValue::Dict(map) => {
+                let key = match left {
+                    WorkflowValue::String(s) => s.clone(),
+                    other => other.to_key_string(),
                 };
-                Ok(JsonValue::Bool(s.contains(&needle)))
+                Ok(WorkflowValue::Bool(map.contains_key(&key)))
+            }
+            WorkflowValue::String(s) => {
+                let needle = match left {
+                    WorkflowValue::String(n) => n.clone(),
+                    other => other.to_key_string(),
+                };
+                Ok(WorkflowValue::Bool(s.contains(&needle)))
             }
             _ => Err(EvaluationError::Evaluation(
-                "'in' requires array, object, or string".to_string(),
+                "'in' requires list, tuple, dict, or string".to_string(),
             )),
         }
     }
 
     /// Check if a value is truthy (Python-style semantics).
-    pub fn is_truthy(value: &JsonValue) -> bool {
-        match value {
-            JsonValue::Null => false,
-            JsonValue::Bool(b) => *b,
-            JsonValue::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
-            JsonValue::String(s) => !s.is_empty(),
-            JsonValue::Array(a) => !a.is_empty(),
-            JsonValue::Object(o) => !o.is_empty(),
-        }
+    pub fn is_truthy(value: &WorkflowValue) -> bool {
+        value.is_truthy()
     }
 
     // Built-in functions - support both positional args and kwargs
     // Positional args take precedence over kwargs
 
     fn builtin_range(
-        args: &[JsonValue],
-        kwargs: &HashMap<String, JsonValue>,
-    ) -> EvaluationResult<JsonValue> {
+        args: &[WorkflowValue],
+        kwargs: &HashMap<String, WorkflowValue>,
+    ) -> EvaluationResult<WorkflowValue> {
         // range(stop) or range(start, stop) or range(start, stop, step)
         let (start, stop, step) = match args.len() {
             0 => {
                 // Fall back to kwargs
-                let start = kwargs.get("start").and_then(|v| v.as_i64()).unwrap_or(0);
-                let stop = kwargs.get("stop").and_then(|v| v.as_i64()).ok_or_else(|| {
-                    EvaluationError::Evaluation("range() requires 'stop' argument".to_string())
-                })?;
-                let step = kwargs.get("step").and_then(|v| v.as_i64()).unwrap_or(1);
+                let start = kwargs
+                    .get("start")
+                    .and_then(WorkflowValue::as_i64)
+                    .unwrap_or(0);
+                let stop = kwargs
+                    .get("stop")
+                    .and_then(WorkflowValue::as_i64)
+                    .ok_or_else(|| {
+                        EvaluationError::Evaluation("range() requires 'stop' argument".to_string())
+                    })?;
+                let step = kwargs
+                    .get("step")
+                    .and_then(WorkflowValue::as_i64)
+                    .unwrap_or(1);
                 (start, stop, step)
             }
             1 => {
@@ -569,17 +554,17 @@ impl ExpressionEvaluator {
         let mut result = Vec::new();
         let mut i = start;
         while (step > 0 && i < stop) || (step < 0 && i > stop) {
-            result.push(JsonValue::Number(i.into()));
+            result.push(WorkflowValue::Int(i));
             i += step;
         }
 
-        Ok(JsonValue::Array(result))
+        Ok(WorkflowValue::List(result))
     }
 
     fn builtin_len(
-        args: &[JsonValue],
-        kwargs: &HashMap<String, JsonValue>,
-    ) -> EvaluationResult<JsonValue> {
+        args: &[WorkflowValue],
+        kwargs: &HashMap<String, WorkflowValue>,
+    ) -> EvaluationResult<WorkflowValue> {
         // len(items)
         let items = if !args.is_empty() {
             &args[0]
@@ -590,9 +575,10 @@ impl ExpressionEvaluator {
         };
 
         let len = match items {
-            JsonValue::Array(a) => a.len(),
-            JsonValue::Object(o) => o.len(),
-            JsonValue::String(s) => s.len(),
+            WorkflowValue::List(a) => a.len(),
+            WorkflowValue::Tuple(a) => a.len(),
+            WorkflowValue::Dict(o) => o.len(),
+            WorkflowValue::String(s) => s.len(),
             _ => {
                 return Err(EvaluationError::Evaluation(
                     "len() requires array, object, or string".to_string(),
@@ -600,13 +586,13 @@ impl ExpressionEvaluator {
             }
         };
 
-        Ok(JsonValue::Number((len as i64).into()))
+        Ok(WorkflowValue::Int(len as i64))
     }
 
     fn builtin_enumerate(
-        args: &[JsonValue],
-        kwargs: &HashMap<String, JsonValue>,
-    ) -> EvaluationResult<JsonValue> {
+        args: &[WorkflowValue],
+        kwargs: &HashMap<String, WorkflowValue>,
+    ) -> EvaluationResult<WorkflowValue> {
         // enumerate(items)
         let items = if !args.is_empty() {
             &args[0]
@@ -617,7 +603,7 @@ impl ExpressionEvaluator {
         };
 
         let arr = match items {
-            JsonValue::Array(a) => a,
+            WorkflowValue::List(a) => a,
             _ => {
                 return Err(EvaluationError::Evaluation(
                     "enumerate() requires array".to_string(),
@@ -625,13 +611,13 @@ impl ExpressionEvaluator {
             }
         };
 
-        let result: Vec<JsonValue> = arr
+        let result: Vec<WorkflowValue> = arr
             .iter()
             .enumerate()
-            .map(|(i, v)| JsonValue::Array(vec![JsonValue::Number((i as i64).into()), v.clone()]))
+            .map(|(i, v)| WorkflowValue::Tuple(vec![WorkflowValue::Int(i as i64), v.clone()]))
             .collect();
 
-        Ok(JsonValue::Array(result))
+        Ok(WorkflowValue::List(result))
     }
 }
 
@@ -642,7 +628,7 @@ impl ExpressionEvaluator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use std::collections::HashMap;
 
     // Helper to create a literal expression
     fn int_literal(value: i64) -> ast::Expr {
@@ -788,7 +774,7 @@ mod tests {
         let scope = Scope::new();
         let expr = int_literal(42);
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Number(42.into()));
+        assert_eq!(result, WorkflowValue::Int(42));
     }
 
     #[test]
@@ -796,10 +782,7 @@ mod tests {
         let scope = Scope::new();
         let expr = float_literal(1.5);
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(
-            result,
-            JsonValue::Number(serde_json::Number::from_f64(1.5).unwrap())
-        );
+        assert_eq!(result, WorkflowValue::Float(1.5));
     }
 
     #[test]
@@ -807,7 +790,7 @@ mod tests {
         let scope = Scope::new();
         let expr = string_literal("hello");
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::String("hello".to_string()));
+        assert_eq!(result, WorkflowValue::String("hello".to_string()));
     }
 
     #[test]
@@ -815,7 +798,7 @@ mod tests {
         let scope = Scope::new();
         let expr = bool_literal(true);
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     #[test]
@@ -823,7 +806,7 @@ mod tests {
         let scope = Scope::new();
         let expr = none_literal();
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Null);
+        assert_eq!(result, WorkflowValue::Null);
     }
 
     // ========================================================================
@@ -833,10 +816,10 @@ mod tests {
     #[test]
     fn test_eval_variable_found() {
         let mut scope = Scope::new();
-        scope.insert("x".to_string(), JsonValue::Number(10.into()));
+        scope.insert("x".to_string(), WorkflowValue::Int(10.into()));
         let expr = variable("x");
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Number(10.into()));
+        assert_eq!(result, WorkflowValue::Int(10));
     }
 
     #[test]
@@ -860,7 +843,7 @@ mod tests {
             int_literal(5),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Number(15.into()));
+        assert_eq!(result, WorkflowValue::Int(15));
     }
 
     #[test]
@@ -872,10 +855,7 @@ mod tests {
             float_literal(2.5),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(
-            result,
-            JsonValue::Number(serde_json::Number::from_f64(4.0).unwrap())
-        );
+        assert_eq!(result, WorkflowValue::Float(4.0));
     }
 
     #[test]
@@ -887,7 +867,7 @@ mod tests {
             string_literal(" world"),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::String("hello world".to_string()));
+        assert_eq!(result, WorkflowValue::String("hello world".to_string()));
     }
 
     #[test]
@@ -901,10 +881,10 @@ mod tests {
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
         assert_eq!(
             result,
-            JsonValue::Array(vec![
-                JsonValue::Number(1.into()),
-                JsonValue::Number(2.into()),
-                JsonValue::Number(3.into()),
+            WorkflowValue::List(vec![
+                WorkflowValue::Int(1.into()),
+                WorkflowValue::Int(2.into()),
+                WorkflowValue::Int(3.into()),
             ])
         );
     }
@@ -918,7 +898,7 @@ mod tests {
             int_literal(3),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Number(7.into()));
+        assert_eq!(result, WorkflowValue::Int(7.into()));
     }
 
     #[test]
@@ -930,7 +910,7 @@ mod tests {
             int_literal(7),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Number(42.into()));
+        assert_eq!(result, WorkflowValue::Int(42.into()));
     }
 
     #[test]
@@ -942,10 +922,7 @@ mod tests {
             int_literal(4),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(
-            result,
-            JsonValue::Number(serde_json::Number::from_f64(2.5).unwrap())
-        );
+        assert_eq!(result, WorkflowValue::Float(2.5));
     }
 
     #[test]
@@ -973,7 +950,7 @@ mod tests {
             int_literal(5),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     #[test]
@@ -985,7 +962,7 @@ mod tests {
             int_literal(3),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     #[test]
@@ -997,7 +974,7 @@ mod tests {
             int_literal(5),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     #[test]
@@ -1009,7 +986,7 @@ mod tests {
             int_literal(5),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     #[test]
@@ -1021,7 +998,7 @@ mod tests {
             int_literal(3),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     #[test]
@@ -1033,7 +1010,7 @@ mod tests {
             int_literal(5),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     #[test]
@@ -1045,7 +1022,7 @@ mod tests {
             string_literal("banana"),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     // ========================================================================
@@ -1061,7 +1038,7 @@ mod tests {
             bool_literal(true),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     #[test]
@@ -1073,7 +1050,7 @@ mod tests {
             bool_literal(false),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(false));
+        assert_eq!(result, WorkflowValue::Bool(false));
     }
 
     #[test]
@@ -1085,7 +1062,7 @@ mod tests {
             bool_literal(true),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     #[test]
@@ -1097,7 +1074,7 @@ mod tests {
             bool_literal(false),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(false));
+        assert_eq!(result, WorkflowValue::Bool(false));
     }
 
     #[test]
@@ -1105,7 +1082,7 @@ mod tests {
         let scope = Scope::new();
         let expr = unary_op(ast::UnaryOperator::UnaryOpNot, bool_literal(true));
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(false));
+        assert_eq!(result, WorkflowValue::Bool(false));
     }
 
     #[test]
@@ -1113,7 +1090,7 @@ mod tests {
         let scope = Scope::new();
         let expr = unary_op(ast::UnaryOperator::UnaryOpNot, bool_literal(false));
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     #[test]
@@ -1121,7 +1098,7 @@ mod tests {
         let scope = Scope::new();
         let expr = unary_op(ast::UnaryOperator::UnaryOpNeg, int_literal(42));
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Number((-42).into()));
+        assert_eq!(result, WorkflowValue::Int((-42).into()));
     }
 
     // ========================================================================
@@ -1137,7 +1114,7 @@ mod tests {
             list_expr(vec![int_literal(1), int_literal(2), int_literal(3)]),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     #[test]
@@ -1149,7 +1126,7 @@ mod tests {
             list_expr(vec![int_literal(1), int_literal(2), int_literal(3)]),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     #[test]
@@ -1161,7 +1138,7 @@ mod tests {
             string_literal("hello"),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     #[test]
@@ -1173,7 +1150,7 @@ mod tests {
             dict_expr(vec![(string_literal("key"), int_literal(42))]),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     // ========================================================================
@@ -1182,39 +1159,43 @@ mod tests {
 
     #[test]
     fn test_is_truthy_bool() {
-        assert!(ExpressionEvaluator::is_truthy(&JsonValue::Bool(true)));
-        assert!(!ExpressionEvaluator::is_truthy(&JsonValue::Bool(false)));
+        assert!(ExpressionEvaluator::is_truthy(&WorkflowValue::Bool(true)));
+        assert!(!ExpressionEvaluator::is_truthy(&WorkflowValue::Bool(false)));
     }
 
     #[test]
     fn test_is_truthy_number() {
-        assert!(ExpressionEvaluator::is_truthy(&JsonValue::Number(1.into())));
-        assert!(!ExpressionEvaluator::is_truthy(&JsonValue::Number(
+        assert!(ExpressionEvaluator::is_truthy(&WorkflowValue::Int(
+            1.into()
+        )));
+        assert!(!ExpressionEvaluator::is_truthy(&WorkflowValue::Int(
             0.into()
         )));
     }
 
     #[test]
     fn test_is_truthy_string() {
-        assert!(ExpressionEvaluator::is_truthy(&JsonValue::String(
+        assert!(ExpressionEvaluator::is_truthy(&WorkflowValue::String(
             "hello".to_string()
         )));
-        assert!(!ExpressionEvaluator::is_truthy(&JsonValue::String(
+        assert!(!ExpressionEvaluator::is_truthy(&WorkflowValue::String(
             "".to_string()
         )));
     }
 
     #[test]
     fn test_is_truthy_array() {
-        assert!(ExpressionEvaluator::is_truthy(&JsonValue::Array(vec![
-            JsonValue::Number(1.into())
+        assert!(ExpressionEvaluator::is_truthy(&WorkflowValue::List(vec![
+            WorkflowValue::Int(1.into())
         ])));
-        assert!(!ExpressionEvaluator::is_truthy(&JsonValue::Array(vec![])));
+        assert!(!ExpressionEvaluator::is_truthy(&WorkflowValue::List(
+            vec![]
+        )));
     }
 
     #[test]
     fn test_is_truthy_null() {
-        assert!(!ExpressionEvaluator::is_truthy(&JsonValue::Null));
+        assert!(!ExpressionEvaluator::is_truthy(&WorkflowValue::Null));
     }
 
     // ========================================================================
@@ -1228,10 +1209,10 @@ mod tests {
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
         assert_eq!(
             result,
-            JsonValue::Array(vec![
-                JsonValue::Number(1.into()),
-                JsonValue::Number(2.into()),
-                JsonValue::Number(3.into()),
+            WorkflowValue::List(vec![
+                WorkflowValue::Int(1.into()),
+                WorkflowValue::Int(2.into()),
+                WorkflowValue::Int(3.into()),
             ])
         );
     }
@@ -1244,13 +1225,13 @@ mod tests {
             (string_literal("b"), int_literal(2)),
         ]);
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        let expected: serde_json::Map<String, JsonValue> = [
-            ("a".to_string(), JsonValue::Number(1.into())),
-            ("b".to_string(), JsonValue::Number(2.into())),
+        let expected: HashMap<String, WorkflowValue> = [
+            ("a".to_string(), WorkflowValue::Int(1)),
+            ("b".to_string(), WorkflowValue::Int(2)),
         ]
         .into_iter()
         .collect();
-        assert_eq!(result, JsonValue::Object(expected));
+        assert_eq!(result, WorkflowValue::Dict(expected));
     }
 
     #[test]
@@ -1261,7 +1242,7 @@ mod tests {
             int_literal(1),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Number(20.into()));
+        assert_eq!(result, WorkflowValue::Int(20.into()));
     }
 
     #[test]
@@ -1272,7 +1253,7 @@ mod tests {
             string_literal("key"),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Number(42.into()));
+        assert_eq!(result, WorkflowValue::Int(42.into()));
     }
 
     #[test]
@@ -1280,56 +1261,64 @@ mod tests {
         let scope = Scope::new();
         let expr = index_access(string_literal("hello"), int_literal(1));
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::String("e".to_string()));
+        assert_eq!(result, WorkflowValue::String("e".to_string()));
     }
 
     #[test]
     fn test_eval_dot_access() {
         let mut scope = Scope::new();
-        let obj: serde_json::Map<String, JsonValue> =
-            [("x".to_string(), JsonValue::Number(10.into()))]
-                .into_iter()
-                .collect();
-        scope.insert("obj".to_string(), JsonValue::Object(obj));
+        let obj: HashMap<String, WorkflowValue> = [("x".to_string(), WorkflowValue::Int(10))]
+            .into_iter()
+            .collect();
+        scope.insert("obj".to_string(), WorkflowValue::Dict(obj));
 
         let expr = dot_access(variable("obj"), "x");
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Number(10.into()));
+        assert_eq!(result, WorkflowValue::Int(10.into()));
     }
 
     #[test]
     fn test_eval_dot_access_pydantic_model() {
-        // Test that dot access works on Pydantic model structures
-        // Pydantic models are stored as {"__type__": "module.ClassName", "field1": ..., "field2": ...}
-        // (flattened structure with __type__ alongside the data fields)
+        // Test that dot access works on model-like dict structures
         let mut scope = Scope::new();
 
         // Create a flattened Pydantic model structure
-        let model: serde_json::Map<String, JsonValue> = [
+        let model: HashMap<String, WorkflowValue> = [
             (
                 "__type__".to_string(),
-                JsonValue::String("mymodule.MyModel".to_string()),
+                WorkflowValue::String("mymodule.MyModel".to_string()),
             ),
             (
                 "archive_s3_urls".to_string(),
-                json!(["url1", "url2", "url3"]),
+                WorkflowValue::List(vec![
+                    WorkflowValue::String("url1".to_string()),
+                    WorkflowValue::String("url2".to_string()),
+                    WorkflowValue::String("url3".to_string()),
+                ]),
             ),
-            ("count".to_string(), JsonValue::Number(42.into())),
+            ("count".to_string(), WorkflowValue::Int(42)),
         ]
         .into_iter()
         .collect();
 
-        scope.insert("response".to_string(), JsonValue::Object(model));
+        scope.insert("response".to_string(), WorkflowValue::Dict(model));
 
         // Access field directly (no nested "data" wrapper)
         let expr = dot_access(variable("response"), "archive_s3_urls");
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, json!(["url1", "url2", "url3"]));
+        assert_eq!(
+            result,
+            WorkflowValue::List(vec![
+                WorkflowValue::String("url1".to_string()),
+                WorkflowValue::String("url2".to_string()),
+                WorkflowValue::String("url3".to_string()),
+            ])
+        );
 
         // Access another field
         let expr = dot_access(variable("response"), "count");
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Number(42.into()));
+        assert_eq!(result, WorkflowValue::Int(42));
     }
 
     // ========================================================================
@@ -1343,12 +1332,12 @@ mod tests {
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
         assert_eq!(
             result,
-            JsonValue::Array(vec![
-                JsonValue::Number(0.into()),
-                JsonValue::Number(1.into()),
-                JsonValue::Number(2.into()),
-                JsonValue::Number(3.into()),
-                JsonValue::Number(4.into()),
+            WorkflowValue::List(vec![
+                WorkflowValue::Int(0.into()),
+                WorkflowValue::Int(1.into()),
+                WorkflowValue::Int(2.into()),
+                WorkflowValue::Int(3.into()),
+                WorkflowValue::Int(4.into()),
             ])
         );
     }
@@ -1363,10 +1352,10 @@ mod tests {
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
         assert_eq!(
             result,
-            JsonValue::Array(vec![
-                JsonValue::Number(2.into()),
-                JsonValue::Number(3.into()),
-                JsonValue::Number(4.into()),
+            WorkflowValue::List(vec![
+                WorkflowValue::Int(2.into()),
+                WorkflowValue::Int(3.into()),
+                WorkflowValue::Int(4.into()),
             ])
         );
     }
@@ -1385,12 +1374,12 @@ mod tests {
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
         assert_eq!(
             result,
-            JsonValue::Array(vec![
-                JsonValue::Number(0.into()),
-                JsonValue::Number(2.into()),
-                JsonValue::Number(4.into()),
-                JsonValue::Number(6.into()),
-                JsonValue::Number(8.into()),
+            WorkflowValue::List(vec![
+                WorkflowValue::Int(0.into()),
+                WorkflowValue::Int(2.into()),
+                WorkflowValue::Int(4.into()),
+                WorkflowValue::Int(6.into()),
+                WorkflowValue::Int(8.into()),
             ])
         );
     }
@@ -1406,7 +1395,7 @@ mod tests {
             )],
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Number(3.into()));
+        assert_eq!(result, WorkflowValue::Int(3.into()));
     }
 
     #[test]
@@ -1414,7 +1403,7 @@ mod tests {
         let scope = Scope::new();
         let expr = function_call("len", vec![("items", string_literal("hello"))]);
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Number(5.into()));
+        assert_eq!(result, WorkflowValue::Int(5.into()));
     }
 
     #[test]
@@ -1434,18 +1423,18 @@ mod tests {
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
         assert_eq!(
             result,
-            JsonValue::Array(vec![
-                JsonValue::Array(vec![
-                    JsonValue::Number(0.into()),
-                    JsonValue::String("a".to_string())
+            WorkflowValue::List(vec![
+                WorkflowValue::Tuple(vec![
+                    WorkflowValue::Int(0.into()),
+                    WorkflowValue::String("a".to_string())
                 ]),
-                JsonValue::Array(vec![
-                    JsonValue::Number(1.into()),
-                    JsonValue::String("b".to_string())
+                WorkflowValue::Tuple(vec![
+                    WorkflowValue::Int(1.into()),
+                    WorkflowValue::String("b".to_string())
                 ]),
-                JsonValue::Array(vec![
-                    JsonValue::Number(2.into()),
-                    JsonValue::String("c".to_string())
+                WorkflowValue::Tuple(vec![
+                    WorkflowValue::Int(2.into()),
+                    WorkflowValue::String("c".to_string())
                 ]),
             ])
         );
@@ -1467,9 +1456,9 @@ mod tests {
     fn test_complex_expression() {
         // Test: (x + y) * 2 == 10 and z
         let mut scope = Scope::new();
-        scope.insert("x".to_string(), JsonValue::Number(2.into()));
-        scope.insert("y".to_string(), JsonValue::Number(3.into()));
-        scope.insert("z".to_string(), JsonValue::Bool(true));
+        scope.insert("x".to_string(), WorkflowValue::Int(2.into()));
+        scope.insert("y".to_string(), WorkflowValue::Int(3.into()));
+        scope.insert("z".to_string(), WorkflowValue::Bool(true));
 
         let add = binary_op(
             variable("x"),
@@ -1481,7 +1470,7 @@ mod tests {
         let expr = binary_op(eq, ast::BinaryOperator::BinaryOpAnd, variable("z"));
 
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     #[test]
@@ -1496,7 +1485,7 @@ mod tests {
         let second_access = index_access(first_access, int_literal(1));
 
         let result = ExpressionEvaluator::evaluate(&second_access, &scope).unwrap();
-        assert_eq!(result, JsonValue::Number(2.into()));
+        assert_eq!(result, WorkflowValue::Int(2.into()));
     }
 
     #[test]
@@ -1509,7 +1498,7 @@ mod tests {
             string_literal("hello"),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(true));
+        assert_eq!(result, WorkflowValue::Bool(true));
     }
 
     #[test]
@@ -1522,6 +1511,6 @@ mod tests {
             string_literal(""),
         );
         let result = ExpressionEvaluator::evaluate(&expr, &scope).unwrap();
-        assert_eq!(result, JsonValue::Bool(false));
+        assert_eq!(result, WorkflowValue::Bool(false));
     }
 }

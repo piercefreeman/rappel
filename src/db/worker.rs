@@ -1375,7 +1375,7 @@ impl Database {
             .bind(instance_id.0)
             .bind(&write.target_node_id)
             .bind(&write.variable_name)
-            .bind(&write.value)
+            .bind(write.value.to_json())
             .bind(&write.source_node_id)
             .bind(write.spread_index)
             .execute(&mut *tx)

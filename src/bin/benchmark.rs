@@ -25,7 +25,7 @@ use tracing::{error, info};
 
 use rappel::{
     Database, PythonWorkerConfig, PythonWorkerPool, WorkerBridgeServer, WorkflowInstanceId,
-    WorkflowVersionId, proto, validate_program,
+    WorkflowValue, WorkflowVersionId, proto, validate_program,
 };
 
 const BENCHMARK_WORKFLOW_MODULE: &str = include_str!("../../tests/fixtures/benchmark_workflow.py");
@@ -555,6 +555,11 @@ async fn main() -> Result<()> {
         serde_json::Value::Number(args.complexity.into()),
     );
 
+    let workflow_inputs: HashMap<String, WorkflowValue> = initial_inputs
+        .iter()
+        .map(|(key, value)| (key.clone(), WorkflowValue::from_json(value)))
+        .collect();
+
     // Create multiple simulated hosts, each with its own runner + worker pool
     let mut hosts: Vec<(
         Arc<rappel::DAGRunner>,
@@ -598,7 +603,7 @@ async fn main() -> Result<()> {
         if host_id == 0 {
             for instance_id in &instance_ids {
                 runner
-                    .start_instance(*instance_id, initial_inputs.clone())
+                    .start_instance(*instance_id, workflow_inputs.clone())
                     .await?;
             }
         }

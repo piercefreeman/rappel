@@ -36,6 +36,7 @@ pub mod schedule;
 pub mod server_client;
 pub mod server_webapp;
 pub mod server_worker;
+pub mod value;
 pub mod worker;
 
 // Configuration
@@ -54,6 +55,7 @@ pub use db::{
 // Worker infrastructure
 pub use messages::{MessageError, ast as ir_ast, proto, workflow_arguments_to_json};
 pub use server_worker::{WorkerBridgeChannels, WorkerBridgeServer};
+pub use value::WorkflowValue;
 pub use worker::{
     ActionDispatchPayload, PythonWorker, PythonWorkerConfig, PythonWorkerPool, RoundTripMetrics,
 };
