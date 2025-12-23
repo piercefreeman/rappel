@@ -15,7 +15,6 @@ from proto import messages_pb2 as pb2
 
 from .bridge import _workflow_stub, ensure_singleton
 from .exceptions import ScheduleAlreadyExistsError
-from .serialization import build_arguments_from_kwargs
 from .workflow import Workflow
 
 ScheduleType = Literal["cron", "interval"]
@@ -142,9 +141,9 @@ async def schedule_workflow(
         registration=registration,
     )
 
-    # Add inputs if provided
-    if inputs:
-        request.inputs.CopyFrom(build_arguments_from_kwargs(inputs))
+    initial_context = workflow_cls._build_initial_context((), inputs or {})
+    if initial_context.arguments:
+        request.inputs.CopyFrom(initial_context)
 
     # Send to server
     async with ensure_singleton():

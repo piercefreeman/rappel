@@ -63,6 +63,31 @@ class Workflow:
     async def run(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError
 
+    @classmethod
+    def _normalize_run_inputs(cls, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+        try:
+            run_impl = cls.__workflow_run_impl__  # type: ignore[attr-defined]
+        except AttributeError:
+            run_impl = cls.run
+        sig = inspect.signature(run_impl)
+        params = list(sig.parameters.keys())[1:]  # Skip 'self'
+
+        normalized = dict(kwargs)
+        for i, arg in enumerate(args):
+            if i < len(params):
+                normalized[params[i]] = arg
+
+        bound = sig.bind_partial(None, **normalized)
+        bound.apply_defaults()
+        return {key: value for key, value in bound.arguments.items() if key != "self"}
+
+    @classmethod
+    def _build_initial_context(
+        cls, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> pb2.WorkflowArguments:
+        initial_kwargs = cls._normalize_run_inputs(args, kwargs)
+        return build_arguments_from_kwargs(initial_kwargs)
+
     async def run_action(
         self,
         awaitable: Awaitable[TResult],
@@ -168,21 +193,7 @@ def workflow(cls: type[TWorkflow]) -> type[TWorkflow]:
             cls.workflow_ir()
             return await run_impl(self, *args, **kwargs)
 
-        # Get the signature of run() to map positional args to parameter names
-        sig = inspect.signature(run_impl)
-        params = list(sig.parameters.keys())[1:]  # Skip 'self'
-
-        # Convert positional args to kwargs
-        for i, arg in enumerate(args):
-            if i < len(params):
-                kwargs[params[i]] = arg
-
-        bound = sig.bind_partial(self, **kwargs)
-        bound.apply_defaults()
-        initial_kwargs = {key: value for key, value in bound.arguments.items() if key != "self"}
-
-        # Serialize kwargs using common logic
-        initial_context = build_arguments_from_kwargs(initial_kwargs)
+        initial_context = cls._build_initial_context(args, kwargs)
 
         payload = cls._build_registration_payload(initial_context)
         run_result = await bridge.run_instance(payload.SerializeToString())

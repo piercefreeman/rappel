@@ -23,6 +23,7 @@ from rappel.schedule import (
     resume_schedule,
     schedule_workflow,
 )
+from rappel.serialization import arguments_to_kwargs
 from rappel.workflow import Workflow, workflow
 
 
@@ -31,6 +32,14 @@ class DemoScheduleWorkflow(Workflow):
     """A simple workflow for testing schedule operations."""
 
     async def run(self) -> str:
+        return "test"
+
+
+@workflow
+class DemoScheduleWorkflowWithDefaults(Workflow):
+    """A workflow with default inputs for scheduling tests."""
+
+    async def run(self, batch_size: int = 50) -> str:
         return "test"
 
 
@@ -291,7 +300,7 @@ class TestScheduleWorkflow:
 
         result = asyncio.run(
             schedule_workflow(
-                DemoScheduleWorkflow,
+                DemoScheduleWorkflowWithDefaults,
                 schedule_name="test-inputs",
                 schedule="0 0 * * *",
                 inputs={"batch_size": 100},
@@ -303,6 +312,28 @@ class TestScheduleWorkflow:
         request = call_args[0][0]
         assert request.schedule_name == "test-inputs"
         assert request.HasField("inputs")
+        assert arguments_to_kwargs(request.inputs) == {"batch_size": 100}
+
+    def test_schedule_workflow_uses_run_defaults(
+        self, monkeypatch: pytest.MonkeyPatch, mock_stub: AsyncMock
+    ) -> None:
+        """Test scheduling a workflow uses run() default inputs."""
+        response = pb2.RegisterScheduleResponse(schedule_id="schedule-101")
+        mock_stub.RegisterSchedule.return_value = response
+
+        result = asyncio.run(
+            schedule_workflow(
+                DemoScheduleWorkflowWithDefaults,
+                schedule_name="test-defaults",
+                schedule="0 * * * *",
+            )
+        )
+
+        assert result == "schedule-101"
+        call_args = mock_stub.RegisterSchedule.call_args
+        request = call_args[0][0]
+        assert request.HasField("inputs")
+        assert arguments_to_kwargs(request.inputs) == {"batch_size": 50}
 
     def test_schedule_workflow_with_jitter(
         self, monkeypatch: pytest.MonkeyPatch, mock_stub: AsyncMock
