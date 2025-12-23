@@ -779,6 +779,9 @@ class ExceptHandler(google.protobuf.message.Message):
     EXCEPTION_TYPES_FIELD_NUMBER: builtins.int
     SPAN_FIELD_NUMBER: builtins.int
     BLOCK_BODY_FIELD_NUMBER: builtins.int
+    EXCEPTION_VAR_FIELD_NUMBER: builtins.int
+    exception_var: builtins.str
+    """Variable name for "except ... as var" """
     @property
     def exception_types(
         self,
@@ -795,16 +798,39 @@ class ExceptHandler(google.protobuf.message.Message):
         exception_types: collections.abc.Iterable[builtins.str] | None = ...,
         span: Global___Span | None = ...,
         block_body: Global___Block | None = ...,
+        exception_var: builtins.str | None = ...,
     ) -> None: ...
     def HasField(
-        self, field_name: typing.Literal["block_body", b"block_body", "span", b"span"]
+        self,
+        field_name: typing.Literal[
+            "_exception_var",
+            b"_exception_var",
+            "block_body",
+            b"block_body",
+            "exception_var",
+            b"exception_var",
+            "span",
+            b"span",
+        ],
     ) -> builtins.bool: ...
     def ClearField(
         self,
         field_name: typing.Literal[
-            "block_body", b"block_body", "exception_types", b"exception_types", "span", b"span"
+            "_exception_var",
+            b"_exception_var",
+            "block_body",
+            b"block_body",
+            "exception_types",
+            b"exception_types",
+            "exception_var",
+            b"exception_var",
+            "span",
+            b"span",
         ],
     ) -> None: ...
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_exception_var", b"_exception_var"]
+    ) -> typing.Literal["exception_var"] | None: ...
 
 Global___ExceptHandler: typing_extensions.TypeAlias = ExceptHandler
 

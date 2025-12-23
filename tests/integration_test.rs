@@ -26,6 +26,8 @@ const EXCEPTION_CUSTOM_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_exception_custom.py");
 const EXCEPTION_WITH_SUCCESS_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_exception_with_success.py");
+const EXCEPTION_VALUES_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_exception_values.py");
 const ERROR_HANDLING_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_error_handling.py");
 const EXCEPTION_WITH_SUCCESS_FAILURE_SCRIPT: &str = r#"
 import asyncio
@@ -67,6 +69,20 @@ async def main():
     wf = ErrorHandlingWorkflow()
     result = await wf.run(should_fail=False)
     print(f"Registration result (should_fail=False): {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_EXCEPTION_VALUES_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_exception_values import ExceptionValuesWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ExceptionValuesWorkflow()
+    result = await wf.run()
+    print(f"Registration result: {result}")
 
 asyncio.run(main())
 "#;
@@ -241,6 +257,18 @@ fn proto_value_to_json(value: &proto::WorkflowArgumentValue) -> serde_json::Valu
                 "message".to_string(),
                 serde_json::Value::String(exc.message.clone()),
             );
+            if let Some(values) = &exc.values {
+                let entries: serde_json::Map<String, serde_json::Value> = values
+                    .entries
+                    .iter()
+                    .filter_map(|arg| {
+                        arg.value
+                            .as_ref()
+                            .map(|v| (arg.key.clone(), proto_value_to_json(v)))
+                    })
+                    .collect();
+                obj.insert("values".to_string(), serde_json::Value::Object(entries));
+            }
             serde_json::Value::Object(obj)
         }
         None => serde_json::Value::Null,
@@ -703,6 +731,40 @@ async fn exception_with_success_workflow_handles_failure_branch() -> Result<()> 
         message.contains("Recovered from error"),
         "unexpected message: {message}"
     );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn exception_values_workflow_returns_exception_metadata() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_exception_values.py",
+                EXCEPTION_VALUES_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_EXCEPTION_VALUES_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "exceptionvaluesworkflow",
+        user_module: "integration_exception_values",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+
+    let result_payload = harness.stored_result().await?;
+    let result = parse_result(result_payload.as_deref().unwrap_or_default())?;
+    assert_eq!(result.as_deref(), Some("CustomError:418"));
 
     harness.shutdown().await?;
     Ok(())

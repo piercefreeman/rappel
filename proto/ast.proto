@@ -151,6 +151,7 @@ message ExceptHandler {
   repeated string exception_types = 1;  // Empty = catch all
   Span span = 2;
   Block block_body = 3;
+  optional string exception_var = 4; // Variable name for "except ... as var"
 }
 
 // Return statement

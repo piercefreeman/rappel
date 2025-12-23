@@ -15,7 +15,7 @@ TAsync = TypeVar("TAsync", bound=AsyncAction)
 @dataclass
 class ActionResultPayload:
     result: Any | None
-    error: dict[str, str] | None
+    error: dict[str, Any] | None
 
 
 def serialize_result_payload(value: Any) -> pb2.WorkflowArguments:

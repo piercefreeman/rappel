@@ -117,6 +117,7 @@ message WorkflowErrorValue {
   string module = 2;
   string message = 3;
   string traceback = 4;
+  WorkflowDictArgument values = 5;
 }
 
 message WorkflowListArgument {

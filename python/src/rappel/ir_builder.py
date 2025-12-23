@@ -1792,6 +1792,8 @@ class IRBuilder(ast.NodeVisitor):
                 block_body=ir.Block(statements=handler_body, span=_make_span(handler)),
                 span=_make_span(handler),
             )
+            if handler.name:
+                except_handler.exception_var = handler.name
             handlers.append(except_handler)
 
         # Build the try/except statement

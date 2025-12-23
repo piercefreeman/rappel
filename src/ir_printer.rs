@@ -238,15 +238,21 @@ impl IrPrinter {
             } else {
                 format!(" {}", handler.exception_types.join(", "))
             };
+            let exc_binding = handler
+                .exception_var
+                .as_ref()
+                .map(|var| format!(" as {}", var))
+                .unwrap_or_default();
             let body = handler
                 .block_body
                 .as_ref()
                 .map(|b| self.print_block(b))
                 .unwrap_or_default();
             result.push_str(&format!(
-                "\n{}except{}:\n{}",
+                "\n{}except{}{}:\n{}",
                 self.current_indent(),
                 exc_types,
+                exc_binding,
                 body
             ));
         }

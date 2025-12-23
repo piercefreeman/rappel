@@ -849,6 +849,18 @@ class TestTryExceptConversion:
         assert "ValueError" in all_exception_types, "Expected ValueError handler"
         assert "TypeError" in all_exception_types, "Expected TypeError handler"
 
+    def test_exception_handler_captures_variable(self) -> None:
+        """Test: except ... as var captures exception variable."""
+        from tests.fixtures_control_flow.try_except_capture import TryExceptCaptureWorkflow
+
+        program = TryExceptCaptureWorkflow.workflow_ir()
+
+        try_except = self._find_try_except(program)
+        assert try_except is not None, "Expected try_except in IR"
+        assert len(try_except.handlers) == 1, "Expected single exception handler"
+        handler = try_except.handlers[0]
+        assert handler.exception_var == "err"
+
 
 class TestActionCallExtraction:
     """Test action call detection and argument handling."""

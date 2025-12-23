@@ -648,10 +648,13 @@ class WorkflowErrorValue(google.protobuf.message.Message):
     MODULE_FIELD_NUMBER: builtins.int
     MESSAGE_FIELD_NUMBER: builtins.int
     TRACEBACK_FIELD_NUMBER: builtins.int
+    VALUES_FIELD_NUMBER: builtins.int
     type: builtins.str
     module: builtins.str
     message: builtins.str
     traceback: builtins.str
+    @property
+    def values(self) -> Global___WorkflowDictArgument: ...
     def __init__(
         self,
         *,
@@ -659,11 +662,22 @@ class WorkflowErrorValue(google.protobuf.message.Message):
         module: builtins.str = ...,
         message: builtins.str = ...,
         traceback: builtins.str = ...,
+        values: Global___WorkflowDictArgument | None = ...,
     ) -> None: ...
+    def HasField(self, field_name: typing.Literal["values", b"values"]) -> builtins.bool: ...
     def ClearField(
         self,
         field_name: typing.Literal[
-            "message", b"message", "module", b"module", "traceback", b"traceback", "type", b"type"
+            "message",
+            b"message",
+            "module",
+            b"module",
+            "traceback",
+            b"traceback",
+            "type",
+            b"type",
+            "values",
+            b"values",
         ],
     ) -> None: ...
 

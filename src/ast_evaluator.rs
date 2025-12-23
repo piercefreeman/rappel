@@ -250,6 +250,20 @@ impl ExpressionEvaluator {
                     .cloned()
                     .ok_or_else(|| EvaluationError::Evaluation(format!("Key '{}' not found", key)))
             }
+            (WorkflowValue::Exception { .. }, _) => {
+                let map = Self::exception_to_dict(&obj);
+                match &index {
+                    WorkflowValue::String(key) => map.get(key).cloned().ok_or_else(|| {
+                        EvaluationError::Evaluation(format!("Key '{}' not found", key))
+                    }),
+                    other => {
+                        let key = other.to_key_string();
+                        map.get(&key).cloned().ok_or_else(|| {
+                            EvaluationError::Evaluation(format!("Key '{}' not found", key))
+                        })
+                    }
+                }
+            }
             (WorkflowValue::String(s), WorkflowValue::Int(i)) => {
                 let idx = *i as usize;
                 s.chars()
@@ -277,10 +291,42 @@ impl ExpressionEvaluator {
             WorkflowValue::Dict(map) => map.get(&dot.attribute).cloned().ok_or_else(|| {
                 EvaluationError::Evaluation(format!("Attribute '{}' not found", dot.attribute))
             }),
+            WorkflowValue::Exception { .. } => {
+                let map = Self::exception_to_dict(&obj);
+                map.get(&dot.attribute).cloned().ok_or_else(|| {
+                    EvaluationError::Evaluation(format!("Attribute '{}' not found", dot.attribute))
+                })
+            }
             _ => Err(EvaluationError::Evaluation(
                 "Dot access on non-object".to_string(),
             )),
         }
+    }
+
+    fn exception_to_dict(value: &WorkflowValue) -> HashMap<String, WorkflowValue> {
+        let WorkflowValue::Exception {
+            exc_type,
+            module,
+            message,
+            traceback,
+            values,
+        } = value
+        else {
+            return HashMap::new();
+        };
+        let mut map = HashMap::new();
+        map.insert("type".to_string(), WorkflowValue::String(exc_type.clone()));
+        map.insert("module".to_string(), WorkflowValue::String(module.clone()));
+        map.insert(
+            "message".to_string(),
+            WorkflowValue::String(message.clone()),
+        );
+        map.insert(
+            "traceback".to_string(),
+            WorkflowValue::String(traceback.clone()),
+        );
+        map.insert("values".to_string(), WorkflowValue::Dict(values.clone()));
+        map
     }
 
     fn eval_function_call(

@@ -70,6 +70,8 @@ pub enum Token {
     Try,
     #[token("except")]
     Except,
+    #[token("as")]
+    As,
     #[token("return")]
     Return,
     #[token("and")]
@@ -197,6 +199,7 @@ impl fmt::Display for Token {
             Token::In => write!(f, "in"),
             Token::Try => write!(f, "try"),
             Token::Except => write!(f, "except"),
+            Token::As => write!(f, "as"),
             Token::Return => write!(f, "return"),
             Token::And => write!(f, "and"),
             Token::Or => write!(f, "or"),

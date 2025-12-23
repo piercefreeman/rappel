@@ -19,6 +19,7 @@ pub enum WorkflowValue {
         module: String,
         message: String,
         traceback: String,
+        values: HashMap<String, WorkflowValue>,
     },
 }
 
@@ -68,12 +69,26 @@ impl WorkflowValue {
                 }
                 WorkflowValue::Dict(data)
             }
-            Some(Kind::Exception(exc)) => WorkflowValue::Exception {
-                exc_type: exc.r#type.clone(),
-                module: exc.module.clone(),
-                message: exc.message.clone(),
-                traceback: exc.traceback.clone(),
-            },
+            Some(Kind::Exception(exc)) => {
+                let mut values = HashMap::new();
+                if let Some(dict) = &exc.values {
+                    for entry in &dict.entries {
+                        let value = entry
+                            .value
+                            .as_ref()
+                            .map(WorkflowValue::from_proto)
+                            .unwrap_or(WorkflowValue::Null);
+                        values.insert(entry.key.clone(), value);
+                    }
+                }
+                WorkflowValue::Exception {
+                    exc_type: exc.r#type.clone(),
+                    module: exc.module.clone(),
+                    message: exc.message.clone(),
+                    traceback: exc.traceback.clone(),
+                    values,
+                }
+            }
             None => WorkflowValue::Null,
         }
     }
@@ -120,12 +135,23 @@ impl WorkflowValue {
                 module,
                 message,
                 traceback,
-            } => Kind::Exception(proto::WorkflowErrorValue {
-                r#type: exc_type.clone(),
-                module: module.clone(),
-                message: message.clone(),
-                traceback: traceback.clone(),
-            }),
+                values,
+            } => {
+                let entries = values
+                    .iter()
+                    .map(|(key, value)| proto::WorkflowArgument {
+                        key: key.clone(),
+                        value: Some(value.to_proto()),
+                    })
+                    .collect();
+                Kind::Exception(proto::WorkflowErrorValue {
+                    r#type: exc_type.clone(),
+                    module: module.clone(),
+                    message: message.clone(),
+                    traceback: traceback.clone(),
+                    values: Some(proto::WorkflowDictArgument { entries }),
+                })
+            }
         };
 
         proto::WorkflowArgumentValue { kind: Some(kind) }
@@ -189,12 +215,18 @@ impl WorkflowValue {
                 module,
                 message,
                 traceback,
+                values,
             } => {
+                let values_json: serde_json::Map<String, JsonValue> = values
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.to_json()))
+                    .collect();
                 let exc_obj = serde_json::json!({
                     "type": exc_type,
                     "module": module,
                     "message": message,
                     "traceback": traceback,
+                    "values": JsonValue::Object(values_json),
                 });
                 serde_json::json!({
                     "__exception__": exc_obj
@@ -275,11 +307,13 @@ impl WorkflowValue {
                     .get("traceback")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                let values = Self::exception_values_from_json(exc_obj);
                 Some(WorkflowValue::Exception {
                     exc_type: exc_type.to_string(),
                     module: module.to_string(),
                     message: message.to_string(),
                     traceback: traceback.to_string(),
+                    values,
                 })
             }
             Some(JsonValue::Bool(true)) => {
@@ -287,15 +321,30 @@ impl WorkflowValue {
                 let module = obj.get("module").and_then(|v| v.as_str()).unwrap_or("");
                 let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
                 let traceback = obj.get("traceback").and_then(|v| v.as_str()).unwrap_or("");
+                let values = Self::exception_values_from_json(obj);
                 Some(WorkflowValue::Exception {
                     exc_type: exc_type.to_string(),
                     module: module.to_string(),
                     message: message.to_string(),
                     traceback: traceback.to_string(),
+                    values,
                 })
             }
             _ => None,
         }
+    }
+
+    fn exception_values_from_json(
+        obj: &serde_json::Map<String, JsonValue>,
+    ) -> HashMap<String, WorkflowValue> {
+        let mut values = HashMap::new();
+        let Some(JsonValue::Object(values_obj)) = obj.get("values") else {
+            return values;
+        };
+        for (key, value) in values_obj {
+            values.insert(key.clone(), WorkflowValue::from_json(value));
+        }
+        values
     }
 }
 
@@ -318,14 +367,16 @@ impl PartialEq for WorkflowValue {
                     module: am,
                     message: amsg,
                     traceback: atb,
+                    values: avals,
                 },
                 WorkflowValue::Exception {
                     exc_type: bt,
                     module: bm,
                     message: bmsg,
                     traceback: btb,
+                    values: bvals,
                 },
-            ) => at == bt && am == bm && amsg == bmsg && atb == btb,
+            ) => at == bt && am == bm && amsg == bmsg && atb == btb && avals == bvals,
             _ => false,
         }
     }

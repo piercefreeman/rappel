@@ -13,6 +13,8 @@ use uuid::Uuid;
 
 use crate::parser::ast;
 
+pub const EXCEPTION_SCOPE_VAR: &str = "__rappel_exception__";
+
 // ============================================================================
 // Edge Types
 // ============================================================================
@@ -2818,11 +2820,16 @@ impl DAGConverter {
         // Collect handler graphs up front so we can decide whether a join is needed.
         let mut handler_graphs: Vec<(Vec<String>, ConvertedSubgraph)> = Vec::new();
         for handler in &try_except.handlers {
-            let graph = handler
+            let mut graph = handler
                 .block_body
                 .as_ref()
                 .map(|block| self.convert_block(block))
                 .unwrap_or_else(ConvertedSubgraph::noop);
+            if let Some(exception_var) =
+                handler.exception_var.as_ref().filter(|var| !var.is_empty())
+            {
+                graph = self.prepend_exception_binding(exception_var, graph);
+            }
             nodes.extend(graph.nodes.clone());
             handler_graphs.push((handler.exception_types.clone(), graph));
         }
@@ -2898,6 +2905,50 @@ impl DAGConverter {
         ConvertedSubgraph {
             entry: try_graph.entry,
             exits: join_id.into_iter().collect(),
+            nodes,
+            is_noop: false,
+        }
+    }
+
+    fn prepend_exception_binding(
+        &mut self,
+        exception_var: &str,
+        graph: ConvertedSubgraph,
+    ) -> ConvertedSubgraph {
+        let binding_id = self.next_id("exc_bind");
+        let label = format!("{exception_var} = {EXCEPTION_SCOPE_VAR}");
+        let assign_expr = ast::Expr {
+            kind: Some(ast::expr::Kind::Variable(ast::Variable {
+                name: EXCEPTION_SCOPE_VAR.to_string(),
+            })),
+            span: None,
+        };
+
+        let mut node = DAGNode::new(binding_id.clone(), "assignment".to_string(), label)
+            .with_target(exception_var)
+            .with_assign_expr(assign_expr);
+        if let Some(ref fn_name) = self.current_function {
+            node = node.with_function_name(fn_name);
+        }
+        self.dag.add_node(node);
+        self.track_var_definition(exception_var, &binding_id);
+
+        if let Some(ref entry) = graph.entry {
+            self.dag
+                .add_edge(DAGEdge::state_machine(binding_id.clone(), entry.clone()));
+        }
+
+        let mut nodes = vec![binding_id.clone()];
+        nodes.extend(graph.nodes);
+        let exits = if graph.exits.is_empty() {
+            vec![binding_id.clone()]
+        } else {
+            graph.exits
+        };
+
+        ConvertedSubgraph {
+            entry: Some(binding_id),
+            exits,
             nodes,
             is_noop: false,
         }
@@ -4355,6 +4406,7 @@ fn main(input: [], output: [result]):
 
         let handler = ast::ExceptHandler {
             exception_types: vec!["Error".to_string()],
+            exception_var: None,
             span: None,
             block_body: Some(handler_block),
         };

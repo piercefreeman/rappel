@@ -51,7 +51,7 @@ use prost::Message;
 use crate::{
     ast_evaluator::{EvaluationError, ExpressionEvaluator, Scope},
     completion::{GuardResult, InlineContext, analyze_subgraph, execute_inline_subgraph},
-    dag::{DAG, DAGConverter, DAGNode, EdgeType},
+    dag::{DAG, DAGConverter, DAGNode, EXCEPTION_SCOPE_VAR, EdgeType},
     dag_state::{DAGHelper, ExecutionMode, SuccessorInfo},
     db::{
         ActionId, BackoffKind, CompletionRecord, Database, NewAction, QueuedAction, ScheduleId,
@@ -2593,7 +2593,7 @@ impl DAGRunner {
     #[allow(clippy::too_many_arguments)]
     async fn process_exception_handler(
         handler_node_id: &str,
-        _exception_result: &WorkflowValue,
+        exception_result: &WorkflowValue,
         dag: &DAG,
         helper: &DAGHelper<'_>,
         inline_scope: &mut Scope,
@@ -2629,6 +2629,11 @@ impl DAGRunner {
             "processing exception handler"
         );
 
+        let is_binding = Self::is_exception_binding_node(handler_node);
+        if is_binding {
+            inline_scope.insert(EXCEPTION_SCOPE_VAR.to_string(), exception_result.clone());
+        }
+
         let exec_mode = helper.get_execution_mode(handler_node);
         match exec_mode {
             ExecutionMode::Inline => {
@@ -2636,6 +2641,9 @@ impl DAGRunner {
                 let inline_result = Self::execute_inline_node(handler_node, inline_scope)?;
                 if let Some(ref target) = handler_node.target {
                     inline_scope.insert(target.clone(), inline_result.clone());
+                }
+                if is_binding {
+                    inline_scope.remove(EXCEPTION_SCOPE_VAR);
                 }
                 // Continue to handler's successors
                 Box::pin(Self::process_successors_with_condition(
@@ -2685,6 +2693,19 @@ impl DAGRunner {
                 Ok(())
             }
         }
+    }
+
+    fn is_exception_binding_node(node: &DAGNode) -> bool {
+        if node.node_type != "assignment" {
+            return false;
+        }
+        let Some(assign_expr) = node.assign_expr.as_ref() else {
+            return false;
+        };
+        let Some(ast::expr::Kind::Variable(var)) = assign_expr.kind.as_ref() else {
+            return false;
+        };
+        var.name == EXCEPTION_SCOPE_VAR
     }
 
     /// Serialize workflow result (inbox values) as protobuf WorkflowArguments.

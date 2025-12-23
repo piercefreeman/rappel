@@ -533,10 +533,18 @@ impl<'source> Parser<'source> {
             self.advance();
 
             // Parse exception types
-            let exception_types = if self.check(&Token::Colon) {
+            let exception_types = if self.check(&Token::Colon) || self.check(&Token::As) {
                 Vec::new() // Bare except:
             } else {
                 self.parse_ident_list()?
+            };
+
+            let exception_var = if self.check(&Token::As) {
+                self.advance();
+                let (var, _) = self.expect_ident()?;
+                Some(var)
+            } else {
+                None
             };
 
             self.expect(&Token::Colon)?;
@@ -545,6 +553,7 @@ impl<'source> Parser<'source> {
 
             handlers.push(ast::ExceptHandler {
                 exception_types,
+                exception_var,
                 span: self.make_span(handler_start, handler_end),
                 block_body: Some(handler_body),
             });

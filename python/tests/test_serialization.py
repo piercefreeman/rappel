@@ -44,6 +44,23 @@ def test_error_payload_serialization() -> None:
     assert decoded.error["module"] == "builtins"
     assert "boom" in decoded.error["message"]
     assert "Traceback" in decoded.error["traceback"]
+    assert decoded.error["values"]["args"][0] == "boom"
+
+
+def test_error_payload_captures_exception_values() -> None:
+    class CustomError(Exception):
+        def __init__(self, message: str, code: int) -> None:
+            super().__init__(message)
+            self.code = code
+
+    try:
+        raise CustomError("boom", 404)
+    except CustomError as exc:
+        payload = serialize_error_payload("demo.echo", exc)
+
+    decoded = deserialize_result_payload(payload)
+    assert decoded.error is not None
+    assert decoded.error["values"]["code"] == 404
 
 
 def test_collections_round_trip() -> None:

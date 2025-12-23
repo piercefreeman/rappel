@@ -109,6 +109,14 @@ def _to_argument_value(value: Any) -> pb2.WorkflowArgumentValue:
         argument.exception.message = str(value)
         tb_text = "".join(traceback.format_exception(type(value), value, value.__traceback__))
         argument.exception.traceback = tb_text
+        values = _serialize_exception_values(value)
+        for key, item in values.items():
+            entry = argument.exception.values.entries.add()
+            entry.key = key
+            try:
+                entry.value.CopyFrom(_to_argument_value(item))
+            except TypeError:
+                entry.value.CopyFrom(_to_argument_value(str(item)))
         return argument
     if _is_base_model(value):
         model_class = value.__class__
@@ -169,11 +177,16 @@ def _from_argument_value(argument: pb2.WorkflowArgumentValue) -> Any:
             data[entry.key] = _from_argument_value(entry.value)
         return _instantiate_serialized_model(module, name, data)
     if kind == "exception":
+        values: dict[str, Any] = {}
+        if argument.exception.HasField("values"):
+            for entry in argument.exception.values.entries:
+                values[entry.key] = _from_argument_value(entry.value)
         return {
             "type": argument.exception.type,
             "module": argument.exception.module,
             "message": argument.exception.message,
             "traceback": argument.exception.traceback,
+            "values": values,
         }
     if kind == "list_value":
         return [_from_argument_value(item) for item in argument.list_value.items]
@@ -193,6 +206,13 @@ def _serialize_model_data(model: BaseModel) -> dict[str, Any]:
     if hasattr(model, "dict"):
         return model.dict()  # type: ignore[attr-defined]
     return model.__dict__
+
+
+def _serialize_exception_values(exc: BaseException) -> dict[str, Any]:
+    values = dict(vars(exc))
+    if "args" not in values:
+        values["args"] = exc.args
+    return values
 
 
 def _serialize_primitive(value: Any) -> pb2.PrimitiveWorkflowArgument:

@@ -81,7 +81,8 @@ pub fn workflow_argument_value_to_json(value: &proto::WorkflowArgumentValue) -> 
                     "type": e.r#type,
                     "module": e.module,
                     "message": e.message,
-                    "traceback": e.traceback
+                    "traceback": e.traceback,
+                    "values": optional_workflow_dict_to_json(&e.values)
                 }
             })
         }
