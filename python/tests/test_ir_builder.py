@@ -15,12 +15,18 @@ The tests are organized by category:
 from __future__ import annotations
 
 from collections.abc import Iterator
+from enum import Enum
 from typing import List, Optional
 
 from proto import ast_pb2 as ir
 
 # Global variable for test_global_statement_raises_error test
 some_var: int = 0
+
+
+class ExampleStatus(Enum):
+    READY = "ready"
+    RETRIES = 2
 
 
 def iter_all_statements(program: ir.Program) -> Iterator[ir.Statement]:
@@ -174,6 +180,47 @@ class TestAnnotatedAssignment:
         value = matches[0].value
         assert value.HasField("literal")
         assert value.literal.is_none
+
+
+class TestEnumAttribute:
+    """Tests for enum attribute handling in IR building."""
+
+    def test_enum_attribute_is_literal(self) -> None:
+        from rappel import action, workflow
+        from rappel.workflow import Workflow
+
+        @action
+        async def echo(value: object) -> None:
+            return None
+
+        @workflow
+        class EnumAttributeWorkflow(Workflow):
+            async def run(self) -> None:
+                await echo(ExampleStatus.READY)
+                await echo(ExampleStatus.RETRIES)
+
+        program = EnumAttributeWorkflow.workflow_ir()
+        calls = [
+            stmt.action_call
+            for stmt in iter_all_statements(program)
+            if stmt.HasField("action_call") and stmt.action_call.action_name == "echo"
+        ]
+        assert len(calls) == 2
+
+        literal_values: list[object] = []
+        for call in calls:
+            kwarg = next(kw for kw in call.kwargs if kw.name == "value")
+            literal = kwarg.value.literal
+            kind = literal.WhichOneof("value")
+            if kind == "string_value":
+                literal_values.append(literal.string_value)
+            elif kind == "int_value":
+                literal_values.append(literal.int_value)
+            else:
+                raise AssertionError(f"Unexpected enum literal kind: {kind}")
+
+        assert "ready" in literal_values
+        assert 2 in literal_values
 
 
 class TestPolicyParsing:
