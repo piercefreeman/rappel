@@ -2825,11 +2825,24 @@ impl DAGConverter {
                 .as_ref()
                 .map(|block| self.convert_block(block))
                 .unwrap_or_else(ConvertedSubgraph::noop);
+            tracing::debug!(
+                handler_entry = ?graph.entry,
+                handler_exits = ?graph.exits,
+                handler_nodes = ?graph.nodes,
+                handler_is_noop = graph.is_noop,
+                "handler graph before prepend_exception_binding"
+            );
             if let Some(exception_var) =
                 handler.exception_var.as_ref().filter(|var| !var.is_empty())
             {
                 graph = self.prepend_exception_binding(exception_var, graph);
             }
+            tracing::debug!(
+                handler_entry = ?graph.entry,
+                handler_exits = ?graph.exits,
+                handler_nodes = ?graph.nodes,
+                "handler graph after prepend_exception_binding"
+            );
             nodes.extend(graph.nodes.clone());
             handler_graphs.push((handler.exception_types.clone(), graph));
         }
@@ -2934,15 +2947,26 @@ impl DAGConverter {
         self.track_var_definition(exception_var, &binding_id);
 
         if let Some(ref entry) = graph.entry {
+            tracing::debug!(
+                binding_id = %binding_id,
+                handler_entry = %entry,
+                "prepend_exception_binding: adding edge from binding to handler entry"
+            );
             self.dag
                 .add_edge(DAGEdge::state_machine(binding_id.clone(), entry.clone()));
         }
 
         let mut nodes = vec![binding_id.clone()];
         nodes.extend(graph.nodes);
-        let exits = if graph.exits.is_empty() {
+
+        // Only use the binding as an exit if the original handler graph was noop.
+        // If the handler has content that terminates (e.g., return statement),
+        // preserve empty exits so we don't incorrectly connect to the join node.
+        let exits = if graph.is_noop {
+            // Empty handler body - the binding itself becomes the exit
             vec![binding_id.clone()]
         } else {
+            // Handler has content - preserve its exits (may be empty for returns)
             graph.exits
         };
 

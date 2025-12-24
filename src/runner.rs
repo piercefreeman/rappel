@@ -2463,11 +2463,17 @@ impl DAGRunner {
 
         // Initialize queue with immediate successors from the starting node
         let mut guard_errors = Vec::new();
-        for successor in Self::filter_successors_with_guards(
-            helper.get_ready_successors(node_id, condition_result),
-            inline_scope,
-            &mut guard_errors,
-        ) {
+        let raw_successors = helper.get_ready_successors(node_id, condition_result);
+        let successor_ids: Vec<_> = raw_successors.iter().map(|s| &s.node_id).collect();
+        debug!(
+            node_id = %node_id,
+            raw_successor_count = raw_successors.len(),
+            raw_successors = ?successor_ids,
+            "process_successors_with_condition: getting ready successors"
+        );
+        for successor in
+            Self::filter_successors_with_guards(raw_successors, inline_scope, &mut guard_errors)
+        {
             work_queue.push_back((successor.node_id, result.clone()));
         }
 
@@ -2660,6 +2666,11 @@ impl DAGRunner {
                     inline_result.clone()
                 };
                 // Continue to handler's successors
+                debug!(
+                    handler_node_id = %handler_node_id,
+                    inline_scope_keys = ?inline_scope.keys().collect::<Vec<_>>(),
+                    "about to process successors of exception binding node"
+                );
                 Box::pin(Self::process_successors_with_condition(
                     handler_node_id,
                     &successor_result,
