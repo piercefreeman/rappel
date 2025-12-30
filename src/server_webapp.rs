@@ -1427,7 +1427,10 @@ fn decode_dag_from_proto(proto_bytes: &[u8]) -> Vec<SimpleDagNode> {
     };
 
     // Convert to DAG using the existing converter
-    let dag = crate::dag::convert_to_dag(&program);
+    let dag = match crate::dag::convert_to_dag(&program) {
+        Ok(d) => d,
+        Err(_) => return vec![],
+    };
 
     dag.nodes
         .values()

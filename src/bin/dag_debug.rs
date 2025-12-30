@@ -73,7 +73,7 @@ async fn main() {
     };
 
     let program = Program::decode(workflow_version.as_slice()).expect("decode program");
-    let dag = convert_to_dag(&program);
+    let dag = convert_to_dag(&program).expect("convert to DAG");
 
     println!("=== Nodes ===");
     let nodes: BTreeMap<_, _> = dag.nodes.iter().collect();

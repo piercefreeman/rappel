@@ -246,7 +246,9 @@ impl DAGCache {
 
         // Convert to DAG
         let mut converter = DAGConverter::new();
-        let dag = converter.convert(&program);
+        let dag = converter
+            .convert(&program)
+            .map_err(|e| RunnerError::Dag(format!("Failed to convert to DAG: {}", e)))?;
 
         let dag = Arc::new(dag);
 
@@ -4047,7 +4049,7 @@ mod tests {
     result = @dummy(flag=True)
     return result"#;
         let program = parse(source).unwrap();
-        let dag = convert_to_dag(&program);
+        let dag = convert_to_dag(&program).unwrap();
 
         let action_node = dag
             .nodes

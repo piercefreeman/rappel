@@ -1428,7 +1428,7 @@ mod tests {
     /// Helper to create a DAG from IR source
     fn dag_from_source(source: &str) -> DAG {
         let program = parse(source).expect("Failed to parse IR");
-        convert_to_dag(&program)
+        convert_to_dag(&program).expect("Failed to convert to DAG")
     }
 
     #[test]
