@@ -526,6 +526,8 @@ pub struct DAGConverter {
     var_modifications: HashMap<String, Vec<String>>,
     /// Stack of loop exit node IDs for break statements
     loop_exit_stack: Vec<String>,
+    /// Stack of loop increment node IDs for continue statements
+    loop_incr_stack: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -558,6 +560,7 @@ impl DAGConverter {
             current_scope_vars: HashMap::new(),
             var_modifications: HashMap::new(),
             loop_exit_stack: Vec::new(),
+            loop_incr_stack: Vec::new(),
         }
     }
 
@@ -1770,6 +1773,9 @@ impl DAGConverter {
             ast::statement::Kind::BreakStmt(_) => {
                 return self.convert_break();
             }
+            ast::statement::Kind::ContinueStmt(_) => {
+                return self.convert_continue();
+            }
             ast::statement::Kind::ExprStmt(expr_stmt) => self.convert_expr_statement(expr_stmt),
         };
 
@@ -2497,6 +2503,10 @@ impl DAGConverter {
         let exit_id = self.next_id("loop_exit");
         self.loop_exit_stack.push(exit_id.clone());
 
+        // Pre-generate incr_id so continue statements can wire to it
+        let incr_id = self.next_id("loop_incr");
+        self.loop_incr_stack.push(incr_id.clone());
+
         let mut body_targets: Vec<String> = Vec::new();
         let body_graph = match for_loop.block_body.as_ref() {
             Some(block_body) => {
@@ -2506,6 +2516,7 @@ impl DAGConverter {
             None => ConvertedSubgraph::noop(),
         };
 
+        self.loop_incr_stack.pop();
         self.loop_exit_stack.pop();
         nodes.extend(body_graph.nodes.clone());
 
@@ -2521,7 +2532,7 @@ impl DAGConverter {
         // ============================================================
         // 5. Create loop_incr node: __loop_i = __loop_i + 1
         // ============================================================
-        let incr_id = self.next_id("loop_incr");
+        // Note: incr_id was pre-generated above so continue statements can wire to it
         let incr_label = format!("{} = {} + 1", loop_i_var, loop_i_var);
 
         // Build expression: __loop_i + 1
@@ -3088,6 +3099,39 @@ impl DAGConverter {
         })
     }
 
+    /// Convert a continue statement
+    fn convert_continue(&mut self) -> Result<ConvertedSubgraph, String> {
+        let loop_incr = self
+            .loop_incr_stack
+            .last()
+            .cloned()
+            .ok_or_else(|| "continue statement outside of loop".to_string())?;
+
+        let node_id = self.next_id("continue");
+        let mut node = DAGNode::new(
+            node_id.clone(),
+            "continue".to_string(),
+            "continue".to_string(),
+        );
+
+        if let Some(ref fn_name) = self.current_function {
+            node = node.with_function_name(fn_name);
+        }
+        self.dag.add_node(node);
+
+        // Wire continue directly to loop increment (skip rest of body, go to next iteration)
+        self.dag
+            .add_edge(DAGEdge::state_machine(node_id.clone(), loop_incr));
+
+        // Continue has no normal exits - it jumps to the loop increment
+        Ok(ConvertedSubgraph {
+            entry: Some(node_id.clone()),
+            exits: Vec::new(),
+            nodes: vec![node_id],
+            is_noop: false,
+        })
+    }
+
     /// Convert an expression statement
     fn convert_expr_statement(&mut self, expr_stmt: &ast::ExprStmt) -> Vec<String> {
         let expr = match &expr_stmt.expr {
@@ -3198,6 +3242,7 @@ impl DAGConverter {
                 | ast::statement::Kind::ActionCall(_)
                 | ast::statement::Kind::ReturnStmt(_)
                 | ast::statement::Kind::BreakStmt(_)
+                | ast::statement::Kind::ContinueStmt(_)
                 | ast::statement::Kind::ExprStmt(_) => {}
             }
         }

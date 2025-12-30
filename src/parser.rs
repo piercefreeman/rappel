@@ -294,6 +294,10 @@ impl<'source> Parser<'source> {
                 self.advance(); // Consume 'break'
                 Some(ast::statement::Kind::BreakStmt(ast::BreakStmt {}))
             }
+            Token::Continue => {
+                self.advance(); // Consume 'continue'
+                Some(ast::statement::Kind::ContinueStmt(ast::ContinueStmt {}))
+            }
             Token::Spread => Some(ast::statement::Kind::SpreadAction(
                 self.parse_spread_action()?,
             )),
@@ -581,6 +585,7 @@ impl<'source> Parser<'source> {
                 | Token::Try
                 | Token::Return
                 | Token::Break
+                | Token::Continue
                 | Token::Spread
                 | Token::Parallel
                 | Token::Fn => None,

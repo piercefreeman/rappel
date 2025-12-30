@@ -884,6 +884,8 @@ class IRBuilder(ast.NodeVisitor):
             return []
         elif isinstance(node, ast.Break):
             return self._visit_break(node)
+        elif isinstance(node, ast.Continue):
+            return self._visit_continue(node)
 
         # Check for unsupported statement types - this MUST raise for any
         # unhandled statement to avoid silently dropping code
@@ -974,13 +976,6 @@ class IRBuilder(ast.NodeVisitor):
             raise UnsupportedPatternError(
                 "Match statements are not supported",
                 RECOMMENDATIONS["match"],
-                line=line,
-                col=col,
-            )
-        elif isinstance(node, ast.Continue):
-            raise UnsupportedPatternError(
-                "Continue statements are not supported",
-                RECOMMENDATIONS["continue_statement"],
                 line=line,
                 col=col,
             )
@@ -2069,6 +2064,12 @@ class IRBuilder(ast.NodeVisitor):
         """Convert break statement to IR."""
         stmt = ir.Statement(span=_make_span(node))
         stmt.break_stmt.CopyFrom(ir.BreakStmt())
+        return [stmt]
+
+    def _visit_continue(self, node: ast.Continue) -> List[ir.Statement]:
+        """Convert continue statement to IR."""
+        stmt = ir.Statement(span=_make_span(node))
+        stmt.continue_stmt.CopyFrom(ir.ContinueStmt())
         return [stmt]
 
     def _visit_aug_assign(self, node: ast.AugAssign) -> List[ir.Statement]:

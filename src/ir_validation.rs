@@ -186,6 +186,9 @@ fn validate_statement(
         Kind::BreakStmt(_) => {
             // Break has no expression to validate
         }
+        Kind::ContinueStmt(_) => {
+            // Continue has no expression to validate
+        }
     }
 
     Ok(current)

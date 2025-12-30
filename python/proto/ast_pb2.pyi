@@ -261,6 +261,7 @@ class Statement(google.protobuf.message.Message):
     RETURN_STMT_FIELD_NUMBER: builtins.int
     EXPR_STMT_FIELD_NUMBER: builtins.int
     BREAK_STMT_FIELD_NUMBER: builtins.int
+    CONTINUE_STMT_FIELD_NUMBER: builtins.int
     SPAN_FIELD_NUMBER: builtins.int
     @property
     def assignment(self) -> Global___Assignment: ...
@@ -283,6 +284,8 @@ class Statement(google.protobuf.message.Message):
     @property
     def break_stmt(self) -> Global___BreakStmt: ...
     @property
+    def continue_stmt(self) -> Global___ContinueStmt: ...
+    @property
     def span(self) -> Global___Span: ...
     def __init__(
         self,
@@ -297,6 +300,7 @@ class Statement(google.protobuf.message.Message):
         return_stmt: Global___ReturnStmt | None = ...,
         expr_stmt: Global___ExprStmt | None = ...,
         break_stmt: Global___BreakStmt | None = ...,
+        continue_stmt: Global___ContinueStmt | None = ...,
         span: Global___Span | None = ...,
     ) -> None: ...
     def HasField(
@@ -310,6 +314,8 @@ class Statement(google.protobuf.message.Message):
             b"break_stmt",
             "conditional",
             b"conditional",
+            "continue_stmt",
+            b"continue_stmt",
             "expr_stmt",
             b"expr_stmt",
             "for_loop",
@@ -339,6 +345,8 @@ class Statement(google.protobuf.message.Message):
             b"break_stmt",
             "conditional",
             b"conditional",
+            "continue_stmt",
+            b"continue_stmt",
             "expr_stmt",
             b"expr_stmt",
             "for_loop",
@@ -371,6 +379,7 @@ class Statement(google.protobuf.message.Message):
             "return_stmt",
             "expr_stmt",
             "break_stmt",
+            "continue_stmt",
         ]
         | None
     ): ...
@@ -388,6 +397,18 @@ class BreakStmt(google.protobuf.message.Message):
     ) -> None: ...
 
 Global___BreakStmt: typing_extensions.TypeAlias = BreakStmt
+
+@typing.final
+class ContinueStmt(google.protobuf.message.Message):
+    """Continue statement (skips to next iteration of innermost loop)"""
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    def __init__(
+        self,
+    ) -> None: ...
+
+Global___ContinueStmt: typing_extensions.TypeAlias = ContinueStmt
 
 @typing.final
 class Assignment(google.protobuf.message.Message):
