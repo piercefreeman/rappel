@@ -653,14 +653,24 @@ impl DAGConverter {
     }
 
     /// Build a mapping from fn_call node ids to the first node of their expansion.
+    /// Handles nested expansions by capturing ALL prefix levels.
+    /// E.g., for node `fn_call_22:fn_call_12:action_5`, we add:
+    /// - `fn_call_22` -> first node with that prefix
+    /// - `fn_call_22:fn_call_12` -> first node with that prefix
     fn build_call_entry_map(dag: &DAG) -> HashMap<String, String> {
         let mut map = HashMap::new();
 
         for id in dag.nodes.keys() {
-            if let Some((call_id, _)) = id.split_once(':') {
-                // Pick a stable representative for the expanded subgraph.
-                map.entry(call_id.to_string())
-                    .and_modify(|existing| {
+            // Extract all possible prefixes from the node ID
+            // For "fn_call_22:fn_call_12:action_5", we get:
+            // - "fn_call_22"
+            // - "fn_call_22:fn_call_12"
+            let parts: Vec<&str> = id.split(':').collect();
+            for i in 1..parts.len() {
+                let prefix = parts[..i].join(":");
+                // Pick a stable representative (lexicographically smallest) for each prefix
+                map.entry(prefix)
+                    .and_modify(|existing: &mut String| {
                         if id < existing {
                             *existing = id.clone();
                         }
@@ -879,7 +889,16 @@ impl DAGConverter {
                                 for exc_edge in &exception_edges {
                                     let mut new_edge = exc_edge.clone();
                                     new_edge.source = expanded_node_id.clone();
-                                    // Target is already the exception handler (outside expansion)
+                                    // Remap target if it was also part of this function's expansion
+                                    // (nested try/except case). Check fn_node_ids since id_map may
+                                    // not be complete yet due to processing order.
+                                    if fn_node_ids.contains(&exc_edge.target) {
+                                        // Target is within this function, apply the same prefix
+                                        if let Some(prefix) = id_prefix {
+                                            new_edge.target =
+                                                format!("{}:{}", prefix, exc_edge.target);
+                                        }
+                                    }
                                     target.add_edge(new_edge);
                                 }
                             }
@@ -6570,14 +6589,7 @@ fn main(input: [], output: []):
     ///   except OuterError:
     ///       outer_flag = True
     ///   @final(outer=outer_flag, inner=inner_flag)
-    ///
-    /// KNOWN BUG: Nested try/except creates dangling exception edges.
-    /// The inner try's exception handler edge targets `fn_call_12` which doesn't
-    /// exist after expansion. The `remap_exception_targets` function fails to
-    /// remap it because the target isn't in the call_entry_map.
-    /// This needs to be fixed in the DAG expansion logic.
     #[test]
-    #[ignore = "nested try/except creates invalid DAG with dangling exception edges - see remap_exception_targets"]
     fn test_try_except_nested_dataflow() {
         let source = r#"
 fn __inner_try__(input: [], output: [result]):
@@ -6987,6 +6999,227 @@ fn main(input: [], output: []):
             "Should have at least 2 DataFlow edges for 'flag' to final_action \
              (from initial and from exception handler). Found: {:?}",
             flag_edges.iter().map(|e| &e.source).collect::<Vec<_>>()
+        );
+    }
+
+    // ========================================================================
+    // DAG Validation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_validate_dag_catches_dangling_edge_target() {
+        // Manually construct a DAG with a dangling edge target
+        let mut dag = DAG::new();
+        dag.add_node(DAGNode::new(
+            "node_1".to_string(),
+            "action_call".to_string(),
+            "test".to_string(),
+        ));
+        dag.add_edge(DAGEdge::state_machine(
+            "node_1".to_string(),
+            "nonexistent_node".to_string(),
+        ));
+
+        let result = validate_dag(&dag);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("non-existent target node 'nonexistent_node'")
+        );
+    }
+
+    #[test]
+    fn test_validate_dag_catches_dangling_edge_source() {
+        // Manually construct a DAG with a dangling edge source
+        let mut dag = DAG::new();
+        dag.add_node(DAGNode::new(
+            "node_1".to_string(),
+            "action_call".to_string(),
+            "test".to_string(),
+        ));
+        dag.add_edge(DAGEdge::state_machine(
+            "nonexistent_source".to_string(),
+            "node_1".to_string(),
+        ));
+
+        let result = validate_dag(&dag);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("non-existent source node 'nonexistent_source'")
+        );
+    }
+
+    #[test]
+    fn test_validate_dag_passes_valid_dag() {
+        let mut dag = DAG::new();
+        dag.add_node(DAGNode::new(
+            "node_1".to_string(),
+            "action_call".to_string(),
+            "test1".to_string(),
+        ));
+        dag.add_node(DAGNode::new(
+            "node_2".to_string(),
+            "action_call".to_string(),
+            "test2".to_string(),
+        ));
+        dag.add_edge(DAGEdge::state_machine(
+            "node_1".to_string(),
+            "node_2".to_string(),
+        ));
+
+        let result = validate_dag(&dag);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_call_entry_map_handles_nested_prefixes() {
+        // Create a DAG that simulates nested function expansion
+        let mut dag = DAG::new();
+
+        // Simulate: main -> fn_call_22 (__outer_try__) -> fn_call_12 (__handler__)
+        // After expansion, we'd have nodes like:
+        // - fn_call_22:action_1
+        // - fn_call_22:fn_call_12:action_2
+        dag.add_node(DAGNode::new(
+            "fn_call_22:action_1".to_string(),
+            "action_call".to_string(),
+            "outer_action".to_string(),
+        ));
+        dag.add_node(DAGNode::new(
+            "fn_call_22:fn_call_12:action_2".to_string(),
+            "action_call".to_string(),
+            "handler_action".to_string(),
+        ));
+        dag.add_node(DAGNode::new(
+            "fn_call_22:fn_call_12:return_3".to_string(),
+            "return".to_string(),
+            "return".to_string(),
+        ));
+
+        let map = DAGConverter::build_call_entry_map(&dag);
+
+        // Should have mapping for fn_call_22
+        assert!(
+            map.contains_key("fn_call_22"),
+            "Should have mapping for fn_call_22"
+        );
+
+        // Should also have mapping for nested fn_call_22:fn_call_12
+        assert!(
+            map.contains_key("fn_call_22:fn_call_12"),
+            "Should have mapping for nested fn_call_22:fn_call_12"
+        );
+
+        // The mapping should point to actual nodes
+        let fn_call_22_entry = map.get("fn_call_22").unwrap();
+        assert!(
+            dag.nodes.contains_key(fn_call_22_entry),
+            "fn_call_22 mapping should point to existing node"
+        );
+
+        let nested_entry = map.get("fn_call_22:fn_call_12").unwrap();
+        assert!(
+            dag.nodes.contains_key(nested_entry),
+            "fn_call_22:fn_call_12 mapping should point to existing node"
+        );
+    }
+
+    #[test]
+    fn test_nested_try_except_exception_edges_properly_remapped() {
+        // This test verifies that exception edges in nested try/except blocks
+        // are properly remapped to point to the expanded handler nodes.
+        //
+        // Pattern:
+        //   def main():
+        //     try:                           # outer try
+        //       inner_result = outer_try()   # calls __outer_try__
+        //     except OuterError:
+        //       handle_outer()
+        //
+        //   def __outer_try__():
+        //     try:                           # inner try (nested)
+        //       result = inner_try()         # calls __inner_try__
+        //     except InnerError:
+        //       handle_inner()               # exception handler IN SAME FUNCTION
+        //     return result
+        let source = r#"
+fn __inner_try__(input: [], output: [result]):
+    result = @risky_inner()
+    return result
+
+fn __outer_try__(input: [], output: [result]):
+    try:
+        result = __inner_try__()
+    except InnerError:
+        result = @handle_inner()
+    return result
+
+fn main(input: [], output: [final]):
+    try:
+        result = __outer_try__()
+    except OuterError:
+        result = @handle_outer()
+    final = @finish(r=result)
+    return final
+"#;
+        let program = parse(source).unwrap();
+
+        // This should not panic - the DAG should be valid
+        let dag = convert_to_dag(&program).unwrap();
+
+        // Find all exception edges
+        let exception_edges: Vec<_> = dag
+            .edges
+            .iter()
+            .filter(|e| e.exception_types.is_some())
+            .collect();
+
+        // Verify all exception edges point to existing nodes
+        for edge in &exception_edges {
+            assert!(
+                dag.nodes.contains_key(&edge.source),
+                "Exception edge source '{}' should exist",
+                edge.source
+            );
+            assert!(
+                dag.nodes.contains_key(&edge.target),
+                "Exception edge target '{}' should exist (from source '{}')",
+                edge.target,
+                edge.source
+            );
+        }
+
+        // Verify we have exception edges for both InnerError and OuterError
+        let inner_error_edges: Vec<_> = exception_edges
+            .iter()
+            .filter(|e| {
+                e.exception_types
+                    .as_ref()
+                    .map(|t| t.contains(&"InnerError".to_string()))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        let outer_error_edges: Vec<_> = exception_edges
+            .iter()
+            .filter(|e| {
+                e.exception_types
+                    .as_ref()
+                    .map(|t| t.contains(&"OuterError".to_string()))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        assert!(
+            !inner_error_edges.is_empty(),
+            "Should have exception edges for InnerError"
+        );
+        assert!(
+            !outer_error_edges.is_empty(),
+            "Should have exception edges for OuterError"
         );
     }
 }
