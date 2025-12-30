@@ -48,7 +48,13 @@ fn validate_function(
     scope.insert("self".to_string());
 
     if let Some(body) = fn_def.body.as_ref() {
-        validate_block(body, &scope, &fn_def.name, function_names, function_signatures)?;
+        validate_block(
+            body,
+            &scope,
+            &fn_def.name,
+            function_names,
+            function_signatures,
+        )?;
     }
     Ok(())
 }
@@ -84,7 +90,13 @@ fn validate_statement(
     match kind {
         Kind::Assignment(assign) => {
             if let Some(value) = assign.value.as_ref() {
-                validate_expr(value, &current, fn_name, function_names, function_signatures)?;
+                validate_expr(
+                    value,
+                    &current,
+                    fn_name,
+                    function_names,
+                    function_signatures,
+                )?;
                 for target in &assign.targets {
                     if let Some(base) = base_target_name(target)
                         && !current.contains(base)
@@ -111,24 +123,48 @@ fn validate_statement(
         }
         Kind::SpreadAction(spread) => {
             if let Some(collection) = spread.collection.as_ref() {
-                validate_expr(collection, &current, fn_name, function_names, function_signatures)?;
+                validate_expr(
+                    collection,
+                    &current,
+                    fn_name,
+                    function_names,
+                    function_signatures,
+                )?;
             }
             let mut spread_scope = current.clone();
             if !spread.loop_var.is_empty() {
                 spread_scope.insert(spread.loop_var.clone());
             }
             if let Some(action) = spread.action.as_ref() {
-                validate_action_call(action, &spread_scope, fn_name, function_names, function_signatures)?;
+                validate_action_call(
+                    action,
+                    &spread_scope,
+                    fn_name,
+                    function_names,
+                    function_signatures,
+                )?;
             }
         }
         Kind::ParallelBlock(block) => {
             for call in &block.calls {
                 match &call.kind {
                     Some(ir_ast::call::Kind::Action(action)) => {
-                        validate_action_call(action, &current, fn_name, function_names, function_signatures)?;
+                        validate_action_call(
+                            action,
+                            &current,
+                            fn_name,
+                            function_names,
+                            function_signatures,
+                        )?;
                     }
                     Some(ir_ast::call::Kind::Function(function)) => {
-                        validate_function_call(function, &current, fn_name, function_names, function_signatures)?;
+                        validate_function_call(
+                            function,
+                            &current,
+                            fn_name,
+                            function_names,
+                            function_signatures,
+                        )?;
                     }
                     None => {}
                 }
@@ -136,14 +172,26 @@ fn validate_statement(
         }
         Kind::ForLoop(for_loop) => {
             if let Some(iterable) = for_loop.iterable.as_ref() {
-                validate_expr(iterable, &current, fn_name, function_names, function_signatures)?;
+                validate_expr(
+                    iterable,
+                    &current,
+                    fn_name,
+                    function_names,
+                    function_signatures,
+                )?;
             }
             let mut loop_scope = current.clone();
             for var in &for_loop.loop_vars {
                 loop_scope.insert(var.clone());
             }
             if let Some(body) = for_loop.block_body.as_ref() {
-                let loop_result = validate_block(body, &loop_scope, fn_name, function_names, function_signatures)?;
+                let loop_result = validate_block(
+                    body,
+                    &loop_scope,
+                    fn_name,
+                    function_names,
+                    function_signatures,
+                )?;
                 current.extend(loop_result);
             }
         }
@@ -151,26 +199,56 @@ fn validate_statement(
             if let Some(if_branch) = cond.if_branch.as_ref()
                 && let Some(condition) = if_branch.condition.as_ref()
             {
-                validate_expr(condition, &current, fn_name, function_names, function_signatures)?;
+                validate_expr(
+                    condition,
+                    &current,
+                    fn_name,
+                    function_names,
+                    function_signatures,
+                )?;
             }
             let mut branch_scopes: Vec<HashSet<String>> = Vec::new();
             if let Some(if_branch) = cond.if_branch.as_ref()
                 && let Some(body) = if_branch.block_body.as_ref()
             {
-                branch_scopes.push(validate_block(body, &current, fn_name, function_names, function_signatures)?);
+                branch_scopes.push(validate_block(
+                    body,
+                    &current,
+                    fn_name,
+                    function_names,
+                    function_signatures,
+                )?);
             }
             for branch in &cond.elif_branches {
                 if let Some(condition) = branch.condition.as_ref() {
-                    validate_expr(condition, &current, fn_name, function_names, function_signatures)?;
+                    validate_expr(
+                        condition,
+                        &current,
+                        fn_name,
+                        function_names,
+                        function_signatures,
+                    )?;
                 }
                 if let Some(body) = branch.block_body.as_ref() {
-                    branch_scopes.push(validate_block(body, &current, fn_name, function_names, function_signatures)?);
+                    branch_scopes.push(validate_block(
+                        body,
+                        &current,
+                        fn_name,
+                        function_names,
+                        function_signatures,
+                    )?);
                 }
             }
             if let Some(else_branch) = cond.else_branch.as_ref()
                 && let Some(body) = else_branch.block_body.as_ref()
             {
-                branch_scopes.push(validate_block(body, &current, fn_name, function_names, function_signatures)?);
+                branch_scopes.push(validate_block(
+                    body,
+                    &current,
+                    fn_name,
+                    function_names,
+                    function_signatures,
+                )?);
             }
             for branch_scope in branch_scopes {
                 current.extend(branch_scope);
@@ -179,7 +257,13 @@ fn validate_statement(
         Kind::TryExcept(try_except) => {
             let mut branch_scopes: Vec<HashSet<String>> = Vec::new();
             if let Some(body) = try_except.try_block.as_ref() {
-                branch_scopes.push(validate_block(body, &current, fn_name, function_names, function_signatures)?);
+                branch_scopes.push(validate_block(
+                    body,
+                    &current,
+                    fn_name,
+                    function_names,
+                    function_signatures,
+                )?);
             }
             for handler in &try_except.handlers {
                 if let Some(body) = handler.block_body.as_ref() {
@@ -204,7 +288,13 @@ fn validate_statement(
         }
         Kind::ReturnStmt(ret) => {
             if let Some(value) = ret.value.as_ref() {
-                validate_expr(value, &current, fn_name, function_names, function_signatures)?;
+                validate_expr(
+                    value,
+                    &current,
+                    fn_name,
+                    function_names,
+                    function_signatures,
+                )?;
             }
         }
         Kind::BreakStmt(_) => {
@@ -292,10 +382,22 @@ fn validate_expr(
             for call in &parallel.calls {
                 match &call.kind {
                     Some(ir_ast::call::Kind::Action(action)) => {
-                        validate_action_call(action, scope, fn_name, function_names, function_signatures)?;
+                        validate_action_call(
+                            action,
+                            scope,
+                            fn_name,
+                            function_names,
+                            function_signatures,
+                        )?;
                     }
                     Some(ir_ast::call::Kind::Function(function)) => {
-                        validate_function_call(function, scope, fn_name, function_names, function_signatures)?;
+                        validate_function_call(
+                            function,
+                            scope,
+                            fn_name,
+                            function_names,
+                            function_signatures,
+                        )?;
                     }
                     None => {}
                 }
@@ -303,14 +405,26 @@ fn validate_expr(
         }
         Kind::SpreadExpr(spread) => {
             if let Some(collection) = spread.collection.as_ref() {
-                validate_expr(collection, scope, fn_name, function_names, function_signatures)?;
+                validate_expr(
+                    collection,
+                    scope,
+                    fn_name,
+                    function_names,
+                    function_signatures,
+                )?;
             }
             let mut spread_scope = scope.clone();
             if !spread.loop_var.is_empty() {
                 spread_scope.insert(spread.loop_var.clone());
             }
             if let Some(action) = spread.action.as_ref() {
-                validate_action_call(action, &spread_scope, fn_name, function_names, function_signatures)?;
+                validate_action_call(
+                    action,
+                    &spread_scope,
+                    fn_name,
+                    function_names,
+                    function_signatures,
+                )?;
             }
         }
         Kind::Literal(_) => {}
@@ -378,8 +492,7 @@ fn validate_function_call(
 
     // Perform arity checking if we have the signature
     if let Some(signature) = function_signatures.get(&call.name) {
-        let expected_inputs: HashSet<&str> =
-            signature.inputs.iter().map(|s| s.as_str()).collect();
+        let expected_inputs: HashSet<&str> = signature.inputs.iter().map(|s| s.as_str()).collect();
 
         // Collect provided arguments: positional args map to inputs in order,
         // then kwargs provide named arguments
@@ -398,10 +511,7 @@ fn validate_function_call(
         }
 
         // Check for missing required inputs
-        let missing: Vec<&str> = expected_inputs
-            .difference(&provided)
-            .copied()
-            .collect();
+        let missing: Vec<&str> = expected_inputs.difference(&provided).copied().collect();
         if !missing.is_empty() {
             let mut missing_sorted = missing.clone();
             missing_sorted.sort();
@@ -734,7 +844,10 @@ mod tests {
         // Main function calls helper with positional args
         let call_stmt = ir_ast::Statement {
             kind: Some(ir_ast::statement::Kind::ExprStmt(ir_ast::ExprStmt {
-                expr: Some(function_call_expr("helper", vec![expr_var("x"), expr_var("y")])),
+                expr: Some(function_call_expr(
+                    "helper",
+                    vec![expr_var("x"), expr_var("y")],
+                )),
             })),
             span: None,
         };
@@ -752,7 +865,10 @@ mod tests {
         // Main function calls helper with only two positional args (missing 'c')
         let call_stmt = ir_ast::Statement {
             kind: Some(ir_ast::statement::Kind::ExprStmt(ir_ast::ExprStmt {
-                expr: Some(function_call_expr("helper", vec![expr_var("x"), expr_var("y")])),
+                expr: Some(function_call_expr(
+                    "helper",
+                    vec![expr_var("x"), expr_var("y")],
+                )),
             })),
             span: None,
         };
