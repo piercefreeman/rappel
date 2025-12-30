@@ -568,7 +568,7 @@ impl DAGConverter {
     /// non-existent nodes, which can happen if exception handler remapping fails).
     pub fn convert(&mut self, program: &ast::Program) -> Result<DAG, String> {
         // Phase 1: Build with function pointers
-        let unexpanded = self.convert_with_pointers(program);
+        let unexpanded = self.convert_with_pointers(program)?;
 
         // Phase 2: Expand into single global DAG
         // Find the entry function deterministically based on source order.
@@ -587,7 +587,7 @@ impl DAGConverter {
             .map(|func| func.name.as_str())
             .unwrap_or("main");
 
-        let mut dag = self.expand_functions(&unexpanded, entry_fn);
+        let mut dag = self.expand_functions(&unexpanded, entry_fn)?;
         self.remap_exception_targets(&mut dag);
         self.add_global_data_flow_edges(&mut dag);
 
@@ -601,7 +601,7 @@ impl DAGConverter {
     ///
     /// Each function becomes its own subgraph with input/output boundary nodes.
     /// Function calls create "fn_call" pointer nodes that reference the called function.
-    fn convert_with_pointers(&mut self, program: &ast::Program) -> DAG {
+    fn convert_with_pointers(&mut self, program: &ast::Program) -> Result<DAG, String> {
         self.dag = DAG::new();
         self.node_counter = 0;
         self.function_defs.clear();
@@ -613,10 +613,10 @@ impl DAGConverter {
 
         // Second pass: convert each function into an isolated subgraph
         for func in &program.functions {
-            self.convert_function(func);
+            self.convert_function(func)?;
         }
 
-        std::mem::take(&mut self.dag)
+        Ok(std::mem::take(&mut self.dag))
     }
 
     /// Remap exception edges that still point at fn_call placeholders to the
@@ -689,7 +689,7 @@ impl DAGConverter {
     /// - Try/except: ALL nodes within expansion get exception edges to handlers
     /// - If/else: Only the LAST node of expansion connects to the join node
     /// - For loop: The LAST node of expansion connects back to loop head
-    fn expand_functions(&self, unexpanded: &DAG, entry_fn: &str) -> DAG {
+    fn expand_functions(&self, unexpanded: &DAG, entry_fn: &str) -> Result<DAG, String> {
         let mut expanded = DAG::new();
         let mut visited_calls: HashSet<String> = HashSet::new();
 
@@ -699,9 +699,9 @@ impl DAGConverter {
             &mut expanded,
             &mut visited_calls,
             None, // No ID remapping for entry function
-        );
+        )?;
 
-        expanded
+        Ok(expanded)
     }
 
     /// Recursively expand a function into the target DAG.
@@ -717,11 +717,11 @@ impl DAGConverter {
         target: &mut DAG,
         visited_calls: &mut HashSet<String>,
         id_prefix: Option<&str>,
-    ) -> Option<(String, String)> {
+    ) -> Result<Option<(String, String)>, String> {
         // Get all nodes for this function
         let fn_nodes = unexpanded.get_nodes_for_function(fn_name);
         if fn_nodes.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // Find input and output nodes
@@ -765,10 +765,10 @@ impl DAGConverter {
                     // Prevent infinite recursion
                     let call_key = format!("{}:{}", fn_name, old_id);
                     if visited_calls.contains(&call_key) {
-                        panic!(
+                        return Err(format!(
                             "Recursive function call detected: {} -> {}",
                             fn_name, called_fn
-                        );
+                        ));
                     }
                     visited_calls.insert(call_key.clone());
 
@@ -794,7 +794,7 @@ impl DAGConverter {
                         target,
                         visited_calls,
                         Some(&child_prefix),
-                    );
+                    )?;
 
                     visited_calls.remove(&call_key);
 
@@ -1035,10 +1035,10 @@ impl DAGConverter {
         // This is important when loops are present: loop_incr nodes may appear last in
         // topo order (because loop_back edges are skipped), but they are NOT the exit point.
         let canonical_last = output_return_node.or(last_real_node);
-        match (first_real_node, canonical_last) {
+        Ok(match (first_real_node, canonical_last) {
             (Some(first), Some(last)) => Some((first, last)),
             _ => None,
-        }
+        })
     }
 
     /// Get topological order of nodes using state machine edges
@@ -1554,7 +1554,7 @@ impl DAGConverter {
     }
 
     /// Convert a function definition into an isolated subgraph
-    fn convert_function(&mut self, fn_def: &ast::FunctionDef) {
+    fn convert_function(&mut self, fn_def: &ast::FunctionDef) -> Result<(), String> {
         self.current_function = Some(fn_def.name.clone());
         self.current_scope_vars.clear();
         self.var_modifications.clear();
@@ -1583,7 +1583,7 @@ impl DAGConverter {
         let mut frontier = vec![input_id.clone()];
         if let Some(body) = &fn_def.body {
             for stmt in &body.statements {
-                let converted = self.convert_statement(stmt);
+                let converted = self.convert_statement(stmt)?;
                 if converted.is_noop {
                     continue;
                 }
@@ -1642,6 +1642,7 @@ impl DAGConverter {
         self.add_data_flow_edges_for_function(&fn_def.name);
 
         self.current_function = None;
+        Ok(())
     }
 
     /// Generate the next unique node ID
@@ -1684,13 +1685,13 @@ impl DAGConverter {
     }
 
     /// Convert a statement to DAG node(s)
-    fn convert_block(&mut self, block: &ast::Block) -> ConvertedSubgraph {
+    fn convert_block(&mut self, block: &ast::Block) -> Result<ConvertedSubgraph, String> {
         let mut nodes = Vec::new();
         let mut entry: Option<String> = None;
         let mut frontier: Option<Vec<String>> = None;
 
         for stmt in &block.statements {
-            let converted = self.convert_statement(stmt);
+            let converted = self.convert_statement(stmt)?;
             nodes.extend(converted.nodes.clone());
 
             if converted.is_noop {
@@ -1714,21 +1715,21 @@ impl DAGConverter {
         }
 
         if entry.is_none() {
-            return ConvertedSubgraph::noop();
+            return Ok(ConvertedSubgraph::noop());
         }
 
-        ConvertedSubgraph {
+        Ok(ConvertedSubgraph {
             entry,
             exits: frontier.unwrap_or_default(),
             nodes,
             is_noop: false,
-        }
+        })
     }
 
-    fn convert_statement(&mut self, stmt: &ast::Statement) -> ConvertedSubgraph {
+    fn convert_statement(&mut self, stmt: &ast::Statement) -> Result<ConvertedSubgraph, String> {
         let kind = match &stmt.kind {
             Some(k) => k,
-            None => return ConvertedSubgraph::noop(),
+            None => return Ok(ConvertedSubgraph::noop()),
         };
 
         let node_ids = match kind {
@@ -1756,26 +1757,26 @@ impl DAGConverter {
             }
             ast::statement::Kind::ReturnStmt(ret) => {
                 let ids = self.convert_return(ret);
-                return ConvertedSubgraph {
+                return Ok(ConvertedSubgraph {
                     entry: ids.first().cloned(),
                     exits: Vec::new(),
                     nodes: ids,
                     is_noop: false,
-                };
+                });
             }
             ast::statement::Kind::ExprStmt(expr_stmt) => self.convert_expr_statement(expr_stmt),
         };
 
         if node_ids.is_empty() {
-            return ConvertedSubgraph::noop();
+            return Ok(ConvertedSubgraph::noop());
         }
 
-        ConvertedSubgraph {
+        Ok(ConvertedSubgraph {
             entry: node_ids.first().cloned(),
             exits: node_ids.last().cloned().into_iter().collect(),
             nodes: node_ids,
             is_noop: false,
-        }
+        })
     }
 
     /// Convert an assignment statement
@@ -2364,7 +2365,7 @@ impl DAGConverter {
     ///
     /// This structure uses the same guard evaluation as if/else branches,
     /// requiring no special runtime handling for loops.
-    fn convert_for_loop(&mut self, for_loop: &ast::ForLoop) -> ConvertedSubgraph {
+    fn convert_for_loop(&mut self, for_loop: &ast::ForLoop) -> Result<ConvertedSubgraph, String> {
         let mut nodes: Vec<String> = Vec::new();
 
         let loop_id = self.next_id("loop");
@@ -2436,12 +2437,12 @@ impl DAGConverter {
         let extract_id = self.next_id("loop_extract");
 
         // Build the index expression: collection[__loop_i]
-        let coll = collection_expr.as_ref().unwrap_or_else(|| {
-            panic!(
-                "BUG: for-loop collection expression is None for loop '{}'",
+        let coll = collection_expr.as_ref().ok_or_else(|| {
+            format!(
+                "for-loop collection expression is None for loop '{}'",
                 loop_vars_str
             )
-        });
+        })?;
         let index_expr = ast::Expr {
             span: None,
             kind: Some(ast::expr::Kind::Index(Box::new(ast::IndexAccess {
@@ -2487,14 +2488,13 @@ impl DAGConverter {
         // 4. Convert body nodes
         // ============================================================
         let mut body_targets: Vec<String> = Vec::new();
-        let body_graph = for_loop
-            .block_body
-            .as_ref()
-            .map(|block_body| {
+        let body_graph = match for_loop.block_body.as_ref() {
+            Some(block_body) => {
                 Self::collect_assigned_targets(&block_body.statements, &mut body_targets);
-                self.convert_block(block_body)
-            })
-            .unwrap_or_else(ConvertedSubgraph::noop);
+                self.convert_block(block_body)?
+            }
+            None => ConvertedSubgraph::noop(),
+        };
         nodes.extend(body_graph.nodes.clone());
 
         if body_graph.is_noop {
@@ -2595,12 +2595,12 @@ impl DAGConverter {
                 .add_edge(DAGEdge::state_machine(cond_id.clone(), exit_id.clone()));
         }
 
-        ConvertedSubgraph {
+        Ok(ConvertedSubgraph {
             entry: Some(init_id),
             exits: vec![exit_id],
             nodes,
             is_noop: false,
-        }
+        })
     }
 
     /// Convert a conditional (if/elif/else)
@@ -2616,7 +2616,7 @@ impl DAGConverter {
     /// Becomes:
     ///   predecessor --[guard: x > 0]--> @pos() --> join
     ///               --[guard: not (x > 0)]--> @neg() --> join
-    fn convert_conditional(&mut self, cond: &ast::Conditional) -> ConvertedSubgraph {
+    fn convert_conditional(&mut self, cond: &ast::Conditional) -> Result<ConvertedSubgraph, String> {
         let mut nodes: Vec<String> = Vec::new();
 
         let branch_id = self.next_id("branch");
@@ -2634,18 +2634,17 @@ impl DAGConverter {
         let if_branch = cond
             .if_branch
             .as_ref()
-            .unwrap_or_else(|| panic!("BUG: conditional missing if_branch"));
+            .ok_or_else(|| "conditional missing if_branch".to_string())?;
         let if_guard = if_branch
             .condition
             .as_ref()
-            .unwrap_or_else(|| panic!("BUG: if branch missing guard expression"))
+            .ok_or_else(|| "if branch missing guard expression".to_string())?
             .clone();
 
-        let if_body_graph = if_branch
-            .block_body
-            .as_ref()
-            .map(|block| self.convert_block(block))
-            .unwrap_or_else(ConvertedSubgraph::noop);
+        let if_body_graph = match if_branch.block_body.as_ref() {
+            Some(block) => self.convert_block(block)?,
+            None => ConvertedSubgraph::noop(),
+        };
         nodes.extend(if_body_graph.nodes.clone());
 
         let mut prior_guards: Vec<ast::Expr> = vec![if_guard.clone()];
@@ -2655,32 +2654,25 @@ impl DAGConverter {
             let elif_cond = elif_branch
                 .condition
                 .as_ref()
-                .unwrap_or_else(|| panic!("BUG: elif branch missing guard expression"))
+                .ok_or_else(|| "elif branch missing guard expression".to_string())?
                 .clone();
-            let compound_guard = self.build_compound_guard(&prior_guards, Some(&elif_cond));
+            let compound_guard = self.build_compound_guard(&prior_guards, Some(&elif_cond))?;
             prior_guards.push(elif_cond);
 
-            let graph = elif_branch
-                .block_body
-                .as_ref()
-                .map(|block| self.convert_block(block))
-                .unwrap_or_else(ConvertedSubgraph::noop);
+            let graph = match elif_branch.block_body.as_ref() {
+                Some(block) => self.convert_block(block)?,
+                None => ConvertedSubgraph::noop(),
+            };
 
             nodes.extend(graph.nodes.clone());
             elif_graphs.push((compound_guard, graph));
         }
 
         // Missing else is an implicit empty else.
-        let else_graph = cond
-            .else_branch
-            .as_ref()
-            .and_then(|else_branch| {
-                else_branch
-                    .block_body
-                    .as_ref()
-                    .map(|block| self.convert_block(block))
-            })
-            .unwrap_or_else(ConvertedSubgraph::noop);
+        let else_graph = match cond.else_branch.as_ref().and_then(|b| b.block_body.as_ref()) {
+            Some(block) => self.convert_block(block)?,
+            None => ConvertedSubgraph::noop(),
+        };
         nodes.extend(else_graph.nodes.clone());
 
         let join_needed = (if_body_graph.is_noop || !if_body_graph.exits.is_empty())
@@ -2771,12 +2763,12 @@ impl DAGConverter {
         }
         connect_else_branch(self, &else_graph, join_id.as_ref());
 
-        ConvertedSubgraph {
+        Ok(ConvertedSubgraph {
             entry: Some(branch_id),
             exits: join_id.into_iter().collect(),
             nodes,
             is_noop: false,
-        }
+        })
     }
 
     /// Build a compound guard expression from prior guards and an optional current condition.
@@ -2787,7 +2779,7 @@ impl DAGConverter {
         &self,
         prior_guards: &[ast::Expr],
         current_condition: Option<&ast::Expr>,
-    ) -> ast::Expr {
+    ) -> Result<ast::Expr, String> {
         // Start with negated prior guards
         let mut parts: Vec<ast::Expr> = prior_guards
             .iter()
@@ -2807,11 +2799,9 @@ impl DAGConverter {
 
         // Combine with AND operators
         if parts.is_empty() {
-            panic!(
-                "BUG: build_elif_guard called with no prior conditions and no current condition"
-            );
+            Err("build_compound_guard called with no prior conditions and no current condition".to_string())
         } else if parts.len() == 1 {
-            parts.remove(0)
+            Ok(parts.remove(0))
         } else {
             // Build left-associative AND chain: ((a AND b) AND c) AND d
             let mut result = parts.remove(0);
@@ -2825,7 +2815,7 @@ impl DAGConverter {
                     }))),
                 };
             }
-            result
+            Ok(result)
         }
     }
 
@@ -2842,28 +2832,26 @@ impl DAGConverter {
     /// Becomes:
     ///   @risky() --[success]--> join
     ///            --[except:NetworkError]--> @fallback() --> join
-    fn convert_try_except(&mut self, try_except: &ast::TryExcept) -> ConvertedSubgraph {
+    fn convert_try_except(&mut self, try_except: &ast::TryExcept) -> Result<ConvertedSubgraph, String> {
         let mut nodes: Vec<String> = Vec::new();
 
-        let try_graph = try_except
-            .try_block
-            .as_ref()
-            .map(|block| self.convert_block(block))
-            .unwrap_or_else(ConvertedSubgraph::noop);
+        let try_graph = match try_except.try_block.as_ref() {
+            Some(block) => self.convert_block(block)?,
+            None => ConvertedSubgraph::noop(),
+        };
 
         if try_graph.is_noop {
-            return ConvertedSubgraph::noop();
+            return Ok(ConvertedSubgraph::noop());
         }
         nodes.extend(try_graph.nodes.clone());
 
         // Collect handler graphs up front so we can decide whether a join is needed.
         let mut handler_graphs: Vec<(Vec<String>, ConvertedSubgraph)> = Vec::new();
         for handler in &try_except.handlers {
-            let mut graph = handler
-                .block_body
-                .as_ref()
-                .map(|block| self.convert_block(block))
-                .unwrap_or_else(ConvertedSubgraph::noop);
+            let mut graph = match handler.block_body.as_ref() {
+                Some(block) => self.convert_block(block)?,
+                None => ConvertedSubgraph::noop(),
+            };
             tracing::debug!(
                 handler_entry = ?graph.entry,
                 handler_exits = ?graph.exits,
@@ -2954,12 +2942,12 @@ impl DAGConverter {
             }
         }
 
-        ConvertedSubgraph {
+        Ok(ConvertedSubgraph {
             entry: try_graph.entry,
             exits: join_id.into_iter().collect(),
             nodes,
             is_noop: false,
-        }
+        })
     }
 
     fn prepend_exception_binding(
