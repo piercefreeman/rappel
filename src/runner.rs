@@ -966,7 +966,7 @@ impl WorkQueueHandler {
         };
 
         // Get worker and send
-        let worker = Arc::clone(&self.worker_pool.workers()[worker_idx]);
+        let worker = self.worker_pool.get_worker(worker_idx).await;
         let delivery_token = action.delivery_token;
         let in_flight_tracker = Arc::clone(&self.in_flight);
         let slot_tracker = Arc::clone(&self.slot_tracker);
@@ -975,7 +975,7 @@ impl WorkQueueHandler {
         tokio::spawn(async move {
             match worker.send_action(dispatch).await {
                 Ok(metrics) => {
-                    worker_pool.record_completion(worker_idx);
+                    worker_pool.record_completion(worker_idx, Arc::clone(&worker_pool));
                     // Get in-flight info and release slot
                     let in_flight_action = {
                         let mut tracker = in_flight_tracker.lock().await;

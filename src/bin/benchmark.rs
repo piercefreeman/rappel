@@ -580,6 +580,7 @@ async fn main() -> Result<()> {
                 worker_config,
                 args.workers_per_host as usize,
                 Arc::clone(&worker_bridge),
+                None, // max_action_lifecycle - not used in benchmarks
             )
             .await?,
         );

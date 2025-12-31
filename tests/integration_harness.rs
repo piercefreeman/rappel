@@ -385,8 +385,9 @@ impl IntegrationHarness {
             user_modules: vec![config.user_module.to_string()],
             extra_python_paths: vec![python_env.path().to_path_buf()],
         };
-        let worker_pool =
-            Arc::new(PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_bridge)).await?);
+        let worker_pool = Arc::new(
+            PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_bridge), None).await?,
+        );
         info!("worker pool ready");
 
         // Create DAGRunner with the proper components

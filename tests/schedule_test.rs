@@ -299,7 +299,7 @@ async fn test_scheduler_creates_instance() -> Result<()> {
 
     // Create worker pool with 1 worker (minimum required)
     let worker_pool =
-        Arc::new(PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_bridge)).await?);
+        Arc::new(PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_bridge), None).await?);
 
     let runner = Arc::new(DAGRunner::new(
         runner_config,

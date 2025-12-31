@@ -10,6 +10,7 @@
 //! - `RAPPEL_POLL_INTERVAL_MS`: Dispatcher poll interval (default: 100)
 //! - `RAPPEL_BATCH_SIZE`: Actions to dispatch per poll (default: worker_count * concurrent_per_worker)
 //! - `RAPPEL_USER_MODULE`: Python module to preload in workers (optional)
+//! - `RAPPEL_MAX_ACTION_LIFECYCLE`: Max actions per worker before recycling (default: None, no limit)
 //! - `RAPPEL_WEBAPP_ENABLED`: Enable webapp dashboard (default: false)
 //! - `RAPPEL_WEBAPP_ADDR`: Webapp bind address (default: 0.0.0.0:24119)
 
@@ -60,6 +61,10 @@ pub struct Config {
 
     /// Python module to preload in workers
     pub user_module: Option<String>,
+
+    /// Maximum number of actions a worker can execute before being recycled.
+    /// None means no limit (workers run indefinitely).
+    pub max_action_lifecycle: Option<u64>,
 
     /// Webapp configuration
     pub webapp: WebappConfig,
@@ -154,6 +159,10 @@ impl Config {
 
         let user_module = env::var("RAPPEL_USER_MODULE").ok();
 
+        let max_action_lifecycle = env::var("RAPPEL_MAX_ACTION_LIFECYCLE")
+            .ok()
+            .and_then(|s| s.parse().ok());
+
         let webapp = WebappConfig::from_env();
 
         Ok(Self {
@@ -166,6 +175,7 @@ impl Config {
             poll_interval_ms,
             batch_size,
             user_module,
+            max_action_lifecycle,
             webapp,
         })
     }
@@ -185,6 +195,7 @@ impl Config {
             poll_interval_ms: 50,
             batch_size: (worker_count * concurrent_per_worker) as i32,
             user_module: None,
+            max_action_lifecycle: None,
             webapp: WebappConfig::default(),
         }
     }

@@ -151,6 +151,7 @@ These are the primary environment parameters that you'll likely want to customiz
 | `RAPPEL_CONCURRENT_PER_WORKER` | Max concurrent actions per worker | `10` | `20` |
 | `RAPPEL_USER_MODULE` | Python module preloaded into each worker | none | `my_app.actions` |
 | `RAPPEL_POLL_INTERVAL_MS` | Poll interval for the dispatch loop (ms) | `100` | `50` |
+| `RAPPEL_MAX_ACTION_LIFECYCLE` | Max actions per worker before recycling (see below) | none (no limit) | `1000` |
 | `RAPPEL_WEBAPP_ENABLED` | Enable the web dashboard | `false` | `true` |
 | `RAPPEL_WEBAPP_ADDR` | Web dashboard bind address | `0.0.0.0:24119` | `0.0.0.0:8080` |
 
@@ -161,6 +162,14 @@ We expect that you won't need to modify the following env parameters, but we pro
 | `RAPPEL_HTTP_ADDR` | HTTP bind address for `rappel-bridge` | `127.0.0.1:24117` | `0.0.0.0:24117` |
 | `RAPPEL_GRPC_ADDR` | gRPC bind address for `rappel-bridge` | HTTP port + 1 | `0.0.0.0:24118` |
 | `RAPPEL_BATCH_SIZE` | Max actions fetched per poll | `workers * concurrent_per_worker` | `200` |
+
+### Worker Recycling
+
+The `RAPPEL_MAX_ACTION_LIFECYCLE` setting controls how many actions a Python worker process can execute before being automatically recycled (shut down and replaced with a fresh process). This can help mitigate memory leaks in third-party libraries that may accumulate memory over time.
+
+When a worker reaches its action limit, rappel spawns a replacement worker before retiring the old one. Any in-flight actions on the old worker will complete normally before the process terminates. This ensures zero downtime during recycling.
+
+By default, this is set to `None` (no limit), meaning workers run indefinitely. If you notice memory growth in your workers over time, try setting this to a value like `1000` or `10000` depending on your action characteristics.
 
 ## Philosophy
 

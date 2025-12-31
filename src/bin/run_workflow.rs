@@ -718,6 +718,7 @@ async fn main() -> Result<()> {
             worker_config,
             args.workers as usize,
             Arc::clone(&worker_bridge),
+            None, // max_action_lifecycle - not used in run_workflow
         )
         .await?,
     );

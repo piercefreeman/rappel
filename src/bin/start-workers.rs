@@ -49,6 +49,7 @@ async fn main() -> Result<()> {
         batch_size = config.batch_size,
         poll_interval_ms = config.poll_interval_ms,
         user_module = ?config.user_module,
+        max_action_lifecycle = ?config.max_action_lifecycle,
         "starting worker pool"
     );
 
@@ -75,6 +76,7 @@ async fn main() -> Result<()> {
             worker_config,
             config.worker_count,
             Arc::clone(&worker_bridge),
+            config.max_action_lifecycle,
         )
         .await?,
     );

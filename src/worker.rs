@@ -49,6 +49,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use tokio::sync::RwLock;
+
 use anyhow::{Context, Result as AnyResult, anyhow};
 use chrono::{DateTime, Utc};
 use prost::Message;
@@ -714,19 +716,27 @@ impl Drop for PythonWorker {
 /// let bridge = WorkerBridgeServer::start(None).await?;
 /// let config = PythonWorkerConfig::new()
 ///     .with_user_module("my_app.actions");
-/// let pool = PythonWorkerPool::new(config, 4, bridge).await?;
+/// let pool = PythonWorkerPool::new(config, 4, bridge, None).await?;
 ///
-/// let metrics = pool.next_worker().send_action(dispatch).await?;
+/// let metrics = pool.get_worker(0).await.send_action(dispatch).await?;
 /// ```
 pub struct PythonWorkerPool {
-    /// The workers in the pool
-    workers: Vec<Arc<PythonWorker>>,
+    /// The workers in the pool (RwLock for recycling support)
+    workers: RwLock<Vec<Arc<PythonWorker>>>,
     /// Cursor for round-robin selection
     cursor: AtomicUsize,
     /// Pool identifier for reporting
     pool_id: Uuid,
     /// Throughput tracker for workers in the pool
     throughput: StdMutex<WorkerThroughputTracker>,
+    /// Action counts per worker slot (for lifecycle tracking)
+    action_counts: Vec<AtomicU64>,
+    /// Maximum actions per worker before recycling (None = no limit)
+    max_action_lifecycle: Option<u64>,
+    /// Bridge server for spawning replacement workers
+    bridge: Arc<WorkerBridgeServer>,
+    /// Worker configuration for spawning replacements
+    config: PythonWorkerConfig,
 }
 
 impl PythonWorkerPool {
@@ -740,6 +750,7 @@ impl PythonWorkerPool {
     /// * `config` - Configuration for worker processes
     /// * `count` - Number of workers to spawn (minimum 1)
     /// * `bridge` - The WorkerBridge server workers will connect to
+    /// * `max_action_lifecycle` - Maximum actions per worker before recycling (None = no limit)
     ///
     /// # Errors
     ///
@@ -748,9 +759,14 @@ impl PythonWorkerPool {
         config: PythonWorkerConfig,
         count: usize,
         bridge: Arc<WorkerBridgeServer>,
+        max_action_lifecycle: Option<u64>,
     ) -> AnyResult<Self> {
         let worker_count = count.max(1);
-        info!(count = worker_count, "spawning python worker pool");
+        info!(
+            count = worker_count,
+            max_action_lifecycle = ?max_action_lifecycle,
+            "spawning python worker pool"
+        );
 
         let mut workers = Vec::with_capacity(worker_count);
         for i in 0..worker_count {
@@ -778,49 +794,134 @@ impl PythonWorkerPool {
         info!(count = workers.len(), "worker pool ready");
 
         let worker_ids = workers.iter().map(|worker| worker.worker_id()).collect();
+        let action_counts = (0..worker_count).map(|_| AtomicU64::new(0)).collect();
         Ok(Self {
-            workers,
+            workers: RwLock::new(workers),
             cursor: AtomicUsize::new(0),
             pool_id: Uuid::new_v4(),
             throughput: StdMutex::new(WorkerThroughputTracker::new(
                 worker_ids,
                 Duration::from_secs(60),
             )),
+            action_counts,
+            max_action_lifecycle,
+            bridge,
+            config,
         })
     }
 
-    /// Get the next worker using round-robin selection.
+    /// Get a worker by index.
     ///
-    /// This is lock-free and O(1). Workers are selected in order,
-    /// wrapping around when all have been used.
-    pub fn next_worker(&self) -> Arc<PythonWorker> {
-        let idx = self.cursor.fetch_add(1, Ordering::Relaxed);
-        Arc::clone(&self.workers[idx % self.workers.len()])
+    /// Returns a clone of the Arc for the worker at the given index.
+    pub async fn get_worker(&self, idx: usize) -> Arc<PythonWorker> {
+        let workers = self.workers.read().await;
+        Arc::clone(&workers[idx % workers.len()])
+    }
+
+    /// Get the next worker index using round-robin selection.
+    ///
+    /// This is lock-free and O(1). Returns the index that can be used
+    /// with `get_worker` to fetch the actual worker.
+    pub fn next_worker_idx(&self) -> usize {
+        self.cursor.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Get the number of workers in the pool.
     pub fn len(&self) -> usize {
-        self.workers.len()
+        self.action_counts.len()
     }
 
     /// Check if the pool is empty.
     pub fn is_empty(&self) -> bool {
-        self.workers.is_empty()
+        self.action_counts.is_empty()
     }
 
-    /// Get all workers in the pool (for health checks, etc.)
-    pub fn workers(&self) -> &[Arc<PythonWorker>] {
-        &self.workers
+    /// Get a snapshot of all workers in the pool.
+    pub async fn workers_snapshot(&self) -> Vec<Arc<PythonWorker>> {
+        self.workers.read().await.clone()
     }
 
     pub(crate) fn pool_id(&self) -> Uuid {
         self.pool_id
     }
 
-    pub(crate) fn record_completion(&self, worker_idx: usize) {
+    /// Record an action completion for a worker and trigger recycling if needed.
+    ///
+    /// This increments the action count for the worker at the given index.
+    /// If `max_action_lifecycle` is set and the count reaches or exceeds the
+    /// threshold, a background task is spawned to recycle the worker.
+    pub fn record_completion(&self, worker_idx: usize, pool: Arc<PythonWorkerPool>) {
+        // Update throughput tracking
         if let Ok(mut tracker) = self.throughput.lock() {
             tracker.record_completion(worker_idx);
         }
+
+        // Increment action count
+        if let Some(counter) = self.action_counts.get(worker_idx) {
+            let new_count = counter.fetch_add(1, Ordering::SeqCst) + 1;
+
+            // Check if recycling is needed
+            if let Some(max_lifecycle) = self.max_action_lifecycle
+                && new_count >= max_lifecycle
+            {
+                info!(
+                    worker_idx,
+                    action_count = new_count,
+                    max_lifecycle,
+                    "worker reached action lifecycle limit, scheduling recycle"
+                );
+                // Spawn a background task to recycle this worker
+                tokio::spawn(async move {
+                    if let Err(err) = pool.recycle_worker(worker_idx).await {
+                        error!(worker_idx, ?err, "failed to recycle worker");
+                    }
+                });
+            }
+        }
+    }
+
+    /// Recycle a worker at the given index.
+    ///
+    /// Spawns a new worker and replaces the old one. The old worker
+    /// will be shut down once all in-flight actions complete (when
+    /// its Arc reference count drops to zero).
+    async fn recycle_worker(&self, worker_idx: usize) -> AnyResult<()> {
+        // Spawn the replacement worker first
+        let new_worker = PythonWorker::spawn(self.config.clone(), Arc::clone(&self.bridge)).await?;
+        let new_worker_id = new_worker.worker_id();
+
+        // Replace the worker in the pool
+        let old_worker = {
+            let mut workers = self.workers.write().await;
+            let idx = worker_idx % workers.len();
+            std::mem::replace(&mut workers[idx], Arc::new(new_worker))
+        };
+
+        // Reset the action count for this slot
+        if let Some(counter) = self
+            .action_counts
+            .get(worker_idx % self.action_counts.len())
+        {
+            counter.store(0, Ordering::SeqCst);
+        }
+
+        // Update throughput tracker with new worker ID
+        if let Ok(mut tracker) = self.throughput.lock() {
+            let idx = worker_idx % tracker.workers.len();
+            tracker.workers[idx] = WorkerThroughputState::new(new_worker_id);
+        }
+
+        info!(
+            worker_idx,
+            old_worker_id = old_worker.worker_id(),
+            new_worker_id,
+            "recycled worker"
+        );
+
+        // The old worker will be cleaned up when its Arc drops
+        // (once all in-flight actions complete)
+
+        Ok(())
     }
 
     pub(crate) fn throughput_snapshot(&self) -> Vec<WorkerThroughputSnapshot> {
@@ -830,14 +931,35 @@ impl PythonWorkerPool {
         Vec::new()
     }
 
+    /// Get the current action count for a worker slot.
+    ///
+    /// Returns the number of actions that have been completed by the worker
+    /// at the given index since it was last spawned/recycled.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn get_action_count(&self, worker_idx: usize) -> u64 {
+        self.action_counts
+            .get(worker_idx)
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    /// Get the maximum action lifecycle setting.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn max_lifecycle(&self) -> Option<u64> {
+        self.max_action_lifecycle
+    }
+
     /// Gracefully shut down all workers in the pool.
     ///
     /// Workers are shut down in order. Any workers still in use
     /// (shared references exist) are skipped with a warning.
     pub async fn shutdown(self) -> AnyResult<()> {
-        info!(count = self.workers.len(), "shutting down worker pool");
+        let workers = self.workers.into_inner();
+        info!(count = workers.len(), "shutting down worker pool");
 
-        for worker in self.workers {
+        for worker in workers {
             match Arc::try_unwrap(worker) {
                 Ok(worker) => {
                     worker.shutdown().await?;
@@ -920,7 +1042,7 @@ mod tests {
         let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
         let config = PythonWorkerConfig::new();
 
-        let pool = PythonWorkerPool::new(config, 2, Arc::clone(&bridge))
+        let pool = PythonWorkerPool::new(config, 2, Arc::clone(&bridge), None)
             .await
             .expect("create pool");
 
@@ -928,7 +1050,7 @@ mod tests {
         assert!(!pool.is_empty());
 
         // Verify workers have sequential IDs
-        let workers = pool.workers();
+        let workers = pool.workers_snapshot().await;
         assert_eq!(workers[0].worker_id(), 1);
         assert_eq!(workers[1].worker_id(), 2);
 
@@ -942,15 +1064,20 @@ mod tests {
         let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
         let config = PythonWorkerConfig::new();
 
-        let pool = PythonWorkerPool::new(config, 3, Arc::clone(&bridge))
+        let pool = PythonWorkerPool::new(config, 3, Arc::clone(&bridge), None)
             .await
             .expect("create pool");
 
         // Round-robin should cycle through workers
-        let w1 = pool.next_worker();
-        let w2 = pool.next_worker();
-        let w3 = pool.next_worker();
-        let w4 = pool.next_worker(); // Should wrap to first
+        let idx1 = pool.next_worker_idx();
+        let idx2 = pool.next_worker_idx();
+        let idx3 = pool.next_worker_idx();
+        let idx4 = pool.next_worker_idx(); // Should wrap to first
+
+        let w1 = pool.get_worker(idx1).await;
+        let w2 = pool.get_worker(idx2).await;
+        let w3 = pool.get_worker(idx3).await;
+        let w4 = pool.get_worker(idx4).await;
 
         assert_eq!(w1.worker_id(), 1);
         assert_eq!(w2.worker_id(), 2);
@@ -967,7 +1094,7 @@ mod tests {
         let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
         let config = PythonWorkerConfig::new().with_user_module("tests.fixtures.test_actions");
 
-        let pool = PythonWorkerPool::new(config, 1, Arc::clone(&bridge))
+        let pool = PythonWorkerPool::new(config, 1, Arc::clone(&bridge), None)
             .await
             .expect("create pool");
 
@@ -986,7 +1113,7 @@ mod tests {
             dispatch_token: Uuid::new_v4(),
         };
 
-        let worker = pool.next_worker();
+        let worker = pool.get_worker(0).await;
         let metrics = worker.send_action(dispatch).await.expect("send action");
 
         assert!(metrics.success);
@@ -1005,7 +1132,7 @@ mod tests {
         let config = PythonWorkerConfig::new().with_user_module("tests.fixtures.test_actions");
 
         let pool = Arc::new(
-            PythonWorkerPool::new(config, 2, Arc::clone(&bridge))
+            PythonWorkerPool::new(config, 2, Arc::clone(&bridge), None)
                 .await
                 .expect("create pool"),
         );
@@ -1030,7 +1157,8 @@ mod tests {
                     dispatch_token: Uuid::new_v4(),
                 };
 
-                let worker = pool.next_worker();
+                let idx = pool.next_worker_idx();
+                let worker = pool.get_worker(idx).await;
                 worker.send_action(dispatch).await
             }));
         }
@@ -1075,5 +1203,152 @@ mod tests {
         assert_eq!(worker_two.total_completed, 0);
         assert_eq!(worker_two.throughput_per_min, 0.0);
         assert!(worker_two.last_action_at.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Python environment with test actions
+    async fn test_worker_recycling_after_lifecycle_limit() {
+        let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
+        let config = PythonWorkerConfig::new().with_user_module("tests.fixtures.test_actions");
+
+        // Create pool with max_action_lifecycle = 2
+        let pool = Arc::new(
+            PythonWorkerPool::new(config, 1, Arc::clone(&bridge), Some(2))
+                .await
+                .expect("create pool"),
+        );
+
+        // Get initial worker ID
+        let initial_worker_id = pool.get_worker(0).await.worker_id();
+        assert_eq!(initial_worker_id, 1);
+
+        // Send first action - count becomes 1
+        let dispatch1 = ActionDispatchPayload {
+            action_id: "test-1".to_string(),
+            instance_id: "instance-1".to_string(),
+            sequence: 0,
+            action_name: "greet".to_string(),
+            module_name: "tests.fixtures.test_actions".to_string(),
+            kwargs: proto::WorkflowArguments {
+                arguments: vec![make_string_kwarg("name", "World1")],
+            },
+            timeout_seconds: 30,
+            max_retries: 0,
+            attempt_number: 0,
+            dispatch_token: Uuid::new_v4(),
+        };
+
+        let worker = pool.get_worker(0).await;
+        let metrics = worker.send_action(dispatch1).await.expect("send action 1");
+        assert!(metrics.success);
+        pool.record_completion(0, Arc::clone(&pool));
+
+        // Worker should still be the same (count = 1, threshold = 2)
+        let worker_id_after_1 = pool.get_worker(0).await.worker_id();
+        assert_eq!(worker_id_after_1, initial_worker_id);
+
+        // Send second action - count becomes 2, triggers recycle
+        let dispatch2 = ActionDispatchPayload {
+            action_id: "test-2".to_string(),
+            instance_id: "instance-1".to_string(),
+            sequence: 1,
+            action_name: "greet".to_string(),
+            module_name: "tests.fixtures.test_actions".to_string(),
+            kwargs: proto::WorkflowArguments {
+                arguments: vec![make_string_kwarg("name", "World2")],
+            },
+            timeout_seconds: 30,
+            max_retries: 0,
+            attempt_number: 0,
+            dispatch_token: Uuid::new_v4(),
+        };
+
+        let worker = pool.get_worker(0).await;
+        let metrics = worker.send_action(dispatch2).await.expect("send action 2");
+        assert!(metrics.success);
+        pool.record_completion(0, Arc::clone(&pool));
+
+        // Give time for the recycling background task to complete
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Worker should now have a different ID (recycled)
+        let worker_id_after_recycle = pool.get_worker(0).await.worker_id();
+        assert_ne!(
+            worker_id_after_recycle, initial_worker_id,
+            "Worker should have been recycled after reaching lifecycle limit"
+        );
+
+        // The new worker should have ID 2 (second worker spawned)
+        assert_eq!(worker_id_after_recycle, 2);
+
+        // Verify the new worker works correctly
+        let dispatch3 = ActionDispatchPayload {
+            action_id: "test-3".to_string(),
+            instance_id: "instance-1".to_string(),
+            sequence: 2,
+            action_name: "greet".to_string(),
+            module_name: "tests.fixtures.test_actions".to_string(),
+            kwargs: proto::WorkflowArguments {
+                arguments: vec![make_string_kwarg("name", "World3")],
+            },
+            timeout_seconds: 30,
+            max_retries: 0,
+            attempt_number: 0,
+            dispatch_token: Uuid::new_v4(),
+        };
+
+        let worker = pool.get_worker(0).await;
+        let metrics = worker.send_action(dispatch3).await.expect("send action 3");
+        assert!(metrics.success);
+
+        bridge.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Python environment with test actions
+    async fn test_worker_no_recycling_when_lifecycle_none() {
+        let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
+        let config = PythonWorkerConfig::new().with_user_module("tests.fixtures.test_actions");
+
+        // Create pool with no lifecycle limit
+        let pool = Arc::new(
+            PythonWorkerPool::new(config, 1, Arc::clone(&bridge), None)
+                .await
+                .expect("create pool"),
+        );
+
+        let initial_worker_id = pool.get_worker(0).await.worker_id();
+
+        // Send several actions
+        for i in 0..5 {
+            let dispatch = ActionDispatchPayload {
+                action_id: format!("test-{}", i),
+                instance_id: "instance-1".to_string(),
+                sequence: i,
+                action_name: "greet".to_string(),
+                module_name: "tests.fixtures.test_actions".to_string(),
+                kwargs: proto::WorkflowArguments {
+                    arguments: vec![make_string_kwarg("name", &format!("World{}", i))],
+                },
+                timeout_seconds: 30,
+                max_retries: 0,
+                attempt_number: 0,
+                dispatch_token: Uuid::new_v4(),
+            };
+
+            let worker = pool.get_worker(0).await;
+            let metrics = worker.send_action(dispatch).await.expect("send action");
+            assert!(metrics.success);
+            pool.record_completion(0, Arc::clone(&pool));
+        }
+
+        // Worker should still be the same (no recycling)
+        let final_worker_id = pool.get_worker(0).await.worker_id();
+        assert_eq!(
+            final_worker_id, initial_worker_id,
+            "Worker should not have been recycled when lifecycle limit is None"
+        );
+
+        bridge.shutdown().await;
     }
 }
