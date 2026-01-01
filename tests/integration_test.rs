@@ -292,7 +292,6 @@ fn proto_value_to_json(value: &proto::WorkflowArgumentValue) -> serde_json::Valu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn simple_workflow_executes_end_to_end() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -357,7 +356,6 @@ asyncio.run(main())
 /// This tests the full sequential execution: fetch_value -> transform_value -> format_result
 /// The workflow should return "result:84" (42 * 2 = 84).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn sequential_workflow_first_action_executes() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -426,7 +424,6 @@ asyncio.run(main())
 /// This tests the conditional execution: get_score -> evaluate_high
 /// With tier="high", score=100, and 100>=75 so result should be "excellent:100".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn conditional_workflow_registers_and_first_action_executes() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -497,7 +494,6 @@ asyncio.run(main())
 /// TODO: Result assertion disabled - exception workflows have complex DAG structures
 /// that need additional handling for proper completion detection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn exception_workflow_registers_and_first_action_executes() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -552,7 +548,6 @@ asyncio.run(main())
 /// 1. The workflow registers via gRPC
 /// 2. Actions with timeout policies are enqueued and execute
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn crash_recovery_workflow_with_timeout_policies() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -606,7 +601,6 @@ asyncio.run(main())
 /// 1. The workflow registers via gRPC
 /// 2. Actions with retry policies are enqueued and execute
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn exception_custom_workflow_with_retry_policy() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -661,7 +655,6 @@ asyncio.run(main())
 /// 1. The workflow registers via gRPC
 /// 2. Actions with retry policies are enqueued and execute
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn exception_with_success_workflow_registers() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -695,7 +688,6 @@ async fn exception_with_success_workflow_registers() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn exception_with_success_workflow_handles_failure_branch() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -761,7 +753,6 @@ async fn exception_with_success_workflow_handles_failure_branch() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn exception_values_workflow_returns_exception_metadata() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -800,7 +791,6 @@ async fn exception_values_workflow_returns_exception_metadata() -> Result<()> {
 /// This workflow captures an exception with custom attributes and accesses them
 /// directly in the handler via dot notation (err.type, err.code, err.detail).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn exception_metadata_workflow_captures_attributes() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -844,7 +834,6 @@ async fn exception_metadata_workflow_captures_attributes() -> Result<()> {
 /// build_error_result action returns an ErrorResult BaseModel. We store it as a dict
 /// and allow Python to coerce it back into a model when needed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn error_handling_workflow_returns_basemodel_on_failure() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -919,7 +908,6 @@ async fn error_handling_workflow_returns_basemodel_on_failure() -> Result<()> {
 
 /// Ensure the BaseModel result also works on the success branch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn error_handling_workflow_returns_basemodel_on_success() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -1012,7 +1000,6 @@ asyncio.run(main())
 /// This tests the conditional execution where guards depend on input values directly.
 /// With value=100, 100>=75 so result should be "high:100".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn immediate_conditional_workflow_high_branch() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -1062,7 +1049,6 @@ async fn immediate_conditional_workflow_high_branch() -> Result<()> {
 ///
 /// With value=50, 50>=25 but 50<75 so result should be "medium:50".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn immediate_conditional_workflow_medium_branch() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -1112,7 +1098,6 @@ async fn immediate_conditional_workflow_medium_branch() -> Result<()> {
 ///
 /// With value=10, 10<25 so result should be "low:10".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn immediate_conditional_workflow_low_branch() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -1160,7 +1145,6 @@ async fn immediate_conditional_workflow_low_branch() -> Result<()> {
 
 /// Ensure missing input parameters fail the workflow during startup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn immediate_required_input_workflow_missing_input_fails_start() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -1231,7 +1215,6 @@ asyncio.run(main())
 
 /// Ensure a falsy guard skips an action and still reaches the next action.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn dead_end_conditional_guard_reaches_followup_action() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -1314,7 +1297,6 @@ asyncio.run(main())
 /// This tests the for loop pattern: for item in items -> process_item -> join_results
 /// With items=["apple", "banana", "cherry"], result should be "APPLE,BANANA,CHERRY".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn loop_workflow_executes_all_iterations() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -1357,7 +1339,6 @@ async fn loop_workflow_executes_all_iterations() -> Result<()> {
 
 /// Test that helper methods with early returns inside loops flow back to the caller.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn helper_loop_workflow_executes_all_iterations() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -1419,7 +1400,6 @@ asyncio.run(main())
 ///
 /// This covers early return semantics within normalized loop DAGs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn return_inside_for_loop_completes_workflow() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -1486,7 +1466,6 @@ asyncio.run(main())
 /// value=5 -> gather(compute_double(5), compute_square(5)) -> combine_results
 /// doubled=10, squared=25 -> "doubled:10,squared:25"
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn parallel_workflow_executes_concurrent_actions() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -1544,7 +1523,6 @@ asyncio.run(main())
 
 /// Parallel workflow that returns a BaseModel (example_app parity).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn parallel_math_workflow_executes_and_returns_model() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -1620,7 +1598,6 @@ async fn parallel_math_workflow_executes_and_returns_model() -> Result<()> {
 ///
 /// With tier="medium", score=50, and 50>=25 but 50<75 so result should be "good:50".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn conditional_workflow_medium_branch() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -1667,7 +1644,6 @@ async fn conditional_workflow_medium_branch() -> Result<()> {
 ///
 /// With tier="low", score=10, and 10<25 so result should be "needs_work:10".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn conditional_workflow_low_branch() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -1735,7 +1711,6 @@ asyncio.run(main())
 /// "hello world" -> "HELLO WORLD" -> "DLROW OLLEH" -> "*** DLROW OLLEH ***"
 /// Then build_chain_result combines: original, step1, step2, step3
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn chain_workflow_executes_all_steps() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -1826,7 +1801,6 @@ asyncio.run(main())
 /// This differs from the spread/gather pattern in that items are processed as a
 /// spread operation under the hood, not via parallel gather.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn for_loop_workflow_executes_all_iterations() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -1874,7 +1848,6 @@ async fn for_loop_workflow_executes_all_iterations() -> Result<()> {
 /// Test that positional args passed into helper methods bind correctly and
 /// flow into action kwargs (including dot access).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn fn_call_binding_workflow_executes() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -1951,7 +1924,6 @@ asyncio.run(main())
 ///
 /// Result should be "slept:1.0s" (approximately 1 second).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Flaky in CI - needs investigation"]
 #[serial]
 async fn durable_sleep_workflow_executes() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
