@@ -60,7 +60,7 @@ class Workflow:
     _ir_lock: ClassVar[RLock] = RLock()
     _workflow_version_id: ClassVar[Optional[str]] = None
 
-    async def run(self, *args: Any, **kwargs: Any) -> Any:
+    async def run(self, *args: Any, _blocking: bool = True, **kwargs: Any) -> Any:
         raise NotImplementedError
 
     @classmethod
@@ -188,7 +188,7 @@ def workflow(cls: type[TWorkflow]) -> type[TWorkflow]:
         raise TypeError("workflow run() must be defined with 'async def'")
 
     @wraps(run_impl)
-    async def run_public(self: Workflow, *args: Any, **kwargs: Any) -> Any:
+    async def run_public(self: Workflow, *args: Any, _blocking: bool = True, **kwargs: Any) -> Any:
         if _running_under_pytest():
             cls.workflow_ir()
             return await run_impl(self, *args, **kwargs)
@@ -198,6 +198,10 @@ def workflow(cls: type[TWorkflow]) -> type[TWorkflow]:
         payload = cls._build_registration_payload(initial_context)
         run_result = await bridge.run_instance(payload.SerializeToString())
         cls._workflow_version_id = run_result.workflow_version_id
+
+        if not _blocking:
+            return run_result.workflow_instance_id
+
         if _skip_wait_for_instance():
             logger.info(
                 "Skipping wait_for_instance for workflow %s due to RAPPEL_SKIP_WAIT_FOR_INSTANCE",

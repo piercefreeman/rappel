@@ -273,3 +273,85 @@ def test_workflow_result_direct_return(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result == expected_result
 
     os.environ["PYTEST_CURRENT_TEST"] = "true"
+
+
+def test_workflow_blocking_false_returns_instance_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that _blocking=False returns immediately with instance_id without waiting."""
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+
+    run_instance_calls: list[bytes] = []
+    wait_for_instance_calls: list[str] = []
+    expected_instance_id = "00000000-0000-0000-0000-000000000999"
+
+    async def fake_run_instance(payload: bytes) -> bridge.RunInstanceResult:
+        run_instance_calls.append(payload)
+        return bridge.RunInstanceResult(
+            workflow_version_id="00000000-0000-0000-0000-000000000888",
+            workflow_instance_id=expected_instance_id,
+        )
+
+    async def fake_wait_for_instance(*, instance_id: str, poll_interval_secs: float = 1.0) -> bytes:
+        wait_for_instance_calls.append(instance_id)
+        payload = serialize_result_payload("should_not_reach")
+        return payload.SerializeToString()
+
+    monkeypatch.setattr(bridge, "run_instance", fake_run_instance)
+    monkeypatch.setattr(bridge, "wait_for_instance", fake_wait_for_instance)
+
+    @workflow_decorator
+    class NonBlockingWorkflow(Workflow):
+        async def run(self, _blocking: bool = True) -> str:
+            return "test"
+
+    instance = NonBlockingWorkflow()
+
+    # With _blocking=False, should return instance_id immediately
+    result = asyncio.run(instance.run(_blocking=False))
+
+    assert result == expected_instance_id
+    assert len(run_instance_calls) == 1
+    assert len(wait_for_instance_calls) == 0  # Should NOT have called wait_for_instance
+
+    os.environ["PYTEST_CURRENT_TEST"] = "true"
+
+
+def test_workflow_blocking_true_waits_for_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that _blocking=True (default) waits for the workflow result."""
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+
+    run_instance_calls: list[bytes] = []
+    wait_for_instance_calls: list[str] = []
+    expected_instance_id = "00000000-0000-0000-0000-000000000777"
+    expected_result = "workflow_completed"
+
+    async def fake_run_instance(payload: bytes) -> bridge.RunInstanceResult:
+        run_instance_calls.append(payload)
+        return bridge.RunInstanceResult(
+            workflow_version_id="00000000-0000-0000-0000-000000000666",
+            workflow_instance_id=expected_instance_id,
+        )
+
+    async def fake_wait_for_instance(*, instance_id: str, poll_interval_secs: float = 1.0) -> bytes:
+        wait_for_instance_calls.append(instance_id)
+        payload = serialize_result_payload(expected_result)
+        return payload.SerializeToString()
+
+    monkeypatch.setattr(bridge, "run_instance", fake_run_instance)
+    monkeypatch.setattr(bridge, "wait_for_instance", fake_wait_for_instance)
+
+    @workflow_decorator
+    class BlockingWorkflow(Workflow):
+        async def run(self, _blocking: bool = True) -> str:
+            return "test"
+
+    instance = BlockingWorkflow()
+
+    # With _blocking=True (default), should wait and return result
+    result = asyncio.run(instance.run(_blocking=True))
+
+    assert result == expected_result
+    assert len(run_instance_calls) == 1
+    assert len(wait_for_instance_calls) == 1
+    assert wait_for_instance_calls[0] == expected_instance_id
+
+    os.environ["PYTEST_CURRENT_TEST"] = "true"
