@@ -162,6 +162,9 @@ We expect that you won't need to modify the following env parameters, but we pro
 | `RAPPEL_HTTP_ADDR` | HTTP bind address for `rappel-bridge` | `127.0.0.1:24117` | `0.0.0.0:24117` |
 | `RAPPEL_GRPC_ADDR` | gRPC bind address for `rappel-bridge` | HTTP port + 1 | `0.0.0.0:24118` |
 | `RAPPEL_BATCH_SIZE` | Max actions fetched per poll | `workers * concurrent_per_worker` | `200` |
+| `RAPPEL_GC_INTERVAL_MS` | Garbage collection interval (ms) | `none` (disabled) | `60000` |
+| `RAPPEL_GC_RETENTION_SECONDS` | Minimum age for completed/failed instances before cleanup | `86400` | `604800` |
+| `RAPPEL_GC_BATCH_SIZE` | Max instances cleaned per GC cycle | `100` | `500` |
 
 ### Worker Recycling
 
