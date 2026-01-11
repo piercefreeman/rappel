@@ -2113,3 +2113,70 @@ async fn loop_exception_workflow_continues_after_catch() -> Result<()> {
     harness.shutdown().await?;
     Ok(())
 }
+
+// =============================================================================
+// Parallel Workflow Helper Methods Test
+// =============================================================================
+
+const PARALLEL_FN_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_parallel_fn.py");
+
+const REGISTER_PARALLEL_FN_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_parallel_fn import ParallelFnWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ParallelFnWorkflow()
+    result = await wf.run(value=5)
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that asyncio.gather with workflow helper methods (not just actions) works.
+///
+/// With value=5:
+/// - helper_double(5) -> multiply(5, 2) = 10
+/// - helper_triple(5) -> multiply(5, 3) = 15
+/// - add(10, 15) = 25
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn parallel_fn_workflow_executes_helper_methods() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("integration_parallel_fn.py", PARALLEL_FN_WORKFLOW_MODULE),
+            ("register.py", REGISTER_PARALLEL_FN_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "parallelfnworkflow",
+        user_module: "integration_parallel_fn",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result: 5*2 + 5*3 = 10 + 15 = 25
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("25".to_string()),
+        "expected result 25 (5*2 + 5*3)"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
