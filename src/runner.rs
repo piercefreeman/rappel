@@ -53,6 +53,7 @@ use crate::{
     completion::{GuardResult, InlineContext, analyze_subgraph, execute_inline_subgraph},
     dag::{DAG, DAGConverter, DAGNode, EXCEPTION_SCOPE_VAR, EdgeType},
     dag_state::{DAGHelper, ExecutionMode, SuccessorInfo},
+    traversal::{get_traversal_successors, select_guarded_edges, LoopAwareTraversal},
     db::{
         ActionId, BackoffKind, CompletionRecord, Database, NewAction, QueuedAction, ScheduleId,
         WorkerStatusUpdate, WorkflowInstanceId, WorkflowVersionId,
@@ -2089,7 +2090,65 @@ impl DAGRunner {
                             handler_id = %handler_id,
                             "found exception handler on current node"
                         );
+                        // Initialize inline scope by gathering variables from multiple sources.
+                        // This is critical for exception handling inside for loops - we need:
+                        // 1. Loop variables (like __loop_loop_N_i) from the action's inbox
+                        // 2. Variables defined before the loop that the handler might use
+                        //
+                        // We gather from: the action's inbox, the handler's inbox, and
+                        // the exception handler's data flow predecessors.
                         let mut inline_scope: Scope = HashMap::new();
+
+                        // Read from action's inbox (has loop variables)
+                        let action_inbox = handler
+                            .db
+                            .read_inbox(instance_id, base_node_id)
+                            .await?;
+                        for (k, v) in action_inbox {
+                            inline_scope.insert(k, json_to_workflow_value(&v));
+                        }
+
+                        // Also read from the exception handler node's inbox
+                        // (may have variables via dataflow edges)
+                        let handler_inbox = handler
+                            .db
+                            .read_inbox(instance_id, &handler_id)
+                            .await?;
+                        for (k, v) in handler_inbox {
+                            inline_scope
+                                .entry(k)
+                                .or_insert_with(|| json_to_workflow_value(&v));
+                        }
+
+                        // Also try to get variables from data flow predecessors of the handler
+                        for edge in dag.edges.iter() {
+                            if edge.target == handler_id
+                                && edge.edge_type == EdgeType::DataFlow
+                            {
+                                if let Some(var_name) = &edge.variable {
+                                    if !inline_scope.contains_key(var_name) {
+                                        // Try to read this variable from the source node's inbox
+                                        let source_inbox = handler
+                                            .db
+                                            .read_inbox(instance_id, &edge.source)
+                                            .await?;
+                                        if let Some(value) = source_inbox.get(var_name) {
+                                            inline_scope.insert(
+                                                var_name.clone(),
+                                                json_to_workflow_value(value),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        debug!(
+                            node_id = %node_id,
+                            handler_id = %handler_id,
+                            inline_scope_keys = ?inline_scope.keys().collect::<Vec<_>>(),
+                            "initialized inline scope from multiple sources for exception handler"
+                        );
                         Self::process_exception_handler(
                             &handler_id,
                             exc_value,
@@ -2127,7 +2186,66 @@ impl DAGRunner {
                                 handler_id = %handler_id,
                                 "found exception handler on enclosing fn_call"
                             );
+                            // Initialize inline scope with variables from multiple sources.
+                            // This is critical for exception handling inside for loops where
+                            // we need:
+                            // 1. Loop variables (like __loop_loop_N_i) from the action's inbox
+                            // 2. Variables defined before the loop that the handler might use
+                            //
+                            // We gather from: the action's inbox, the handler's inbox, and
+                            // the exception handler's data flow predecessors.
                             let mut inline_scope: Scope = HashMap::new();
+
+                            // Read from action's inbox (has loop variables)
+                            let action_inbox = handler
+                                .db
+                                .read_inbox(instance_id, base_node_id)
+                                .await?;
+                            for (k, v) in action_inbox {
+                                inline_scope.insert(k, json_to_workflow_value(&v));
+                            }
+
+                            // Also read from the exception handler node's inbox
+                            // (may have variables via dataflow edges)
+                            let handler_inbox = handler
+                                .db
+                                .read_inbox(instance_id, &handler_id)
+                                .await?;
+                            for (k, v) in handler_inbox {
+                                inline_scope
+                                    .entry(k)
+                                    .or_insert_with(|| json_to_workflow_value(&v));
+                            }
+
+                            // Also try to get variables from data flow predecessors of the handler
+                            for edge in dag.edges.iter() {
+                                if edge.target == handler_id
+                                    && edge.edge_type == EdgeType::DataFlow
+                                {
+                                    if let Some(var_name) = &edge.variable {
+                                        if !inline_scope.contains_key(var_name) {
+                                            // Try to read this variable from the source node's inbox
+                                            let source_inbox = handler
+                                                .db
+                                                .read_inbox(instance_id, &edge.source)
+                                                .await?;
+                                            if let Some(value) = source_inbox.get(var_name) {
+                                                inline_scope.insert(
+                                                    var_name.clone(),
+                                                    json_to_workflow_value(value),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            debug!(
+                                fn_call_id = %fn_call_id,
+                                handler_id = %handler_id,
+                                inline_scope_keys = ?inline_scope.keys().collect::<Vec<_>>(),
+                                "initialized inline scope from multiple sources for exception handler"
+                            );
                             Self::process_exception_handler(
                                 &handler_id,
                                 exc_value,
@@ -2519,7 +2637,7 @@ impl DAGRunner {
         batch: &mut CompletionBatch,
         instance_id: WorkflowInstanceId,
         db: &Database,
-        condition_result: Option<bool>,
+        _condition_result: Option<bool>,
     ) -> RunnerResult<()> {
         // Check if result is an exception
         if let Some((exception_type, type_hierarchy)) = Self::is_exception_result(result) {
@@ -2612,30 +2730,36 @@ impl DAGRunner {
             inline_scope.insert(target.clone(), result.clone());
         }
 
-        // BFS work queue: (node_id, result to pass forward)
-        // This replaces recursive calls with an iterative loop
+        // BFS work queue: (node_id, result to pass forward, via_loop_back)
+        // This replaces recursive calls with an iterative loop.
+        // We use loop-aware traversal to properly handle for loops - when an exception
+        // is caught inside a loop, we need to follow loop-back edges to continue iteration.
         use std::collections::VecDeque;
 
-        let mut work_queue: VecDeque<(String, WorkflowValue)> = VecDeque::new();
+        let mut work_queue: VecDeque<(String, WorkflowValue, bool)> = VecDeque::new();
+        let mut traversal_state = LoopAwareTraversal::new();
 
         // Initialize queue with immediate successors from the starting node
+        // Use get_traversal_successors which includes loop-back edges (unlike get_ready_successors)
         let mut guard_errors = Vec::new();
-        let raw_successors = helper.get_ready_successors(node_id, condition_result);
-        let successor_ids: Vec<_> = raw_successors.iter().map(|s| &s.node_id).collect();
+        let raw_edges = get_traversal_successors(helper, node_id);
+        let edge_targets: Vec<_> = raw_edges.iter().map(|e| &e.target).collect();
         debug!(
             node_id = %node_id,
-            raw_successor_count = raw_successors.len(),
-            raw_successors = ?successor_ids,
-            "process_successors_with_condition: getting ready successors"
+            raw_edge_count = raw_edges.len(),
+            raw_edges = ?edge_targets,
+            "process_successors_with_condition: getting traversal successors (loop-aware)"
         );
-        for successor in
-            Self::filter_successors_with_guards(raw_successors, inline_scope, &mut guard_errors)
-        {
-            work_queue.push_back((successor.node_id, result.clone()));
+        for edge in select_guarded_edges(raw_edges, inline_scope, &mut guard_errors) {
+            work_queue.push_back((edge.target.clone(), result.clone(), edge.is_loop_back));
         }
 
-        // Process work queue iteratively (BFS)
-        while let Some((current_node_id, current_result)) = work_queue.pop_front() {
+        // Process work queue iteratively (BFS) with loop-aware visited tracking
+        while let Some((current_node_id, current_result, via_loop_back)) = work_queue.pop_front() {
+            // Check if we should visit this node (handles loop iteration limits)
+            if !traversal_state.should_visit(&current_node_id, via_loop_back) {
+                continue;
+            }
             let succ_node = match dag.nodes.get(&current_node_id) {
                 Some(n) => n,
                 None => continue,
@@ -2690,6 +2814,12 @@ impl DAGRunner {
                         "executed inline node"
                     );
 
+                    // Update inline scope with the result (so subsequent nodes see the updated value)
+                    // This is critical for loop increments and assignments to work correctly
+                    if let Some(ref target) = succ_node.target {
+                        inline_scope.insert(target.clone(), inline_result.clone());
+                    }
+
                     // Collect inbox writes for inline node's result
                     if let Some(ref target) = succ_node.target {
                         Self::collect_inbox_writes_for_node(
@@ -2711,13 +2841,19 @@ impl DAGRunner {
                     };
 
                     // Add successors to work queue (instead of recursive call)
+                    // Use loop-aware traversal to properly follow loop-back edges
                     let mut guard_errors = Vec::new();
-                    for successor in Self::filter_successors_with_guards(
-                        helper.get_ready_successors(&current_node_id, None),
-                        inline_scope,
-                        &mut guard_errors,
-                    ) {
-                        work_queue.push_back((successor.node_id, passthrough_result.clone()));
+                    let successor_edges = get_traversal_successors(helper, &current_node_id);
+                    for edge in select_guarded_edges(successor_edges, inline_scope, &mut guard_errors)
+                    {
+                        // Propagate loop-back context: if we're already in a loop-back context
+                        // OR this edge is a loop-back edge, mark the successor accordingly
+                        let successor_via_loop_back = via_loop_back || edge.is_loop_back;
+                        work_queue.push_back((
+                            edge.target.clone(),
+                            passthrough_result.clone(),
+                            successor_via_loop_back,
+                        ));
                     }
                 }
                 ExecutionMode::Delegated => {
@@ -2813,6 +2949,26 @@ impl DAGRunner {
                 let inline_result = Self::execute_inline_node(handler_node, inline_scope)?;
                 if let Some(ref target) = handler_node.target {
                     inline_scope.insert(target.clone(), inline_result.clone());
+
+                    // CRITICAL: Persist the updated variable to the database.
+                    // Exception handler assignments don't have DataFlow edges to downstream consumers,
+                    // so we need to find ALL nodes that have DataFlow edges for this variable
+                    // (from any source) and write the updated value to their inboxes.
+                    // This ensures that when the completion handler runs later, it sees the updated value.
+                    for edge in dag.edges.iter() {
+                        if edge.edge_type == EdgeType::DataFlow
+                            && edge.variable.as_deref() == Some(target)
+                        {
+                            batch.inbox_writes.push(InboxWrite {
+                                instance_id,
+                                target_node_id: edge.target.clone(),
+                                variable_name: target.clone(),
+                                value: inline_result.clone(),
+                                source_node_id: handler_node_id.to_string(),
+                                spread_index: None,
+                            });
+                        }
+                    }
                 }
                 if is_binding {
                     inline_scope.remove(EXCEPTION_SCOPE_VAR);

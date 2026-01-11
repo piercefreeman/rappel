@@ -36,6 +36,7 @@ pub mod schedule;
 pub mod server_client;
 pub mod server_webapp;
 pub mod server_worker;
+pub mod traversal;
 pub mod value;
 pub mod worker;
 
@@ -96,3 +97,10 @@ pub use server_webapp::WebappServer;
 
 // Schedule utilities
 pub use schedule::{next_cron_run, next_interval_run, validate_cron};
+
+// Traversal (shared DAG traversal logic)
+pub use traversal::{
+    LoopAwareTraversal, TraversalEdge, TraversalQueue, WorkQueueEntry,
+    evaluate_guard as traversal_evaluate_guard, get_traversal_successors, select_guarded_edges,
+    InlineScope as TraversalScope, MAX_LOOP_ITERATIONS,
+};

@@ -2001,3 +2001,116 @@ async fn durable_sleep_workflow_executes() -> Result<()> {
     harness.shutdown().await?;
     Ok(())
 }
+
+// =============================================================================
+// Loop Exception Handling Test (Bug Reproduction)
+// =============================================================================
+
+const LOOP_EXCEPTION_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_loop_exception.py");
+
+const REGISTER_LOOP_EXCEPTION_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_loop_exception import LoopExceptionWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = LoopExceptionWorkflow()
+    result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that exception handling inside a for loop allows the loop to continue.
+///
+/// This is a regression test for a bug where:
+/// 1. An action inside a for loop raises an exception
+/// 2. The exception is caught by a try-except block
+/// 3. The exception handler runs (inline assignment)
+/// 4. BUG: The loop-back edge is not followed, causing the workflow to stall
+///
+/// Expected: Process ["good1", "bad", "good2"]
+/// - "good1" succeeds
+/// - "bad" fails, exception caught, error_count incremented
+/// - "good2" succeeds (this is the part that fails with the bug)
+/// - Returns {"results": ["processed:good1", "processed:good2"], "errors": 1}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn loop_exception_workflow_continues_after_catch() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_loop_exception.py",
+                LOOP_EXCEPTION_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_LOOP_EXCEPTION_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "loopexceptionworkflow",
+        user_module: "integration_loop_exception",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Execute all actions via the DAGRunner
+    // If the bug is present, this will stall after the first exception is caught
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    // Verify the workflow result
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let arguments = proto::WorkflowArguments::decode(&stored_payload[..])?;
+    let result_value = arguments
+        .arguments
+        .iter()
+        .find(|arg| arg.key == "result")
+        .and_then(|arg| arg.value.as_ref())
+        .map(proto_value_to_json)
+        .ok_or_else(|| anyhow::anyhow!("missing result value"))?;
+    let json_obj = result_value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("result is not an object: {result_value}"))?;
+
+    // Verify error_count is 1 (one exception was caught)
+    assert_eq!(
+        json_obj.get("errors"),
+        Some(&serde_json::Value::Number(1.into())),
+        "expected 1 error to be counted"
+    );
+
+    // Verify results contains both successful items
+    let results = json_obj
+        .get("results")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("missing results array"))?;
+    assert_eq!(
+        results.len(),
+        2,
+        "expected 2 successful results, got {}: {:?}",
+        results.len(),
+        results
+    );
+    assert_eq!(
+        results[0],
+        serde_json::Value::String("processed:good1".to_string())
+    );
+    assert_eq!(
+        results[1],
+        serde_json::Value::String("processed:good2".to_string())
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
