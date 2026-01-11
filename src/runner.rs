@@ -53,7 +53,6 @@ use crate::{
     completion::{GuardResult, InlineContext, analyze_subgraph, execute_inline_subgraph},
     dag::{DAG, DAGConverter, DAGNode, EXCEPTION_SCOPE_VAR, EdgeType},
     dag_state::{DAGHelper, ExecutionMode, SuccessorInfo},
-    traversal::{get_traversal_successors, select_guarded_edges, LoopAwareTraversal},
     db::{
         ActionId, BackoffKind, CompletionRecord, Database, NewAction, QueuedAction, ScheduleId,
         WorkerStatusUpdate, WorkflowInstanceId, WorkflowVersionId,
@@ -61,6 +60,7 @@ use crate::{
     messages::proto,
     parser::ast,
     schedule::{apply_jitter, next_cron_run, next_interval_run},
+    traversal::{LoopAwareTraversal, get_traversal_successors, select_guarded_edges},
     value::WorkflowValue,
     worker::{ActionDispatchPayload, PythonWorkerPool, RoundTripMetrics, WorkerThroughputSnapshot},
 };
@@ -2100,20 +2100,14 @@ impl DAGRunner {
                         let mut inline_scope: Scope = HashMap::new();
 
                         // Read from action's inbox (has loop variables)
-                        let action_inbox = handler
-                            .db
-                            .read_inbox(instance_id, base_node_id)
-                            .await?;
+                        let action_inbox = handler.db.read_inbox(instance_id, base_node_id).await?;
                         for (k, v) in action_inbox {
                             inline_scope.insert(k, json_to_workflow_value(&v));
                         }
 
                         // Also read from the exception handler node's inbox
                         // (may have variables via dataflow edges)
-                        let handler_inbox = handler
-                            .db
-                            .read_inbox(instance_id, &handler_id)
-                            .await?;
+                        let handler_inbox = handler.db.read_inbox(instance_id, &handler_id).await?;
                         for (k, v) in handler_inbox {
                             inline_scope
                                 .entry(k)
@@ -2124,21 +2118,15 @@ impl DAGRunner {
                         for edge in dag.edges.iter() {
                             if edge.target == handler_id
                                 && edge.edge_type == EdgeType::DataFlow
+                                && let Some(var_name) = &edge.variable
+                                && !inline_scope.contains_key(var_name)
                             {
-                                if let Some(var_name) = &edge.variable {
-                                    if !inline_scope.contains_key(var_name) {
-                                        // Try to read this variable from the source node's inbox
-                                        let source_inbox = handler
-                                            .db
-                                            .read_inbox(instance_id, &edge.source)
-                                            .await?;
-                                        if let Some(value) = source_inbox.get(var_name) {
-                                            inline_scope.insert(
-                                                var_name.clone(),
-                                                json_to_workflow_value(value),
-                                            );
-                                        }
-                                    }
+                                // Try to read this variable from the source node's inbox
+                                let source_inbox =
+                                    handler.db.read_inbox(instance_id, &edge.source).await?;
+                                if let Some(value) = source_inbox.get(var_name) {
+                                    inline_scope
+                                        .insert(var_name.clone(), json_to_workflow_value(value));
                                 }
                             }
                         }
@@ -2197,20 +2185,16 @@ impl DAGRunner {
                             let mut inline_scope: Scope = HashMap::new();
 
                             // Read from action's inbox (has loop variables)
-                            let action_inbox = handler
-                                .db
-                                .read_inbox(instance_id, base_node_id)
-                                .await?;
+                            let action_inbox =
+                                handler.db.read_inbox(instance_id, base_node_id).await?;
                             for (k, v) in action_inbox {
                                 inline_scope.insert(k, json_to_workflow_value(&v));
                             }
 
                             // Also read from the exception handler node's inbox
                             // (may have variables via dataflow edges)
-                            let handler_inbox = handler
-                                .db
-                                .read_inbox(instance_id, &handler_id)
-                                .await?;
+                            let handler_inbox =
+                                handler.db.read_inbox(instance_id, &handler_id).await?;
                             for (k, v) in handler_inbox {
                                 inline_scope
                                     .entry(k)
@@ -2221,21 +2205,17 @@ impl DAGRunner {
                             for edge in dag.edges.iter() {
                                 if edge.target == handler_id
                                     && edge.edge_type == EdgeType::DataFlow
+                                    && let Some(var_name) = &edge.variable
+                                    && !inline_scope.contains_key(var_name)
                                 {
-                                    if let Some(var_name) = &edge.variable {
-                                        if !inline_scope.contains_key(var_name) {
-                                            // Try to read this variable from the source node's inbox
-                                            let source_inbox = handler
-                                                .db
-                                                .read_inbox(instance_id, &edge.source)
-                                                .await?;
-                                            if let Some(value) = source_inbox.get(var_name) {
-                                                inline_scope.insert(
-                                                    var_name.clone(),
-                                                    json_to_workflow_value(value),
-                                                );
-                                            }
-                                        }
+                                    // Try to read this variable from the source node's inbox
+                                    let source_inbox =
+                                        handler.db.read_inbox(instance_id, &edge.source).await?;
+                                    if let Some(value) = source_inbox.get(var_name) {
+                                        inline_scope.insert(
+                                            var_name.clone(),
+                                            json_to_workflow_value(value),
+                                        );
                                     }
                                 }
                             }
@@ -2844,7 +2824,8 @@ impl DAGRunner {
                     // Use loop-aware traversal to properly follow loop-back edges
                     let mut guard_errors = Vec::new();
                     let successor_edges = get_traversal_successors(helper, &current_node_id);
-                    for edge in select_guarded_edges(successor_edges, inline_scope, &mut guard_errors)
+                    for edge in
+                        select_guarded_edges(successor_edges, inline_scope, &mut guard_errors)
                     {
                         // Propagate loop-back context: if we're already in a loop-back context
                         // OR this edge is a loop-back edge, mark the successor accordingly

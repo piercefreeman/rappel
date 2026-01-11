@@ -2006,8 +2006,7 @@ async fn durable_sleep_workflow_executes() -> Result<()> {
 // Loop Exception Handling Test (Bug Reproduction)
 // =============================================================================
 
-const LOOP_EXCEPTION_WORKFLOW_MODULE: &str =
-    include_str!("fixtures/integration_loop_exception.py");
+const LOOP_EXCEPTION_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_loop_exception.py");
 
 const REGISTER_LOOP_EXCEPTION_SCRIPT: &str = r#"
 import asyncio

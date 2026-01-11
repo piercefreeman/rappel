@@ -100,7 +100,7 @@ pub use schedule::{next_cron_run, next_interval_run, validate_cron};
 
 // Traversal (shared DAG traversal logic)
 pub use traversal::{
-    LoopAwareTraversal, TraversalEdge, TraversalQueue, WorkQueueEntry,
-    evaluate_guard as traversal_evaluate_guard, get_traversal_successors, select_guarded_edges,
-    InlineScope as TraversalScope, MAX_LOOP_ITERATIONS,
+    InlineScope as TraversalScope, LoopAwareTraversal, MAX_LOOP_ITERATIONS, TraversalEdge,
+    TraversalQueue, WorkQueueEntry, evaluate_guard as traversal_evaluate_guard,
+    get_traversal_successors, select_guarded_edges,
 };

@@ -161,7 +161,10 @@ pub fn select_guarded_edges(
 /// - Excludes exception edges (handled separately)
 ///
 /// The returned edges preserve the `is_loop_back` flag for proper tracking.
-pub fn get_traversal_successors<'a>(helper: &'a DAGHelper<'a>, node_id: &str) -> Vec<TraversalEdge> {
+pub fn get_traversal_successors<'a>(
+    helper: &'a DAGHelper<'a>,
+    node_id: &str,
+) -> Vec<TraversalEdge> {
     helper
         .get_state_machine_successors(node_id)
         .into_iter()
