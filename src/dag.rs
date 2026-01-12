@@ -1304,6 +1304,17 @@ impl DAGConverter {
                 }
             }
 
+            if let Some(ref spread_expr) = node.spread_collection_expr {
+                if Self::expr_uses_var(spread_expr, var_name) {
+                    tracing::trace!(
+                        node_id = %node.id,
+                        var_name = %var_name,
+                        "uses_var: found in spread_collection_expr"
+                    );
+                    return true;
+                }
+            }
+
             false
         };
 
@@ -4084,6 +4095,38 @@ fn main(input: [], output: [result]):
         // Should have aggregator node
         let node_types: HashSet<_> = dag.nodes.values().map(|n| n.node_type.as_str()).collect();
         assert!(node_types.contains("aggregator"));
+    }
+
+    #[test]
+    fn test_spread_collection_expr_creates_dataflow_edge() {
+        let source = r#"fn main(input: [], output: [results]):
+    items = @fetch_items()
+    results = spread items:item -> @process_item(item=item)
+    return results"#;
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program).unwrap();
+
+        let items_node = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("fetch_items"))
+            .expect("Should have fetch_items action");
+        let spread_node = dag
+            .nodes
+            .values()
+            .find(|n| n.is_spread && n.action_name.as_deref() == Some("process_item"))
+            .expect("Should have process_item spread action");
+
+        let has_dataflow = dag.edges.iter().any(|edge| {
+            edge.edge_type == EdgeType::DataFlow
+                && edge.source == items_node.id
+                && edge.target == spread_node.id
+                && edge.variable.as_deref() == Some("items")
+        });
+        assert!(
+            has_dataflow,
+            "Expected data flow from items action to spread collection"
+        );
     }
 
     #[test]

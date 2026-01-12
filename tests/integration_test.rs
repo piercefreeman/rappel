@@ -34,6 +34,8 @@ const EXCEPTION_METADATA_WORKFLOW_MODULE: &str =
 const SPREAD_FROM_ACTION_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_spread_from_action.py");
 const SPREAD_LOOP_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_spread_loop.py");
+const SPREAD_HELPER_INPUT_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_spread_helper_input.py");
 const ERROR_HANDLING_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_error_handling.py");
 const EXCEPTION_WITH_SUCCESS_FAILURE_SCRIPT: &str = r#"
 import asyncio
@@ -130,6 +132,20 @@ async def main():
     os.environ.pop("PYTEST_CURRENT_TEST", None)
     wf = SpreadLoopWorkflow()
     result = await wf.run(items=[1, 2])
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_SPREAD_HELPER_INPUT_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_spread_helper_input import SpreadHelperInputWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = SpreadHelperInputWorkflow()
+    result = await wf.run()
     print(f"Registration result: {result}")
 
 asyncio.run(main())
@@ -2309,6 +2325,49 @@ async fn spread_in_loop_executes() -> Result<()> {
 
     assert_eq!(parsed.get("totals"), Some(&json!([3, 5])));
     assert_eq!(parsed.get("empties"), Some(&json!([0, 0])));
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test spread collection that relies on a helper input from an upstream action.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn spread_helper_input_from_action_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_spread_helper_input.py",
+                SPREAD_HELPER_INPUT_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_SPREAD_HELPER_INPUT_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "spreadhelperinputworkflow",
+        user_module: "integration_spread_helper_input",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("processed:a,processed:b".to_string()),
+        "unexpected workflow result"
+    );
 
     harness.shutdown().await?;
     Ok(())
