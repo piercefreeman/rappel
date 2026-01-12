@@ -538,6 +538,12 @@ pub enum CompletionError {
     #[error("Missing spread metadata")]
     MissingSpreadMetadata,
 
+    #[error("Evaluation error: {0}")]
+    Evaluation(String),
+
+    #[error("Expression evaluation error: {0}")]
+    EvaluationError(#[from] EvaluationError),
+
     #[error("JSON serialization error: {0}")]
     JsonError(#[from] serde_json::Error),
 
@@ -896,8 +902,24 @@ pub fn execute_inline_subgraph(
                         frontier_node_id = %frontier.node_id,
                         inline_scope_keys = ?inline_scope.keys().collect::<Vec<_>>(),
                         action_inbox_keys = ?action_inbox.keys().collect::<Vec<_>>(),
+                        is_spread = frontier_node.is_spread,
                         "building action dispatch payload"
                     );
+
+                    // Handle spread nodes specially - they need to evaluate the collection
+                    // and create multiple actions (or none if empty)
+                    if frontier_node.is_spread {
+                        handle_spread_frontier(
+                            frontier_node,
+                            frontier,
+                            &action_inbox,
+                            instance_id,
+                            completed_node_id,
+                            dag,
+                            &mut plan,
+                        )?;
+                        continue;
+                    }
 
                     // Write action_inbox variables to the action's inbox in DB.
                     // This ensures variables are available when the action completes
@@ -1403,6 +1425,266 @@ fn merge_data_flow_into_inbox(
             }
         }
     }
+}
+
+/// Handle a spread node frontier by evaluating the collection and creating
+/// appropriate actions (or none if empty).
+///
+/// For spread nodes, we need to:
+/// 1. Evaluate the spread collection expression to get the items
+/// 2. If empty: inline the aggregator completion and trigger its successors directly
+/// 3. If non-empty: create N actions (one per item) with spread_index tracking
+fn handle_spread_frontier(
+    frontier_node: &DAGNode,
+    frontier: &FrontierNode,
+    action_inbox: &HashMap<String, WorkflowValue>,
+    instance_id: WorkflowInstanceId,
+    _completed_node_id: &str,
+    dag: &DAG,
+    plan: &mut CompletionPlan,
+) -> Result<(), CompletionError> {
+    // Get spread metadata from the node
+    let loop_var = frontier_node
+        .spread_loop_var
+        .as_ref()
+        .ok_or_else(|| CompletionError::Evaluation("Spread node missing loop_var".to_string()))?;
+
+    let collection_expr = frontier_node
+        .spread_collection_expr
+        .as_ref()
+        .ok_or_else(|| {
+            CompletionError::Evaluation("Spread node missing collection expression".to_string())
+        })?;
+
+    // Evaluate the collection expression
+    let collection = ExpressionEvaluator::evaluate(collection_expr, action_inbox)?;
+
+    let items = match &collection {
+        WorkflowValue::List(arr) | WorkflowValue::Tuple(arr) => arr.clone(),
+        _ => {
+            return Err(CompletionError::Evaluation(format!(
+                "Spread collection is not a list or tuple: {:?}",
+                collection
+            )));
+        }
+    };
+
+    debug!(
+        frontier_node_id = %frontier.node_id,
+        loop_var = %loop_var,
+        item_count = items.len(),
+        "expanding spread frontier"
+    );
+
+    // Get the aggregator node ID
+    let aggregator_id = frontier_node.aggregates_to.as_ref().ok_or_else(|| {
+        CompletionError::Evaluation("Spread node missing aggregates_to".to_string())
+    })?;
+
+    // Get the result variable name for the aggregator
+    let result_var = frontier_node
+        .target
+        .clone()
+        .unwrap_or_else(|| "_spread_result".to_string());
+
+    if items.is_empty() {
+        // Empty collection - no actions to create.
+        // Instead of enqueueing the aggregator as a barrier, we inline its completion
+        // by finding its downstream frontiers and adding them directly to the plan.
+        // This treats empty spread + aggregator as a single inline passthrough.
+
+        let helper = DAGHelper::new(dag);
+
+        // Write the empty result to the aggregator's inbox (for data flow)
+        plan.inbox_writes.push(InboxWrite {
+            instance_id,
+            target_node_id: aggregator_id.clone(),
+            variable_name: result_var.clone(),
+            value: WorkflowValue::List(vec![]),
+            source_node_id: frontier.node_id.clone(),
+            spread_index: None,
+        });
+
+        // Also add the empty result to inline scope for downstream data flow
+        // The aggregator's target variables need to be available to successors
+        if let Some(agg_node) = dag.nodes.get(aggregator_id) {
+            // Write the aggregated result to successor nodes via DataFlow edges
+            let empty_result = WorkflowValue::List(vec![]);
+            let writes = collect_data_flow_writes(
+                aggregator_id,
+                &{
+                    let mut scope = HashMap::new();
+                    scope.insert(result_var.clone(), empty_result.clone());
+                    // Also add under the aggregator's target names if different
+                    if let Some(ref targets) = agg_node.targets {
+                        for target in targets {
+                            scope.insert(target.clone(), empty_result.clone());
+                        }
+                    }
+                    if let Some(ref target) = agg_node.target {
+                        scope.insert(target.clone(), empty_result.clone());
+                    }
+                    scope
+                },
+                dag,
+                instance_id,
+            );
+            plan.inbox_writes.extend(writes);
+        }
+
+        // Find the aggregator's downstream frontiers
+        let subgraph = analyze_subgraph(aggregator_id, dag, &helper);
+
+        info!(
+            frontier_node_id = %frontier.node_id,
+            aggregator_id = %aggregator_id,
+            downstream_frontiers = subgraph.frontier_nodes.len(),
+            inline_nodes = subgraph.inline_nodes.len(),
+            "spread has empty collection, inlining aggregator completion"
+        );
+
+        // Add ReadinessIncrements for the aggregator's downstream frontiers
+        for downstream_frontier in &subgraph.frontier_nodes {
+            let downstream_node = match dag.nodes.get(&downstream_frontier.node_id) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            // Collect DataFlow writes from aggregator to this frontier
+            let empty_scope: HashMap<String, WorkflowValue> = {
+                let mut scope = HashMap::new();
+                scope.insert(result_var.clone(), WorkflowValue::List(vec![]));
+                if let Some(agg_node) = dag.nodes.get(aggregator_id) {
+                    if let Some(ref targets) = agg_node.targets {
+                        for target in targets {
+                            scope.insert(target.clone(), WorkflowValue::List(vec![]));
+                        }
+                    }
+                    if let Some(ref target) = agg_node.target {
+                        scope.insert(target.clone(), WorkflowValue::List(vec![]));
+                    }
+                }
+                scope
+            };
+            let writes = collect_data_flow_writes(
+                &downstream_frontier.node_id,
+                &empty_scope,
+                dag,
+                instance_id,
+            );
+            plan.inbox_writes.extend(writes);
+
+            match downstream_frontier.category {
+                FrontierCategory::Action => {
+                    // For action frontiers, we need to build dispatch payload
+                    // But we don't have the full inbox - this is a simplified path
+                    let policies = extract_policies_from_node(downstream_node);
+                    plan.readiness_increments.push(ReadinessIncrement {
+                        node_id: downstream_frontier.node_id.clone(),
+                        required_count: downstream_frontier.required_count,
+                        node_type: NodeType::Action,
+                        module_name: downstream_node.module_name.clone(),
+                        action_name: downstream_node.action_name.clone(),
+                        dispatch_payload: None, // Will be built when action is ready
+                        scheduled_at: None,
+                        timeout_seconds: policies.timeout_seconds,
+                        max_retries: policies.max_retries,
+                        backoff_kind: policies.backoff_kind,
+                        backoff_base_delay_ms: policies.backoff_base_delay_ms,
+                    });
+                }
+                FrontierCategory::Barrier => {
+                    plan.readiness_increments.push(ReadinessIncrement {
+                        node_id: downstream_frontier.node_id.clone(),
+                        required_count: downstream_frontier.required_count,
+                        node_type: NodeType::Barrier,
+                        module_name: None,
+                        action_name: None,
+                        dispatch_payload: None,
+                        scheduled_at: None,
+                        timeout_seconds: 300,
+                        max_retries: 0,
+                        backoff_kind: crate::db::BackoffKind::None,
+                        backoff_base_delay_ms: 0,
+                    });
+                }
+                FrontierCategory::Output => {
+                    // Output node reached - workflow should complete
+                    // The output handling will be done by the normal completion logic
+                    plan.readiness_increments.push(ReadinessIncrement {
+                        node_id: downstream_frontier.node_id.clone(),
+                        required_count: downstream_frontier.required_count,
+                        node_type: NodeType::Barrier, // Outputs are treated as barriers
+                        module_name: None,
+                        action_name: None,
+                        dispatch_payload: None,
+                        scheduled_at: None,
+                        timeout_seconds: 300,
+                        max_retries: 0,
+                        backoff_kind: crate::db::BackoffKind::None,
+                        backoff_base_delay_ms: 0,
+                    });
+                }
+            }
+        }
+
+        return Ok(());
+    }
+
+    // Non-empty collection - create actions for each item
+    let item_count = items.len();
+    let policies = extract_policies_from_node(frontier_node);
+
+    // Reset readiness for the frontier node if required_count=1
+    // (same logic as regular actions for loop re-triggering)
+    if frontier.required_count == 1 {
+        plan.readiness_resets.push(frontier.node_id.clone());
+    }
+
+    for (idx, item) in items.into_iter().enumerate() {
+        // Create modified inbox with the loop variable bound to this item
+        let mut iteration_inbox = action_inbox.clone();
+        iteration_inbox.insert(loop_var.clone(), item);
+
+        // Build dispatch payload for this iteration
+        let dispatch_payload = build_action_payload(frontier_node, &iteration_inbox)?;
+
+        // Create node_id that includes the spread index for tracking
+        let spread_node_id = format!("{}[{}]", frontier.node_id, idx);
+
+        plan.readiness_increments.push(ReadinessIncrement {
+            node_id: spread_node_id,
+            required_count: 1, // Each spread item is triggered by the spread node being ready
+            node_type: NodeType::Action,
+            module_name: frontier_node.module_name.clone(),
+            action_name: frontier_node.action_name.clone(),
+            dispatch_payload: Some(dispatch_payload),
+            scheduled_at: None,
+            timeout_seconds: policies.timeout_seconds,
+            max_retries: policies.max_retries,
+            backoff_kind: policies.backoff_kind,
+            backoff_base_delay_ms: policies.backoff_base_delay_ms,
+        });
+    }
+
+    // Initialize the aggregator's required_count based on the number of items
+    // This is done by adding a special readiness increment for the aggregator
+    // The aggregator will become ready when all spread actions complete
+    plan.readiness_increments.push(ReadinessIncrement {
+        node_id: aggregator_id.clone(),
+        required_count: item_count as i32,
+        node_type: NodeType::Barrier,
+        module_name: None,
+        action_name: None,
+        dispatch_payload: None,
+        scheduled_at: None,
+        timeout_seconds: 300,
+        max_retries: 0,
+        backoff_kind: crate::db::BackoffKind::None,
+        backoff_base_delay_ms: 0,
+    });
+
+    Ok(())
 }
 
 /// Build action dispatch payload from node kwargs and inbox.

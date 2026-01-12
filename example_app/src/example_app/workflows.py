@@ -957,6 +957,72 @@ class LoopExceptionWorkflow(Workflow):
 
 
 # =============================================================================
+# Actions - Spread Empty Collection Workflow
+# =============================================================================
+
+
+class SpreadEmptyResult(BaseModel):
+    """Final result from the spread empty collection workflow."""
+
+    items_processed: int
+    message: str
+
+
+class SpreadEmptyRequest(BaseModel):
+    items: list[str] = Field(
+        description="Items to process. Use empty list [] to test empty spread."
+    )
+
+
+@action
+async def process_spread_item(item: str) -> str:
+    """Process a single item in the spread."""
+    await asyncio.sleep(0.05)
+    return f"processed:{item}"
+
+
+@action
+async def build_spread_empty_result(
+    results: list[str],
+) -> SpreadEmptyResult:
+    """Build the final result."""
+    count = len(results)
+    if count == 0:
+        message = "No items to process - empty spread handled correctly!"
+    else:
+        message = f"Processed {count} items: {', '.join(results)}"
+    return SpreadEmptyResult(
+        items_processed=count,
+        message=message,
+    )
+
+
+@workflow
+class SpreadEmptyCollectionWorkflow(Workflow):
+    """
+    Demonstrates spread (parallel execution) over potentially empty collections.
+
+    This workflow tests the scenario where asyncio.gather spreads over
+    a collection that may be empty.
+
+    The key test cases:
+    - items=["a", "b", "c"] - Normal case with items
+    - items=[] - Empty collection, should handle gracefully with no actions
+
+    Before the fix, spreading over an empty collection would incorrectly
+    dispatch actions. After the fix, empty spreads are handled correctly.
+    """
+
+    async def run(self, items: list[str]) -> SpreadEmptyResult:
+        # Spread over items - may be empty!
+        results = await asyncio.gather(
+            *[process_spread_item(item=item) for item in items]
+        )
+
+        return await build_spread_empty_result(results=results)
+
+
+# =============================================================================
 # Legacy alias for backwards compatibility
 # =============================================================================
 

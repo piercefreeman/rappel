@@ -320,9 +320,26 @@
       <div class="result" id="early-return-result" hidden></div>
     </section>
 
+    <!-- Spread Empty Collection -->
+    <section class="workflow-section">
+      <h3>12. Spread Over Empty Collection</h3>
+      <p>
+        Tests spread (asyncio.gather) over collections that may be empty.
+        Enter comma-separated items, or leave empty to test empty spread handling.
+      </p>
+      <form id="spread-empty-form">
+        <label for="spread-empty-items">Items:</label>
+        <input type="text" id="spread-empty-items" name="items" value="apple, banana, cherry" style="width: 16rem;" />
+        <button type="submit">Run Spread</button>
+      </form>
+      <div class="hint">Try: "apple, banana" (normal) or clear the field for empty spread test</div>
+      <div class="status" id="spread-empty-status"></div>
+      <div class="result" id="spread-empty-result" hidden></div>
+    </section>
+
     <!-- Kw-only Inputs -->
     <section class="workflow-section">
-      <h3>12. Kw-only Inputs</h3>
+      <h3>13. Kw-only Inputs</h3>
       <p>
         Demonstrates keyword-only workflow inputs flowing into a request model.
         Leave fields empty to use defaults.
@@ -340,7 +357,7 @@
 
     <!-- Undefined Variable Validation -->
     <section class="workflow-section">
-      <h3>13. Undefined Variable Validation</h3>
+      <h3>14. Undefined Variable Validation</h3>
       <p>
         This workflow intentionally references a module-level variable to show
         IR validation errors before execution.
@@ -357,7 +374,7 @@
 
     <!-- Scheduled Workflows -->
     <section class="workflow-section">
-      <h3>14. Scheduled Workflows</h3>
+      <h3>15. Scheduled Workflows</h3>
       <p>
         Register a workflow to run automatically on a cron schedule or at fixed intervals.
         Schedules persist across server restarts.
@@ -576,7 +593,20 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
-      // 12. Kw-only Inputs
+      // 12. Spread Empty Collection
+      runWorkflow(
+        "spread-empty-form",
+        "/api/spread-empty",
+        (form) => {
+          const raw = form.querySelector("#spread-empty-items").value;
+          const items = raw.split(",").map((s) => s.trim()).filter(Boolean);
+          // Allow empty items array to test empty spread
+          return { items };
+        },
+        (data) => JSON.stringify(data, null, 2)
+      );
+
+      // 13. Kw-only Inputs
       runWorkflow(
         "kw-only-form",
         "/api/kw-only",
@@ -592,7 +622,7 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
-      // 13. Undefined Variable Validation
+      // 14. Undefined Variable Validation
       runWorkflow(
         "undefined-variable-form",
         "/api/undefined-variable",
@@ -604,7 +634,7 @@
       );
 
 
-      // 14. Schedule - toggle between cron and interval inputs
+      // 15. Schedule - toggle between cron and interval inputs
       const scheduleTypeSelect = document.getElementById("schedule-type");
       const intervalInput = document.getElementById("schedule-interval");
       const cronInput = document.getElementById("schedule-cron");
@@ -619,7 +649,7 @@
         }
       });
 
-      // 14. Schedule - register schedule
+      // 15. Schedule - register schedule
       runWorkflow(
         "schedule-form",
         "/api/schedule",
@@ -643,7 +673,7 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
-      // 14. Schedule actions - pause, resume, delete
+      // 15. Schedule actions - pause, resume, delete
       async function scheduleAction(endpoint, action) {
         const workflow_name = document.getElementById("action-workflow").value;
         const status = document.getElementById("schedule-action-status");

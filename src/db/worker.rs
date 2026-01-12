@@ -1544,8 +1544,10 @@ impl Database {
                 )));
             }
 
+            let is_immediately_ready = completed_count == required_count;
+
             // If this increment made the node ready, enqueue it
-            if completed_count == required_count {
+            if is_immediately_ready {
                 // Get the next action_seq for this instance
                 let seq_row = sqlx::query(
                     r#"

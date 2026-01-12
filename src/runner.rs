@@ -1124,6 +1124,9 @@ struct NodeActionResult {
     /// If this is a spread node, the aggregator node ID and expected count
     /// that needs readiness initialization.
     pub readiness_init: Option<ReadinessInit>,
+    /// For empty spreads, the aggregator node ID that needs immediate completion.
+    /// When set, the aggregator should be triggered as if the spread completed with empty results.
+    pub empty_spread_aggregator: Option<String>,
 }
 
 /// Info needed to initialize readiness tracking for an aggregator node.
@@ -3297,6 +3300,7 @@ impl DAGRunner {
         // Find first delegated successors starting from input node
         let mut actions_to_enqueue = Vec::new();
         let mut readiness_inits: Vec<ReadinessInit> = Vec::new();
+        let mut empty_spread_aggregators: Vec<String> = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let mut queue = std::collections::VecDeque::new();
         let mut completion_payload: Option<Vec<u8>> = None;
@@ -3386,6 +3390,10 @@ impl DAGRunner {
                         // Collect readiness init for spread aggregators
                         if let Some(init) = result.readiness_init {
                             readiness_inits.push(init);
+                        }
+                        // Collect empty spread aggregators for immediate completion
+                        if let Some(agg_id) = result.empty_spread_aggregator {
+                            empty_spread_aggregators.push(agg_id);
                         }
                         // Don't traverse past delegated nodes - they'll handle their successors
                     }
@@ -3528,6 +3536,32 @@ impl DAGRunner {
             db.enqueue_action(action).await?;
         }
 
+        // Handle empty spread aggregators - these need to be triggered immediately
+        // since there are no spread actions that will complete and trigger them.
+        // We enqueue them directly as barriers without using readiness tracking.
+        for agg_id in empty_spread_aggregators {
+            info!(
+                instance_id = %instance_id.0,
+                aggregator_id = %agg_id,
+                "enqueueing empty spread aggregator for immediate completion"
+            );
+            // Enqueue the aggregator as a barrier directly - no readiness tracking needed
+            // since there are no spread actions to wait for.
+            let barrier_action = NewAction {
+                instance_id,
+                module_name: "".to_string(),
+                action_name: "".to_string(),
+                dispatch_payload: Vec::new(),
+                timeout_seconds: 300,
+                max_retries: 0,
+                backoff_kind: BackoffKind::None,
+                backoff_base_delay_ms: 0,
+                node_id: Some(agg_id),
+                node_type: Some("barrier".to_string()),
+            };
+            db.enqueue_action(barrier_action).await?;
+        }
+
         info!(instance_id = %instance_id.0, actions = count, "started workflow instance");
         Ok(count)
     }
@@ -3588,6 +3622,7 @@ impl DAGRunner {
                 actions: vec![action],
                 inbox_writes,
                 readiness_init: None,
+                empty_spread_aggregator: None,
             });
         }
 
@@ -3606,6 +3641,7 @@ impl DAGRunner {
                 actions: vec![action],
                 inbox_writes: vec![],
                 readiness_init: None,
+                empty_spread_aggregator: None,
             }),
             None => Ok(NodeActionResult::default()),
         }
@@ -3613,6 +3649,11 @@ impl DAGRunner {
 
     /// Create actions and inbox writes for a spread node.
     /// Returns readiness init info so caller can initialize node_readiness table.
+    ///
+    /// For empty spreads (0 items in collection), this returns:
+    /// - No actions
+    /// - An inbox write of empty array to the aggregator
+    /// - empty_spread_aggregator set to trigger the aggregator immediately
     fn create_spread_node_result(
         node: &DAGNode,
         instance_id: WorkflowInstanceId,
@@ -3626,6 +3667,37 @@ impl DAGRunner {
         // This is set during DAG conversion and propagated during function expansion
         let aggregator_id = node.aggregates_to.clone();
 
+        // Handle empty spreads specially - write empty result and mark for immediate completion
+        if spread_count == 0
+            && let Some(ref agg_id) = aggregator_id
+        {
+            let result_var = node
+                .target
+                .clone()
+                .unwrap_or_else(|| "_spread_result".to_string());
+
+            info!(
+                node_id = %node.id,
+                aggregator_id = %agg_id,
+                result_var = %result_var,
+                "spread has empty collection, writing empty result to aggregator"
+            );
+
+            return Ok(NodeActionResult {
+                actions: vec![],
+                inbox_writes: vec![InboxWrite {
+                    instance_id,
+                    target_node_id: agg_id.clone(),
+                    variable_name: result_var,
+                    value: WorkflowValue::List(vec![]),
+                    source_node_id: node.id.clone(),
+                    spread_index: None,
+                }],
+                readiness_init: None,
+                empty_spread_aggregator: Some(agg_id.clone()),
+            });
+        }
+
         // Return readiness init info so caller can initialize node_readiness
         let readiness_init = aggregator_id.clone().map(|agg_id| ReadinessInit {
             aggregator_node_id: agg_id,
@@ -3636,6 +3708,7 @@ impl DAGRunner {
             actions,
             inbox_writes: vec![],
             readiness_init,
+            empty_spread_aggregator: None,
         })
     }
 
