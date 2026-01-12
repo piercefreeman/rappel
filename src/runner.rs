@@ -36,7 +36,7 @@ use std::{
     collections::{BinaryHeap, HashMap},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -1124,6 +1124,9 @@ struct NodeActionResult {
     /// If this is a spread node, the aggregator node ID and expected count
     /// that needs readiness initialization.
     pub readiness_init: Option<ReadinessInit>,
+    /// For empty spreads, the aggregator node ID that needs immediate completion.
+    /// When set, the aggregator should be triggered as if the spread completed with empty results.
+    pub empty_spread_aggregator: Option<String>,
 }
 
 /// Info needed to initialize readiness tracking for an aggregator node.
@@ -1208,6 +1211,7 @@ pub struct DAGRunner {
     instance_contexts: Arc<RwLock<HashMap<Uuid, Scope>>>,
     /// Shutdown signal
     shutdown: Arc<tokio::sync::Notify>,
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 impl DAGRunner {
@@ -1241,6 +1245,7 @@ impl DAGRunner {
             dag_cache,
             instance_contexts: Arc::new(RwLock::new(HashMap::new())),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1276,6 +1281,9 @@ impl DAGRunner {
                 "timeout_check",
             );
             loop {
+                if timeout_runner.shutdown_flag.load(Ordering::Acquire) {
+                    break;
+                }
                 tokio::select! {
                     _ = timeout_runner.shutdown.notified() => break,
                     _ = interval.tick() => {
@@ -1335,6 +1343,9 @@ impl DAGRunner {
                 "in_flight_timeout_check",
             );
             loop {
+                if in_flight_runner.shutdown_flag.load(Ordering::Acquire) {
+                    break;
+                }
                 tokio::select! {
                     _ = in_flight_runner.shutdown.notified() => break,
                     _ = interval.tick() => {
@@ -1358,6 +1369,9 @@ impl DAGRunner {
                 "schedule_check",
             );
             loop {
+                if schedule_runner.shutdown_flag.load(Ordering::Acquire) {
+                    break;
+                }
                 tokio::select! {
                     _ = schedule_runner.shutdown.notified() => break,
                     _ = interval.tick() => {
@@ -1377,6 +1391,9 @@ impl DAGRunner {
                 "worker_status",
             );
             loop {
+                if status_runner.shutdown_flag.load(Ordering::Acquire) {
+                    break;
+                }
                 tokio::select! {
                     _ = status_runner.shutdown.notified() => break,
                     _ = interval.tick() => {
@@ -1413,6 +1430,9 @@ impl DAGRunner {
             let _gc_handle = tokio::spawn(async move {
                 let mut interval = make_interval(gc_interval_ms, "gc");
                 loop {
+                    if gc_runner.shutdown_flag.load(Ordering::Acquire) {
+                        break;
+                    }
                     tokio::select! {
                         _ = gc_runner.shutdown.notified() => break,
                         _ = interval.tick() => {
@@ -1453,6 +1473,9 @@ impl DAGRunner {
         let poll_interval = tokio::time::Duration::from_millis(poll_runner.config.poll_interval_ms);
         let _poll_handle = tokio::spawn(async move {
             loop {
+                if poll_runner.shutdown_flag.load(Ordering::Acquire) {
+                    break;
+                }
                 tokio::select! {
                     _ = poll_runner.shutdown.notified() => break,
                     _ = tokio::time::sleep(poll_interval) => {
@@ -1482,6 +1505,10 @@ impl DAGRunner {
         });
 
         loop {
+            if self.shutdown_flag.load(Ordering::Acquire) {
+                info!("Runner shutdown requested");
+                break;
+            }
             tokio::select! {
                 // Use biased selection to prioritize shutdown check.
                 // This prevents race condition where a task exits due to shutdown
@@ -3118,6 +3145,7 @@ impl DAGRunner {
 
     /// Request shutdown.
     pub fn shutdown(&self) {
+        self.shutdown_flag.store(true, Ordering::Release);
         self.shutdown.notify_waiters();
     }
 
@@ -3297,6 +3325,7 @@ impl DAGRunner {
         // Find first delegated successors starting from input node
         let mut actions_to_enqueue = Vec::new();
         let mut readiness_inits: Vec<ReadinessInit> = Vec::new();
+        let mut empty_spread_aggregators: Vec<String> = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let mut queue = std::collections::VecDeque::new();
         let mut completion_payload: Option<Vec<u8>> = None;
@@ -3386,6 +3415,10 @@ impl DAGRunner {
                         // Collect readiness init for spread aggregators
                         if let Some(init) = result.readiness_init {
                             readiness_inits.push(init);
+                        }
+                        // Collect empty spread aggregators for immediate completion
+                        if let Some(agg_id) = result.empty_spread_aggregator {
+                            empty_spread_aggregators.push(agg_id);
                         }
                         // Don't traverse past delegated nodes - they'll handle their successors
                     }
@@ -3528,6 +3561,32 @@ impl DAGRunner {
             db.enqueue_action(action).await?;
         }
 
+        // Handle empty spread aggregators - these need to be triggered immediately
+        // since there are no spread actions that will complete and trigger them.
+        // We enqueue them directly as barriers without using readiness tracking.
+        for agg_id in empty_spread_aggregators {
+            info!(
+                instance_id = %instance_id.0,
+                aggregator_id = %agg_id,
+                "enqueueing empty spread aggregator for immediate completion"
+            );
+            // Enqueue the aggregator as a barrier directly - no readiness tracking needed
+            // since there are no spread actions to wait for.
+            let barrier_action = NewAction {
+                instance_id,
+                module_name: "".to_string(),
+                action_name: "".to_string(),
+                dispatch_payload: Vec::new(),
+                timeout_seconds: 300,
+                max_retries: 0,
+                backoff_kind: BackoffKind::None,
+                backoff_base_delay_ms: 0,
+                node_id: Some(agg_id),
+                node_type: Some("barrier".to_string()),
+            };
+            db.enqueue_action(barrier_action).await?;
+        }
+
         info!(instance_id = %instance_id.0, actions = count, "started workflow instance");
         Ok(count)
     }
@@ -3588,6 +3647,7 @@ impl DAGRunner {
                 actions: vec![action],
                 inbox_writes,
                 readiness_init: None,
+                empty_spread_aggregator: None,
             });
         }
 
@@ -3606,6 +3666,7 @@ impl DAGRunner {
                 actions: vec![action],
                 inbox_writes: vec![],
                 readiness_init: None,
+                empty_spread_aggregator: None,
             }),
             None => Ok(NodeActionResult::default()),
         }
@@ -3613,6 +3674,11 @@ impl DAGRunner {
 
     /// Create actions and inbox writes for a spread node.
     /// Returns readiness init info so caller can initialize node_readiness table.
+    ///
+    /// For empty spreads (0 items in collection), this returns:
+    /// - No actions
+    /// - An inbox write of empty array to the aggregator
+    /// - empty_spread_aggregator set to trigger the aggregator immediately
     fn create_spread_node_result(
         node: &DAGNode,
         instance_id: WorkflowInstanceId,
@@ -3626,6 +3692,37 @@ impl DAGRunner {
         // This is set during DAG conversion and propagated during function expansion
         let aggregator_id = node.aggregates_to.clone();
 
+        // Handle empty spreads specially - write empty result and mark for immediate completion
+        if spread_count == 0
+            && let Some(ref agg_id) = aggregator_id
+        {
+            let result_var = node
+                .target
+                .clone()
+                .unwrap_or_else(|| "_spread_result".to_string());
+
+            info!(
+                node_id = %node.id,
+                aggregator_id = %agg_id,
+                result_var = %result_var,
+                "spread has empty collection, writing empty result to aggregator"
+            );
+
+            return Ok(NodeActionResult {
+                actions: vec![],
+                inbox_writes: vec![InboxWrite {
+                    instance_id,
+                    target_node_id: agg_id.clone(),
+                    variable_name: result_var,
+                    value: WorkflowValue::List(vec![]),
+                    source_node_id: node.id.clone(),
+                    spread_index: None,
+                }],
+                readiness_init: None,
+                empty_spread_aggregator: Some(agg_id.clone()),
+            });
+        }
+
         // Return readiness init info so caller can initialize node_readiness
         let readiness_init = aggregator_id.clone().map(|agg_id| ReadinessInit {
             aggregator_node_id: agg_id,
@@ -3636,6 +3733,7 @@ impl DAGRunner {
             actions,
             inbox_writes: vec![],
             readiness_init,
+            empty_spread_aggregator: None,
         })
     }
 
@@ -3841,21 +3939,19 @@ impl DAGRunner {
             .as_ref()
             .ok_or_else(|| RunnerError::Dag("Spread node missing loop_var".to_string()))?;
 
-        let collection_str = node
-            .spread_collection
-            .as_ref()
-            .ok_or_else(|| RunnerError::Dag("Spread node missing collection".to_string()))?;
+        let collection_expr = node.spread_collection_expr.as_ref().ok_or_else(|| {
+            RunnerError::Dag("Spread node missing collection expression".to_string())
+        })?;
 
-        // Evaluate the collection expression
-        let collection =
-            Self::resolve_kwarg_value_from_inbox("spread_collection", collection_str, None, inbox)?;
+        // Evaluate the collection expression using the expression evaluator
+        let collection = ExpressionEvaluator::evaluate(collection_expr, inbox)?;
 
         let items = match &collection {
             WorkflowValue::List(arr) | WorkflowValue::Tuple(arr) => arr.clone(),
             _ => {
                 return Err(EvaluationError::Evaluation(format!(
-                    "Spread collection '{}' is not a list or tuple: {:?}",
-                    collection_str, collection
+                    "Spread collection is not a list or tuple: {:?}",
+                    collection
                 ))
                 .into());
             }
@@ -3864,7 +3960,6 @@ impl DAGRunner {
         debug!(
             node_id = %node.id,
             loop_var = %loop_var,
-            collection = %collection_str,
             item_count = items.len(),
             "expanding spread action"
         );

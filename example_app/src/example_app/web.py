@@ -47,6 +47,9 @@ from example_app.workflows import (
     SequentialChainWorkflow,
     SleepRequest,
     SleepResult,
+    SpreadEmptyCollectionWorkflow,
+    SpreadEmptyRequest,
+    SpreadEmptyResult,
     UndefinedVariableWorkflow,
 )
 
@@ -247,6 +250,26 @@ async def run_early_return_loop_workflow(
 
 
 # =============================================================================
+# Spread Over Empty Collection (tests empty spread handling in for-loops)
+# =============================================================================
+
+
+@app.post("/api/spread-empty", response_model=SpreadEmptyResult)
+async def run_spread_empty_workflow(
+    payload: SpreadEmptyRequest,
+) -> SpreadEmptyResult:
+    """
+    Run the spread empty collection workflow demonstrating empty spread handling.
+
+    Test cases:
+    - items=["a", "b", "c"] - Normal spread with items
+    - items=[] - Empty collection, should handle gracefully
+    """
+    workflow = SpreadEmptyCollectionWorkflow()
+    return await workflow.run(items=payload.items)
+
+
+# =============================================================================
 # Scheduled Workflows
 # =============================================================================
 
@@ -263,6 +286,7 @@ WORKFLOW_REGISTRY = {
     "GuardFallbackWorkflow": GuardFallbackWorkflow,
     "EarlyReturnLoopWorkflow": EarlyReturnLoopWorkflow,
     "KwOnlyLocationWorkflow": KwOnlyLocationWorkflow,
+    "SpreadEmptyCollectionWorkflow": SpreadEmptyCollectionWorkflow,
 }
 
 
