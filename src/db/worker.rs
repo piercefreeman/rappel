@@ -80,10 +80,23 @@ impl Database {
         input_payload: Option<&[u8]>,
         schedule_id: Option<ScheduleId>,
     ) -> DbResult<WorkflowInstanceId> {
+        self.create_instance_with_priority(workflow_name, version_id, input_payload, schedule_id, 0)
+            .await
+    }
+
+    /// Create a new workflow instance with a specific priority
+    pub async fn create_instance_with_priority(
+        &self,
+        workflow_name: &str,
+        version_id: WorkflowVersionId,
+        input_payload: Option<&[u8]>,
+        schedule_id: Option<ScheduleId>,
+        priority: i32,
+    ) -> DbResult<WorkflowInstanceId> {
         let row = sqlx::query(
             r#"
-            INSERT INTO workflow_instances (workflow_name, workflow_version_id, input_payload, schedule_id)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO workflow_instances (workflow_name, workflow_version_id, input_payload, schedule_id, priority)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING id
             "#,
         )
@@ -91,6 +104,7 @@ impl Database {
         .bind(version_id.0)
         .bind(input_payload)
         .bind(schedule_id.map(|id| id.0))
+        .bind(priority)
         .fetch_one(&self.pool)
         .await?;
 
@@ -111,19 +125,20 @@ impl Database {
     }
 
     /// Find instances that need to be started (running but no actions created yet)
+    /// Orders by priority DESC (higher priority first), then by created_at ASC
     pub async fn find_unstarted_instances(&self, limit: i32) -> DbResult<Vec<WorkflowInstance>> {
         let instances = sqlx::query_as::<_, WorkflowInstance>(
             r#"
             SELECT i.id, i.partition_id, i.workflow_name, i.workflow_version_id,
                    i.schedule_id, i.next_action_seq, i.input_payload, i.result_payload, i.status,
-                   i.created_at, i.completed_at
+                   i.created_at, i.completed_at, i.priority
             FROM workflow_instances i
             WHERE i.status = 'running'
               AND i.next_action_seq = 0
               AND NOT EXISTS (
                   SELECT 1 FROM action_queue a WHERE a.instance_id = i.id
               )
-            ORDER BY i.created_at ASC
+            ORDER BY i.priority DESC, i.created_at ASC
             LIMIT $1
             "#,
         )
@@ -251,17 +266,21 @@ impl Database {
     /// 4. Sets deadline and delivery token
     /// 5. Creates action log entries for tracking run history
     /// 6. Returns the actions for execution
+    ///
+    /// Actions are ordered by their workflow instance's priority (higher first),
+    /// then by scheduled_at, then by action_seq.
     pub async fn dispatch_actions(&self, limit: i32) -> DbResult<Vec<QueuedAction>> {
         let start = std::time::Instant::now();
         let rows = sqlx::query(
             r#"
             WITH next_actions AS (
-                SELECT id
-                FROM action_queue
-                WHERE status = 'queued'
-                  AND scheduled_at <= NOW()
-                ORDER BY scheduled_at, action_seq
-                FOR UPDATE SKIP LOCKED
+                SELECT aq.id
+                FROM action_queue aq
+                JOIN workflow_instances wi ON wi.id = aq.instance_id
+                WHERE aq.status = 'queued'
+                  AND aq.scheduled_at <= NOW()
+                ORDER BY wi.priority DESC, aq.scheduled_at, aq.action_seq
+                FOR UPDATE OF aq SKIP LOCKED
                 LIMIT $1
             ),
             updated AS (
@@ -360,17 +379,19 @@ impl Database {
 
     /// Dispatch only action nodes (not barriers).
     /// Use this when you want to send work to external workers only.
+    /// Orders by workflow instance priority (higher first).
     pub async fn dispatch_actions_only(&self, limit: i32) -> DbResult<Vec<QueuedAction>> {
         let rows = sqlx::query(
             r#"
             WITH next_actions AS (
-                SELECT id
-                FROM action_queue
-                WHERE status = 'queued'
-                  AND scheduled_at <= NOW()
-                  AND (node_type = 'action' OR node_type IS NULL)
-                ORDER BY scheduled_at, action_seq
-                FOR UPDATE SKIP LOCKED
+                SELECT aq.id
+                FROM action_queue aq
+                JOIN workflow_instances wi ON wi.id = aq.instance_id
+                WHERE aq.status = 'queued'
+                  AND aq.scheduled_at <= NOW()
+                  AND (aq.node_type = 'action' OR aq.node_type IS NULL)
+                ORDER BY wi.priority DESC, aq.scheduled_at, aq.action_seq
+                FOR UPDATE OF aq SKIP LOCKED
                 LIMIT $1
             ),
             updated AS (
@@ -449,17 +470,19 @@ impl Database {
 
     /// Dispatch only barrier nodes.
     /// Use this when you want to process aggregators separately.
+    /// Orders by workflow instance priority (higher first).
     pub async fn dispatch_barriers_only(&self, limit: i32) -> DbResult<Vec<QueuedAction>> {
         let rows = sqlx::query(
             r#"
             WITH next_barriers AS (
-                SELECT id
-                FROM action_queue
-                WHERE status = 'queued'
-                  AND scheduled_at <= NOW()
-                  AND node_type = 'barrier'
-                ORDER BY scheduled_at, action_seq
-                FOR UPDATE SKIP LOCKED
+                SELECT aq.id
+                FROM action_queue aq
+                JOIN workflow_instances wi ON wi.id = aq.instance_id
+                WHERE aq.status = 'queued'
+                  AND aq.scheduled_at <= NOW()
+                  AND aq.node_type = 'barrier'
+                ORDER BY wi.priority DESC, aq.scheduled_at, aq.action_seq
+                FOR UPDATE OF aq SKIP LOCKED
                 LIMIT $1
             ),
             updated AS (
@@ -1749,12 +1772,13 @@ impl Database {
         jitter_seconds: i64,
         input_payload: Option<&[u8]>,
         next_run_at: DateTime<Utc>,
+        priority: i32,
     ) -> DbResult<ScheduleId> {
         let row = sqlx::query(
             r#"
             INSERT INTO workflow_schedules
-                (workflow_name, schedule_name, schedule_type, cron_expression, interval_seconds, jitter_seconds, input_payload, next_run_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                (workflow_name, schedule_name, schedule_type, cron_expression, interval_seconds, jitter_seconds, input_payload, next_run_at, priority)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             ON CONFLICT (workflow_name, schedule_name)
             DO UPDATE SET
                 schedule_type = EXCLUDED.schedule_type,
@@ -1763,6 +1787,7 @@ impl Database {
                 jitter_seconds = EXCLUDED.jitter_seconds,
                 input_payload = EXCLUDED.input_payload,
                 next_run_at = EXCLUDED.next_run_at,
+                priority = EXCLUDED.priority,
                 status = 'active',
                 updated_at = NOW()
             RETURNING id
@@ -1776,6 +1801,7 @@ impl Database {
         .bind(jitter_seconds)
         .bind(input_payload)
         .bind(next_run_at)
+        .bind(priority)
         .fetch_one(&self.pool)
         .await?;
 
@@ -1793,7 +1819,7 @@ impl Database {
             r#"
             SELECT id, workflow_name, schedule_name, schedule_type, cron_expression, interval_seconds, jitter_seconds,
                    input_payload, status, next_run_at, last_run_at, last_instance_id,
-                   created_at, updated_at
+                   created_at, updated_at, priority
             FROM workflow_schedules
             WHERE workflow_name = $1 AND schedule_name = $2 AND status != 'deleted'
             "#,
@@ -1813,7 +1839,7 @@ impl Database {
             r#"
             SELECT id, workflow_name, schedule_name, schedule_type, cron_expression, interval_seconds, jitter_seconds,
                    input_payload, status, next_run_at, last_run_at, last_instance_id,
-                   created_at, updated_at
+                   created_at, updated_at, priority
             FROM workflow_schedules
             WHERE status = 'active'
               AND next_run_at IS NOT NULL
@@ -1933,7 +1959,7 @@ impl Database {
                 r#"
                 SELECT id, workflow_name, schedule_name, schedule_type, cron_expression, interval_seconds, jitter_seconds,
                        input_payload, status, next_run_at, last_run_at, last_instance_id,
-                       created_at, updated_at
+                       created_at, updated_at, priority
                 FROM workflow_schedules
                 WHERE status = $1
                 ORDER BY workflow_name, schedule_name
@@ -1947,7 +1973,7 @@ impl Database {
                 r#"
                 SELECT id, workflow_name, schedule_name, schedule_type, cron_expression, interval_seconds, jitter_seconds,
                        input_payload, status, next_run_at, last_run_at, last_instance_id,
-                       created_at, updated_at
+                       created_at, updated_at, priority
                 FROM workflow_schedules
                 WHERE status != 'deleted'
                 ORDER BY workflow_name, schedule_name

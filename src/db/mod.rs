@@ -260,6 +260,8 @@ pub struct WorkflowInstance {
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// Priority for queue ordering (higher values are processed first)
+    pub priority: i32,
 }
 
 /// An action ready for dispatch (returned from dispatch_actions)
@@ -438,6 +440,8 @@ pub struct WorkflowSchedule {
     pub last_instance_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Priority for queue ordering (higher values are processed first)
+    pub priority: i32,
 }
 
 // ============================================================================

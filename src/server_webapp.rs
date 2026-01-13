@@ -1830,6 +1830,7 @@ mod tests {
             status: "completed".to_string(),
             created_at: chrono::Utc::now(),
             completed_at: Some(chrono::Utc::now()),
+            priority: 0,
         }];
 
         let html = render_workflow_detail_page(&templates, &version, &instances);
@@ -1867,6 +1868,7 @@ mod tests {
             status: "completed".to_string(),
             created_at: chrono::Utc::now(),
             completed_at: Some(chrono::Utc::now()),
+            priority: 0,
         };
 
         let actions: Vec<crate::db::QueuedAction> = vec![];
@@ -1910,6 +1912,7 @@ mod tests {
             status: "running".to_string(),
             created_at: chrono::Utc::now(),
             completed_at: None,
+            priority: 0,
         };
 
         let actions = vec![crate::db::QueuedAction {
@@ -1982,6 +1985,7 @@ mod tests {
             status: "completed".to_string(),
             created_at: chrono::Utc::now(),
             completed_at: Some(chrono::Utc::now()),
+            priority: 0,
         }];
 
         let html = render_invocations_page(&templates, &instances, 1, 1, None, 1);
@@ -2082,6 +2086,7 @@ mod tests {
             last_instance_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            priority: 0,
         }];
 
         let html = render_scheduled_page(&templates, &schedules, 1, 1, None, 1);
@@ -2110,6 +2115,7 @@ mod tests {
             last_instance_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            priority: 0,
         }];
 
         let html = render_scheduled_page(&templates, &schedules, 1, 1, None, 1);
@@ -2138,6 +2144,7 @@ mod tests {
             last_instance_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            priority: 0,
         };
         let invocations: Vec<crate::db::WorkflowInstance> = vec![];
 
@@ -2173,6 +2180,7 @@ mod tests {
             last_instance_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            priority: 0,
         };
         let invocations: Vec<crate::db::WorkflowInstance> = vec![];
 
@@ -2204,6 +2212,7 @@ mod tests {
             last_instance_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            priority: 0,
         };
 
         let invocations = vec![
@@ -2219,6 +2228,7 @@ mod tests {
                 status: "completed".to_string(),
                 created_at: chrono::Utc::now(),
                 completed_at: Some(chrono::Utc::now()),
+                priority: 0,
             },
             crate::db::WorkflowInstance {
                 id: Uuid::new_v4(),
@@ -2232,6 +2242,7 @@ mod tests {
                 status: "running".to_string(),
                 created_at: chrono::Utc::now(),
                 completed_at: None,
+                priority: 0,
             },
         ];
 
@@ -2275,6 +2286,7 @@ mod tests {
             status: "completed".to_string(),
             created_at: chrono::Utc::now(),
             completed_at: Some(chrono::Utc::now()),
+            priority: 0,
         }];
 
         // Page 2 of 3 with search query
@@ -2310,6 +2322,7 @@ mod tests {
             status: "completed".to_string(),
             created_at: chrono::Utc::now(),
             completed_at: Some(chrono::Utc::now()),
+            priority: 0,
         }];
 
         // Search query with special characters that need URL encoding
@@ -2358,6 +2371,7 @@ mod tests {
             last_instance_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            priority: 0,
         }];
 
         // Page 2 of 3 with search query
@@ -2395,6 +2409,7 @@ mod tests {
             last_instance_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            priority: 0,
         }];
 
         // Search query with special characters
