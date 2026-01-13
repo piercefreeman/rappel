@@ -2246,6 +2246,175 @@ mod tests {
     }
 
     // ========================================================================
+    // Search Query URL Encoding Tests
+    // ========================================================================
+
+    #[test]
+    fn test_render_invocations_page_with_search_query() {
+        let templates = test_templates();
+        let html = render_invocations_page(&templates, &[], 1, 1, Some("test query".to_string()), 0);
+
+        assert!(html.contains("Invocations"));
+        assert!(html.contains("test query")); // search query should appear in the form
+        assert!(html.contains(r#"No invocations match "test query""#));
+    }
+
+    #[test]
+    fn test_render_invocations_page_with_pagination_and_search() {
+        let templates = test_templates();
+        let instances = vec![crate::db::WorkflowInstance {
+            id: Uuid::new_v4(),
+            partition_id: 0,
+            workflow_name: "workflow".to_string(),
+            workflow_version_id: Some(Uuid::new_v4()),
+            schedule_id: None,
+            next_action_seq: 1,
+            input_payload: None,
+            result_payload: None,
+            status: "completed".to_string(),
+            created_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+        }];
+
+        // Page 2 of 3 with search query
+        let html = render_invocations_page(
+            &templates,
+            &instances,
+            2,
+            3,
+            Some("hello world".to_string()),
+            25,
+        );
+
+        assert!(html.contains("Page 2 of 3"));
+        // Should have both Previous and Next links with URL-encoded search query
+        assert!(html.contains("Previous"));
+        assert!(html.contains("Next"));
+        // The search query should be URL-encoded in pagination links
+        assert!(html.contains("q=hello%20world") || html.contains("q=hello+world"));
+    }
+
+    #[test]
+    fn test_render_invocations_page_with_special_chars_in_search() {
+        let templates = test_templates();
+        let instances = vec![crate::db::WorkflowInstance {
+            id: Uuid::new_v4(),
+            partition_id: 0,
+            workflow_name: "workflow".to_string(),
+            workflow_version_id: Some(Uuid::new_v4()),
+            schedule_id: None,
+            next_action_seq: 1,
+            input_payload: None,
+            result_payload: None,
+            status: "completed".to_string(),
+            created_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+        }];
+
+        // Search query with special characters that need URL encoding
+        let html = render_invocations_page(
+            &templates,
+            &instances,
+            1,
+            2,
+            Some("status:running AND name:test&foo".to_string()),
+            10,
+        );
+
+        assert!(html.contains("Next"));
+        // The & character must be URL-encoded to %26 in the pagination link
+        assert!(
+            html.contains("%26"),
+            "Expected & to be URL-encoded as %26 in pagination links"
+        );
+    }
+
+    #[test]
+    fn test_render_scheduled_page_with_search_query() {
+        let templates = test_templates();
+        let html = render_scheduled_page(&templates, &[], 1, 1, Some("cron job".to_string()), 0);
+
+        assert!(html.contains("Scheduled Workflows"));
+        assert!(html.contains("cron job")); // search query should appear in the form
+        assert!(html.contains(r#"No scheduled workflows match "cron job""#));
+    }
+
+    #[test]
+    fn test_render_scheduled_page_with_pagination_and_search() {
+        let templates = test_templates();
+        let schedules = vec![crate::db::WorkflowSchedule {
+            id: Uuid::new_v4(),
+            workflow_name: "workflow".to_string(),
+            schedule_name: "schedule".to_string(),
+            schedule_type: "cron".to_string(),
+            cron_expression: Some("0 * * * *".to_string()),
+            interval_seconds: None,
+            jitter_seconds: 0,
+            input_payload: None,
+            status: "active".to_string(),
+            next_run_at: Some(chrono::Utc::now()),
+            last_run_at: None,
+            last_instance_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }];
+
+        // Page 2 of 3 with search query
+        let html = render_scheduled_page(
+            &templates,
+            &schedules,
+            2,
+            3,
+            Some("daily backup".to_string()),
+            25,
+        );
+
+        assert!(html.contains("Page 2 of 3"));
+        assert!(html.contains("Previous"));
+        assert!(html.contains("Next"));
+        // The search query should be URL-encoded in pagination links
+        assert!(html.contains("q=daily%20backup") || html.contains("q=daily+backup"));
+    }
+
+    #[test]
+    fn test_render_scheduled_page_with_special_chars_in_search() {
+        let templates = test_templates();
+        let schedules = vec![crate::db::WorkflowSchedule {
+            id: Uuid::new_v4(),
+            workflow_name: "workflow".to_string(),
+            schedule_name: "schedule".to_string(),
+            schedule_type: "interval".to_string(),
+            cron_expression: None,
+            interval_seconds: Some(3600),
+            jitter_seconds: 0,
+            input_payload: None,
+            status: "active".to_string(),
+            next_run_at: Some(chrono::Utc::now()),
+            last_run_at: None,
+            last_instance_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }];
+
+        // Search query with special characters
+        let html = render_scheduled_page(
+            &templates,
+            &schedules,
+            1,
+            2,
+            Some("type:cron OR status:active&paused".to_string()),
+            10,
+        );
+
+        assert!(html.contains("Next"));
+        // The & character must be URL-encoded to %26
+        assert!(
+            html.contains("%26"),
+            "Expected & to be URL-encoded as %26 in pagination links"
+        );
+    }
+
+    // ========================================================================
     // HTTP Route Tests (require database)
     // These tests require RAPPEL_DATABASE_URL to be set and run with serial_test
     // to avoid conflicts with other database tests.

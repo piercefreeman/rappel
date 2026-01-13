@@ -79,10 +79,10 @@
         <span>Page {{ current_page }} of {{ total_pages }}</span>
         <div class="flex items-center gap-2">
             {% if current_page > 1 %}
-                <a href="/?page={{ current_page - 1 }}{% if search_query %}&q={{ search_query | url_encode }}{% endif %}" class="rounded-lg bg-zinc-200 dark:bg-zinc-800 px-3 py-1 text-zinc-700 dark:text-zinc-300 transition hover:bg-zinc-300 dark:hover:bg-zinc-700">&larr; Previous</a>
+                <a href="/?page={{ current_page - 1 }}{% if search_query %}&q={{ search_query | urlencode }}{% endif %}" class="rounded-lg bg-zinc-200 dark:bg-zinc-800 px-3 py-1 text-zinc-700 dark:text-zinc-300 transition hover:bg-zinc-300 dark:hover:bg-zinc-700">&larr; Previous</a>
             {% endif %}
             {% if current_page < total_pages %}
-                <a href="/?page={{ current_page + 1 }}{% if search_query %}&q={{ search_query | url_encode }}{% endif %}" class="rounded-lg bg-zinc-200 dark:bg-zinc-800 px-3 py-1 text-zinc-700 dark:text-zinc-300 transition hover:bg-zinc-300 dark:hover:bg-zinc-700">Next &rarr;</a>
+                <a href="/?page={{ current_page + 1 }}{% if search_query %}&q={{ search_query | urlencode }}{% endif %}" class="rounded-lg bg-zinc-200 dark:bg-zinc-800 px-3 py-1 text-zinc-700 dark:text-zinc-300 transition hover:bg-zinc-300 dark:hover:bg-zinc-700">Next &rarr;</a>
             {% endif %}
         </div>
     </div>
