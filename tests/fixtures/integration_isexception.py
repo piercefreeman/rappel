@@ -21,7 +21,7 @@ class IsExceptionWorkflow(Workflow):
             await boom()
             return await format_result(kind="none", message="none", is_value=False)
         except Exception as err:
-            is_value = isexception(err, "ValueError")
+            is_value = isinstance(err, ValueError)
             kind = "other"
             if is_value:
                 kind = "value"
