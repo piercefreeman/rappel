@@ -15,6 +15,11 @@ async def decorate_item(item: str) -> str:
 
 
 @action
+async def format_local_value(seed: str, index: int) -> str:
+    return f"{seed}-local-{index}"
+
+
+@action
 async def finalize_payload(items: list[str]) -> str:
     return ",".join(items)
 
@@ -26,7 +31,7 @@ class LoopAccumWorkflow(Workflow):
         outputs: list[str] = []
         for seed in seeds:
             index = len(outputs)
-            local_value = f"{seed}-local-{index}"
+            local_value = await format_local_value(seed=seed, index=index)
             finalized = await decorate_item(item=local_value)
             outputs.append(finalized)
         result = await finalize_payload(items=outputs)

@@ -615,6 +615,7 @@ pub fn execute_inline_subgraph(
 
     // Initialize inline scope with completed node's result
     let mut inline_scope: InlineScope = initial_scope.clone();
+    let mut updated_vars: HashSet<String> = HashSet::new();
     if let Some(node) = dag.nodes.get(completed_node_id)
         && let Some(ref target) = node.target
     {
@@ -630,6 +631,7 @@ pub fn execute_inline_subgraph(
 
         if !is_parallel_aggregator {
             inline_scope.insert(target.clone(), completed_result.clone());
+            updated_vars.insert(target.clone());
         }
     }
 
@@ -771,7 +773,44 @@ pub fn execute_inline_subgraph(
                 scope_keys = ?inline_scope.keys().collect::<Vec<_>>(),
                 "DEBUG: executed inline node (completion)"
             );
-            if let Some(ref target) = node.target {
+            let mut inserted_targets = false;
+            if (node.node_type == "assignment" || node.node_type == "fn_call")
+                && let Some(targets) = node.targets.as_ref()
+                && targets.len() > 1
+            {
+                let values = match &result {
+                    WorkflowValue::Tuple(items) | WorkflowValue::List(items) => items.clone(),
+                    other => {
+                        debug!(
+                            node_id = %node.id,
+                            result = ?other,
+                            "multi-target assignment expected tuple/list result"
+                        );
+                        vec![other.clone()]
+                    }
+                };
+
+                for (idx, target) in targets.iter().enumerate() {
+                    let value = values.get(idx).cloned().unwrap_or(WorkflowValue::Null);
+                    info!(
+                        node_id = %node.id,
+                        target = %target,
+                        old_value = ?inline_scope.get(target),
+                        new_value = ?value,
+                        "DEBUG: scope update (multi-target)"
+                    );
+                    inline_scope.insert(target.clone(), value);
+                    updated_vars.insert(target.clone());
+                }
+                inserted_targets = true;
+            }
+
+            if !inserted_targets
+                && (node.node_type == "assignment"
+                    || node.node_type == "return"
+                    || node.node_type == "fn_call")
+                && let Some(ref target) = node.target
+            {
                 info!(
                     node_id = %node.id,
                     target = %target,
@@ -780,6 +819,7 @@ pub fn execute_inline_subgraph(
                     "DEBUG: scope update"
                 );
                 inline_scope.insert(target.clone(), result);
+                updated_vars.insert(target.clone());
                 info!(
                     node_id = %node.id,
                     target = %target,
@@ -899,6 +939,7 @@ pub fn execute_inline_subgraph(
                     merge_data_flow_into_inbox(
                         &frontier.node_id,
                         &inline_scope,
+                        &updated_vars,
                         dag,
                         &mut action_inbox,
                     );
@@ -908,8 +949,10 @@ pub fn execute_inline_subgraph(
                     // updates), which must take precedence over stale values from existing_inbox.
                     // This is critical for for-loops where variables like `processed` accumulate
                     // across iterations - we need the updated value, not the stale DB value.
-                    for (var, val) in &inline_scope {
-                        action_inbox.insert(var.clone(), val.clone());
+                    for var in &updated_vars {
+                        if let Some(val) = inline_scope.get(var) {
+                            action_inbox.insert(var.clone(), val.clone());
+                        }
                     }
 
                     debug!(
@@ -1059,6 +1102,7 @@ pub fn execute_inline_subgraph(
                     merge_data_flow_into_inbox(
                         &frontier.node_id,
                         &inline_scope,
+                        &updated_vars,
                         dag,
                         &mut output_inbox,
                     );
@@ -1090,7 +1134,6 @@ pub fn execute_inline_subgraph(
                                     None
                                 }
                             })
-                            .or_else(|| inline_scope.values().next())
                             .cloned()
                             .unwrap_or(WorkflowValue::Null)
                     };
@@ -1118,7 +1161,7 @@ fn execute_inline_node(node: &DAGNode, scope: &InlineScope) -> WorkflowValue {
     // Most inline nodes don't produce meaningful values themselves
     // The actual data flows through DataFlow edges from their predecessors
     match node.node_type.as_str() {
-        "assignment" => {
+        "assignment" | "fn_call" => {
             // Evaluate the assignment expression
             if let Some(ref expr) = node.assign_expr {
                 match ExpressionEvaluator::evaluate(expr, scope) {
@@ -1402,6 +1445,7 @@ fn collect_all_data_flow_writes(
 fn merge_data_flow_into_inbox(
     target_node_id: &str,
     inline_scope: &InlineScope,
+    updated_vars: &HashSet<String>,
     dag: &DAG,
     inbox: &mut HashMap<String, WorkflowValue>,
 ) {
@@ -1423,6 +1467,9 @@ fn merge_data_flow_into_inbox(
     for edge in df_edges {
         if let Some(ref var_name) = edge.variable {
             if let Some(value) = inline_scope.get(var_name) {
+                if inbox.contains_key(var_name) && !updated_vars.contains(var_name) {
+                    continue;
+                }
                 debug!(
                     target_node_id = %target_node_id,
                     var_name = %var_name,
@@ -1521,12 +1568,6 @@ fn handle_spread_frontier(
     let item_count = items.len();
     let policies = extract_policies_from_node(frontier_node);
 
-    // Reset readiness for the frontier node if required_count=1
-    // (same logic as regular actions for loop re-triggering)
-    if frontier.required_count == 1 {
-        plan.readiness_resets.push(frontier.node_id.clone());
-    }
-
     for (idx, item) in items.into_iter().enumerate() {
         // Create modified inbox with the loop variable bound to this item
         let mut iteration_inbox = action_inbox.clone();
@@ -1537,6 +1578,11 @@ fn handle_spread_frontier(
 
         // Create node_id that includes the spread index for tracking
         let spread_node_id = format!("{}[{}]", frontier.node_id, idx);
+
+        // Reset readiness for this spread action when re-triggering loops.
+        if frontier.required_count == 1 {
+            plan.readiness_resets.push(spread_node_id.clone());
+        }
 
         plan.readiness_increments.push(ReadinessIncrement {
             node_id: spread_node_id,

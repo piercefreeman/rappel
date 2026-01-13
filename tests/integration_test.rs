@@ -37,6 +37,27 @@ const SPREAD_LOOP_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_spr
 const SPREAD_HELPER_INPUT_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_spread_helper_input.py");
 const ERROR_HANDLING_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_error_handling.py");
+const LOOP_ACCUM_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_loop_accum.py");
+const MULTI_ACTION_LOOP_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_multi_action_loop.py");
+const MULTI_ACCUMULATOR_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_multi_accumulator.py");
+const COMPLEX_LOGIC_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_complex_logic.py");
+const DATA_PIPELINE_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_data_pipeline.py");
+const NESTED_CONDITIONALS_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_nested_conditionals.py");
+const STRING_PROCESSING_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_string_processing.py");
+const MODULE_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_module.py");
+const COMPLETE_FEATURE_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/complete_feature_workflow.py");
+const REPRO_ACTION_REQUEST_NULL_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/repro_action_request_null.py");
+const EXPRESSION_OPS_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_expression_ops.py");
+const LOOP_CONTROL_FLOW_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_loop_control_flow.py");
+const PARALLEL_BLOCK_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_parallel_block.py");
+const ISEXCEPTION_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_isexception.py");
 const EXCEPTION_WITH_SUCCESS_FAILURE_SCRIPT: &str = r#"
 import asyncio
 import os
@@ -150,6 +171,202 @@ async def main():
 
 asyncio.run(main())
 "#;
+const REGISTER_LOOP_ACCUM_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_loop_accum import LoopAccumWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = LoopAccumWorkflow()
+    result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_MULTI_ACTION_LOOP_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_multi_action_loop import MultiActionLoopWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = MultiActionLoopWorkflow()
+    result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_MULTI_ACCUMULATOR_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_multi_accumulator import MultiAccumulatorWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = MultiAccumulatorWorkflow()
+    result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_COMPLEX_LOGIC_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_complex_logic import ComplexLogicWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ComplexLogicWorkflow()
+    result = await wf.run(key="beta", apply_bonus=True)
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_DATA_PIPELINE_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_data_pipeline import DataPipelineWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = DataPipelineWorkflow()
+    result = await wf.run(source="sales", threshold=100)
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_NESTED_CONDITIONALS_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_nested_conditionals import NestedConditionalsWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = NestedConditionalsWorkflow()
+    result = await wf.run(user_id="user_a")
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_STRING_PROCESSING_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_string_processing import StringProcessingWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = StringProcessingWorkflow()
+    result = await wf.run(text="Abc123")
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_MODULE_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_module import IntegrationWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = IntegrationWorkflow()
+    result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_COMPLETE_FEATURE_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from complete_feature_workflow import CompleteFeatureWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = CompleteFeatureWorkflow()
+    result = await wf.run(items=[1, 2], threshold=1)
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_REPRO_ACTION_REQUEST_NULL_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from repro_action_request_null import ReproActionRequestNullWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ReproActionRequestNullWorkflow()
+    result = await wf.run(user_id="user_123")
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_EXPRESSION_OPS_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_expression_ops import ExpressionOpsWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ExpressionOpsWorkflow()
+    result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_LOOP_CONTROL_FLOW_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_loop_control_flow import LoopControlFlowWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = LoopControlFlowWorkflow()
+    result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_PARALLEL_BLOCK_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_parallel_block import ParallelBlockWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ParallelBlockWorkflow()
+    result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_ISEXCEPTION_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_isexception import IsExceptionWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = IsExceptionWorkflow()
+    result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
 const IMMEDIATE_CONDITIONAL_WORKFLOW_MODULE: &str =
     include_str!("fixtures/immediate_conditional_workflow.py");
 const IMMEDIATE_REQUIRED_INPUT_WORKFLOW_MODULE: &str =
@@ -209,6 +426,24 @@ fn parse_result(payload: &[u8]) -> Result<Option<String>> {
             && let Some(value) = argument.value.as_ref()
         {
             return extract_string_from_value(value);
+        }
+    }
+    Err(anyhow::anyhow!("missing result in payload"))
+}
+
+fn parse_result_json(payload: &[u8]) -> Result<serde_json::Value> {
+    if payload.is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+
+    let arguments = proto::WorkflowArguments::decode(payload)
+        .map_err(|err| anyhow::anyhow!("decode workflow arguments: {err}"))?;
+
+    for argument in arguments.arguments {
+        if argument.key == "result"
+            && let Some(value) = argument.value.as_ref()
+        {
+            return Ok(proto_value_to_json(value));
         }
     }
     Err(anyhow::anyhow!("missing result in payload"))
@@ -539,8 +774,7 @@ asyncio.run(main())
 /// get_initial_value -> risky_operation -> format_success
 /// With value=42, 42<=100 so no exception, result = 42*2=84, should be "success:84".
 ///
-/// TODO: Result assertion disabled - exception workflows have complex DAG structures
-/// that need additional handling for proper completion detection.
+/// Expected result: "success:84" (no exception thrown).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn exception_workflow_registers_and_first_action_executes() -> Result<()> {
@@ -565,6 +799,18 @@ async fn exception_workflow_registers_and_first_action_executes() -> Result<()> 
     // Execute all actions via the DAGRunner
     harness.dispatch_all().await?;
     info!("workflow completed");
+
+    // Verify the workflow result: no exception -> result = 84 -> "success:84"
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("success:84".to_string()),
+        "unexpected workflow result"
+    );
 
     harness.shutdown().await?;
     Ok(())
@@ -2439,6 +2685,603 @@ async fn run_action_spread_workflow_executes() -> Result<()> {
         message,
         Some("processed:a,processed:b,processed:c".to_string()),
         "expected all items to be processed and combined"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Additional Integration Coverage
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn loop_accum_workflow_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("integration_loop_accum.py", LOOP_ACCUM_WORKFLOW_MODULE),
+            ("register.py", REGISTER_LOOP_ACCUM_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "loopaccumworkflow",
+        user_module: "integration_loop_accum",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("alpha-local-0-decorated,beta-local-1-decorated".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn multi_action_loop_workflow_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_multi_action_loop.py",
+                MULTI_ACTION_LOOP_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_MULTI_ACTION_LOOP_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "multiactionloopworkflow",
+        user_module: "integration_multi_action_loop",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("CONF_A_PAY_A|CONF_B_PAY_B|CONF_C_PAY_C".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn multi_accumulator_workflow_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_multi_accumulator.py",
+                MULTI_ACCUMULATOR_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_MULTI_ACCUMULATOR_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "multiaccumulatorworkflow",
+        user_module: "integration_multi_accumulator",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("RESULTS:PROCESSED_A_10,PROCESSED_B_20,PROCESSED_C_30|METRICS:20,40,60".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn complex_logic_workflow_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_complex_logic.py",
+                COMPLEX_LOGIC_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_COMPLEX_LOGIC_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "complexlogicworkflow",
+        user_module: "integration_complex_logic",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("medium:25->55+bonus".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn data_pipeline_workflow_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_data_pipeline.py",
+                DATA_PIPELINE_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_DATA_PIPELINE_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "datapipelineworkflow",
+        user_module: "integration_data_pipeline",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("total:850,count:4,filtered:3,avg:212".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn nested_conditionals_workflow_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_nested_conditionals.py",
+                NESTED_CONDITIONALS_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_NESTED_CONDITIONALS_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "nestedconditionalsworkflow",
+        user_module: "integration_nested_conditionals",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("user_a:veteran|notified:keep_going".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn string_processing_workflow_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_string_processing.py",
+                STRING_PROCESSING_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_STRING_PROCESSING_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "stringprocessingworkflow",
+        user_module: "integration_string_processing",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("ABC-42".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn module_workflow_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("integration_module.py", MODULE_WORKFLOW_MODULE),
+            ("register.py", REGISTER_MODULE_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "integrationworkflow",
+        user_module: "integration_module",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("hello world".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn complete_feature_workflow_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "complete_feature_workflow.py",
+                COMPLETE_FEATURE_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_COMPLETE_FEATURE_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "completefeatureworkflow",
+        user_module: "complete_feature_workflow",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let result = parse_result_json(&stored_payload)?;
+    let expected = json!({
+        "total_items": 2,
+        "status_a": {
+            "service": "alpha",
+            "status": "healthy",
+            "latency_ms": 42,
+        },
+        "status_b": {
+            "service": "beta",
+            "status": "healthy",
+            "latency_ms": 38,
+        },
+        "final_status": "normal:0",
+        "complete": true,
+        "risky_result": {
+            "success": true,
+            "data_length": 2,
+        },
+    });
+    assert_eq!(result, expected, "unexpected workflow result");
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn repro_action_request_null_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "repro_action_request_null.py",
+                REPRO_ACTION_REQUEST_NULL_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_REPRO_ACTION_REQUEST_NULL_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "reproactionrequestnullworkflow",
+        user_module: "repro_action_request_null",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(message, None, "expected no result payload");
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn expression_ops_workflow_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_expression_ops.py",
+                EXPRESSION_OPS_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_EXPRESSION_OPS_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "expressionopsworkflow",
+        user_module: "integration_expression_ops",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some(
+            "first:1|neg:-1|floor:2|mod:1|has_two:True|no_four:True|combined:True|not_flag:True|total:4|range:6|indexed:2|dotted:9"
+                .to_string()
+        ),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn loop_control_flow_workflow_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_loop_control_flow.py",
+                LOOP_CONTROL_FLOW_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_LOOP_CONTROL_FLOW_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "loopcontrolflowworkflow",
+        user_module: "integration_loop_control_flow",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("values:1,3|indices:0,2".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn parallel_block_workflow_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_parallel_block.py",
+                PARALLEL_BLOCK_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_PARALLEL_BLOCK_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "parallelblockworkflow",
+        user_module: "integration_parallel_block",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("alpha,beta,delta,gamma,start".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn isexception_workflow_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("integration_isexception.py", ISEXCEPTION_WORKFLOW_MODULE),
+            ("register.py", REGISTER_ISEXCEPTION_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "isexceptionworkflow",
+        user_module: "integration_isexception",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("value:boom:True".to_string()),
+        "unexpected workflow result"
     );
 
     harness.shutdown().await?;

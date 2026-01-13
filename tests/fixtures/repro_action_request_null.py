@@ -1,12 +1,14 @@
 """Repro fixture for action request constructor evaluation."""
 
+from dataclasses import dataclass
+
 from rappel import action, workflow
 from rappel.workflow import Workflow
 
 
+@dataclass
 class CheckRequest:
-    def __init__(self, user_id: str) -> None:
-        self.user_id = user_id
+    user_id: str
 
 
 @action
@@ -20,6 +22,6 @@ class PredictCommon(Workflow):
 
 
 @workflow
-class PredictWorkflow(PredictCommon):
+class ReproActionRequestNullWorkflow(PredictCommon):
     async def run(self, user_id: str) -> None:
         await self.run_internal(user_id)

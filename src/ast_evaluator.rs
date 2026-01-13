@@ -130,6 +130,8 @@ impl ExpressionEvaluator {
             ast::BinaryOperator::BinaryOpSub => Self::apply_sub(&left, &right),
             ast::BinaryOperator::BinaryOpMul => Self::apply_mul(&left, &right),
             ast::BinaryOperator::BinaryOpDiv => Self::apply_div(&left, &right),
+            ast::BinaryOperator::BinaryOpFloorDiv => Self::apply_floor_div(&left, &right),
+            ast::BinaryOperator::BinaryOpMod => Self::apply_mod(&left, &right),
             ast::BinaryOperator::BinaryOpEq => Ok(WorkflowValue::Bool(left == right)),
             ast::BinaryOperator::BinaryOpNe => Ok(WorkflowValue::Bool(left != right)),
             ast::BinaryOperator::BinaryOpLt => Self::apply_lt(&left, &right),
@@ -429,6 +431,54 @@ impl ExpressionEvaluator {
             return Err(EvaluationError::Evaluation("Division by zero".to_string()));
         }
         Ok(WorkflowValue::Float(af / bf))
+    }
+
+    fn apply_floor_div(
+        left: &WorkflowValue,
+        right: &WorkflowValue,
+    ) -> EvaluationResult<WorkflowValue> {
+        let Some(af) = left.as_f64() else {
+            return Err(EvaluationError::Evaluation(
+                "Cannot divide non-numbers".to_string(),
+            ));
+        };
+        let Some(bf) = right.as_f64() else {
+            return Err(EvaluationError::Evaluation(
+                "Cannot divide non-numbers".to_string(),
+            ));
+        };
+        if bf == 0.0 {
+            return Err(EvaluationError::Evaluation("Division by zero".to_string()));
+        }
+
+        let result = (af / bf).floor();
+        if matches!(left, WorkflowValue::Int(_)) && matches!(right, WorkflowValue::Int(_)) {
+            return Ok(WorkflowValue::Int(result as i64));
+        }
+        Ok(WorkflowValue::Float(result))
+    }
+
+    fn apply_mod(left: &WorkflowValue, right: &WorkflowValue) -> EvaluationResult<WorkflowValue> {
+        let Some(af) = left.as_f64() else {
+            return Err(EvaluationError::Evaluation(
+                "Cannot modulo non-numbers".to_string(),
+            ));
+        };
+        let Some(bf) = right.as_f64() else {
+            return Err(EvaluationError::Evaluation(
+                "Cannot modulo non-numbers".to_string(),
+            ));
+        };
+        if bf == 0.0 {
+            return Err(EvaluationError::Evaluation("Modulo by zero".to_string()));
+        }
+
+        let div = (af / bf).floor();
+        let result = af - (div * bf);
+        if matches!(left, WorkflowValue::Int(_)) && matches!(right, WorkflowValue::Int(_)) {
+            return Ok(WorkflowValue::Int(result as i64));
+        }
+        Ok(WorkflowValue::Float(result))
     }
 
     fn apply_lt(left: &WorkflowValue, right: &WorkflowValue) -> EvaluationResult<WorkflowValue> {

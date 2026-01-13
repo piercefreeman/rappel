@@ -66,6 +66,12 @@ async def send_notification(message: str) -> str:
     return f"notified:{message}"
 
 
+@action
+async def format_award(badge: str, notification: str) -> str:
+    """Format the badge and notification summary."""
+    return f"{badge}|{notification}"
+
+
 @workflow
 class NestedConditionalsWorkflow(Workflow):
     """Workflow with conditional logic using computed intermediate values."""
@@ -83,4 +89,4 @@ class NestedConditionalsWorkflow(Workflow):
         badge = await award_badge(badge_type, user_id)
         notification = await send_notification(notification_msg)
 
-        return f"{badge}|{notification}"
+        return await format_award(badge=badge, notification=notification)

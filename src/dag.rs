@@ -1898,11 +1898,16 @@ impl DAGConverter {
         // Extract kwargs from the function call (positional args mapped when possible)
         let (kwargs, kwarg_exprs) = self.extract_fn_call_args(call);
 
+        let call_expr = ast::Expr {
+            span: None,
+            kind: Some(ast::expr::Kind::FunctionCall(call.clone())),
+        };
         let mut node = DAGNode::new(node_id.clone(), "fn_call".to_string(), label)
             .with_fn_call(&call.name)
             .with_kwargs(kwargs)
             .with_kwarg_exprs(kwarg_exprs)
-            .with_targets(targets);
+            .with_targets(targets)
+            .with_assign_expr(call_expr);
         if let Some(ref fn_name) = self.current_function {
             node = node.with_function_name(fn_name);
         }
@@ -2285,13 +2290,20 @@ impl DAGConverter {
         self.dag.add_node(parallel_node);
         result_nodes.push(parallel_id.clone());
 
+        let list_aggregate = targets.len() == 1;
+        let agg_id = self.next_id("parallel_aggregator");
+
         // Create a node for each call
         let mut call_node_ids = Vec::new();
         for (i, call) in calls.iter().enumerate() {
             // Assign a target to each parallel call based on index
             // If we have targets ["a", "b"] and calls [action1, action2],
             // then action1 produces "a" and action2 produces "b"
-            let call_target = targets.get(i).cloned();
+            let call_target = if list_aggregate {
+                None
+            } else {
+                targets.get(i).cloned()
+            };
 
             let (call_id, call_node) = match &call.kind {
                 Some(ast::call::Kind::Action(action)) => {
@@ -2309,6 +2321,9 @@ impl DAGConverter {
                         .with_kwarg_exprs(kwarg_exprs);
                     if let Some(ref t) = call_target {
                         node = node.with_target(t);
+                    }
+                    if list_aggregate {
+                        node = node.with_aggregates_to(&agg_id);
                     }
                     if let Some(ref fn_name) = self.current_function {
                         node = node.with_function_name(fn_name);
@@ -2329,6 +2344,9 @@ impl DAGConverter {
                         .with_kwarg_exprs(kwarg_exprs);
                     if let Some(ref t) = call_target {
                         node = node.with_target(t);
+                    }
+                    if list_aggregate {
+                        node = node.with_aggregates_to(&agg_id);
                     }
                     if let Some(ref fn_name) = self.current_function {
                         node = node.with_function_name(fn_name);
@@ -2357,7 +2375,6 @@ impl DAGConverter {
         }
 
         // Create aggregator node (still needed for control flow even without targets)
-        let agg_id = self.next_id("parallel_aggregator");
         let target_label = if !targets.is_empty() {
             if targets.len() == 1 {
                 format!("parallel_aggregate -> {}", targets[0])

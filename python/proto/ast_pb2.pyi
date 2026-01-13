@@ -107,6 +107,7 @@ class _GlobalFunctionEnumTypeWrapper(
     GLOBAL_FUNCTION_RANGE: _GlobalFunction.ValueType  # 1
     GLOBAL_FUNCTION_LEN: _GlobalFunction.ValueType  # 2
     GLOBAL_FUNCTION_ENUMERATE: _GlobalFunction.ValueType  # 3
+    GLOBAL_FUNCTION_ISEXCEPTION: _GlobalFunction.ValueType  # 4
 
 class GlobalFunction(_GlobalFunction, metaclass=_GlobalFunctionEnumTypeWrapper):
     """Global (built-in) functions supported by the runtime."""
@@ -115,6 +116,7 @@ GLOBAL_FUNCTION_UNSPECIFIED: GlobalFunction.ValueType  # 0
 GLOBAL_FUNCTION_RANGE: GlobalFunction.ValueType  # 1
 GLOBAL_FUNCTION_LEN: GlobalFunction.ValueType  # 2
 GLOBAL_FUNCTION_ENUMERATE: GlobalFunction.ValueType  # 3
+GLOBAL_FUNCTION_ISEXCEPTION: GlobalFunction.ValueType  # 4
 Global___GlobalFunction: typing_extensions.TypeAlias = GlobalFunction
 
 @typing.final

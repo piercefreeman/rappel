@@ -50,9 +50,9 @@ use prost::Message;
 
 use crate::{
     ast_evaluator::{EvaluationError, ExpressionEvaluator, Scope},
-    completion::{GuardResult, InlineContext, analyze_subgraph, execute_inline_subgraph},
+    completion::{CompletionError, InlineContext, analyze_subgraph, execute_inline_subgraph},
     dag::{DAG, DAGConverter, DAGNode, EXCEPTION_SCOPE_VAR, EdgeType},
-    dag_state::{DAGHelper, ExecutionMode, SuccessorInfo},
+    dag_state::{DAGHelper, ExecutionMode},
     db::{
         ActionId, BackoffKind, CompletionRecord, Database, NewAction, QueuedAction, ScheduleId,
         WorkerStatusUpdate, WorkflowInstanceId, WorkflowVersionId,
@@ -1121,19 +1121,6 @@ pub struct InboxWrite {
 struct NodeActionResult {
     pub actions: Vec<NewAction>,
     pub inbox_writes: Vec<InboxWrite>,
-    /// If this is a spread node, the aggregator node ID and expected count
-    /// that needs readiness initialization.
-    pub readiness_init: Option<ReadinessInit>,
-    /// For empty spreads, the aggregator node ID that needs immediate completion.
-    /// When set, the aggregator should be triggered as if the spread completed with empty results.
-    pub empty_spread_aggregator: Option<String>,
-}
-
-/// Info needed to initialize readiness tracking for an aggregator node.
-#[derive(Debug, Clone)]
-struct ReadinessInit {
-    pub aggregator_node_id: String,
-    pub required_count: i32,
 }
 
 /// Exception information for error handling.
@@ -1717,7 +1704,10 @@ impl DAGRunner {
         };
 
         // Parse spread index if present
-        let (base_node_id, spread_index) = Self::parse_spread_node_id(node_id);
+        let (base_node_id, mut spread_index) = Self::parse_spread_node_id(node_id);
+        if spread_index.is_none() {
+            spread_index = Self::parallel_list_index(base_node_id, &dag);
+        }
 
         // Merge initial workflow inputs into the inline scope so downstream actions can
         // access them even if no intermediate node has rewritten them into the inbox.
@@ -2309,6 +2299,28 @@ impl DAGRunner {
         (node_id, None)
     }
 
+    fn parallel_list_index(node_id: &str, dag: &DAG) -> Option<usize> {
+        let node = dag.nodes.get(node_id)?;
+        let agg_id = node.aggregates_to.as_ref()?;
+        let agg_node = dag.nodes.get(agg_id)?;
+        let target_count = agg_node.targets.as_ref().map(|t| t.len()).unwrap_or(0);
+        if target_count != 1 {
+            return None;
+        }
+
+        dag.edges
+            .iter()
+            .filter(|edge| edge.edge_type == EdgeType::StateMachine)
+            .find_map(|edge| {
+                if edge.target != node_id {
+                    return None;
+                }
+                let condition = edge.condition.as_deref()?;
+                let idx_str = condition.strip_prefix("parallel:")?;
+                idx_str.parse::<usize>().ok()
+            })
+    }
+
     /// Collect inbox writes for a node's result via DATA_FLOW edges, with spread index support.
     #[allow(clippy::too_many_arguments)]
     fn collect_inbox_writes_for_node_with_spread(
@@ -2541,95 +2553,6 @@ impl DAGRunner {
             .or(catch_all_handler)
     }
 
-    /// Evaluate a guard expression for the runner's scope type.
-    ///
-    /// This is a wrapper around the completion module's evaluate_guard that
-    /// accepts the runner's Scope type (which is the same as InlineScope).
-    ///
-    /// Returns:
-    /// - `GuardResult::Pass` if the guard passes
-    /// - `GuardResult::Fail` if the guard evaluates to false
-    /// - `GuardResult::Error` if evaluation failed
-    fn evaluate_guard_for_scope(
-        guard_expr: Option<&ast::Expr>,
-        scope: &Scope,
-        successor_id: &str,
-    ) -> GuardResult {
-        let Some(guard) = guard_expr else {
-            // No guard expression - always pass
-            return GuardResult::Pass;
-        };
-
-        match ExpressionEvaluator::evaluate(guard, scope) {
-            Ok(val) => {
-                let is_true = val.is_truthy();
-                debug!(
-                    successor_id = %successor_id,
-                    guard_expr = ?guard,
-                    result = ?val,
-                    is_true = is_true,
-                    "evaluated guard expression"
-                );
-                if is_true {
-                    GuardResult::Pass
-                } else {
-                    GuardResult::Fail
-                }
-            }
-            Err(e) => {
-                warn!(
-                    successor_id = %successor_id,
-                    error = %e,
-                    "failed to evaluate guard expression"
-                );
-                GuardResult::Error(e.to_string())
-            }
-        }
-    }
-
-    fn filter_successors_with_guards(
-        successors: Vec<SuccessorInfo>,
-        scope: &Scope,
-        guard_errors: &mut Vec<(String, String)>,
-    ) -> Vec<SuccessorInfo> {
-        let mut selected = Vec::new();
-        let mut else_successors = Vec::new();
-        let mut has_guarded_edges = false;
-        let mut guard_passed = false;
-        let mut guard_error = false;
-
-        for successor in successors {
-            if successor.is_else {
-                else_successors.push(successor);
-                continue;
-            }
-
-            if let Some(ref guard) = successor.guard_expr {
-                has_guarded_edges = true;
-                match Self::evaluate_guard_for_scope(Some(guard), scope, &successor.node_id) {
-                    GuardResult::Pass => {
-                        guard_passed = true;
-                        selected.push(successor);
-                    }
-                    GuardResult::Fail => {}
-                    GuardResult::Error(error) => {
-                        guard_error = true;
-                        guard_errors.push((successor.node_id.clone(), error));
-                    }
-                }
-                continue;
-            }
-
-            selected.push(successor);
-        }
-
-        if has_guarded_edges && !guard_passed && !guard_error {
-            selected.extend(else_successors);
-        }
-
-        selected
-    }
-
     /// Process successor nodes with optional condition result for branching.
     ///
     /// Uses BFS traversal to process inline nodes and their successors iteratively.
@@ -2843,7 +2766,7 @@ impl DAGRunner {
                     // - Control-flow nodes (join, branch) pass through the incoming result
                     // - Value-producing nodes use their own inline_result
                     let passthrough_result = match succ_node.node_type.as_str() {
-                        "join" | "branch" | "fn_call" => current_result.clone(),
+                        "join" | "branch" => current_result.clone(),
                         _ => inline_result,
                     };
 
@@ -2884,12 +2807,11 @@ impl DAGRunner {
                         }
                     }
 
-                    // Merge inline scope variables (from parent inline nodes like `if`)
-                    // This ensures actions inside branches have access to variables defined earlier
+                    // Merge inline scope variables (from parent inline nodes like `if`).
+                    // Inline scope holds fresh values from the current traversal (e.g. loop updates),
+                    // so it should override stale inbox entries.
                     for (var_name, var_value) in inline_scope.iter() {
-                        inbox
-                            .entry(var_name.clone())
-                            .or_insert_with(|| var_value.clone());
+                        inbox.insert(var_name.clone(), var_value.clone());
                     }
 
                     // Create actions (may be multiple for spread nodes)
@@ -3088,7 +3010,7 @@ impl DAGRunner {
     /// Execute an inline node with in-memory scope (non-durable).
     fn execute_inline_node(node: &DAGNode, scope: &mut Scope) -> RunnerResult<WorkflowValue> {
         match node.node_type.as_str() {
-            "assignment" => {
+            "assignment" | "fn_call" => {
                 // Evaluate the assignment expression
                 if let Some(ref expr) = node.assign_expr {
                     match ExpressionEvaluator::evaluate(expr, scope) {
@@ -3306,7 +3228,7 @@ impl DAGRunner {
         );
 
         // Seed scope and inbox writes from initial inputs
-        let (mut scope, mut inbox_writes_to_commit) =
+        let (scope, inbox_writes_to_commit) =
             Self::seed_scope_and_inbox(&initial_inputs, &dag, &input_node.id, instance_id);
 
         debug!(
@@ -3322,273 +3244,48 @@ impl DAGRunner {
             contexts.insert(instance_id.0, scope.clone());
         }
 
-        // Find first delegated successors starting from input node
-        let mut actions_to_enqueue = Vec::new();
-        let mut readiness_inits: Vec<ReadinessInit> = Vec::new();
-        let mut empty_spread_aggregators: Vec<String> = Vec::new();
-        let mut visited = std::collections::HashSet::new();
-        let mut queue = std::collections::VecDeque::new();
-        let mut completion_payload: Option<Vec<u8>> = None;
-        let mut guard_errors: Vec<(String, String)> = Vec::new();
-
-        // Start from input node's successors
-        let initial_successors = helper.get_ready_successors(&input_node.id, None);
-        debug!(
-            input_node_id = %input_node.id,
-            successor_count = initial_successors.len(),
-            successors = ?initial_successors.iter().map(|s| &s.node_id).collect::<Vec<_>>(),
-            "input node successors"
-        );
-        for successor in
-            Self::filter_successors_with_guards(initial_successors, &scope, &mut guard_errors)
-        {
-            queue.push_back(successor.node_id);
-        }
-
-        while let Some(node_id) = queue.pop_front() {
-            if visited.contains(&node_id) {
-                continue;
+        // Build an initial completion plan from the input node so inline-only loops
+        // execute before the first delegated action is scheduled.
+        let subgraph = analyze_subgraph(&input_node.id, &dag, &helper);
+        let existing_inbox: HashMap<String, HashMap<String, WorkflowValue>> = HashMap::new();
+        let ctx = InlineContext {
+            initial_scope: &scope,
+            existing_inbox: &existing_inbox,
+            spread_index: None,
+        };
+        let plan = execute_inline_subgraph(
+            &input_node.id,
+            WorkflowValue::Null,
+            ctx,
+            &subgraph,
+            &dag,
+            instance_id,
+        )
+        .map_err(|err| match err {
+            CompletionError::GuardEvaluationError { node_id, message } => {
+                RunnerError::GuardEvaluationFailed(vec![(node_id, message)])
             }
-            visited.insert(node_id.clone());
-
-            let node = match helper.get_node(&node_id) {
-                Some(n) => n,
-                None => {
-                    debug!(node_id = %node_id, "node not found in DAG during start_instance");
-                    continue;
-                }
-            };
-
-            let mode = helper.get_execution_mode(node);
-            debug!(
-                node_id = %node_id,
-                node_type = %node.node_type,
-                is_spread = node.is_spread,
-                execution_mode = ?mode,
-                "processing node during start_instance"
-            );
-
-            match mode {
-                ExecutionMode::Delegated => {
-                    // Check if this is a fn_call node - these need to be expanded into
-                    // their function body rather than treated as external actions
-                    if node.is_fn_call {
-                        if let Some(ref called_fn) = node.called_function {
-                            // Find the input node for this function
-                            let fn_input_node_id = format!("{}_input_", called_fn);
-                            if let Some(input_id) =
-                                dag.nodes.keys().find(|k| k.starts_with(&fn_input_node_id))
-                            {
-                                debug!(
-                                    fn_call_node = %node_id,
-                                    called_function = %called_fn,
-                                    input_node = %input_id,
-                                    "expanding fn_call into function body"
-                                );
-                                // Add the function's input node to the queue to traverse
-                                if !visited.contains(input_id) {
-                                    queue.push_back(input_id.clone());
-                                }
-                            } else {
-                                warn!(
-                                    fn_call_node = %node_id,
-                                    called_function = %called_fn,
-                                    "fn_call: could not find input node for called function"
-                                );
-                            }
-                        }
-                    } else {
-                        // This is an action - enqueue it
-                        // For initial actions, we use the initial scope as the "inbox"
-                        // For spread nodes, this creates multiple actions plus inbox writes
-                        let result =
-                            Self::create_actions_for_node(node, instance_id, &scope, &dag)?;
-                        debug!(
-                            node_id = %node_id,
-                            actions_created = result.actions.len(),
-                            inbox_writes = result.inbox_writes.len(),
-                            readiness_init = ?result.readiness_init,
-                            "created initial actions for node"
-                        );
-                        actions_to_enqueue.extend(result.actions);
-                        inbox_writes_to_commit.extend(result.inbox_writes);
-                        // Collect readiness init for spread aggregators
-                        if let Some(init) = result.readiness_init {
-                            readiness_inits.push(init);
-                        }
-                        // Collect empty spread aggregators for immediate completion
-                        if let Some(agg_id) = result.empty_spread_aggregator {
-                            empty_spread_aggregators.push(agg_id);
-                        }
-                        // Don't traverse past delegated nodes - they'll handle their successors
-                    }
-                }
-                ExecutionMode::Inline => {
-                    // Execute inline nodes (e.g., assignments) and continue to their successors
-                    let inline_result = Self::execute_inline_node(node, &mut scope)?;
-                    debug!(
-                        node_id = %node_id,
-                        result = ?inline_result,
-                        "executed inline node during start_instance"
-                    );
-
-                    // Add result to scope if this node has a target
-                    if let Some(ref target) = node.target {
-                        scope.insert(target.clone(), inline_result.clone());
-                        // Propagate inline defaults to downstream inboxes so later actions receive them
-                        Self::collect_inbox_writes_for_node(
-                            &node.id,
-                            target,
-                            &inline_result,
-                            &dag,
-                            instance_id,
-                            &mut inbox_writes_to_commit,
-                        );
-                    }
-                    // Also handle multiple targets (tuple unpacking)
-                    if let Some(ref targets) = node.targets
-                        && targets.len() == 1
-                    {
-                        scope.insert(targets[0].clone(), inline_result.clone());
-                        // For multiple targets, the inline_result would be an array
-                        Self::collect_inbox_writes_for_node(
-                            &node.id,
-                            &targets[0],
-                            &inline_result,
-                            &dag,
-                            instance_id,
-                            &mut inbox_writes_to_commit,
-                        );
-                    } else if let Some(ref targets) = node.targets
-                        && targets.len() > 1
-                    {
-                        let items = match &inline_result {
-                            WorkflowValue::List(values) | WorkflowValue::Tuple(values) => {
-                                Some(values)
-                            }
-                            _ => None,
-                        };
-
-                        if let Some(items) = items {
-                            for (idx, target) in targets.iter().enumerate() {
-                                let value = items.get(idx).cloned().unwrap_or(WorkflowValue::Null);
-                                scope.insert(target.clone(), value.clone());
-                                Self::collect_inbox_writes_for_node(
-                                    &node.id,
-                                    target,
-                                    &value,
-                                    &dag,
-                                    instance_id,
-                                    &mut inbox_writes_to_commit,
-                                );
-                            }
-                        }
-                    }
-
-                    if node.node_type == "return" || node.is_output {
-                        let result_value = if node.node_type == "return" {
-                            inline_result
-                        } else {
-                            scope.get("result").cloned().unwrap_or(WorkflowValue::Null)
-                        };
-                        let mut result_map = HashMap::new();
-                        result_map.insert("result".to_string(), result_value);
-                        completion_payload = Some(Self::serialize_workflow_result(&result_map));
-                        break;
-                    }
-
-                    let inline_successors = helper.get_ready_successors(&node_id, None);
-                    debug!(
-                        node_id = %node_id,
-                        inline_successor_count = inline_successors.len(),
-                        "continuing to successors after inline execution"
-                    );
-                    for successor in Self::filter_successors_with_guards(
-                        inline_successors,
-                        &scope,
-                        &mut guard_errors,
-                    ) {
-                        if !visited.contains(&successor.node_id) {
-                            queue.push_back(successor.node_id);
-                        }
-                    }
-                }
+            CompletionError::WorkflowDeadEnd { guard_errors, .. } => {
+                RunnerError::GuardEvaluationFailed(guard_errors)
             }
-        }
+            other => RunnerError::Dag(other.to_string()),
+        })?;
 
-        // Write inbox entries for spread counts
         let db = &self.completion_handler.db;
-        for write in inbox_writes_to_commit {
-            db.append_to_inbox(
-                write.instance_id,
-                &write.target_node_id,
-                &write.variable_name,
-                write.value.to_json(),
-                &write.source_node_id,
-                write.spread_index,
-            )
-            .await?;
-        }
-
-        if let Some(payload) = completion_payload {
-            db.complete_instance(instance_id, Some(&payload)).await?;
+        let result = db.execute_completion_plan(instance_id, plan).await?;
+        if result.workflow_completed {
             info!(
                 instance_id = %instance_id.0,
                 "completed workflow instance during start_instance"
             );
-            return Ok(0);
         }
 
-        if actions_to_enqueue.is_empty() && !guard_errors.is_empty() {
-            return Err(RunnerError::GuardEvaluationFailed(guard_errors));
-        }
-
-        // Initialize node_readiness for spread aggregators BEFORE enqueuing actions
-        // This ensures the readiness row exists when spread actions complete
-        for init in readiness_inits {
-            debug!(
-                aggregator_node_id = %init.aggregator_node_id,
-                required_count = init.required_count,
-                "initializing node readiness for aggregator"
-            );
-            db.init_node_readiness(instance_id, &init.aggregator_node_id, init.required_count)
-                .await?;
-        }
-
-        // Enqueue all initial actions
-        let count = actions_to_enqueue.len();
-        for action in actions_to_enqueue {
-            db.enqueue_action(action).await?;
-        }
-
-        // Handle empty spread aggregators - these need to be triggered immediately
-        // since there are no spread actions that will complete and trigger them.
-        // We enqueue them directly as barriers without using readiness tracking.
-        for agg_id in empty_spread_aggregators {
-            info!(
-                instance_id = %instance_id.0,
-                aggregator_id = %agg_id,
-                "enqueueing empty spread aggregator for immediate completion"
-            );
-            // Enqueue the aggregator as a barrier directly - no readiness tracking needed
-            // since there are no spread actions to wait for.
-            let barrier_action = NewAction {
-                instance_id,
-                module_name: "".to_string(),
-                action_name: "".to_string(),
-                dispatch_payload: Vec::new(),
-                timeout_seconds: 300,
-                max_retries: 0,
-                backoff_kind: BackoffKind::None,
-                backoff_base_delay_ms: 0,
-                node_id: Some(agg_id),
-                node_type: Some("barrier".to_string()),
-            };
-            db.enqueue_action(barrier_action).await?;
-        }
-
-        info!(instance_id = %instance_id.0, actions = count, "started workflow instance");
-        Ok(count)
+        info!(
+            instance_id = %instance_id.0,
+            actions = result.newly_ready_nodes.len(),
+            "started workflow instance"
+        );
+        Ok(result.newly_ready_nodes.len())
     }
 
     /// Create action(s) for a node using inbox values.
@@ -3646,8 +3343,6 @@ impl DAGRunner {
             return Ok(NodeActionResult {
                 actions: vec![action],
                 inbox_writes,
-                readiness_init: None,
-                empty_spread_aggregator: None,
             });
         }
 
@@ -3665,20 +3360,15 @@ impl DAGRunner {
             Some(action) => Ok(NodeActionResult {
                 actions: vec![action],
                 inbox_writes: vec![],
-                readiness_init: None,
-                empty_spread_aggregator: None,
             }),
             None => Ok(NodeActionResult::default()),
         }
     }
 
     /// Create actions and inbox writes for a spread node.
-    /// Returns readiness init info so caller can initialize node_readiness table.
-    ///
     /// For empty spreads (0 items in collection), this returns:
     /// - No actions
     /// - An inbox write of empty array to the aggregator
-    /// - empty_spread_aggregator set to trigger the aggregator immediately
     fn create_spread_node_result(
         node: &DAGNode,
         instance_id: WorkflowInstanceId,
@@ -3718,22 +3408,12 @@ impl DAGRunner {
                     source_node_id: node.id.clone(),
                     spread_index: None,
                 }],
-                readiness_init: None,
-                empty_spread_aggregator: Some(agg_id.clone()),
             });
         }
-
-        // Return readiness init info so caller can initialize node_readiness
-        let readiness_init = aggregator_id.clone().map(|agg_id| ReadinessInit {
-            aggregator_node_id: agg_id,
-            required_count: spread_count as i32,
-        });
 
         Ok(NodeActionResult {
             actions,
             inbox_writes: vec![],
-            readiness_init,
-            empty_spread_aggregator: None,
         })
     }
 

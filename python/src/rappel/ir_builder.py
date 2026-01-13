@@ -249,6 +249,7 @@ RECOMMENDATIONS = {
 
 GLOBAL_FUNCTIONS = {
     "enumerate": ir.GlobalFunction.GLOBAL_FUNCTION_ENUMERATE,
+    "isexception": ir.GlobalFunction.GLOBAL_FUNCTION_ISEXCEPTION,
     "len": ir.GlobalFunction.GLOBAL_FUNCTION_LEN,
     "range": ir.GlobalFunction.GLOBAL_FUNCTION_RANGE,
 }
