@@ -3141,7 +3141,9 @@ impl DAGRunner {
     async fn start_unstarted_instances(&self) -> RunnerResult<usize> {
         let db = &self.completion_handler.db;
         // Use the same batch size as dispatch to ensure we can keep up with workflow creation rate
-        let instances = db.find_unstarted_instances(self.config.batch_size as i32).await?;
+        let instances = db
+            .find_unstarted_instances(self.config.batch_size as i32)
+            .await?;
         let count = instances.len();
 
         for instance in instances {

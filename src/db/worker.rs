@@ -683,6 +683,14 @@ impl Database {
 
         let requeued_count = result.len() as i64;
 
+        // Debug: log when we check but find nothing to requeue
+        if requeued_count == 0 {
+            tracing::debug!(
+                limit = limit,
+                "requeue_failed_actions: no retryable actions found"
+            );
+        }
+
         // Now mark actions that have exhausted their retries as permanently failed
         let permanent_result = sqlx::query(
             r#"
@@ -734,14 +742,15 @@ impl Database {
         // 1. Are still 'running'
         // 2. Have at least one action in a terminal failure state
         //    (status = 'exhausted' or status = 'timed_out')
+        //
+        // Query is structured to use idx_action_queue_exhausted efficiently:
+        // start from the smaller set (exhausted actions) and join to instances.
         let result = sqlx::query(
             r#"
             WITH instances_to_fail AS (
-                SELECT DISTINCT wi.id
-                FROM workflow_instances wi
-                JOIN action_queue aq ON aq.instance_id = wi.id
-                WHERE wi.status = 'running'
-                  AND aq.status IN ('exhausted', 'timed_out')
+                SELECT DISTINCT aq.instance_id as id
+                FROM action_queue aq
+                WHERE aq.status IN ('exhausted', 'timed_out')
                 LIMIT $1
             )
             UPDATE workflow_instances wi
