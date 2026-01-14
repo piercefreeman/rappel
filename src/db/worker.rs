@@ -2046,15 +2046,19 @@ impl Database {
                     throughput_per_min,
                     total_completed,
                     last_action_at,
-                    updated_at
+                    updated_at,
+                    median_dequeue_ms,
+                    median_handling_ms
                 )
-                VALUES ($1, $2, $3, $4, $5, NOW())
+                VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7)
                 ON CONFLICT (pool_id, worker_id)
                 DO UPDATE SET
                     throughput_per_min = EXCLUDED.throughput_per_min,
                     total_completed = EXCLUDED.total_completed,
                     last_action_at = EXCLUDED.last_action_at,
-                    updated_at = EXCLUDED.updated_at
+                    updated_at = EXCLUDED.updated_at,
+                    median_dequeue_ms = EXCLUDED.median_dequeue_ms,
+                    median_handling_ms = EXCLUDED.median_handling_ms
                 "#,
             )
             .bind(pool_id)
@@ -2062,12 +2066,60 @@ impl Database {
             .bind(status.throughput_per_min)
             .bind(status.total_completed)
             .bind(status.last_action_at)
+            .bind(status.median_dequeue_ms)
+            .bind(status.median_handling_ms)
             .execute(&mut *tx)
             .await?;
         }
 
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Calculate median timing metrics for workers from action_logs.
+    ///
+    /// Returns median dequeue time (dispatched_at - enqueued_at) and median handling time
+    /// (completed_at - enqueued_at) for each worker in the pool over the given time window.
+    pub async fn calculate_worker_median_times(
+        &self,
+        pool_id: Uuid,
+        lookback_seconds: i64,
+    ) -> DbResult<Vec<(i64, Option<i64>, Option<i64>)>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                worker_id,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (
+                    ORDER BY EXTRACT(EPOCH FROM (dispatched_at - enqueued_at)) * 1000
+                )::BIGINT as median_dequeue_ms,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (
+                    ORDER BY EXTRACT(EPOCH FROM (completed_at - enqueued_at)) * 1000
+                )::BIGINT as median_handling_ms
+            FROM action_logs
+            WHERE pool_id = $1
+              AND worker_id IS NOT NULL
+              AND enqueued_at IS NOT NULL
+              AND completed_at IS NOT NULL
+              AND completed_at >= NOW() - ($2 || ' seconds')::interval
+            GROUP BY worker_id
+            "#,
+        )
+        .bind(pool_id)
+        .bind(lookback_seconds.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        let results: Vec<(i64, Option<i64>, Option<i64>)> = rows
+            .iter()
+            .map(|row| {
+                let worker_id: i64 = row.get("worker_id");
+                let median_dequeue_ms: Option<i64> = row.get("median_dequeue_ms");
+                let median_handling_ms: Option<i64> = row.get("median_handling_ms");
+                (worker_id, median_dequeue_ms, median_handling_ms)
+            })
+            .collect();
+
+        Ok(results)
     }
 
     // ========================================================================

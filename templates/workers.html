@@ -42,6 +42,8 @@
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Worker</th>
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Throughput/min</th>
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Total Completed</th>
+                        <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Median Dequeue</th>
+                        <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Median Handling</th>
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Last Action</th>
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Updated</th>
                     </tr>
@@ -53,6 +55,20 @@
                             <td class="px-4 py-3 font-mono text-xs text-zinc-700 dark:text-zinc-300">{{ worker.worker_id }}</td>
                             <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">{{ worker.throughput_per_min }}</td>
                             <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">{{ worker.total_completed }}</td>
+                            <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">
+                                {% if worker.median_dequeue_ms %}
+                                    {{ worker.median_dequeue_ms }}ms
+                                {% else %}
+                                    <span class="text-zinc-400">—</span>
+                                {% endif %}
+                            </td>
+                            <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">
+                                {% if worker.median_handling_ms %}
+                                    {{ worker.median_handling_ms }}ms
+                                {% else %}
+                                    <span class="text-zinc-400">—</span>
+                                {% endif %}
+                            </td>
                             <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">
                                 {% if worker.last_action_at %}
                                     {{ macros::datetime(timestamp=worker.last_action_at) }}
