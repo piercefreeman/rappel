@@ -750,7 +750,9 @@ impl Database {
             WITH instances_to_fail AS (
                 SELECT DISTINCT aq.instance_id as id
                 FROM action_queue aq
+                JOIN workflow_instances wi ON wi.id = aq.instance_id
                 WHERE aq.status IN ('exhausted', 'timed_out')
+                  AND wi.status = 'running'
                 LIMIT $1
             )
             UPDATE workflow_instances wi
@@ -758,7 +760,6 @@ impl Database {
                 completed_at = NOW()
             FROM instances_to_fail
             WHERE wi.id = instances_to_fail.id
-              AND wi.status = 'running'
             "#,
         )
         .bind(limit)
