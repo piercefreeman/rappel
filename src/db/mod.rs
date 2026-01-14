@@ -233,6 +233,10 @@ pub struct WorkerStatusUpdate {
     pub throughput_per_min: f64,
     pub total_completed: i64,
     pub last_action_at: Option<DateTime<Utc>>,
+    /// Median time from enqueue to dispatch (dequeue latency) in milliseconds
+    pub median_dequeue_ms: Option<i64>,
+    /// Median time from enqueue to completion (total handling time) in milliseconds
+    pub median_handling_ms: Option<i64>,
 }
 
 /// Worker throughput status for webapp reporting.
@@ -244,6 +248,10 @@ pub struct WorkerStatus {
     pub total_completed: i64,
     pub last_action_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    /// Median time from enqueue to dispatch (dequeue latency) in milliseconds
+    pub median_dequeue_ms: Option<i64>,
+    /// Median time from enqueue to completion (total handling time) in milliseconds
+    pub median_handling_ms: Option<i64>,
 }
 
 /// A workflow instance (execution)
@@ -301,6 +309,10 @@ pub struct CompletionRecord {
     pub result_payload: Vec<u8>,
     pub delivery_token: Uuid,
     pub error_message: Option<String>,
+    /// Worker pool that processed this action
+    pub pool_id: Option<Uuid>,
+    /// Worker ID within the pool that processed this action
+    pub worker_id: Option<i64>,
 }
 
 /// New action to enqueue
@@ -342,6 +354,12 @@ pub struct ActionLog {
     pub result_payload: Option<Vec<u8>>,
     pub error_message: Option<String>,
     pub duration_ms: Option<i64>,
+    /// Worker pool that handled this action (set on completion)
+    pub pool_id: Option<Uuid>,
+    /// Worker ID within the pool that handled this action (set on completion)
+    pub worker_id: Option<i64>,
+    /// When the action was originally enqueued (copied from action_queue at dispatch)
+    pub enqueued_at: Option<DateTime<Utc>>,
 }
 
 // ============================================================================

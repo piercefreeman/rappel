@@ -2011,6 +2011,8 @@ mod tests {
             total_completed: 42,
             last_action_at: Some(chrono::Utc::now()),
             updated_at: chrono::Utc::now(),
+            median_dequeue_ms: Some(15),
+            median_handling_ms: Some(120),
         }];
 
         let html = render_workers_page(&templates, &statuses, 5);

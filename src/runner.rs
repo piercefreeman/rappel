@@ -1401,13 +1401,32 @@ impl DAGRunner {
                         let pool_id = status_runner.work_handler.worker_pool_id();
                         let snapshots = status_runner.work_handler.worker_throughput_snapshot();
                         if !snapshots.is_empty() {
+                            // Calculate median times for workers (look back 5 minutes)
+                            let median_times = status_runner
+                                .completion_handler
+                                .db
+                                .calculate_worker_median_times(pool_id, 300)
+                                .await
+                                .unwrap_or_default();
+
+                            // Create a lookup map for median times by worker_id
+                            let median_map: std::collections::HashMap<i64, (Option<i64>, Option<i64>)> =
+                                median_times.into_iter().map(|(w, d, h)| (w, (d, h))).collect();
+
                             let updates: Vec<WorkerStatusUpdate> = snapshots
                                 .into_iter()
-                                .map(|snapshot| WorkerStatusUpdate {
-                                    worker_id: snapshot.worker_id as i64,
-                                    throughput_per_min: snapshot.throughput_per_min,
-                                    total_completed: snapshot.total_completed as i64,
-                                    last_action_at: snapshot.last_action_at,
+                                .map(|snapshot| {
+                                    let worker_id = snapshot.worker_id as i64;
+                                    let (median_dequeue_ms, median_handling_ms) =
+                                        median_map.get(&worker_id).copied().unwrap_or((None, None));
+                                    WorkerStatusUpdate {
+                                        worker_id,
+                                        throughput_per_min: snapshot.throughput_per_min,
+                                        total_completed: snapshot.total_completed as i64,
+                                        last_action_at: snapshot.last_action_at,
+                                        median_dequeue_ms,
+                                        median_handling_ms,
+                                    }
                                 })
                                 .collect();
 
@@ -1547,6 +1566,9 @@ impl DAGRunner {
                     let dag_cache = Arc::clone(&self.dag_cache);
                     let instance_contexts = Arc::clone(&self.instance_contexts);
                     let instance_id = in_flight.action.instance_id;
+                    // Capture worker tracking info for action logs
+                    let pool_id = self.work_handler.worker_pool_id();
+                    let worker_id = in_flight.worker_idx as i64;
 
                     tokio::spawn(async move {
                         // Use unified completion path for successful actions
@@ -1559,6 +1581,8 @@ impl DAGRunner {
                                 &in_flight,
                                 &metrics,
                                 WorkflowInstanceId(instance_id),
+                                Some(pool_id),
+                                Some(worker_id),
                             ).await {
                                 error!("Unified completion processing failed: {}", e);
 
@@ -1580,6 +1604,8 @@ impl DAGRunner {
                                 in_flight,
                                 metrics,
                                 WorkflowInstanceId(instance_id),
+                                Some(pool_id),
+                                Some(worker_id),
                             ).await {
                                 error!("Completion processing failed: {}", e);
                             }
@@ -1716,6 +1742,7 @@ impl DAGRunner {
     ///
     /// Every frontier node gets readiness tracking. A node is only enqueued
     /// when `completed_count == required_count`.
+    #[allow(clippy::too_many_arguments)]
     async fn process_completion_unified(
         db: &Database,
         dag_cache: &DAGCache,
@@ -1723,6 +1750,8 @@ impl DAGRunner {
         in_flight: &InFlightAction,
         metrics: &RoundTripMetrics,
         instance_id: WorkflowInstanceId,
+        pool_id: Option<Uuid>,
+        worker_id: Option<i64>,
     ) -> RunnerResult<crate::completion::CompletionResult> {
         let total_start = std::time::Instant::now();
 
@@ -1823,13 +1852,15 @@ impl DAGRunner {
                 .map_err(|e| RunnerError::Dag(e.to_string()))?;
 
         // Fill in action completion details
-        plan = plan.with_action_completion(
-            ActionId(in_flight.action.id),
-            in_flight.action.delivery_token,
-            metrics.success,
-            metrics.response_payload.clone(),
-            metrics.error_message.clone(),
-        );
+        plan = plan
+            .with_action_completion(
+                ActionId(in_flight.action.id),
+                in_flight.action.delivery_token,
+                metrics.success,
+                metrics.response_payload.clone(),
+                metrics.error_message.clone(),
+            )
+            .with_worker(pool_id, worker_id);
         let inline_ms = inline_start.elapsed().as_micros() as u64;
 
         debug!(
@@ -1908,6 +1939,8 @@ impl DAGRunner {
             result_payload: metrics.response_payload.clone(),
             delivery_token: in_flight.action.delivery_token,
             error_message: Some(format!("DAG completion failed: {}", error)),
+            pool_id: None,
+            worker_id: None,
         };
 
         if let Err(db_err) = db.complete_action(completion_record).await {
@@ -2023,6 +2056,7 @@ impl DAGRunner {
     /// 3. For inline nodes: execute immediately, collect their inbox writes too
     /// 4. For delegated nodes: read inbox, create action, add to batch
     /// 5. Write everything in one batch at the end
+    #[allow(clippy::too_many_arguments)]
     async fn process_completion_task(
         handler: WorkCompletionHandler,
         dag_cache: Arc<DAGCache>,
@@ -2030,6 +2064,8 @@ impl DAGRunner {
         in_flight: InFlightAction,
         metrics: RoundTripMetrics,
         instance_id: WorkflowInstanceId,
+        pool_id: Option<Uuid>,
+        worker_id: Option<i64>,
     ) -> RunnerResult<()> {
         let mut batch = CompletionBatch::new();
 
@@ -2040,6 +2076,8 @@ impl DAGRunner {
             result_payload: metrics.response_payload.clone(),
             delivery_token: in_flight.action.delivery_token,
             error_message: metrics.error_message.clone(),
+            pool_id,
+            worker_id,
         });
 
         // If failed, check if this is an exception that should be caught
@@ -4154,6 +4192,8 @@ mod tests {
             result_payload: vec![],
             delivery_token: Uuid::new_v4(),
             error_message: None,
+            pool_id: None,
+            worker_id: None,
         });
         assert!(!batch.is_empty());
     }

@@ -97,6 +97,12 @@ pub struct CompletionPlan {
     /// Error message if failed.
     pub error_message: Option<String>,
 
+    /// Worker pool that processed this action.
+    pub pool_id: Option<Uuid>,
+
+    /// Worker ID within the pool that processed this action.
+    pub worker_id: Option<i64>,
+
     /// Inbox writes for frontier nodes.
     pub inbox_writes: Vec<InboxWrite>,
 
@@ -126,6 +132,8 @@ impl CompletionPlan {
             success: true,
             result_payload: Vec::new(),
             error_message: None,
+            pool_id: None,
+            worker_id: None,
             inbox_writes: Vec::new(),
             readiness_resets: Vec::new(),
             readiness_inits: Vec::new(),
@@ -149,6 +157,13 @@ impl CompletionPlan {
         self.success = success;
         self.result_payload = result_payload;
         self.error_message = error_message;
+        self
+    }
+
+    /// Set worker tracking details.
+    pub fn with_worker(mut self, pool_id: Option<Uuid>, worker_id: Option<i64>) -> Self {
+        self.pool_id = pool_id;
+        self.worker_id = worker_id;
         self
     }
 }
