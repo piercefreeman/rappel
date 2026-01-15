@@ -96,3 +96,69 @@ Date: 2026-01-14
 ### Benchmark results (post DAG cache warm)
 - queue-noop, 10k instances, 10s, 4 workers: 13211 actions / 10.05s (~1314.0 actions/sec)
 - queue-noop, 50k instances, 10s, 4 workers: 7120 actions / 10.06s (~707.9 actions/sec)
+
+## Change 8: Delete completed actions on success + log queue
+- Success path now deletes action_queue rows and enqueues action_log_queue entries (includes pool_id/worker_id).
+- Flush loop now only drains action_log_queue.
+
+### Benchmark results (post delete-on-complete)
+- queue-noop, 10k instances, 10s, 4 workers: 11160 actions / 10.04s (~1111.8 actions/sec)
+- queue-noop, 50k instances, 10s, 4 workers: 7328 actions / 10.05s (~729.4 actions/sec)
+
+### Metrics snapshot (queue-noop, 10k instances, 10s)
+- process_completion_db_avg_us: ~19105us
+
+## Change 9: Decouple start_unstarted from dispatch loop
+- start_unstarted_instances runs in its own poll loop, avoiding dispatch starvation.
+
+### Benchmark results (post start loop split)
+- queue-noop, 10k instances, 10s, 4 workers: 23304 actions / 10.05s (~2319.4 actions/sec)
+- queue-noop, 50k instances, 10s, 4 workers: 21696 actions / 10.02s (~2165.1 actions/sec)
+
+### Metrics snapshot (queue-noop, 50k instances, 10s)
+- start_unstarted_avg_us: ~54808us (no longer blocks dispatch loop)
+- process_completion_db_avg_us: ~30047us
+
+## Change 10: Per-query timing inside execute_completion_plans_batch
+- Added per-query timing fields to debug logs (action_complete, inbox_insert, readiness_* updates, next_action_seq update, enqueue_insert, instance_complete, total).
+- Logged from `execute_completion_plans_batch` at debug level.
+
+### Timing summary (queue-noop, 10k instances, 5s, 4 workers)
+- Sampled 389 batch logs from `docs/benchmark_batch_timing_10k.log`.
+- Average per batch (us):
+  - enqueue_insert_us: ~10581
+  - inbox_insert_us: ~7182
+  - action_complete_us: ~913
+  - readiness_increment_us: ~919
+  - readiness_init_us: ~871
+  - next_action_seq_us: ~648
+  - total_us: ~23750
+- Max per batch (us): enqueue_insert_us ~55278, inbox_insert_us ~23029, total_us ~70548.
+
+## Change 11: Use UNNEST arrays for action_queue inserts
+- Replaced QueryBuilder multi-row insert with UNNEST arrays to cut bind/parse overhead on action_queue inserts.
+
+### Timing summary (queue-noop, 10k instances, 5s, 4 workers)
+- Sampled 403 batch logs from `docs/benchmark_batch_timing_10k_unnest.log`.
+- Average per batch (us):
+  - enqueue_insert_us: ~8155 (down from ~10581)
+  - inbox_insert_us: ~7045 (flat)
+  - total_us: ~20356 (down from ~23750)
+- Max per batch (us): enqueue_insert_us ~28633, total_us ~66027.
+
+## Change 12: UNNEST for inbox writes + drop redundant action_queue index
+- Replaced node_inputs multi-row insert with UNNEST arrays.
+- Dropped idx_action_queue_instance (covered by UNIQUE (instance_id, action_seq)).
+
+### Benchmark results (post UNNEST inbox + drop idx)
+- queue-noop, 10k instances, 10s, 4 workers: 25667 actions / 10.05s (~2553.2 actions/sec)
+- queue-noop, 50k instances, 10s, 4 workers: 24115 actions / 10.06s (~2396.3 actions/sec)
+- Benchmark still logs "Worker pool still has references, cannot shut down cleanly".
+
+### Timing summary (queue-noop, 10k instances, 5s, 4 workers)
+- Sampled 458 batch logs from `docs/benchmark_batch_timing_10k_unnest_inbox_dropidx.log`.
+- Average per batch (us):
+  - enqueue_insert_us: ~6804 (down from ~8155)
+  - inbox_insert_us: ~5453 (down from ~7045)
+  - total_us: ~17149 (down from ~20356)
+- Max per batch (us): enqueue_insert_us ~32925, inbox_insert_us ~20876, total_us ~55711.

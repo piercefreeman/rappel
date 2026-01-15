@@ -1910,22 +1910,6 @@ impl DAGRunner {
                                 match log_runner
                                     .completion_handler
                                     .db
-                                    .flush_completed_actions(batch_size)
-                                    .await
-                                {
-                                    Ok(count) => {
-                                        if count >= batch_size {
-                                            should_continue = true;
-                                        }
-                                    }
-                                    Err(err) => {
-                                        error!(?err, "failed to flush completed actions");
-                                    }
-                                }
-
-                                match log_runner
-                                    .completion_handler
-                                    .db
                                     .flush_action_log_queue(batch_size)
                                     .await
                                 {
@@ -1987,6 +1971,39 @@ impl DAGRunner {
             });
         }
 
+        // Start unstarted instances loop.
+        let start_runner = Arc::clone(&self);
+        let start_interval =
+            tokio::time::Duration::from_millis(start_runner.config.poll_interval_ms);
+        let _start_handle = tokio::spawn(async move {
+            loop {
+                if start_runner.shutdown_flag.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::select! {
+                    _ = start_runner.shutdown.notified() => break,
+                    _ = tokio::time::sleep(start_interval) => {
+                        let batch_size = start_runner.config.batch_size;
+                        let mut should_continue = true;
+
+                        while should_continue {
+                            should_continue = false;
+                            match start_runner.start_unstarted_instances().await {
+                                Ok(count) => {
+                                    if count >= batch_size {
+                                        should_continue = true;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to start unstarted instances: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         // Poll + dispatch loop - uses sleep() like original for consistent timing behavior
         let poll_runner = Arc::clone(&self);
         let poll_tx = completion_tx.clone();
@@ -2006,18 +2023,6 @@ impl DAGRunner {
                         // Keep processing until we've drained work or hit capacity
                         while should_continue {
                             should_continue = false;
-
-                            // Start unstarted instances - if we hit batch size, loop immediately
-                            match poll_runner.start_unstarted_instances().await {
-                                Ok(count) => {
-                                    if count >= batch_size {
-                                        should_continue = true;
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Failed to start unstarted instances: {}", e);
-                                }
-                            }
 
                             // Skip dispatch if no slots available
                             if poll_runner.work_handler.available_slots() == 0 {
