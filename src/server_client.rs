@@ -162,6 +162,138 @@ impl proto::workflow_service_server::WorkflowService for WorkflowGrpcService {
         }))
     }
 
+    async fn register_workflow_batch(
+        &self,
+        request: tonic::Request<proto::RegisterWorkflowBatchRequest>,
+    ) -> Result<tonic::Response<proto::RegisterWorkflowBatchResponse>, tonic::Status> {
+        let inner = request.into_inner();
+        let registration = inner
+            .registration
+            .ok_or_else(|| tonic::Status::invalid_argument("registration missing"))?;
+
+        let proto::WorkflowRegistration {
+            workflow_name,
+            ir,
+            ir_hash,
+            concurrent,
+            initial_context,
+            priority,
+        } = registration;
+
+        let program = ir_ast::Program::decode(&ir[..])
+            .map_err(|e| tonic::Status::invalid_argument(format!("invalid IR: {e}")))?;
+        if let Err(err) = validate_program(&program) {
+            return Err(tonic::Status::invalid_argument(format!(
+                "invalid IR: {err}"
+            )));
+        }
+
+        log_workflow_ir(&workflow_name, &ir_hash, &program);
+
+        let version_id = self
+            .database
+            .upsert_workflow_version(&workflow_name, &ir_hash, &ir, concurrent)
+            .await
+            .map_err(|e| tonic::Status::internal(format!("database error: {e}")))?;
+
+        let priority = priority.unwrap_or(0);
+        let batch_size = match inner.batch_size {
+            0 => 500usize,
+            size => size as usize,
+        };
+
+        let mut queued: u64 = 0;
+        let mut instance_ids: Vec<String> = Vec::new();
+
+        if !inner.inputs_list.is_empty() {
+            for chunk in inner.inputs_list.chunks(batch_size) {
+                let input_payloads: Vec<Option<Vec<u8>>> = chunk
+                    .iter()
+                    .map(|inputs| Some(inputs.encode_to_vec()))
+                    .collect();
+                if inner.include_instance_ids {
+                    let ids = self
+                        .database
+                        .create_instances_batch_with_priority(
+                            &workflow_name,
+                            version_id,
+                            &input_payloads,
+                            None,
+                            priority,
+                        )
+                        .await
+                        .map_err(|e| tonic::Status::internal(format!("database error: {e}")))?;
+                    queued += ids.len() as u64;
+                    instance_ids.extend(ids.into_iter().map(|id| id.to_string()));
+                } else {
+                    let count = self
+                        .database
+                        .create_instances_batch_count_with_priority(
+                            &workflow_name,
+                            version_id,
+                            &input_payloads,
+                            None,
+                            priority,
+                        )
+                        .await
+                        .map_err(|e| tonic::Status::internal(format!("database error: {e}")))?;
+                    queued += count as u64;
+                }
+            }
+        } else {
+            if inner.count == 0 {
+                return Err(tonic::Status::invalid_argument(
+                    "count must be >= 1 when inputs_list is empty",
+                ));
+            }
+            let base_inputs = inner.inputs.or(initial_context);
+            let base_payload = base_inputs.map(|inputs| inputs.encode_to_vec());
+            let mut remaining = inner.count as usize;
+            while remaining > 0 {
+                let size = batch_size.min(remaining);
+                let input_payloads = vec![base_payload.clone(); size];
+                if inner.include_instance_ids {
+                    let ids = self
+                        .database
+                        .create_instances_batch_with_priority(
+                            &workflow_name,
+                            version_id,
+                            &input_payloads,
+                            None,
+                            priority,
+                        )
+                        .await
+                        .map_err(|e| tonic::Status::internal(format!("database error: {e}")))?;
+                    queued += ids.len() as u64;
+                    instance_ids.extend(ids.into_iter().map(|id| id.to_string()));
+                } else {
+                    let count = self
+                        .database
+                        .create_instances_batch_count_with_priority(
+                            &workflow_name,
+                            version_id,
+                            &input_payloads,
+                            None,
+                            priority,
+                        )
+                        .await
+                        .map_err(|e| tonic::Status::internal(format!("database error: {e}")))?;
+                    queued += count as u64;
+                }
+                remaining -= size;
+            }
+        }
+
+        let queued_u32 = u32::try_from(queued)
+            .map_err(|_| tonic::Status::invalid_argument("queued instance count exceeds u32"))?;
+
+        Ok(tonic::Response::new(proto::RegisterWorkflowBatchResponse {
+            workflow_version_id: version_id.to_string(),
+            workflow_instance_ids: instance_ids,
+            queued: queued_u32,
+        }))
+    }
+
     async fn wait_for_instance(
         &self,
         request: tonic::Request<proto::WaitForInstanceRequest>,

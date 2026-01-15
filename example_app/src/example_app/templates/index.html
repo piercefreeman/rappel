@@ -58,6 +58,16 @@
         width: 1.2rem;
         height: 1.2rem;
       }
+      textarea {
+        padding: 0.5rem;
+        border: 1px solid #cbd5e1;
+        border-radius: 0.375rem;
+        font-size: 0.9rem;
+        width: 20rem;
+        min-height: 4.5rem;
+        resize: vertical;
+        font-family: ui-monospace, monospace;
+      }
       select {
         padding: 0.5rem;
         border: 1px solid #cbd5e1;
@@ -374,7 +384,36 @@
 
     <!-- Scheduled Workflows -->
     <section class="workflow-section">
-      <h3>15. Scheduled Workflows</h3>
+      <h3>15. Batch Workflow Runs</h3>
+      <p>
+        Queue a large number of workflow instances without blocking on execution.
+        Uses the bridge batch enqueue API under the hood.
+      </p>
+      <form id="batch-form">
+        <label for="batch-workflow">Workflow:</label>
+        <select id="batch-workflow" name="workflow_name">
+          <option value="ParallelMathWorkflow">ParallelMathWorkflow</option>
+        </select>
+        <label for="batch-count">Count:</label>
+        <input type="number" id="batch-count" name="count" min="1" value="1000" />
+        <label for="batch-size">Batch size:</label>
+        <input type="number" id="batch-size" name="batch_size" min="1" value="500" />
+        <label for="batch-priority">Priority:</label>
+        <input type="number" id="batch-priority" name="priority" placeholder="0" />
+        <label for="batch-ids">
+          <input type="checkbox" id="batch-ids" name="include_instance_ids" />
+          Include instance IDs
+        </label>
+        <button type="submit">Queue Batch</button>
+      </form>
+      <div class="hint">Inputs JSON (required): {"number": 7}</div>
+      <textarea id="batch-inputs" name="inputs" spellcheck="false">{"number": 7}</textarea>
+      <div class="status" id="batch-status"></div>
+      <div class="result" id="batch-result" hidden></div>
+    </section>
+
+    <section class="workflow-section">
+      <h3>16. Scheduled Workflows</h3>
       <p>
         Register a workflow to run automatically on a cron schedule or at fixed intervals.
         Schedules persist across server restarts.
@@ -634,7 +673,121 @@
       );
 
 
-      // 15. Schedule - toggle between cron and interval inputs
+      // 15. Batch workflow runs
+      const batchForm = document.getElementById("batch-form");
+      const batchStatus = document.getElementById("batch-status");
+      const batchResult = document.getElementById("batch-result");
+      const batchInputs = document.getElementById("batch-inputs");
+      const batchButton = batchForm.querySelector("button");
+
+      batchForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+
+        const workflow_name = document.getElementById("batch-workflow").value;
+        const count = Number(document.getElementById("batch-count").value);
+        const batch_size = Number(document.getElementById("batch-size").value);
+        const priorityRaw = document.getElementById("batch-priority").value.trim();
+        const include_instance_ids = document.getElementById("batch-ids").checked;
+        const inputsText = batchInputs.value.trim();
+
+        if (!Number.isFinite(count) || count < 1) return;
+        if (!Number.isFinite(batch_size) || batch_size < 1) return;
+
+        let inputs = null;
+        if (inputsText) {
+          try {
+            inputs = JSON.parse(inputsText);
+          } catch (error) {
+            batchStatus.textContent = `Invalid JSON: ${error.message}`;
+            batchStatus.className = "status error";
+            return;
+          }
+        }
+
+        const payload = {
+          workflow_name,
+          count,
+          batch_size,
+          include_instance_ids,
+        };
+        if (inputs !== null) {
+          payload.inputs = inputs;
+        }
+        if (priorityRaw !== "") {
+          const priority = Number(priorityRaw);
+          if (Number.isFinite(priority)) {
+            payload.priority = priority;
+          }
+        }
+
+        batchStatus.textContent = "Queueing instances...";
+        batchStatus.className = "status";
+        batchResult.hidden = true;
+        batchResult.textContent = "";
+        batchButton.disabled = true;
+
+        try {
+          const response = await fetch("/api/batch-run", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            throw new Error(data.detail ?? response.statusText);
+          }
+          if (!response.body) {
+            throw new Error("Missing response stream");
+          }
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const chunks = buffer.split("\n\n");
+            buffer = chunks.pop() ?? "";
+
+            chunks.forEach((chunk) => {
+              const lines = chunk.split("\n");
+              let eventName = "message";
+              let dataPayload = "";
+              lines.forEach((line) => {
+                if (line.startsWith("event:")) {
+                  eventName = line.slice(6).trim();
+                } else if (line.startsWith("data:")) {
+                  dataPayload += line.slice(5).trim();
+                }
+              });
+
+              if (!dataPayload) return;
+              const payload = JSON.parse(dataPayload);
+              if (eventName === "start") {
+                batchStatus.textContent = "Queueing instances...";
+                batchStatus.className = "status";
+              } else if (eventName === "complete") {
+                batchStatus.textContent = `Queued ${payload.queued} instances in ${payload.elapsed_ms}ms`;
+                batchStatus.className = "status success";
+                batchResult.textContent = JSON.stringify(payload, null, 2);
+                batchResult.hidden = false;
+              } else if (eventName === "error") {
+                batchStatus.textContent = `Failed: ${payload.message}`;
+                batchStatus.className = "status error";
+              }
+            });
+          }
+        } catch (error) {
+          batchStatus.textContent = `Failed: ${error.message}`;
+          batchStatus.className = "status error";
+        } finally {
+          batchButton.disabled = false;
+        }
+      });
+
+      // 16. Schedule - toggle between cron and interval inputs
       const scheduleTypeSelect = document.getElementById("schedule-type");
       const intervalInput = document.getElementById("schedule-interval");
       const cronInput = document.getElementById("schedule-cron");
@@ -649,7 +802,7 @@
         }
       });
 
-      // 15. Schedule - register schedule
+      // 16. Schedule - register schedule
       runWorkflow(
         "schedule-form",
         "/api/schedule",
@@ -673,7 +826,7 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
-      // 15. Schedule actions - pause, resume, delete
+      // 16. Schedule actions - pause, resume, delete
       async function scheduleAction(endpoint, action) {
         const workflow_name = document.getElementById("action-workflow").value;
         const status = document.getElementById("schedule-action-status");

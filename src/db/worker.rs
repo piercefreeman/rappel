@@ -128,6 +128,84 @@ impl Database {
         Ok(WorkflowInstanceId(id))
     }
 
+    /// Create workflow instances in bulk with a specific priority (returns instance IDs).
+    pub async fn create_instances_batch_with_priority(
+        &self,
+        workflow_name: &str,
+        version_id: WorkflowVersionId,
+        input_payloads: &[Option<Vec<u8>>],
+        schedule_id: Option<ScheduleId>,
+        priority: i32,
+    ) -> DbResult<Vec<WorkflowInstanceId>> {
+        if input_payloads.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = sqlx::query(
+            r#"
+            WITH new_instances AS (
+                INSERT INTO workflow_instances
+                    (workflow_name, workflow_version_id, input_payload, schedule_id, priority)
+                SELECT $1, $2, payload, $3, $4
+                FROM UNNEST($5::bytea[]) AS payload
+                RETURNING id
+            )
+            INSERT INTO instance_context (instance_id)
+            SELECT id FROM new_instances
+            RETURNING instance_id
+            "#,
+        )
+        .bind(workflow_name)
+        .bind(version_id.0)
+        .bind(schedule_id.map(|id| id.0))
+        .bind(priority)
+        .bind(input_payloads)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| WorkflowInstanceId(row.get::<Uuid, _>("instance_id")))
+            .collect())
+    }
+
+    /// Create workflow instances in bulk with a specific priority (returns count).
+    pub async fn create_instances_batch_count_with_priority(
+        &self,
+        workflow_name: &str,
+        version_id: WorkflowVersionId,
+        input_payloads: &[Option<Vec<u8>>],
+        schedule_id: Option<ScheduleId>,
+        priority: i32,
+    ) -> DbResult<i64> {
+        if input_payloads.is_empty() {
+            return Ok(0);
+        }
+
+        let result = sqlx::query(
+            r#"
+            WITH new_instances AS (
+                INSERT INTO workflow_instances
+                    (workflow_name, workflow_version_id, input_payload, schedule_id, priority)
+                SELECT $1, $2, payload, $3, $4
+                FROM UNNEST($5::bytea[]) AS payload
+                RETURNING id
+            )
+            INSERT INTO instance_context (instance_id)
+            SELECT id FROM new_instances
+            "#,
+        )
+        .bind(workflow_name)
+        .bind(version_id.0)
+        .bind(schedule_id.map(|id| id.0))
+        .bind(priority)
+        .bind(input_payloads)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() as i64)
+    }
+
     /// Claim instances that need to be started (running but no actions created yet).
     /// Orders by priority DESC (higher priority first), then by created_at ASC.
     pub async fn find_unstarted_instances(
@@ -3275,8 +3353,8 @@ impl Database {
 
     /// Calculate median timing metrics for workers from action_logs.
     ///
-    /// Returns median dequeue time (dispatched_at - enqueued_at) and median handling time
-    /// (completed_at - enqueued_at) for each worker in the pool over the given time window.
+    /// Returns median dequeue time (dispatched_at - enqueued_at) and median execution time
+    /// (completed_at - dispatched_at) for each worker in the pool over the given time window.
     pub async fn calculate_worker_median_times(
         &self,
         pool_id: Uuid,
@@ -3290,12 +3368,16 @@ impl Database {
                     ORDER BY EXTRACT(EPOCH FROM (dispatched_at - enqueued_at)) * 1000
                 )::BIGINT as median_dequeue_ms,
                 PERCENTILE_CONT(0.5) WITHIN GROUP (
-                    ORDER BY EXTRACT(EPOCH FROM (completed_at - enqueued_at)) * 1000
+                    ORDER BY COALESCE(
+                        duration_ms::DOUBLE PRECISION,
+                        EXTRACT(EPOCH FROM (completed_at - dispatched_at)) * 1000
+                    )
                 )::BIGINT as median_handling_ms
             FROM action_logs
             WHERE pool_id = $1
               AND worker_id IS NOT NULL
               AND enqueued_at IS NOT NULL
+              AND dispatched_at IS NOT NULL
               AND completed_at IS NOT NULL
               AND completed_at >= NOW() - ($2 || ' seconds')::interval
             GROUP BY worker_id

@@ -235,7 +235,7 @@ pub struct WorkerStatusUpdate {
     pub last_action_at: Option<DateTime<Utc>>,
     /// Median time from enqueue to dispatch (dequeue latency) in milliseconds
     pub median_dequeue_ms: Option<i64>,
-    /// Median time from enqueue to completion (total handling time) in milliseconds
+    /// Median execution time from dispatch to completion in milliseconds
     pub median_handling_ms: Option<i64>,
 }
 
@@ -250,7 +250,7 @@ pub struct WorkerStatus {
     pub updated_at: DateTime<Utc>,
     /// Median time from enqueue to dispatch (dequeue latency) in milliseconds
     pub median_dequeue_ms: Option<i64>,
-    /// Median time from enqueue to completion (total handling time) in milliseconds
+    /// Median execution time from dispatch to completion in milliseconds
     pub median_handling_ms: Option<i64>,
 }
 

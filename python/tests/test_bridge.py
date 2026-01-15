@@ -10,7 +10,13 @@ from grpc import aio  # type: ignore[attr-defined]
 
 from proto import messages_pb2 as pb2
 from rappel import bridge
-from rappel.bridge import RunInstanceResult, run_instance, wait_for_instance
+from rappel.bridge import (
+    RunBatchResult,
+    RunInstanceResult,
+    run_instance,
+    run_instances_batch,
+    wait_for_instance,
+)
 
 
 class TestWorkflowStub:
@@ -217,6 +223,106 @@ class TestWaitForInstance:
         call_args = mock_stub.WaitForInstance.call_args
         request = call_args[0][0]
         assert request.poll_interval_secs == 5.0
+
+
+class TestRunInstancesBatch:
+    """Tests for run_instances_batch function."""
+
+    @pytest.fixture
+    def mock_stub(self, monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+        """Create a mock gRPC stub."""
+        stub = AsyncMock()
+
+        async def fake_workflow_stub() -> AsyncMock:
+            return stub
+
+        @asynccontextmanager
+        async def fake_ensure_singleton():
+            yield 8080
+
+        monkeypatch.setattr(bridge, "_workflow_stub", fake_workflow_stub)
+        monkeypatch.setattr(bridge, "ensure_singleton", fake_ensure_singleton)
+        return stub
+
+    def test_run_instances_batch_success(
+        self, monkeypatch: pytest.MonkeyPatch, mock_stub: AsyncMock
+    ) -> None:
+        response = pb2.RegisterWorkflowBatchResponse(
+            workflow_version_id="version-123",
+            workflow_instance_ids=["instance-1", "instance-2"],
+            queued=2,
+        )
+        mock_stub.RegisterWorkflowBatch.return_value = response
+
+        initial_context = pb2.WorkflowArguments()
+        arg = initial_context.arguments.add()
+        arg.key = "name"
+        arg.value.primitive.string_value = "hello"
+
+        registration = pb2.WorkflowRegistration(
+            workflow_name="batchworkflow",
+            ir=b"ir-data",
+            ir_hash="hash123",
+        )
+        payload = registration.SerializeToString()
+
+        result = asyncio.run(
+            run_instances_batch(
+                payload,
+                count=2,
+                inputs=initial_context,
+                batch_size=100,
+                include_instance_ids=True,
+            )
+        )
+
+        assert isinstance(result, RunBatchResult)
+        assert result.workflow_version_id == "version-123"
+        assert result.workflow_instance_ids == ["instance-1", "instance-2"]
+        assert result.queued == 2
+
+        call_args = mock_stub.RegisterWorkflowBatch.call_args
+        request = call_args[0][0]
+        assert request.registration.workflow_name == "batchworkflow"
+        assert request.count == 2
+        assert request.batch_size == 100
+        assert request.include_instance_ids is True
+        assert request.inputs.arguments[0].key == "name"
+
+    def test_run_instances_batch_validation_error(
+        self, monkeypatch: pytest.MonkeyPatch, mock_stub: AsyncMock
+    ) -> None:
+        registration = pb2.WorkflowRegistration(
+            workflow_name="batchworkflow",
+            ir=b"ir-data",
+            ir_hash="hash123",
+        )
+        payload = registration.SerializeToString()
+
+        with pytest.raises(ValueError, match="count must be >= 1"):
+            asyncio.run(run_instances_batch(payload, count=0))
+
+    def test_run_instances_batch_grpc_error(
+        self, monkeypatch: pytest.MonkeyPatch, mock_stub: AsyncMock
+    ) -> None:
+        class MockAioRpcError(aio.AioRpcError, Exception):
+            def __init__(self) -> None:
+                pass
+
+            def __str__(self) -> str:
+                return "Connection refused"
+
+        mock_stub.RegisterWorkflowBatch.side_effect = MockAioRpcError()
+
+        registration = pb2.WorkflowRegistration(
+            workflow_name="batchworkflow",
+            ir=b"ir-data",
+            ir_hash="hash123",
+        )
+        payload = registration.SerializeToString()
+
+        with pytest.raises(RuntimeError, match="register_workflow_batch failed"):
+            asyncio.run(run_instances_batch(payload, count=1))
 
     def test_wait_for_instance_not_found(
         self, monkeypatch: pytest.MonkeyPatch, mock_stub: AsyncMock

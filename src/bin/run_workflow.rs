@@ -132,6 +132,13 @@ impl proto::workflow_service_server::WorkflowService for WorkflowService {
         }))
     }
 
+    async fn register_workflow_batch(
+        &self,
+        _request: tonic::Request<proto::RegisterWorkflowBatchRequest>,
+    ) -> Result<tonic::Response<proto::RegisterWorkflowBatchResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not implemented"))
+    }
+
     async fn wait_for_instance(
         &self,
         _request: tonic::Request<proto::WaitForInstanceRequest>,

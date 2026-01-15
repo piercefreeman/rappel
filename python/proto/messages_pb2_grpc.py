@@ -130,6 +130,11 @@ class WorkflowServiceStub(object):
                 request_serializer=messages__pb2.RegisterWorkflowRequest.SerializeToString,
                 response_deserializer=messages__pb2.RegisterWorkflowResponse.FromString,
                 _registered_method=True)
+        self.RegisterWorkflowBatch = channel.unary_unary(
+                '/rappel.messages.WorkflowService/RegisterWorkflowBatch',
+                request_serializer=messages__pb2.RegisterWorkflowBatchRequest.SerializeToString,
+                response_deserializer=messages__pb2.RegisterWorkflowBatchResponse.FromString,
+                _registered_method=True)
         self.WaitForInstance = channel.unary_unary(
                 '/rappel.messages.WorkflowService/WaitForInstance',
                 request_serializer=messages__pb2.WaitForInstanceRequest.SerializeToString,
@@ -162,6 +167,12 @@ class WorkflowServiceServicer(object):
     """
 
     def RegisterWorkflow(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RegisterWorkflowBatch(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -205,6 +216,11 @@ def add_WorkflowServiceServicer_to_server(servicer, server):
                     servicer.RegisterWorkflow,
                     request_deserializer=messages__pb2.RegisterWorkflowRequest.FromString,
                     response_serializer=messages__pb2.RegisterWorkflowResponse.SerializeToString,
+            ),
+            'RegisterWorkflowBatch': grpc.unary_unary_rpc_method_handler(
+                    servicer.RegisterWorkflowBatch,
+                    request_deserializer=messages__pb2.RegisterWorkflowBatchRequest.FromString,
+                    response_serializer=messages__pb2.RegisterWorkflowBatchResponse.SerializeToString,
             ),
             'WaitForInstance': grpc.unary_unary_rpc_method_handler(
                     servicer.WaitForInstance,
@@ -260,6 +276,33 @@ class WorkflowService(object):
             '/rappel.messages.WorkflowService/RegisterWorkflow',
             messages__pb2.RegisterWorkflowRequest.SerializeToString,
             messages__pb2.RegisterWorkflowResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RegisterWorkflowBatch(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/rappel.messages.WorkflowService/RegisterWorkflowBatch',
+            messages__pb2.RegisterWorkflowBatchRequest.SerializeToString,
+            messages__pb2.RegisterWorkflowBatchResponse.FromString,
             options,
             channel_credentials,
             insecure,

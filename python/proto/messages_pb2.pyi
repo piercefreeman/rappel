@@ -877,6 +877,103 @@ class RegisterWorkflowResponse(google.protobuf.message.Message):
 Global___RegisterWorkflowResponse: typing_extensions.TypeAlias = RegisterWorkflowResponse
 
 @typing.final
+class RegisterWorkflowBatchRequest(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    REGISTRATION_FIELD_NUMBER: builtins.int
+    COUNT_FIELD_NUMBER: builtins.int
+    INPUTS_FIELD_NUMBER: builtins.int
+    INPUTS_LIST_FIELD_NUMBER: builtins.int
+    BATCH_SIZE_FIELD_NUMBER: builtins.int
+    INCLUDE_INSTANCE_IDS_FIELD_NUMBER: builtins.int
+    count: builtins.int
+    """Total number of instances to create when inputs_list is empty."""
+    batch_size: builtins.int
+    """Batch size for database inserts."""
+    include_instance_ids: builtins.bool
+    """Whether to return instance IDs in the response."""
+    @property
+    def registration(self) -> Global___WorkflowRegistration: ...
+    @property
+    def inputs(self) -> Global___WorkflowArguments:
+        """Base inputs to apply to each instance when inputs_list is empty."""
+
+    @property
+    def inputs_list(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[
+        Global___WorkflowArguments
+    ]:
+        """Per-instance inputs (overrides count/inputs when provided)."""
+
+    def __init__(
+        self,
+        *,
+        registration: Global___WorkflowRegistration | None = ...,
+        count: builtins.int = ...,
+        inputs: Global___WorkflowArguments | None = ...,
+        inputs_list: collections.abc.Iterable[Global___WorkflowArguments] | None = ...,
+        batch_size: builtins.int = ...,
+        include_instance_ids: builtins.bool = ...,
+    ) -> None: ...
+    def HasField(
+        self, field_name: typing.Literal["inputs", b"inputs", "registration", b"registration"]
+    ) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing.Literal[
+            "batch_size",
+            b"batch_size",
+            "count",
+            b"count",
+            "include_instance_ids",
+            b"include_instance_ids",
+            "inputs",
+            b"inputs",
+            "inputs_list",
+            b"inputs_list",
+            "registration",
+            b"registration",
+        ],
+    ) -> None: ...
+
+Global___RegisterWorkflowBatchRequest: typing_extensions.TypeAlias = RegisterWorkflowBatchRequest
+
+@typing.final
+class RegisterWorkflowBatchResponse(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    WORKFLOW_VERSION_ID_FIELD_NUMBER: builtins.int
+    WORKFLOW_INSTANCE_IDS_FIELD_NUMBER: builtins.int
+    QUEUED_FIELD_NUMBER: builtins.int
+    workflow_version_id: builtins.str
+    queued: builtins.int
+    @property
+    def workflow_instance_ids(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedScalarFieldContainer[builtins.str]: ...
+    def __init__(
+        self,
+        *,
+        workflow_version_id: builtins.str = ...,
+        workflow_instance_ids: collections.abc.Iterable[builtins.str] | None = ...,
+        queued: builtins.int = ...,
+    ) -> None: ...
+    def ClearField(
+        self,
+        field_name: typing.Literal[
+            "queued",
+            b"queued",
+            "workflow_instance_ids",
+            b"workflow_instance_ids",
+            "workflow_version_id",
+            b"workflow_version_id",
+        ],
+    ) -> None: ...
+
+Global___RegisterWorkflowBatchResponse: typing_extensions.TypeAlias = RegisterWorkflowBatchResponse
+
+@typing.final
 class WaitForInstanceRequest(google.protobuf.message.Message):
     DESCRIPTOR: google.protobuf.descriptor.Descriptor
 

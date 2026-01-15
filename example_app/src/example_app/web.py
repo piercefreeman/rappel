@@ -1,17 +1,21 @@
 """FastAPI surface for the rappel example app."""
 
+import inspect
+import json
 import os
+import time
+from collections.abc import AsyncIterator
 from datetime import timedelta
 from pathlib import Path
 from typing import Literal, Optional
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from rappel import delete_schedule, pause_schedule, resume_schedule, schedule_workflow
+from rappel import bridge, delete_schedule, pause_schedule, resume_schedule, schedule_workflow
 
 from example_app.workflows import (
     BranchRequest,
@@ -320,6 +324,59 @@ class ScheduleActionResponse(BaseModel):
     message: str
 
 
+class BatchRunRequest(BaseModel):
+    workflow_name: str = Field(description="Name of the workflow to enqueue")
+    count: int = Field(
+        default=1,
+        ge=1,
+        description="Number of instances to enqueue when inputs_list is not provided",
+    )
+    inputs: Optional[dict] = Field(
+        default=None,
+        description="Base inputs to reuse for all instances when inputs_list is not provided",
+    )
+    inputs_list: Optional[list[dict]] = Field(
+        default=None,
+        description="Per-instance inputs; overrides count/inputs if provided",
+    )
+    batch_size: int = Field(
+        default=500,
+        ge=1,
+        le=10000,
+        description="Number of instances to insert per database batch",
+    )
+    priority: Optional[int] = Field(
+        default=None,
+        description="Optional priority for queued instances (higher runs first)",
+    )
+    include_instance_ids: bool = Field(
+        default=False,
+        description="Include instance IDs in SSE batch events",
+    )
+
+
+def _sse_event(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+def _required_workflow_inputs(workflow_cls: type) -> set[str]:
+    try:
+        run_impl = workflow_cls.__workflow_run_impl__
+    except AttributeError:
+        run_impl = workflow_cls.run
+    signature = inspect.signature(run_impl)
+    required = set()
+    for name, param in list(signature.parameters.items())[1:]:
+        if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
+            continue
+        if param.default is inspect._empty:
+            required.add(name)
+    return required
+
+
+def _missing_input_keys(required: set[str], inputs: dict) -> list[str]:
+    return [key for key in sorted(required) if inputs.get(key) is None]
+
+
 @app.post("/api/schedule", response_model=ScheduleResponse)
 async def register_schedule(payload: ScheduleRequest) -> ScheduleResponse:
     """Register a workflow to run on a schedule."""
@@ -356,6 +413,99 @@ async def register_schedule(payload: ScheduleRequest) -> ScheduleResponse:
         )
     except Exception as e:
         return ScheduleResponse(success=False, message=str(e))
+
+
+@app.post("/api/batch-run")
+async def run_batch_workflow(payload: BatchRunRequest) -> StreamingResponse:
+    """Queue a batch of workflow instances and stream progress via SSE."""
+    workflow_cls = WORKFLOW_REGISTRY.get(payload.workflow_name)
+    if not workflow_cls:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown workflow: {payload.workflow_name}"
+        )
+
+    inputs_list = payload.inputs_list
+    if inputs_list is not None and len(inputs_list) == 0:
+        raise HTTPException(status_code=400, detail="inputs_list must not be empty")
+
+    total = len(inputs_list) if inputs_list is not None else payload.count
+    if total < 1:
+        raise HTTPException(status_code=400, detail="count must be >= 1")
+
+    base_inputs = dict(payload.inputs or {})
+    required_keys = _required_workflow_inputs(workflow_cls)
+    if inputs_list is not None:
+        for idx, inputs in enumerate(inputs_list):
+            missing = _missing_input_keys(required_keys, inputs)
+            if missing:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"inputs_list[{idx}] missing required keys: "
+                        f"{', '.join(missing)}"
+                    ),
+                )
+    else:
+        missing = _missing_input_keys(required_keys, base_inputs)
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"inputs missing required keys: {', '.join(missing)}",
+            )
+
+    async def event_stream() -> AsyncIterator[str]:
+        start_time = time.perf_counter()
+        try:
+            yield _sse_event(
+                "start",
+                {
+                    "workflow_name": payload.workflow_name,
+                    "total": total,
+                    "batch_size": payload.batch_size,
+                },
+            )
+
+            registration = workflow_cls._build_registration_payload(priority=payload.priority)
+            if inputs_list is not None:
+                batch_inputs = [
+                    workflow_cls._build_initial_context((), inputs)
+                    for inputs in inputs_list
+                ]
+                base_inputs_message = None
+            else:
+                batch_inputs = None
+                base_inputs_message = (
+                    workflow_cls._build_initial_context((), base_inputs)
+                    if payload.inputs is not None
+                    else None
+                )
+
+            batch_result = await bridge.run_instances_batch(
+                registration.SerializeToString(),
+                count=total,
+                inputs=base_inputs_message,
+                inputs_list=batch_inputs,
+                batch_size=payload.batch_size,
+                include_instance_ids=payload.include_instance_ids,
+            )
+            workflow_cls._workflow_version_id = batch_result.workflow_version_id
+            elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+            yield _sse_event(
+                "complete",
+                {
+                    "workflow_version_id": batch_result.workflow_version_id,
+                    "queued": batch_result.queued,
+                    "total": total,
+                    "elapsed_ms": elapsed_ms,
+                    "instance_ids": batch_result.workflow_instance_ids
+                    if payload.include_instance_ids
+                    else None,
+                },
+            )
+        except Exception as exc:  # pragma: no cover - streaming errors
+            yield _sse_event("error", {"message": str(exc)})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.post("/api/schedule/pause", response_model=ScheduleActionResponse)

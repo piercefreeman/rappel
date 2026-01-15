@@ -35,6 +35,13 @@ class RunInstanceResult:
     workflow_instance_id: str
 
 
+@dataclass
+class RunBatchResult:
+    workflow_version_id: str
+    workflow_instance_ids: list[str]
+    queued: int
+
+
 def _boot_command() -> list[str]:
     override = os.environ.get("RAPPEL_BOOT_COMMAND")
     if override:
@@ -204,6 +211,46 @@ async def run_instance(payload: bytes) -> RunInstanceResult:
     return RunInstanceResult(
         workflow_version_id=response.workflow_version_id,
         workflow_instance_id=response.workflow_instance_id,
+    )
+
+
+async def run_instances_batch(
+    payload: bytes,
+    *,
+    count: int = 1,
+    inputs: Optional[pb2.WorkflowArguments] = None,
+    inputs_list: Optional[list[pb2.WorkflowArguments]] = None,
+    batch_size: int = 500,
+    include_instance_ids: bool = False,
+) -> RunBatchResult:
+    """Register a workflow definition and start multiple instances over the gRPC bridge."""
+    if count < 1 and not inputs_list:
+        raise ValueError("count must be >= 1 when inputs_list is empty")
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+
+    async with ensure_singleton():
+        stub = await _workflow_stub()
+    registration = pb2.WorkflowRegistration()
+    registration.ParseFromString(payload)
+    request = pb2.RegisterWorkflowBatchRequest(
+        registration=registration,
+        count=count,
+        batch_size=batch_size,
+        include_instance_ids=include_instance_ids,
+    )
+    if inputs is not None:
+        request.inputs.CopyFrom(inputs)
+    if inputs_list:
+        request.inputs_list.extend(inputs_list)
+    try:
+        response = await stub.RegisterWorkflowBatch(request, timeout=30.0)
+    except aio.AioRpcError as exc:  # pragma: no cover
+        raise RuntimeError(f"register_workflow_batch failed: {exc}") from exc
+    return RunBatchResult(
+        workflow_version_id=response.workflow_version_id,
+        workflow_instance_ids=list(response.workflow_instance_ids),
+        queued=response.queued,
     )
 
 

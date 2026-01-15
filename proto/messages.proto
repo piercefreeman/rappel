@@ -161,6 +161,26 @@ message RegisterWorkflowResponse {
   string workflow_instance_id = 2;
 }
 
+message RegisterWorkflowBatchRequest {
+  WorkflowRegistration registration = 1;
+  // Total number of instances to create when inputs_list is empty.
+  uint32 count = 2;
+  // Base inputs to apply to each instance when inputs_list is empty.
+  WorkflowArguments inputs = 3;
+  // Per-instance inputs (overrides count/inputs when provided).
+  repeated WorkflowArguments inputs_list = 4;
+  // Batch size for database inserts.
+  uint32 batch_size = 5;
+  // Whether to return instance IDs in the response.
+  bool include_instance_ids = 6;
+}
+
+message RegisterWorkflowBatchResponse {
+  string workflow_version_id = 1;
+  repeated string workflow_instance_ids = 2;
+  uint32 queued = 3;
+}
+
 message WaitForInstanceRequest {
   string instance_id = 1;
   double poll_interval_secs = 2;
@@ -279,6 +299,8 @@ service WorkerBridge {
 // Workflow management service for client operations.
 service WorkflowService {
   rpc RegisterWorkflow(RegisterWorkflowRequest) returns (RegisterWorkflowResponse);
+  rpc RegisterWorkflowBatch(RegisterWorkflowBatchRequest)
+      returns (RegisterWorkflowBatchResponse);
   rpc WaitForInstance(WaitForInstanceRequest) returns (WaitForInstanceResponse);
   // Schedule management
   rpc RegisterSchedule(RegisterScheduleRequest) returns (RegisterScheduleResponse);
