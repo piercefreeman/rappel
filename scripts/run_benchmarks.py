@@ -708,6 +708,12 @@ def single(
 @click.option("--hosts", default=1, help="Number of hosts")
 @click.option("--instances", default=1, help="Number of workflow instances")
 @click.option("--timeout", default=300, help="Timeout per benchmark run in seconds")
+@click.option(
+    "--benchmark-config",
+    "benchmark_config_str",
+    default=None,
+    help="Per-benchmark config: 'bench:loop_size:complexity,...' e.g. 'for-loop:64:500,fan-out:32:200'",
+)
 def suite(
     output: str | None,
     fmt: str,
@@ -718,6 +724,7 @@ def suite(
     hosts: int,
     instances: int,
     timeout: int,
+    benchmark_config_str: str | None,
 ):
     """Run multiple benchmarks with the same configuration."""
     if not check_benchmark_available():
@@ -731,8 +738,22 @@ def suite(
         print(f"Unknown benchmarks: {', '.join(invalid)}", file=sys.stderr)
         sys.exit(1)
 
+    benchmark_configs: dict[str, dict[str, int]] = {}
+    if benchmark_config_str:
+        benchmark_configs = parse_benchmark_config(benchmark_config_str)
+
+    unknown_configs = [b for b in benchmark_configs if b not in allowed]
+    if unknown_configs:
+        print(f"Unknown benchmarks in config: {', '.join(unknown_configs)}", file=sys.stderr)
+        sys.exit(1)
+
+    for bench in benchmark_types:
+        if bench not in benchmark_configs:
+            benchmark_configs[bench] = {"loop_size": loop_size, "complexity": complexity}
+
     results: dict[str, BenchmarkResult | BenchmarkError] = {}
     for benchmark in benchmark_types:
+        bench_cfg = benchmark_configs[benchmark]
         print(f"=== Running {benchmark} Benchmark ===", file=sys.stderr)
         reset_database()
         result = run_benchmark(
@@ -740,9 +761,9 @@ def suite(
                 "--benchmark",
                 benchmark,
                 "--loop-size",
-                str(loop_size),
+                str(bench_cfg["loop_size"]),
                 "--complexity",
-                str(complexity),
+                str(bench_cfg["complexity"]),
                 "--workers-per-host",
                 str(workers_per_host),
                 "--hosts",
@@ -765,6 +786,7 @@ def suite(
             "hosts": hosts,
             "instances": instances,
             "timeout": timeout,
+            "benchmark_configs": benchmark_configs,
         },
         results=results,
     )
