@@ -130,7 +130,11 @@ impl Database {
 
     /// Claim instances that need to be started (running but no actions created yet).
     /// Orders by priority DESC (higher priority first), then by created_at ASC.
-    pub async fn find_unstarted_instances(&self, limit: i32) -> DbResult<Vec<WorkflowInstance>> {
+    pub async fn find_unstarted_instances(
+        &self,
+        limit: i32,
+        stale_before: DateTime<Utc>,
+    ) -> DbResult<Vec<WorkflowInstance>> {
         let instances = sqlx::query_as::<_, WorkflowInstance>(
             r#"
             WITH claimed AS (
@@ -138,7 +142,7 @@ impl Database {
                 FROM workflow_instances
                 WHERE status = 'running'
                   AND next_action_seq = 0
-                  AND started_at IS NULL
+                  AND (started_at IS NULL OR started_at < $2)
                 ORDER BY priority DESC, created_at ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT $1
@@ -153,6 +157,7 @@ impl Database {
             "#,
         )
         .bind(limit)
+        .bind(stale_before)
         .fetch_all(&self.pool)
         .await?;
 
@@ -1084,6 +1089,50 @@ impl Database {
         Ok(())
     }
 
+    /// Fetch the latest inbox update timestamp for cache invalidation.
+    pub async fn get_inbox_updated_at(
+        &self,
+        instance_id: WorkflowInstanceId,
+    ) -> DbResult<DateTime<Utc>> {
+        let updated_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+            r#"
+            SELECT inbox_updated_at
+            FROM workflow_instances
+            WHERE id = $1
+            "#,
+        )
+        .bind(instance_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        updated_at.ok_or_else(|| {
+            DbError::NotFound(format!(
+                "workflow instance {} (inbox updated_at)",
+                instance_id.0
+            ))
+        })
+    }
+
+    /// Mark inbox updated_at for a set of instances after inbox writes.
+    pub async fn touch_inbox_updated_at(&self, instance_ids: &[Uuid]) -> DbResult<()> {
+        if instance_ids.is_empty() {
+            return Ok(());
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE workflow_instances
+            SET inbox_updated_at = NOW()
+            WHERE id = ANY($1)
+            "#,
+        )
+        .bind(instance_ids)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     /// Read all pending inputs for a node (single query).
     ///
     /// Returns a map of variable_name -> latest value (non-spread only).
@@ -1152,6 +1201,50 @@ impl Database {
         .await?;
 
         Ok(())
+    }
+
+    /// Compact inbox rows by removing older duplicates per variable/spread index.
+    ///
+    /// Keeps the latest row per (instance_id, target_node_id, variable_name, spread_index).
+    pub async fn compact_node_inputs(&self, min_age_seconds: i64, limit: i64) -> DbResult<i64> {
+        if limit <= 0 {
+            return Ok(0);
+        }
+
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY instance_id, target_node_id, variable_name, COALESCE(spread_index, -1)
+                           ORDER BY created_at DESC
+                       ) AS rn
+                FROM node_inputs
+                WHERE created_at < NOW() - ($1 || ' seconds')::interval
+            ),
+            deleted AS (
+                DELETE FROM node_inputs
+                WHERE id IN (
+                    SELECT id
+                    FROM ranked
+                    WHERE rn > 1
+                    LIMIT $2
+                )
+                RETURNING 1
+            )
+            SELECT COUNT(*) FROM deleted
+            "#,
+        )
+        .bind(min_age_seconds)
+        .bind(limit)
+        .fetch_one(&self.pool)
+        .await?;
+
+        if count > 0 {
+            tracing::info!(count = count, "compact_node_inputs");
+        }
+
+        Ok(count)
     }
 
     /// Count completed actions for a set of node IDs within an instance.
@@ -1293,6 +1386,17 @@ impl Database {
                     .push_bind(write.4);
             });
             builder.build().execute(&mut *tx).await?;
+
+            sqlx::query(
+                r#"
+                UPDATE workflow_instances
+                SET inbox_updated_at = NOW()
+                WHERE id = $1
+                "#,
+            )
+            .bind(instance_id.0)
+            .execute(&mut *tx)
+            .await?;
         }
 
         // Atomically increment readiness counter (init-on-first-use)
@@ -1413,6 +1517,17 @@ impl Database {
         .bind(&value)
         .bind(source_node_id)
         .bind(spread_index)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE workflow_instances
+            SET inbox_updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(instance_id.0)
         .execute(&mut *tx)
         .await?;
 
@@ -1894,6 +2009,10 @@ impl Database {
 
         if !inbox_writes.is_empty() {
             let step_start = std::time::Instant::now();
+            let mut touch_instance_ids: HashSet<Uuid> = HashSet::new();
+            for write in &inbox_writes {
+                touch_instance_ids.insert(write.instance_id.0);
+            }
             let mut instance_ids = Vec::with_capacity(inbox_writes.len());
             let mut target_node_ids = Vec::with_capacity(inbox_writes.len());
             let mut variable_names = Vec::with_capacity(inbox_writes.len());
@@ -1937,6 +2056,18 @@ impl Database {
             .bind(&values)
             .bind(&source_node_ids)
             .bind(&spread_indexes)
+            .execute(&mut *tx)
+            .await?;
+
+            let touch_ids: Vec<Uuid> = touch_instance_ids.into_iter().collect();
+            sqlx::query(
+                r#"
+                UPDATE workflow_instances
+                SET inbox_updated_at = NOW()
+                WHERE id = ANY($1)
+                "#,
+            )
+            .bind(&touch_ids)
             .execute(&mut *tx)
             .await?;
             timings.inbox_insert_us = step_start.elapsed().as_micros() as u64;
@@ -2562,6 +2693,17 @@ impl Database {
                     .push_bind(write.spread_index);
             });
             builder.build().execute(&mut *tx).await?;
+
+            sqlx::query(
+                r#"
+                UPDATE workflow_instances
+                SET inbox_updated_at = NOW()
+                WHERE id = $1
+                "#,
+            )
+            .bind(instance_id.0)
+            .execute(&mut *tx)
+            .await?;
         }
 
         // 2.5. Reset readiness for loop re-triggering (before increments)

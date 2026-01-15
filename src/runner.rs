@@ -33,7 +33,7 @@
 
 use std::{
     cmp::Ordering as CmpOrdering,
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -47,6 +47,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use chrono::{DateTime, Utc};
 use prost::Message;
 
 use crate::{
@@ -68,7 +69,13 @@ use crate::{
     worker::{ActionDispatchPayload, PythonWorkerPool, RoundTripMetrics, WorkerThroughputSnapshot},
 };
 
-type InboxCache = HashMap<String, HashMap<String, WorkflowValue>>;
+type InboxValues = HashMap<String, HashMap<String, WorkflowValue>>;
+
+#[derive(Debug, Clone)]
+pub(crate) struct InstanceInboxCache {
+    values: InboxValues,
+    updated_at: DateTime<Utc>,
+}
 
 // ============================================================================
 // Workflow Value Conversion
@@ -621,7 +628,7 @@ pub struct WorkQueueHandler {
     slot_tracker: Arc<WorkerSlotTracker>,
     in_flight: Arc<Mutex<InFlightTracker>>,
     dag_cache: Arc<DAGCache>,
-    instance_inboxes: Arc<RwLock<HashMap<Uuid, InboxCache>>>,
+    instance_inboxes: Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
     metrics: Option<Arc<RunnerMetrics>>,
 }
 
@@ -632,7 +639,7 @@ impl WorkQueueHandler {
         slot_tracker: Arc<WorkerSlotTracker>,
         in_flight: Arc<Mutex<InFlightTracker>>,
         dag_cache: Arc<DAGCache>,
-        instance_inboxes: Arc<RwLock<HashMap<Uuid, InboxCache>>>,
+        instance_inboxes: Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
         metrics: Option<Arc<RunnerMetrics>>,
     ) -> Self {
         Self {
@@ -1102,12 +1109,19 @@ impl WorkQueueHandler {
         }
 
         let mut cache = self.instance_inboxes.write().await;
-        let instance_cache = cache.entry(instance_id.0).or_default();
+        let instance_cache = cache
+            .entry(instance_id.0)
+            .or_insert_with(|| InstanceInboxCache {
+                values: HashMap::new(),
+                updated_at: Utc::now(),
+            });
+        instance_cache.updated_at = Utc::now();
         for write in inbox_writes {
             if write.spread_index.is_some() {
                 continue;
             }
             let node_cache = instance_cache
+                .values
                 .entry(write.target_node_id.clone())
                 .or_default();
             node_cache.insert(write.variable_name.clone(), write.value.clone());
@@ -1150,7 +1164,9 @@ impl WorkCompletionHandler {
         }
 
         // Write inbox entries (data flow between nodes)
+        let mut inbox_instance_ids: HashSet<Uuid> = HashSet::new();
         for inbox_write in batch.inbox_writes {
+            inbox_instance_ids.insert(inbox_write.instance_id.0);
             self.db
                 .append_to_inbox(
                     inbox_write.instance_id,
@@ -1162,6 +1178,8 @@ impl WorkCompletionHandler {
                 )
                 .await?;
         }
+        let touch_ids: Vec<Uuid> = inbox_instance_ids.into_iter().collect();
+        self.db.touch_inbox_updated_at(&touch_ids).await?;
 
         // Enqueue new actions
         for new_action in batch.new_actions {
@@ -1579,6 +1597,14 @@ pub struct RunnerConfig {
     pub gc_retention_seconds: i64,
     /// Batch size for garbage collection operations.
     pub gc_batch_size: i32,
+    /// Maximum age in milliseconds for a start claim before reclaiming it.
+    pub start_claim_timeout_ms: u64,
+    /// Inbox compaction interval (milliseconds). If None, compaction is disabled.
+    pub inbox_compaction_interval_ms: Option<u64>,
+    /// Maximum inbox rows to compact per pass.
+    pub inbox_compaction_batch_size: i64,
+    /// Minimum age in seconds for inbox rows eligible for compaction.
+    pub inbox_compaction_min_age_seconds: i64,
 }
 
 impl Default for RunnerConfig {
@@ -1600,6 +1626,10 @@ impl Default for RunnerConfig {
             gc_interval_ms: None,
             gc_retention_seconds: 86400, // 24 hours
             gc_batch_size: 100,
+            start_claim_timeout_ms: 60000,
+            inbox_compaction_interval_ms: None,
+            inbox_compaction_batch_size: 10000,
+            inbox_compaction_min_age_seconds: 60,
         }
     }
 }
@@ -1621,7 +1651,7 @@ pub struct DAGRunner {
     /// Used to provide workflow input variables during inline evaluation.
     instance_contexts: Arc<RwLock<HashMap<Uuid, Scope>>>,
     /// Best-effort cache of latest inbox values per instance/node.
-    instance_inboxes: Arc<RwLock<HashMap<Uuid, InboxCache>>>,
+    instance_inboxes: Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
     /// Shutdown signal
     shutdown: Arc<tokio::sync::Notify>,
     shutdown_flag: Arc<AtomicBool>,
@@ -1971,6 +2001,47 @@ impl DAGRunner {
             });
         }
 
+        // Inbox compaction loop (only if enabled).
+        if let Some(compact_interval_ms) = self.config.inbox_compaction_interval_ms {
+            let compact_runner = Arc::clone(&self);
+            let _compact_handle = tokio::spawn(async move {
+                let mut interval = make_interval(compact_interval_ms, "inbox_compaction");
+                loop {
+                    if compact_runner.shutdown_flag.load(Ordering::Acquire) {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = compact_runner.shutdown.notified() => break,
+                        _ = interval.tick() => {
+                            let min_age_seconds =
+                                compact_runner.config.inbox_compaction_min_age_seconds;
+                            let batch_size = compact_runner.config.inbox_compaction_batch_size;
+                            let mut should_continue = true;
+
+                            while should_continue {
+                                should_continue = false;
+                                match compact_runner
+                                    .completion_handler
+                                    .db
+                                    .compact_node_inputs(min_age_seconds, batch_size)
+                                    .await
+                                {
+                                    Ok(count) => {
+                                        if count >= batch_size {
+                                            should_continue = true;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        error!(?err, "failed to compact node_inputs");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         // Start unstarted instances loop.
         let start_runner = Arc::clone(&self);
         let start_interval =
@@ -2275,7 +2346,7 @@ impl DAGRunner {
         db: &Database,
         dag_cache: &DAGCache,
         instance_contexts: &Arc<RwLock<HashMap<Uuid, Scope>>>,
-        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InboxCache>>>,
+        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
         completion_batcher: Arc<CompletionBatcher>,
         in_flight: &InFlightAction,
         metrics: &RoundTripMetrics,
@@ -2574,7 +2645,7 @@ impl DAGRunner {
         handler: WorkCompletionHandler,
         dag_cache: Arc<DAGCache>,
         instance_contexts: Arc<RwLock<HashMap<Uuid, Scope>>>,
-        instance_inboxes: Arc<RwLock<HashMap<Uuid, InboxCache>>>,
+        instance_inboxes: Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
         in_flight: InFlightAction,
         metrics: RoundTripMetrics,
         instance_id: WorkflowInstanceId,
@@ -3727,36 +3798,61 @@ impl DAGRunner {
     /// Best-effort inbox cache lookup; fetches missing nodes from DB.
     async fn load_inbox_with_cache(
         db: &Database,
-        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InboxCache>>>,
+        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
         instance_id: WorkflowInstanceId,
         node_ids: &std::collections::HashSet<String>,
-    ) -> RunnerResult<InboxCache> {
+    ) -> RunnerResult<InboxValues> {
         if node_ids.is_empty() {
-            return Ok(InboxCache::new());
+            return Ok(InboxValues::new());
         }
 
-        let mut merged: InboxCache = InboxCache::new();
+        let db_updated_at = db.get_inbox_updated_at(instance_id).await?;
+        let mut merged: InboxValues = InboxValues::new();
         let mut missing: std::collections::HashSet<String> = node_ids.clone();
+        let mut cache_valid = false;
 
         {
             let cache = instance_inboxes.read().await;
+            if let Some(instance_cache) = cache.get(&instance_id.0)
+                && db_updated_at <= instance_cache.updated_at
+            {
+                cache_valid = true;
+            }
+        }
+
+        if cache_valid {
+            let cache = instance_inboxes.read().await;
             if let Some(instance_cache) = cache.get(&instance_id.0) {
                 for node_id in node_ids {
-                    if let Some(values) = instance_cache.get(node_id) {
+                    if let Some(values) = instance_cache.values.get(node_id) {
                         merged.insert(node_id.clone(), values.clone());
                         missing.remove(node_id);
                     }
                 }
             }
+        } else {
+            let mut cache = instance_inboxes.write().await;
+            cache.remove(&instance_id.0);
+            missing = node_ids.clone();
+            merged.clear();
         }
 
         if !missing.is_empty() {
             let fetched = inbox_json_to_workflow(db.batch_read_inbox(instance_id, &missing).await?);
             {
                 let mut cache = instance_inboxes.write().await;
-                let instance_cache = cache.entry(instance_id.0).or_default();
+                let instance_cache =
+                    cache
+                        .entry(instance_id.0)
+                        .or_insert_with(|| InstanceInboxCache {
+                            values: HashMap::new(),
+                            updated_at: db_updated_at,
+                        });
+                instance_cache.updated_at = db_updated_at;
                 for (node_id, values) in &fetched {
-                    instance_cache.insert(node_id.clone(), values.clone());
+                    instance_cache
+                        .values
+                        .insert(node_id.clone(), values.clone());
                 }
             }
             for (node_id, values) in fetched {
@@ -3769,7 +3865,7 @@ impl DAGRunner {
 
     /// Update inbox cache with newly written non-spread values.
     async fn apply_inbox_writes_to_cache(
-        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InboxCache>>>,
+        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
         instance_id: WorkflowInstanceId,
         inbox_writes: &[crate::completion::InboxWrite],
     ) {
@@ -3778,12 +3874,19 @@ impl DAGRunner {
         }
 
         let mut cache = instance_inboxes.write().await;
-        let instance_cache = cache.entry(instance_id.0).or_default();
+        let instance_cache = cache
+            .entry(instance_id.0)
+            .or_insert_with(|| InstanceInboxCache {
+                values: HashMap::new(),
+                updated_at: Utc::now(),
+            });
+        instance_cache.updated_at = Utc::now();
         for write in inbox_writes {
             if write.spread_index.is_some() {
                 continue;
             }
             let node_cache = instance_cache
+                .values
                 .entry(write.target_node_id.clone())
                 .or_default();
             node_cache.insert(write.variable_name.clone(), write.value.clone());
@@ -3792,7 +3895,7 @@ impl DAGRunner {
 
     /// Update inbox cache with newly written non-spread values from completion batches.
     async fn apply_batch_inbox_writes_to_cache(
-        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InboxCache>>>,
+        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
         instance_id: WorkflowInstanceId,
         inbox_writes: &[InboxWrite],
     ) {
@@ -3801,12 +3904,19 @@ impl DAGRunner {
         }
 
         let mut cache = instance_inboxes.write().await;
-        let instance_cache = cache.entry(instance_id.0).or_default();
+        let instance_cache = cache
+            .entry(instance_id.0)
+            .or_insert_with(|| InstanceInboxCache {
+                values: HashMap::new(),
+                updated_at: Utc::now(),
+            });
+        instance_cache.updated_at = Utc::now();
         for write in inbox_writes {
             if write.spread_index.is_some() {
                 continue;
             }
             let node_cache = instance_cache
+                .values
                 .entry(write.target_node_id.clone())
                 .or_default();
             node_cache.insert(write.variable_name.clone(), write.value.clone());
@@ -3815,7 +3925,7 @@ impl DAGRunner {
 
     /// Drop cached inbox data for an instance.
     async fn clear_inbox_cache(
-        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InboxCache>>>,
+        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
         instance_id: WorkflowInstanceId,
     ) {
         let mut cache = instance_inboxes.write().await;
@@ -3825,7 +3935,7 @@ impl DAGRunner {
     async fn write_batch_and_update_cache(
         handler: &WorkCompletionHandler,
         batch: CompletionBatch,
-        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InboxCache>>>,
+        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
         instance_id: WorkflowInstanceId,
     ) -> RunnerResult<()> {
         let inbox_writes = batch.inbox_writes.clone();
@@ -3855,9 +3965,11 @@ impl DAGRunner {
     async fn start_unstarted_instances(&self) -> RunnerResult<usize> {
         let total_start = std::time::Instant::now();
         let db = &self.completion_handler.db;
+        let stale_before =
+            Utc::now() - Duration::from_millis(self.config.start_claim_timeout_ms.max(1));
         // Use the same batch size as dispatch to ensure we can keep up with workflow creation rate
         let instances = db
-            .find_unstarted_instances(self.config.batch_size as i32)
+            .find_unstarted_instances(self.config.batch_size as i32, stale_before)
             .await?;
         let count = instances.len();
         let mut pending_start_plans: Vec<StartPlan> = Vec::with_capacity(count);
@@ -3949,6 +4061,10 @@ impl DAGRunner {
         }
 
         if !pending_start_plans.is_empty() {
+            let claimed_instance_ids: Vec<WorkflowInstanceId> = pending_start_plans
+                .iter()
+                .map(|plan| plan.instance_id)
+                .collect();
             let mut plans = Vec::with_capacity(pending_start_plans.len());
             let mut inbox_writes = Vec::with_capacity(pending_start_plans.len());
             for plan in pending_start_plans {
@@ -3956,7 +4072,21 @@ impl DAGRunner {
                 inbox_writes.push((plan.instance_id, plan.inbox_writes));
             }
 
-            let results = db.execute_completion_plans_batch(plans).await?;
+            let results = match db.execute_completion_plans_batch(plans).await {
+                Ok(results) => results,
+                Err(err) => {
+                    for instance_id in claimed_instance_ids {
+                        if let Err(db_err) = db.clear_instance_started_at(instance_id).await {
+                            error!(
+                                instance_id = %instance_id.0,
+                                error = %db_err,
+                                "failed to clear started_at after batch start failure"
+                            );
+                        }
+                    }
+                    return Err(err.into());
+                }
+            };
             for ((instance_id, writes), result) in inbox_writes.into_iter().zip(results) {
                 if !result.was_stale {
                     Self::apply_inbox_writes_to_cache(&self.instance_inboxes, instance_id, &writes)

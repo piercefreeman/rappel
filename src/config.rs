@@ -20,6 +20,10 @@
 //! - `RAPPEL_WEBAPP_ADDR`: Webapp bind address (default: 0.0.0.0:24119)
 //! - `RAPPEL_GC_INTERVAL_MS`: Garbage collection interval in milliseconds (default: None, disabled)
 //! - `RAPPEL_GC_RETENTION_SECONDS`: Minimum age of completed/failed instances before cleanup (default: 86400 = 24 hours)
+//! - `RAPPEL_START_CLAIM_TIMEOUT_MS`: Reclaim stale start claims after this many ms (default: 60000)
+//! - `RAPPEL_INBOX_COMPACTION_INTERVAL_MS`: Inbox compaction interval (default: None, disabled)
+//! - `RAPPEL_INBOX_COMPACTION_BATCH_SIZE`: Max inbox rows to compact per pass (default: 10000)
+//! - `RAPPEL_INBOX_COMPACTION_MIN_AGE_SECONDS`: Minimum age for inbox rows eligible for compaction (default: 60)
 
 use std::{
     env,
@@ -93,6 +97,12 @@ pub struct Config {
 
     /// Garbage collection configuration
     pub gc: GcConfig,
+
+    /// Inbox compaction configuration
+    pub inbox_compaction: InboxCompactionConfig,
+
+    /// Maximum age in milliseconds for a start claim before reclaiming it.
+    pub start_claim_timeout_ms: u64,
 }
 
 /// Webapp server configuration
@@ -124,6 +134,56 @@ impl Default for GcConfig {
             retention_seconds: 86400, // 24 hours
             batch_size: 100,
         }
+    }
+}
+
+/// Inbox compaction configuration
+#[derive(Debug, Clone)]
+pub struct InboxCompactionConfig {
+    /// Compaction interval in milliseconds.
+    /// If None, compaction is disabled.
+    pub interval_ms: Option<u64>,
+    /// Maximum rows to compact per pass.
+    pub batch_size: i64,
+    /// Minimum age in seconds before a row is eligible for compaction.
+    pub min_age_seconds: i64,
+}
+
+impl Default for InboxCompactionConfig {
+    fn default() -> Self {
+        Self {
+            interval_ms: None,
+            batch_size: 10000,
+            min_age_seconds: 60,
+        }
+    }
+}
+
+impl InboxCompactionConfig {
+    fn from_env() -> Self {
+        let interval_ms = env::var("RAPPEL_INBOX_COMPACTION_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok());
+
+        let batch_size = env::var("RAPPEL_INBOX_COMPACTION_BATCH_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10000);
+
+        let min_age_seconds = env::var("RAPPEL_INBOX_COMPACTION_MIN_AGE_SECONDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+
+        Self {
+            interval_ms,
+            batch_size,
+            min_age_seconds,
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.interval_ms.is_some() && self.interval_ms.unwrap() > 0
     }
 }
 
@@ -266,8 +326,14 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(10000);
 
+        let start_claim_timeout_ms = env::var("RAPPEL_START_CLAIM_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60000);
+
         let webapp = WebappConfig::from_env();
         let gc = GcConfig::from_env();
+        let inbox_compaction = InboxCompactionConfig::from_env();
 
         Ok(Self {
             database_url,
@@ -287,6 +353,8 @@ impl Config {
             max_action_lifecycle,
             webapp,
             gc,
+            inbox_compaction,
+            start_claim_timeout_ms,
         })
     }
 
@@ -313,6 +381,8 @@ impl Config {
             max_action_lifecycle: None,
             webapp: WebappConfig::default(),
             gc: GcConfig::default(),
+            inbox_compaction: InboxCompactionConfig::default(),
+            start_claim_timeout_ms: 60000,
         }
     }
 }

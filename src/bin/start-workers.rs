@@ -108,6 +108,10 @@ async fn main() -> Result<()> {
         gc_interval_ms: config.gc.interval_ms,
         gc_retention_seconds: config.gc.retention_seconds,
         gc_batch_size: config.gc.batch_size,
+        start_claim_timeout_ms: config.start_claim_timeout_ms,
+        inbox_compaction_interval_ms: config.inbox_compaction.interval_ms,
+        inbox_compaction_batch_size: config.inbox_compaction.batch_size,
+        inbox_compaction_min_age_seconds: config.inbox_compaction.min_age_seconds,
     };
 
     let runner = Arc::new(DAGRunner::new(
