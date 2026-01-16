@@ -3,6 +3,20 @@ import { toProtoMessage } from "./proto.js";
 import { resolveWorkflow } from "./registry.js";
 import { buildWorkflowArguments } from "./serialization.js";
 
+type RegisterScheduleResponse = {
+  getScheduleId(): string;
+};
+
+type ScheduleStatusResponse = {
+  getSuccess(): boolean;
+};
+
+type RegisterBatchResponse = {
+  getWorkflowVersionId(): string;
+  getWorkflowInstanceIdsList(): string[];
+  getQueued(): number;
+};
+
 export type ScheduleInput = {
   schedule_type: "cron" | "interval";
   cron_expression?: string;
@@ -86,7 +100,11 @@ export async function registerSchedule(
   );
 
   const client = await getWorkflowClient();
-  const response = (await callUnary(client, "registerSchedule", request)) as any;
+  const response = await callUnary<RegisterScheduleResponse>(
+    client,
+    "registerSchedule",
+    request
+  );
   return response.getScheduleId();
 }
 
@@ -111,7 +129,11 @@ export async function updateScheduleStatus(
   );
 
   const client = await getWorkflowClient();
-  const response = (await callUnary(client, "updateScheduleStatus", request)) as any;
+  const response = await callUnary<ScheduleStatusResponse>(
+    client,
+    "updateScheduleStatus",
+    request
+  );
   return Boolean(response.getSuccess());
 }
 
@@ -130,7 +152,11 @@ export async function deleteSchedule(workflow, scheduleName: string) {
   );
 
   const client = await getWorkflowClient();
-  const response = (await callUnary(client, "deleteSchedule", request)) as any;
+  const response = await callUnary<ScheduleStatusResponse>(
+    client,
+    "deleteSchedule",
+    request
+  );
   return Boolean(response.getSuccess());
 }
 
@@ -175,7 +201,11 @@ export async function registerWorkflowBatch(
   );
 
   const client = await getWorkflowClient();
-  const response = (await callUnary(client, "registerWorkflowBatch", request)) as any;
+  const response = await callUnary<RegisterBatchResponse>(
+    client,
+    "registerWorkflowBatch",
+    request
+  );
   return {
     workflowVersionId: response.getWorkflowVersionId(),
     workflowInstanceIds: response.getWorkflowInstanceIdsList(),

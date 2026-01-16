@@ -138,6 +138,8 @@ export function serializeValue(value) {
   throw new Error(`unsupported workflow argument type: ${typeof value}`);
 }
 
+type SerializedValue = ReturnType<typeof serializeValue>;
+
 export function deserializeValue(value) {
   if (!value || typeof value !== "object") {
     return null;
@@ -221,7 +223,7 @@ function buildExceptionValues(error) {
     if (value === undefined) {
       continue;
     }
-    let serialized;
+    let serialized: SerializedValue;
     try {
       serialized = serializeValue(value);
     } catch (err) {

@@ -58,6 +58,7 @@
     "protobufjs": "^7.4.0"
   },
   "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
     "@types/jest": "^29.5.14",
     "@types/node": "^22.18.0",
     "grpc-tools": "^1.12.4",

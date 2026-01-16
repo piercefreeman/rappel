@@ -10,6 +10,15 @@ import { resolveWorkflow, registerWorkflow } from "./registry.js";
 
 export { registerWorkflow };
 
+type RegisterWorkflowResponse = {
+  getWorkflowInstanceId(): string;
+};
+
+type WaitForInstanceResponse = {
+  getPayload(): Uint8Array;
+  getPayload_asU8?(): Uint8Array;
+};
+
 type StartOptions = {
   priority?: number;
   blocking?: boolean;
@@ -43,11 +52,11 @@ export async function start(
     "rappel.messages.RegisterWorkflowRequest",
     { registration }
   );
-  const registerResponse = (await callUnary(
+  const registerResponse = await callUnary<RegisterWorkflowResponse>(
     client,
     "registerWorkflow",
     registerRequest
-  )) as any;
+  );
 
   const instanceId = registerResponse.getWorkflowInstanceId();
   if (options.blocking === false) {
@@ -80,7 +89,11 @@ async function waitForInstance(client, instanceId, options) {
       poll_interval_secs: pollInterval,
     }
   );
-  const response = (await callUnary(client, "waitForInstance", request)) as any;
+  const response = await callUnary<WaitForInstanceResponse>(
+    client,
+    "waitForInstance",
+    request
+  );
 
   if (!response) {
     return null;

@@ -558,7 +558,7 @@ function buildManifestComment(workflows, actions) {
         shortName: workflow.shortName,
       };
     }
-    manifest["workflows"] = workflowManifest;
+    manifest.workflows = workflowManifest;
   }
 
   if (actions.length > 0) {
@@ -573,7 +573,7 @@ function buildManifestComment(workflows, actions) {
         moduleName: action.moduleName,
       };
     }
-    manifest["actions"] = actionManifest;
+    manifest.actions = actionManifest;
   }
 
   return `/**__rappel_internal${JSON.stringify(manifest)}*/;`;

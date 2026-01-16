@@ -14,6 +14,10 @@ import {
   toProtoMessage,
 } from "./proto.js";
 
+type ResultPayload =
+  | ReturnType<typeof serializeResultPayload>
+  | ReturnType<typeof serializeErrorPayload>;
+
 export type WorkerOptions = {
   workerId?: number;
   target?: string;
@@ -115,7 +119,7 @@ export function startWorker(options: WorkerOptions = {}): WorkerRuntime {
     const args = params.map((name) => kwargs[name]);
 
     const startNs = process.hrtime.bigint();
-    let resultPayload;
+    let resultPayload: ResultPayload;
     let success = true;
 
     try {

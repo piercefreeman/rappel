@@ -6,6 +6,9 @@ const proto = require("../proto/messages_grpc_pb.js");
 
 let clientPromise = null;
 
+type UnaryCallback<Response> = (err: grpc.ServiceError | null, response: Response) => void;
+type UnaryClient = Record<string, (request: unknown, callback: UnaryCallback<unknown>) => void>;
+
 export async function getWorkflowClient() {
   if (!clientPromise) {
     clientPromise = Promise.resolve(createWorkflowClient());
@@ -34,14 +37,23 @@ export function resolveGrpcTarget() {
   return `${host}:${port}`;
 }
 
-export function callUnary(client, method, request) {
+export function callUnary<Response>(
+  client: UnaryClient,
+  method: string,
+  request: unknown
+) {
   return new Promise((resolve, reject) => {
-    client[method](request, (err, response) => {
+    const rpc = client[method];
+    if (typeof rpc !== "function") {
+      reject(new Error(`gRPC method not found: ${method}`));
+      return;
+    }
+    rpc(request, (err, response) => {
       if (err) {
         reject(err);
         return;
       }
-      resolve(response);
+      resolve(response as Response);
     });
   });
 }
