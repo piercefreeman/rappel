@@ -5,7 +5,7 @@ import { build } from "esbuild";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
-const protoRoot = path.resolve(projectRoot, "..", "proto");
+const protoRoot = path.resolve(projectRoot, "..", "..", "proto");
 
 if (!process.env.RAPPEL_PROTO_ROOT) {
   process.env.RAPPEL_PROTO_ROOT = protoRoot;

@@ -5,7 +5,7 @@ COMPOSE_CMD ?= docker compose -f docker-compose.yml
 
 build:
 	@echo "Building $(IMAGE_NAME) image"
-	docker build -f Dockerfile -t $(IMAGE_NAME) ..
+	docker build -f Dockerfile -t $(IMAGE_NAME) ../..
 
 up:
 	$(COMPOSE_CMD) up --build -d

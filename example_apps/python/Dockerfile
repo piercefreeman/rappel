@@ -35,7 +35,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
 
 WORKDIR /app
-COPY example_app /app
+COPY example_apps/python /app
 
 # Copy templates for the webapp dashboard
 COPY templates /app/templates

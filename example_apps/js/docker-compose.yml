@@ -1,8 +1,8 @@
 version: "3.9"
 
 x-app-build: &app-build
-  context: ..
-  dockerfile: example_app_js/Dockerfile
+  context: ../..
+  dockerfile: example_apps/js/Dockerfile
 
 services:
   postgres:
@@ -49,8 +49,8 @@ services:
       RAPPEL_CONCURRENT_PER_WORKER: 200
       RAPPEL_WORKER_COUNT: 2
       RAPPEL_WORKER_RUNTIME: node
-      RAPPEL_NODE_WORKER_SCRIPT: /app/example_app_js/node_modules/@rappel/js/dist/worker-cli.js
-      RAPPEL_USER_MODULE: /app/example_app_js/dist/workflows.js
+      RAPPEL_NODE_WORKER_SCRIPT: /app/example_apps/js/node_modules/@rappel/js/dist/worker-cli.js
+      RAPPEL_USER_MODULE: /app/example_apps/js/dist/workflows.js
       RAPPEL_WEBAPP_ENABLED: "true"
       RAPPEL_WEBAPP_ADDR: "0.0.0.0:24119"
     ports:

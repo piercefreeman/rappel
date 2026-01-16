@@ -19,13 +19,13 @@ FROM node:20-bookworm-slim AS node-builder
 WORKDIR /repo
 COPY js /repo/js
 COPY proto /repo/proto
-COPY example_app_js /repo/example_app_js
+COPY example_apps/js /repo/example_apps/js
 
 RUN cd /repo/js && npm install && npm run build && npm pack --silent
-RUN cd /repo/example_app_js && npm install
-RUN rm -rf /repo/example_app_js/node_modules/@rappel/js
-RUN cd /repo/example_app_js && npm install --no-save ../js/*.tgz
-RUN cd /repo/example_app_js && npm run build
+RUN cd /repo/example_apps/js && npm install
+RUN rm -rf /repo/example_apps/js/node_modules/@rappel/js
+RUN cd /repo/example_apps/js && npm install --no-save ../../js/*.tgz
+RUN cd /repo/example_apps/js && npm run build
 
 FROM node:20-bookworm-slim AS runtime
 
@@ -38,9 +38,9 @@ COPY --from=rust-builder /repo/target/release/start-workers /usr/local/bin/start
 
 COPY proto /app/proto
 
-COPY --from=node-builder /repo/example_app_js /app/example_app_js
+COPY --from=node-builder /repo/example_apps/js /app/example_apps/js
 
 EXPOSE 8001 24117 24118 24119
 
-WORKDIR /app/example_app_js
+WORKDIR /app/example_apps/js
 CMD ["node", "dist/server.js"]

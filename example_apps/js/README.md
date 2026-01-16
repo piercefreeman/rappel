@@ -1,6 +1,6 @@
 ## Rappel JS example app
 
-`example_app_js` mirrors the Python example app, but defines workflows + actions in TypeScript
+`example_apps/js` mirrors the Python example app, but defines workflows + actions in TypeScript
 and serves the UI with an Express server. Worker execution is managed by the Rust pool using
 the Node runtime.
 
@@ -17,7 +17,7 @@ cd js
 npm install
 npm run build
 
-cd ../example_app_js
+cd ../example_apps/js
 npm install
 npm run build
 ```
@@ -30,7 +30,7 @@ Recommended (Rust-managed worker pool with Node runtime):
 cd js
 npm run build
 
-cd ../example_app_js
+cd ../example_apps/js
 npm run build
 
 RAPPEL_DATABASE_URL=postgresql://rappel:rappel@localhost:5432/rappel_example_js \
@@ -43,7 +43,7 @@ cargo run --bin start-workers
 Start the web server in another terminal:
 
 ```bash
-cd example_app_js
+cd example_apps/js
 RAPPEL_BRIDGE_GRPC_ADDR=127.0.0.1:24117 npm run start
 ```
 
@@ -56,7 +56,7 @@ Notes:
 ### Docker
 
 ```bash
-cd example_app_js
+cd example_apps/js
 make up
 ```
 
