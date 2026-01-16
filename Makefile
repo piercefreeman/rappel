@@ -1,11 +1,13 @@
 PY_PROTO_OUT := python/proto
+JS_PROTO_OUT := js/proto
 
-.PHONY: all build-proto clean lint lint-verify python-lint python-lint-verify rust-lint rust-lint-verify coverage python-coverage rust-coverage
+.PHONY: all build-proto clean lint lint-verify python-lint python-lint-verify rust-lint rust-lint-verify js-lint js-lint-verify coverage python-coverage rust-coverage
 
 all: build-proto
 
 build-proto:
 	@mkdir -p $(PY_PROTO_OUT)
+	@mkdir -p $(JS_PROTO_OUT)
 	cd python && uv run python -m grpc_tools.protoc \
 		--proto_path=../proto \
 		--plugin=protoc-gen-mypy="$$(pwd)/.venv/bin/protoc-gen-mypy" \
@@ -15,6 +17,12 @@ build-proto:
 		--mypy_out=../$(PY_PROTO_OUT) \
 		--mypy_grpc_out=../$(PY_PROTO_OUT) \
 		../proto/messages.proto ../proto/ast.proto
+	cd js && ./node_modules/.bin/grpc_tools_node_protoc \
+		--proto_path=../proto \
+		--proto_path=./proto \
+		--js_out=import_style=commonjs,binary:./proto \
+		--grpc_out=grpc_js:./proto \
+		../proto/messages.proto ../proto/ast.proto
 	@python scripts/fix_proto_imports.py
 	$(MAKE) lint
 
@@ -22,9 +30,9 @@ clean:
 	rm -rf target
 	rm -rf $(PY_PROTO_OUT)
 
-lint: python-lint rust-lint
+lint: python-lint rust-lint js-lint
 
-lint-verify: python-lint-verify rust-lint-verify
+lint-verify: python-lint-verify rust-lint-verify js-lint-verify
 
 python-lint:
 	cd python && uv run ruff format .
@@ -49,6 +57,12 @@ rust-lint:
 rust-lint-verify:
 	cargo fmt -- --check
 	cargo clippy --all-targets --all-features -- -D warnings
+
+js-lint:
+	cd js && npm exec biome lint --write src tests
+
+js-lint-verify:
+	cd js && npm exec biome lint src tests
 
 # Coverage targets
 coverage: python-coverage rust-coverage

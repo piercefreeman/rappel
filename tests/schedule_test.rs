@@ -18,7 +18,7 @@ use tracing::info;
 
 use rappel::{
     DAGRunner, Database, PythonWorkerConfig, PythonWorkerPool, RunnerConfig, ScheduleId,
-    ScheduleType, WorkerBridgeServer, WorkflowVersionId, ir_ast, proto,
+    ScheduleType, WorkerBridgeServer, WorkerRuntime, WorkflowVersionId, ir_ast, proto,
 };
 use sha2::{Digest, Sha256};
 
@@ -283,6 +283,7 @@ async fn test_scheduler_creates_instance() -> Result<()> {
         .join("rappel-worker");
 
     let worker_config = PythonWorkerConfig {
+        runtime: WorkerRuntime::Python,
         script_path: worker_script,
         script_args: Vec::new(),
         user_modules: Vec::new(),

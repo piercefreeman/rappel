@@ -1,7 +1,7 @@
-//! Python worker process management.
+//! Worker process management.
 //!
 //! This module provides the core infrastructure for spawning and managing
-//! Python worker processes that execute workflow actions.
+//! worker processes that execute workflow actions.
 //!
 //! ## Architecture
 //!
@@ -9,7 +9,7 @@
 //! ┌─────────────────────────────────────────────────────────────────────────┐
 //! │                           PythonWorkerPool                               │
 //! │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐                        │
-//! │  │PythonWorker │ │PythonWorker │ │PythonWorker │  ... (N workers)       │
+//! │  │ Worker Proc │ │ Worker Proc │ │ Worker Proc │  ... (N workers)       │
 //! │  │  (process)  │ │  (process)  │ │  (process)  │                        │
 //! │  └──────┬──────┘ └──────┬──────┘ └──────┬──────┘                        │
 //! │         │               │               │                                │
@@ -64,18 +64,21 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    config::WorkerRuntime,
     messages::{self, MessageError, proto},
     server_worker::{WorkerBridgeChannels, WorkerBridgeServer},
 };
 
-/// Configuration for spawning Python workers.
+/// Configuration for spawning worker processes.
 #[derive(Clone, Debug)]
 pub struct PythonWorkerConfig {
+    /// Worker runtime selection
+    pub runtime: WorkerRuntime,
     /// Path to the script/executable to run (e.g., "uv" or "rappel-worker")
     pub script_path: PathBuf,
     /// Arguments to pass before the worker-specific args
     pub script_args: Vec<String>,
-    /// Python module(s) to preload (contains @action definitions)
+    /// Module(s) to preload (contains @action definitions)
     pub user_modules: Vec<String>,
     /// Additional paths to add to PYTHONPATH
     pub extra_python_paths: Vec<PathBuf>,
@@ -83,8 +86,9 @@ pub struct PythonWorkerConfig {
 
 impl Default for PythonWorkerConfig {
     fn default() -> Self {
-        let (script_path, script_args) = default_runner();
+        let (script_path, script_args) = default_runner(WorkerRuntime::Python);
         Self {
+            runtime: WorkerRuntime::Python,
             script_path,
             script_args,
             user_modules: vec![],
@@ -97,6 +101,31 @@ impl PythonWorkerConfig {
     /// Create a new config with default runner detection.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the worker runtime, resetting runner defaults for that runtime.
+    pub fn with_runtime(mut self, runtime: WorkerRuntime) -> Self {
+        let (script_path, script_args) = default_runner(runtime);
+        self.runtime = runtime;
+        self.script_path = script_path;
+        self.script_args = script_args;
+        self
+    }
+
+    /// Override the node binary for node workers.
+    pub fn with_node_binary(mut self, binary: PathBuf) -> Self {
+        if self.runtime == WorkerRuntime::Node {
+            self.script_path = binary;
+        }
+        self
+    }
+
+    /// Override the node worker script for node workers.
+    pub fn with_node_script(mut self, script: PathBuf) -> Self {
+        if self.runtime == WorkerRuntime::Node {
+            self.script_args = vec![script.display().to_string()];
+        }
+        self
     }
 
     /// Set the user module to preload.
@@ -120,7 +149,7 @@ impl PythonWorkerConfig {
 
 /// Find the default Python runner.
 /// Prefers `rappel-worker` if in PATH, otherwise uses `uv run`.
-fn default_runner() -> (PathBuf, Vec<String>) {
+fn default_python_runner() -> (PathBuf, Vec<String>) {
     if let Some(path) = find_executable("rappel-worker") {
         return (path, Vec::new());
     }
@@ -133,6 +162,22 @@ fn default_runner() -> (PathBuf, Vec<String>) {
             "rappel.worker".to_string(),
         ],
     )
+}
+
+fn default_node_runner() -> (PathBuf, Vec<String>) {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script_path = repo_root.join("js").join("dist").join("worker-cli.js");
+    (
+        PathBuf::from("node"),
+        vec![script_path.display().to_string()],
+    )
+}
+
+fn default_runner(runtime: WorkerRuntime) -> (PathBuf, Vec<String>) {
+    match runtime {
+        WorkerRuntime::Python => default_python_runner(),
+        WorkerRuntime::Node => default_node_runner(),
+    }
 }
 
 /// Search PATH for an executable.
@@ -291,7 +336,7 @@ pub struct ActionDispatchPayload {
     pub sequence: u32,
     /// Name of the action function to call
     pub action_name: String,
-    /// Python module containing the action
+    /// Module containing the action
     pub module_name: String,
     /// Keyword arguments for the action
     pub kwargs: proto::WorkflowArguments,
@@ -322,9 +367,9 @@ impl SharedState {
     }
 }
 
-/// A single Python worker process.
+/// A single worker process.
 ///
-/// Manages the lifecycle of a Python subprocess that executes actions.
+/// Manages the lifecycle of a subprocess that executes actions.
 /// Communication happens via gRPC streaming through the WorkerBridge.
 ///
 /// Workers are not meant to be used directly - use [`PythonWorkerPool`] instead.
@@ -344,11 +389,11 @@ pub struct PythonWorker {
 }
 
 impl PythonWorker {
-    /// Spawn a new Python worker process.
+    /// Spawn a new worker process.
     ///
     /// This will:
     /// 1. Reserve a worker ID on the bridge
-    /// 2. Spawn the Python process with appropriate arguments
+    /// 2. Spawn the worker process with appropriate arguments
     /// 3. Wait for the worker to connect (15s timeout)
     /// 4. Set up bidirectional communication channels
     ///
@@ -363,42 +408,68 @@ impl PythonWorker {
         bridge: Arc<WorkerBridgeServer>,
     ) -> AnyResult<Self> {
         let (worker_id, connection_rx) = bridge.reserve_worker().await;
+        let runtime = config.runtime;
 
         // Determine working directory and module paths
-        let package_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python");
-        let working_dir = if package_root.is_dir() {
-            Some(package_root.clone())
-        } else {
-            None
-        };
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let (working_dir, python_path) = match runtime {
+            WorkerRuntime::Python => {
+                let package_root = repo_root.join("python");
+                let working_dir = if package_root.is_dir() {
+                    Some(package_root.clone())
+                } else {
+                    None
+                };
 
-        // Build PYTHONPATH with all necessary directories
-        let mut module_paths = Vec::new();
-        if let Some(root) = working_dir.as_ref() {
-            module_paths.push(root.clone());
-            let src_dir = root.join("src");
-            if src_dir.exists() {
-                module_paths.push(src_dir);
+                // Build PYTHONPATH with all necessary directories
+                let mut module_paths = Vec::new();
+                if let Some(root) = working_dir.as_ref() {
+                    module_paths.push(root.clone());
+                    let src_dir = root.join("src");
+                    if src_dir.exists() {
+                        module_paths.push(src_dir);
+                    }
+                    let proto_dir = root.join("proto");
+                    if proto_dir.exists() {
+                        module_paths.push(proto_dir);
+                    }
+                }
+                module_paths.extend(config.extra_python_paths.clone());
+
+                let joined_python_path = module_paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(":");
+
+                let python_path = match env::var("PYTHONPATH") {
+                    Ok(existing) if !existing.is_empty() => {
+                        format!("{existing}:{joined_python_path}")
+                    }
+                    _ => joined_python_path,
+                };
+
+                info!(
+                    runtime = %runtime,
+                    python_path = %python_path,
+                    worker_id,
+                    "configured python path for worker"
+                );
+                (working_dir, Some(python_path))
             }
-            let proto_dir = root.join("proto");
-            if proto_dir.exists() {
-                module_paths.push(proto_dir);
+            WorkerRuntime::Node => {
+                let js_root = repo_root.join("js");
+                let working_dir = if js_root.is_dir() {
+                    Some(js_root)
+                } else if repo_root.is_dir() {
+                    Some(repo_root)
+                } else {
+                    None
+                };
+                info!(runtime = %runtime, worker_id, "configured node worker runtime");
+                (working_dir, None)
             }
-        }
-        module_paths.extend(config.extra_python_paths.clone());
-
-        let joined_python_path = module_paths
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(":");
-
-        let python_path = match env::var("PYTHONPATH") {
-            Ok(existing) if !existing.is_empty() => format!("{existing}:{joined_python_path}"),
-            _ => joined_python_path,
         };
-
-        info!(python_path = %python_path, worker_id, "configured python path for worker");
 
         // Build the command
         let mut command = Command::new(&config.script_path);
@@ -414,24 +485,30 @@ impl PythonWorker {
             command.arg("--user-module").arg(module);
         }
 
-        command
-            .stderr(Stdio::inherit())
-            .env("PYTHONPATH", python_path);
+        command.stderr(Stdio::inherit());
+        if let Some(path) = python_path {
+            command.env("PYTHONPATH", path);
+        }
 
         if let Some(dir) = working_dir {
-            info!(?dir, worker_id, "using package root for worker process");
+            info!(?dir, worker_id, runtime = %runtime, "using package root for worker process");
             command.current_dir(dir);
         } else {
             let cwd = env::current_dir().context("failed to resolve current directory")?;
             info!(
                 ?cwd,
-                worker_id, "package root missing, using current directory for worker process"
+                worker_id,
+                runtime = %runtime,
+                "package root missing, using current directory for worker process"
             );
             command.current_dir(cwd);
         }
 
         // Spawn the process
-        let mut child = match command.spawn().context("failed to launch python worker") {
+        let mut child = match command
+            .spawn()
+            .context(format!("failed to launch {runtime} worker"))
+        {
             Ok(child) => child,
             Err(err) => {
                 bridge.cancel_worker(worker_id).await;
@@ -443,7 +520,8 @@ impl PythonWorker {
             pid = child.id(),
             script = %config.script_path.display(),
             worker_id,
-            "spawned python worker"
+            runtime = %runtime,
+            "spawned worker"
         );
 
         // Wait for the worker to connect (with timeout)
@@ -477,15 +555,11 @@ impl PythonWorker {
         let reader_worker_id = worker_id;
         let reader_handle = tokio::spawn(async move {
             if let Err(err) = Self::reader_loop(&mut from_worker, reader_shared).await {
-                error!(
-                    ?err,
-                    worker_id = reader_worker_id,
-                    "python worker stream exited"
-                );
+                error!(?err, worker_id = reader_worker_id, "worker stream exited");
             }
         });
 
-        info!(worker_id, "worker connected and ready");
+        info!(worker_id, runtime = %runtime, "worker connected and ready");
 
         Ok(Self {
             child,
@@ -699,13 +773,13 @@ impl Drop for PythonWorker {
             warn!(
                 ?err,
                 worker_id = self.worker_id,
-                "failed to kill python worker during drop"
+                "failed to kill worker during drop"
             );
         }
     }
 }
 
-/// Pool of Python workers for action execution.
+/// Pool of workers for action execution.
 ///
 /// Provides round-robin load balancing across multiple worker processes.
 /// Workers are spawned eagerly on pool creation.
@@ -765,7 +839,8 @@ impl PythonWorkerPool {
         info!(
             count = worker_count,
             max_action_lifecycle = ?max_action_lifecycle,
-            "spawning python worker pool"
+            runtime = %config.runtime,
+            "spawning worker pool"
         );
 
         let mut workers = Vec::with_capacity(worker_count);
@@ -791,7 +866,11 @@ impl PythonWorkerPool {
             }
         }
 
-        info!(count = workers.len(), "worker pool ready");
+        info!(
+            count = workers.len(),
+            runtime = %config.runtime,
+            "worker pool ready"
+        );
 
         let worker_ids = workers.iter().map(|worker| worker.worker_id()).collect();
         let action_counts = (0..worker_count).map(|_| AtomicU64::new(0)).collect();
@@ -1006,7 +1085,7 @@ mod tests {
     #[test]
     fn test_default_runner_detection() {
         // Should return uv as fallback if rappel-worker not in PATH
-        let (path, args) = default_runner();
+        let (path, args) = default_python_runner();
         // Either rappel-worker was found, or we get uv with args
         if args.is_empty() {
             assert!(path.to_string_lossy().contains("rappel-worker"));

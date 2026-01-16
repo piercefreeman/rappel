@@ -31,8 +31,8 @@ use tonic::transport::Server;
 use tracing::{error, info, warn};
 
 use rappel::{
-    Database, PythonWorkerConfig, PythonWorkerPool, WorkerBridgeServer, WorkflowInstanceId,
-    WorkflowValue, WorkflowVersionId, proto, validate_program,
+    Database, PythonWorkerConfig, PythonWorkerPool, WorkerBridgeServer, WorkerRuntime,
+    WorkflowInstanceId, WorkflowValue, WorkflowVersionId, proto, validate_program,
 };
 
 // ============================================================================
@@ -714,6 +714,7 @@ async fn main() -> Result<()> {
         .context("Invalid workflow filename")?;
 
     let worker_config = PythonWorkerConfig {
+        runtime: WorkerRuntime::Python,
         script_path: worker_script,
         script_args: Vec::new(),
         user_modules: vec![workflow_module.to_string()],

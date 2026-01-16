@@ -34,7 +34,7 @@ use tracing::info;
 
 use rappel::{
     DAGRunner, Database, PythonWorkerConfig, PythonWorkerPool, RunnerConfig, WorkerBridgeServer,
-    WorkflowInstanceId, WorkflowValue, WorkflowVersionId, proto, validate_program,
+    WorkerRuntime, WorkflowInstanceId, WorkflowValue, WorkflowVersionId, proto, validate_program,
 };
 
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -384,6 +384,7 @@ impl IntegrationHarness {
             .join("rappel-worker");
 
         let worker_config = PythonWorkerConfig {
+            runtime: WorkerRuntime::Python,
             script_path: worker_script,
             script_args: Vec::new(),
             user_modules: vec![config.user_module.to_string()],

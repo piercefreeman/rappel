@@ -1,12 +1,12 @@
-//! Rappel - A workflow execution engine with durable Python workers
+//! Rappel - A workflow execution engine with durable worker processes
 //!
 //! This crate provides the core infrastructure for executing workflow actions
-//! in Python worker processes. The key components are:
+//! in worker processes (Python or Node). The key components are:
 //!
 //! ## Worker Infrastructure
 //!
 //! - [`WorkerBridgeServer`]: gRPC server that workers connect to
-//! - [`PythonWorkerPool`]: Pool of Python worker processes for action execution
+//! - [`PythonWorkerPool`]: Pool of worker processes for action execution
 //! - [`PythonWorker`]: Individual worker process management
 //!
 //! ## IR Language
@@ -42,7 +42,8 @@ pub mod worker;
 
 // Configuration
 pub use config::{
-    Config, DEFAULT_BASE_PORT, DEFAULT_WEBAPP_ADDR, WebappConfig, get_config, try_get_config,
+    Config, DEFAULT_BASE_PORT, DEFAULT_WEBAPP_ADDR, WebappConfig, WorkerRuntime, get_config,
+    try_get_config,
 };
 
 // Database
