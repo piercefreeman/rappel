@@ -14,12 +14,12 @@ class GatherUnsupportedVariableWorkflow(Workflow):
     data flow analysis to understand what's in the tasks list.
     """
 
-    async def run(self, count: int) -> list[int]:
+    async def run(self, count: int) -> list[int | BaseException]:
         # Build up tasks list in a loop - NOT SUPPORTED
         tasks = []
         for i in range(count):
             tasks.append(i)
 
         # Spread the variable - this should raise an error
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         return results

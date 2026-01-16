@@ -27,7 +27,9 @@ async def compute_fibonacci(n: int) -> int:
 
 
 @action
-async def summarize_math(factorial_value: int, fib_value: int) -> str:
+async def summarize_math(
+    factorial_value: int | BaseException, fib_value: int | BaseException
+) -> str:
     """Summarize the computed values."""
     return f"factorial={factorial_value}, fibonacci={fib_value}"
 
@@ -41,6 +43,7 @@ class GatherTupleUnpackWorkflow(Workflow):
         factorial_value, fib_value = await asyncio.gather(
             compute_factorial(n=5),
             compute_fibonacci(n=10),
+            return_exceptions=True,
         )
         # Use the unpacked values
         summary = await summarize_math(

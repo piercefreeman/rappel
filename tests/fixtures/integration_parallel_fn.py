@@ -37,6 +37,7 @@ class ParallelFnWorkflow(Workflow):
         doubled, tripled = await asyncio.gather(
             self.helper_double(n=value),
             self.helper_triple(n=value),
+            return_exceptions=True,
         )
         # Sum the results
         total = await add(x=doubled, y=tripled)

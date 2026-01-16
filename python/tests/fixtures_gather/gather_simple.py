@@ -20,9 +20,10 @@ async def action_b() -> int:
 class GatherSimpleWorkflow(Workflow):
     """Simple gather of two actions."""
 
-    async def run(self) -> int:
+    async def run(self) -> tuple[int | BaseException, int | BaseException]:
         a, b = await asyncio.gather(
             action_a(),
             action_b(),
+            return_exceptions=True,
         )
-        return a + b
+        return a, b

@@ -133,12 +133,14 @@ class CompleteFeatureWorkflow(Workflow):
         status_a, status_b = await asyncio.gather(
             check_status_a(service="alpha"),
             check_status_b(service="beta"),
+            return_exceptions=True,
         )
 
         # 3. Spread action (parallel iteration over a collection)
-        processed = await asyncio.gather(*[
-            process_item(item=x) for x in items
-        ])
+        processed = await asyncio.gather(
+            *[process_item(item=x) for x in items],
+            return_exceptions=True,
+        )
 
         # 4. For loop with single action per iteration
         for i, item in enumerate(processed):

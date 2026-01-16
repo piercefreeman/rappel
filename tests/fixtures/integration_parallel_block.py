@@ -30,7 +30,11 @@ class ParallelBlockWorkflow(Workflow):
         await asyncio.gather(
             record_event(name="alpha"),
             record_event(name="beta"),
+            return_exceptions=True,
         )
-        await asyncio.gather(*[record_event(name=item) for item in ["gamma", "delta"]])
+        await asyncio.gather(
+            *[record_event(name=item) for item in ["gamma", "delta"]],
+            return_exceptions=True,
+        )
         events = await snapshot_events()
         return await format_events(events=events)

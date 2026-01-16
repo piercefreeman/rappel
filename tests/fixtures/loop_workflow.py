@@ -28,7 +28,10 @@ class LoopWorkflow(Workflow):
 
     async def run(self, items: list) -> str:
         # Process all items in parallel using gather
-        processed = await asyncio.gather(*[process_item(item=item) for item in items])
+        processed = await asyncio.gather(
+            *[process_item(item=item) for item in items],
+            return_exceptions=True,
+        )
 
         # Join all results
         final = await join_results(processed)

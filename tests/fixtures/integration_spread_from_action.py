@@ -29,5 +29,8 @@ async def combine_results(results: list[str]) -> str:
 class SpreadFromActionWorkflow(Workflow):
     async def run(self, include_items: bool) -> str:
         items = await fetch_items(include_items=include_items)
-        results = await asyncio.gather(*[process_item(item=item) for item in items])
+        results = await asyncio.gather(
+            *[process_item(item=item) for item in items],
+            return_exceptions=True,
+        )
         return await combine_results(results=results)

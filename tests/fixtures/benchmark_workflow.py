@@ -318,10 +318,13 @@ class BenchmarkFanOutWorkflow(Workflow):
         complexity: int = 100,
     ) -> dict[str, Any]:
         # Fan-out: compute hashes in parallel over the range
-        hashes = await asyncio.gather(*[
-            compute_hash_for_index(index=i, complexity=complexity)
-            for i in indices
-        ])
+        hashes = await asyncio.gather(
+            *[
+                compute_hash_for_index(index=i, complexity=complexity)
+                for i in indices
+            ],
+            return_exceptions=True,
+        )
 
         # Process each hash sequentially with conditional logic
         processed = []
@@ -366,10 +369,13 @@ class BenchmarkPureFanOutWorkflow(Workflow):
         complexity: int = 100,
     ) -> dict[str, Any]:
         # Pure fan-out: compute ALL hashes in parallel
-        hash_results = await asyncio.gather(*[
-            compute_hash_for_index(index=i, complexity=complexity)
-            for i in indices
-        ])
+        hash_results = await asyncio.gather(
+            *[
+                compute_hash_for_index(index=i, complexity=complexity)
+                for i in indices
+            ],
+            return_exceptions=True,
+        )
 
         # Fan-in: aggregate with a single action (no sequential processing)
         # Note: hash_results from gather is already a list that can be passed directly
@@ -404,10 +410,13 @@ class BenchmarkQueueNoopWorkflow(Workflow):
         _ = complexity
 
         # Fan-out: noop actions in parallel
-        stage1 = await asyncio.gather(*[
-            noop_int(value=i)
-            for i in indices
-        ])
+        stage1 = await asyncio.gather(
+            *[
+                noop_int(value=i)
+                for i in indices
+            ],
+            return_exceptions=True,
+        )
 
         # Sequential loop with conditional branch
         processed = []
@@ -419,10 +428,13 @@ class BenchmarkQueueNoopWorkflow(Workflow):
             processed.append(result)
 
         # Fan-out: tag values and fan-in summary
-        tagged = await asyncio.gather(*[
-            noop_tag_from_value(value=value)
-            for value in processed
-        ])
+        tagged = await asyncio.gather(
+            *[
+                noop_tag_from_value(value=value)
+                for value in processed
+            ],
+            return_exceptions=True,
+        )
 
         summary = await noop_combine(items=tagged)
         return summary

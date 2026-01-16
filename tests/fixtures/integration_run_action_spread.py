@@ -33,6 +33,7 @@ class RunActionSpreadWorkflow(Workflow):
                     timeout=timedelta(seconds=30),
                 )
                 for item in items
-            ]
+            ],
+            return_exceptions=True,
         )
         return await combine_results(results=results)

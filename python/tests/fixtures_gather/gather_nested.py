@@ -17,8 +17,9 @@ async def fetch_b() -> int:
 
 
 @action
-async def combine(values: tuple[int, int]) -> int:
-    return sum(values)
+async def combine(values: tuple[int | BaseException, int | BaseException]) -> int:
+    numeric_values = [value for value in values if isinstance(value, int)]
+    return sum(numeric_values)
 
 
 @workflow
@@ -30,6 +31,7 @@ class GatherNestedWorkflow(Workflow):
         results = await asyncio.gather(
             fetch_a(),
             fetch_b(),
+            return_exceptions=True,
         )
         # Fan-in
         total = await combine(values=results)

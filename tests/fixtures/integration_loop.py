@@ -22,7 +22,11 @@ async def finalize_payload(items: list[str]) -> str:
 @workflow
 class LoopWorkflow(Workflow):
     async def run(self) -> str:
-        seeds = await asyncio.gather(load_item(name="alpha"), load_item(name="beta"))
+        seeds = await asyncio.gather(
+            load_item(name="alpha"),
+            load_item(name="beta"),
+            return_exceptions=True,
+        )
         outputs = []
         for seed in seeds:
             local_value = f"{seed}-local"

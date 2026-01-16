@@ -27,7 +27,11 @@ async def finalize_payload(items: list[str]) -> str:
 @workflow
 class LoopAccumWorkflow(Workflow):
     async def run(self) -> str:
-        seeds = await asyncio.gather(load_item(name="alpha"), load_item(name="beta"))
+        seeds = await asyncio.gather(
+            load_item(name="alpha"),
+            load_item(name="beta"),
+            return_exceptions=True,
+        )
         outputs: list[str] = []
         for seed in seeds:
             index = len(outputs)

@@ -28,14 +28,18 @@ class SpreadLoopWorkflow(Workflow):
         totals = []
         for item in items:
             results = await asyncio.gather(
-                *[identity(value=value) for value in [item, item + 1]]
+                *[identity(value=value) for value in [item, item + 1]],
+                return_exceptions=True,
             )
             total = await sum_values(values=results)
             totals = totals + [total]
 
         empties = []
         for _item in items:
-            results = await asyncio.gather(*[identity(value=value) for value in []])
+            results = await asyncio.gather(
+                *[identity(value=value) for value in []],
+                return_exceptions=True,
+            )
             empties = empties + [0]
 
         return await format_results(totals=totals, empties=empties)

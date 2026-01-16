@@ -18,10 +18,13 @@ class WelcomeEmailWorkflow(Workflow):
         users = await fetch_users(user_ids)
         active_users = [user for user in users if user.active]
 
-        results = await asyncio.gather(*[
-            send_email(to=user.email, subject="Welcome")
-            for user in active_users
-        ])
+        results = await asyncio.gather(
+            *[
+                send_email(to=user.email, subject="Welcome")
+                for user in active_users
+            ],
+            return_exceptions=True,
+        )
         
         return results
 ```
@@ -106,7 +109,8 @@ Workflows can get much more complex than the example above:
         profile, settings, history = await asyncio.gather(
             fetch_profile(user_id=user_id),
             fetch_settings(user_id=user_id),
-            fetch_purchase_history(user_id=user_id)
+            fetch_purchase_history(user_id=user_id),
+            return_exceptions=True,
         ) 
 
         # wait before sending email
