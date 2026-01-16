@@ -1,8 +1,8 @@
 ## Rappel JS example app
 
 `example_app_js` mirrors the Python example app, but defines workflows + actions in TypeScript
-and serves the UI with an Express server. It also ships a small Node worker that executes
-JS actions via the Rappel bridge.
+and serves the UI with an Express server. Worker execution is managed by the Rust pool using
+the Node runtime.
 
 ### Prerequisites
 
@@ -24,24 +24,33 @@ npm run build
 
 ### Run
 
-Start the worker in one terminal:
+Recommended (Rust-managed worker pool with Node runtime):
 
 ```bash
-cd example_app_js
-npm run worker
+cd js
+npm run build
+
+cd ../example_app_js
+npm run build
+
+RAPPEL_DATABASE_URL=postgresql://rappel:rappel@localhost:5432/rappel_example_js \
+RAPPEL_WORKER_RUNTIME=node \
+RAPPEL_NODE_WORKER_SCRIPT=$(pwd)/node_modules/@rappel/js/dist/worker-cli.js \
+RAPPEL_USER_MODULE=$(pwd)/dist/workflows.js \
+cargo run --bin start-workers
 ```
 
 Start the web server in another terminal:
 
 ```bash
 cd example_app_js
-npm run start
+RAPPEL_BRIDGE_GRPC_ADDR=127.0.0.1:24117 npm run start
 ```
 
 Then visit http://localhost:8001/.
 
 Notes:
-- The JS worker executes actions defined in `src/workflows.ts`.
+- Actions are defined in `src/workflows.ts` and loaded via `RAPPEL_USER_MODULE`.
 - Schedule endpoints use the default schedule name `default`.
 
 ### Docker

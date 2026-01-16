@@ -48,6 +48,9 @@ services:
       RAPPEL_PROTO_ROOT: /app/proto
       RAPPEL_CONCURRENT_PER_WORKER: 200
       RAPPEL_WORKER_COUNT: 2
+      RAPPEL_WORKER_RUNTIME: node
+      RAPPEL_NODE_WORKER_SCRIPT: /app/example_app_js/node_modules/@rappel/js/dist/worker-cli.js
+      RAPPEL_USER_MODULE: /app/example_app_js/dist/workflows.js
       RAPPEL_WEBAPP_ENABLED: "true"
       RAPPEL_WEBAPP_ADDR: "0.0.0.0:24119"
     ports:

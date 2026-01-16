@@ -1,9 +1,9 @@
-//! Start Workers - Runs the DAG runner with Python worker pool.
+//! Start Workers - Runs the DAG runner with a worker pool.
 //!
 //! This binary starts the worker infrastructure:
 //! - Connects to the database
 //! - Starts the WorkerBridge gRPC server for worker connections
-//! - Spawns a pool of Python workers
+//! - Spawns a pool of worker processes
 //! - Runs the DAGRunner to process workflow actions
 //! - Optionally starts the web dashboard for monitoring
 //!
@@ -11,6 +11,7 @@
 //! - RAPPEL_DATABASE_URL: PostgreSQL connection string (required)
 //! - RAPPEL_WORKER_GRPC_ADDR: gRPC server for worker connections (default: 127.0.0.1:24118)
 //! - RAPPEL_USER_MODULE: Python module to preload
+//! - RAPPEL_WORKER_RUNTIME: python or node (default: python)
 //! - RAPPEL_WORKER_COUNT: Number of workers (default: num_cpus)
 //! - RAPPEL_BATCH_SIZE: Actions per poll cycle (default: 100)
 //! - RAPPEL_POLL_INTERVAL_MS: Poll interval in ms (default: 100)
@@ -26,7 +27,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use rappel::{
     DAGRunner, Database, PythonWorkerConfig, PythonWorkerPool, RunnerConfig, WebappServer,
-    WorkerBridgeServer, get_config,
+    WorkerBridgeServer, WorkerRuntime, get_config,
 };
 
 #[tokio::main]
@@ -55,6 +56,7 @@ async fn main() -> Result<()> {
         worker_status_interval_ms = config.worker_status_interval_ms,
         user_module = ?config.user_module,
         max_action_lifecycle = ?config.max_action_lifecycle,
+        worker_runtime = %config.worker_runtime,
         "starting worker pool"
     );
 
@@ -86,8 +88,15 @@ async fn main() -> Result<()> {
         None => WebappServer::start(config.webapp.clone(), Arc::clone(&database)).await?,
     };
 
-    // Configure Python workers
-    let mut worker_config = PythonWorkerConfig::new();
+    // Configure worker runtime
+    let mut worker_config = PythonWorkerConfig::new().with_runtime(config.worker_runtime);
+    if config.worker_runtime == WorkerRuntime::Node {
+        worker_config =
+            worker_config.with_node_binary(std::path::PathBuf::from(&config.node_worker_bin));
+        if let Some(script) = &config.node_worker_script {
+            worker_config = worker_config.with_node_script(script.clone());
+        }
+    }
     if let Some(module) = &config.user_module {
         worker_config = worker_config.with_user_module(module);
     }
@@ -104,7 +113,8 @@ async fn main() -> Result<()> {
     );
     info!(
         worker_count = config.worker_count,
-        "python worker pool created"
+        runtime = %config.worker_runtime,
+        "worker pool created"
     );
 
     // Configure and create DAG runner
@@ -140,7 +150,8 @@ async fn main() -> Result<()> {
     info!(
         batch_size = config.batch_size,
         poll_interval_ms = config.poll_interval_ms,
-        "python worker pool started - waiting for shutdown signal"
+        runtime = %config.worker_runtime,
+        "worker pool started - waiting for shutdown signal"
     );
 
     // Spawn runner in background task

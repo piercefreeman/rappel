@@ -6,7 +6,10 @@
 //! - `RAPPEL_BRIDGE_GRPC_ADDR`: gRPC server for client connections to singleton (default: 127.0.0.1:24117)
 //! - `RAPPEL_WORKER_GRPC_ADDR`: gRPC server for worker cluster connections (default: 127.0.0.1:24118)
 //! - `RAPPEL_BASE_PORT`: Base port for singleton server probing (default: 24117)
-//! - `RAPPEL_WORKER_COUNT`: Number of Python workers (default: num_cpus)
+//! - `RAPPEL_WORKER_COUNT`: Number of workers (default: num_cpus)
+//! - `RAPPEL_WORKER_RUNTIME`: Worker runtime: python or node (default: python)
+//! - `RAPPEL_NODE_WORKER_BIN`: Node binary for node workers (default: node)
+//! - `RAPPEL_NODE_WORKER_SCRIPT`: Node worker entry script (default: js/dist/worker-cli.js)
 //! - `RAPPEL_CONCURRENT_PER_WORKER`: Max concurrent actions per worker (default: 10)
 //! - `RAPPEL_POLL_INTERVAL_MS`: Dispatcher poll interval (default: 100)
 //! - `RAPPEL_BATCH_SIZE`: Actions to dispatch per poll (default: worker_count * concurrent_per_worker)
@@ -30,11 +33,12 @@
 use std::{
     env,
     net::SocketAddr,
+    path::PathBuf,
     str::FromStr,
     sync::{OnceLock, RwLock},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 /// Default address for the webapp server
 pub const DEFAULT_WEBAPP_ADDR: &str = "0.0.0.0:24119";
@@ -45,6 +49,36 @@ pub const DEFAULT_WEBAPP_DB_MAX_CONNECTIONS: u32 = 2;
 
 /// Default base port for server singleton probing
 pub const DEFAULT_BASE_PORT: u16 = 24117;
+
+/// Worker runtime selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerRuntime {
+    Python,
+    Node,
+}
+
+impl WorkerRuntime {
+    fn from_env(value: &str) -> Result<Self> {
+        match value.trim().to_lowercase().as_str() {
+            "python" => Ok(Self::Python),
+            "node" => Ok(Self::Node),
+            other => Err(anyhow!("invalid RAPPEL_WORKER_RUNTIME: {other}")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Python => "python",
+            Self::Node => "node",
+        }
+    }
+}
+
+impl std::fmt::Display for WorkerRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
 
 /// Global configuration cache
 static CONFIG: OnceLock<RwLock<Config>> = OnceLock::new();
@@ -66,8 +100,17 @@ pub struct Config {
     /// Base port for singleton server probing
     pub base_port: u16,
 
-    /// Number of Python worker processes
+    /// Number of worker processes
     pub worker_count: usize,
+
+    /// Runtime for worker processes
+    pub worker_runtime: WorkerRuntime,
+
+    /// Node binary for node workers
+    pub node_worker_bin: String,
+
+    /// Node worker entry script (optional override)
+    pub node_worker_script: Option<PathBuf>,
 
     /// Maximum concurrent actions per worker
     pub concurrent_per_worker: usize,
@@ -302,6 +345,23 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(num_cpus::get);
 
+        let worker_runtime = env::var("RAPPEL_WORKER_RUNTIME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| WorkerRuntime::from_env(&value))
+            .transpose()?
+            .unwrap_or(WorkerRuntime::Python);
+
+        let node_worker_bin = env::var("RAPPEL_NODE_WORKER_BIN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "node".to_string());
+
+        let node_worker_script = env::var("RAPPEL_NODE_WORKER_SCRIPT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from);
+
         let concurrent_per_worker = env::var("RAPPEL_CONCURRENT_PER_WORKER")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -366,6 +426,9 @@ impl Config {
             worker_grpc_addr,
             base_port,
             worker_count,
+            worker_runtime,
+            node_worker_bin,
+            node_worker_script,
             concurrent_per_worker,
             poll_interval_ms,
             batch_size,
@@ -395,6 +458,9 @@ impl Config {
             worker_grpc_addr: "127.0.0.1:0".parse().unwrap(),
             base_port: DEFAULT_BASE_PORT,
             worker_count,
+            worker_runtime: WorkerRuntime::Python,
+            node_worker_bin: "node".to_string(),
+            node_worker_script: None,
             concurrent_per_worker,
             poll_interval_ms: 50,
             batch_size: (worker_count * concurrent_per_worker) as i32,

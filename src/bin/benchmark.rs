@@ -26,7 +26,7 @@ use tracing_subscriber::prelude::*;
 
 use rappel::{
     Database, PythonWorkerConfig, PythonWorkerPool, RunnerMetricsSnapshot, WorkerBridgeServer,
-    WorkflowInstanceId, WorkflowValue, WorkflowVersionId, proto, validate_program,
+    WorkerRuntime, WorkflowInstanceId, WorkflowValue, WorkflowVersionId, proto, validate_program,
 };
 
 const BENCHMARK_WORKFLOW_MODULE: &str = include_str!("../../tests/fixtures/benchmark_workflow.py");
@@ -782,6 +782,7 @@ async fn main() -> Result<()> {
 
     for host_id in 0..args.hosts {
         let worker_config = PythonWorkerConfig {
+            runtime: WorkerRuntime::Python,
             script_path: worker_script.clone(),
             script_args: Vec::new(),
             user_modules: vec!["benchmark_workflow".to_string()],

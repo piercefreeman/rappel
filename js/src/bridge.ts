@@ -41,14 +41,14 @@ export function callUnary<Response>(
   client: UnaryClient,
   method: string,
   request: unknown
-) {
+): Promise<Response> {
   return new Promise((resolve, reject) => {
     const rpc = client[method];
     if (typeof rpc !== "function") {
       reject(new Error(`gRPC method not found: ${method}`));
       return;
     }
-    rpc(request, (err, response) => {
+    rpc.call(client, request, (err, response) => {
       if (err) {
         reject(err);
         return;

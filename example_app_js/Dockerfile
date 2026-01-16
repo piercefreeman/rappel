@@ -40,9 +40,6 @@ COPY proto /app/proto
 
 COPY --from=node-builder /repo/example_app_js /app/example_app_js
 
-COPY example_app_js/scripts/rappel-worker /usr/local/bin/rappel-worker
-RUN chmod +x /usr/local/bin/rappel-worker
-
 EXPOSE 8001 24117 24118 24119
 
 WORKDIR /app/example_app_js

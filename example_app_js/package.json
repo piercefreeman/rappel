@@ -4,8 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "node ./scripts/build.mjs",
-    "start": "node ./dist/server.js",
-    "worker": "node ./dist/worker.js"
+    "start": "node ./dist/server.js"
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.10.8",

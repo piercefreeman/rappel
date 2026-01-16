@@ -27,8 +27,8 @@ await build({
 });
 
 await build({
-  entryPoints: [path.join(projectRoot, "src/worker.ts")],
-  outfile: path.join(projectRoot, "dist/worker.js"),
+  entryPoints: [path.join(projectRoot, "src/workflows.ts")],
+  outfile: path.join(projectRoot, "dist/workflows.js"),
   bundle: true,
   platform: "node",
   format: "esm",
