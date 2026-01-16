@@ -47,6 +47,7 @@ from example_app.workflows import (
     LoopProcessingWorkflow,
     LoopRequest,
     LoopResult,
+    NoOpWorkflow,
     ParallelMathWorkflow,
     SequentialChainWorkflow,
     SleepRequest,
@@ -291,6 +292,7 @@ WORKFLOW_REGISTRY = {
     "EarlyReturnLoopWorkflow": EarlyReturnLoopWorkflow,
     "KwOnlyLocationWorkflow": KwOnlyLocationWorkflow,
     "SpreadEmptyCollectionWorkflow": SpreadEmptyCollectionWorkflow,
+    "NoOpWorkflow": NoOpWorkflow,
 }
 
 

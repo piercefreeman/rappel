@@ -651,13 +651,18 @@ function renderTimeline() {
   // Flatten all logs from actionLogs (keyed by action_id) into a single array
   const allLogs = [];
   for (const [actionId, logs] of Object.entries(actionLogs)) {
-    const info = actionInfoLookup[actionId] || { nodeId: actionId, action: 'Unknown', module: '' };
+    const info = actionInfoLookup[actionId];
     logs.forEach(log => {
+      const resolved = info || {
+        nodeId: log.node_id || actionId,
+        action: log.action_name || 'Unknown',
+        module: log.module_name || ''
+      };
       allLogs.push({
         ...log,
-        nodeId: info.nodeId,
-        actionName: info.action,
-        moduleName: info.module
+        nodeId: resolved.nodeId,
+        actionName: resolved.action,
+        moduleName: resolved.module
       });
     });
   }

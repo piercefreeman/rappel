@@ -393,6 +393,7 @@
         <label for="batch-workflow">Workflow:</label>
         <select id="batch-workflow" name="workflow_name">
           <option value="ParallelMathWorkflow">ParallelMathWorkflow</option>
+          <option value="NoOpWorkflow">NoOpWorkflow</option>
         </select>
         <label for="batch-count">Count:</label>
         <input type="number" id="batch-count" name="count" min="1" value="1000" />
@@ -406,7 +407,7 @@
         </label>
         <button type="submit">Queue Batch</button>
       </form>
-      <div class="hint">Inputs JSON (required): {"number": 7}</div>
+      <div class="hint" id="batch-hint">Inputs JSON: {"number": 7}</div>
       <textarea id="batch-inputs" name="inputs" spellcheck="false">{"number": 7}</textarea>
       <div class="status" id="batch-status"></div>
       <div class="result" id="batch-result" hidden></div>
@@ -678,12 +679,33 @@
       const batchStatus = document.getElementById("batch-status");
       const batchResult = document.getElementById("batch-result");
       const batchInputs = document.getElementById("batch-inputs");
+      const batchHint = document.getElementById("batch-hint");
+      const batchWorkflowSelect = document.getElementById("batch-workflow");
       const batchButton = batchForm.querySelector("button");
+      const batchDefaults = {
+        ParallelMathWorkflow: { hint: 'Inputs JSON: {"number": 7}', inputs: '{"number": 7}' },
+        NoOpWorkflow: {
+          hint: 'Inputs JSON: {"indices": [0, 1, 2, 3, 4], "complexity": 0}',
+          inputs: '{"indices": [0, 1, 2, 3, 4], "complexity": 0}'
+        },
+      };
+
+      function applyBatchDefaults(workflowName) {
+        const defaults = batchDefaults[workflowName];
+        if (!defaults) return;
+        batchHint.textContent = defaults.hint;
+        batchInputs.value = defaults.inputs;
+      }
+
+      batchWorkflowSelect.addEventListener("change", (event) => {
+        applyBatchDefaults(event.target.value);
+      });
+      applyBatchDefaults(batchWorkflowSelect.value);
 
       batchForm.addEventListener("submit", async (event) => {
         event.preventDefault();
 
-        const workflow_name = document.getElementById("batch-workflow").value;
+        const workflow_name = batchWorkflowSelect.value;
         const count = Number(document.getElementById("batch-count").value);
         const batch_size = Number(document.getElementById("batch-size").value);
         const priorityRaw = document.getElementById("batch-priority").value.trim();

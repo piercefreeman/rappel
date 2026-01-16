@@ -1023,6 +1023,89 @@ class SpreadEmptyCollectionWorkflow(Workflow):
 
 
 # =============================================================================
+# No-op Workflow (queue throughput)
+# =============================================================================
+
+
+class NoOpRequest(BaseModel):
+    """Inputs for the no-op queue benchmark workflow."""
+
+    indices: list[int] = Field(
+        default_factory=list,
+        description="Indices to fan out over.",
+    )
+    complexity: int = Field(
+        default=0,
+        ge=0,
+        description="Accepted for parity with benchmark inputs; unused.",
+    )
+
+
+class NoOpResult(BaseModel):
+    """Summary for the no-op queue benchmark workflow."""
+
+    count: int
+    even_count: int
+    odd_count: int
+
+
+class NoOpTag(BaseModel):
+    """Tagged value emitted by the no-op workflow."""
+
+    value: int
+    tag: str
+
+
+@action
+async def noop_int(value: int) -> int:
+    """Return the input value without extra work."""
+    return value
+
+
+@action
+async def noop_tag_from_value(value: int) -> NoOpTag:
+    """Tag a value based on parity without extra work."""
+    tag = "even" if value % 2 == 0 else "odd"
+    return NoOpTag(value=value, tag=tag)
+
+
+@action
+async def noop_combine(items: list[NoOpTag]) -> NoOpResult:
+    """Summarize tagged items with minimal work."""
+    even_count = sum(1 for item in items if item.tag == "even")
+    odd_count = len(items) - even_count
+    return NoOpResult(count=len(items), even_count=even_count, odd_count=odd_count)
+
+
+@workflow
+class NoOpWorkflow(Workflow):
+    """Queue stress workflow with fan-out, loops, and fan-in."""
+
+    async def run(self, indices: list[int], complexity: int = 0) -> NoOpResult:
+        _ = complexity
+
+        stage1 = await asyncio.gather(*[
+            noop_int(value=i)
+            for i in indices
+        ])
+
+        processed: list[int] = []
+        for value in stage1:
+            if value % 2 == 0:
+                result = await noop_int(value=value)
+            else:
+                result = await noop_int(value=value)
+            processed.append(result)
+
+        tagged = await asyncio.gather(*[
+            noop_tag_from_value(value=value)
+            for value in processed
+        ])
+
+        return await noop_combine(items=tagged)
+
+
+# =============================================================================
 # Legacy alias for backwards compatibility
 # =============================================================================
 

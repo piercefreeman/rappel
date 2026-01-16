@@ -921,6 +921,12 @@ struct ActionLogContext {
     id: String,
     /// The action ID this log belongs to
     action_id: String,
+    /// Node ID in the DAG (for UI lookup)
+    node_id: Option<String>,
+    /// Action name (for UI lookup)
+    action_name: Option<String>,
+    /// Module name (for UI lookup)
+    module_name: Option<String>,
     /// Attempt number (0-indexed)
     attempt_number: i32,
     /// When this attempt was dispatched (with milliseconds for precise sorting)
@@ -1098,6 +1104,9 @@ fn render_workflow_run_page(
         let log_ctx = ActionLogContext {
             id: log.id.to_string(),
             action_id: log.action_id.to_string(),
+            node_id: log.node_id.clone(),
+            action_name: log.action_name.clone(),
+            module_name: log.module_name.clone(),
             attempt_number: log.attempt_number,
             dispatched_at: log
                 .dispatched_at
