@@ -343,7 +343,7 @@ class TestAsyncioGatherDetection:
         return names
 
     def test_gather_simple_two_actions(self) -> None:
-        """Test: a, b = await asyncio.gather(action_a(), action_b())"""
+        """Test: a, b = await asyncio.gather(action_a(), action_b(), return_exceptions=True)"""
         from tests.fixtures_gather.gather_simple import GatherSimpleWorkflow
 
         program = GatherSimpleWorkflow.workflow_ir()
@@ -383,7 +383,7 @@ class TestAsyncioGatherDetection:
                     assert action.kwargs[0].name == "n", "Expected 'n' kwarg"
 
     def test_gather_to_single_variable(self) -> None:
-        """Test: results = await asyncio.gather(a(), b(), c())"""
+        """Test: results = await asyncio.gather(a(), b(), c(), return_exceptions=True)"""
         from tests.fixtures_gather.gather_to_variable import GatherToVariableWorkflow
 
         program = GatherToVariableWorkflow.workflow_ir()
@@ -425,7 +425,7 @@ class TestAsyncioGatherDetection:
         assert combine_found, "Expected combine action after parallel block"
 
     def test_gather_starred_list_comprehension(self) -> None:
-        """Test: await asyncio.gather(*[action(x) for x in items])
+        """Test: await asyncio.gather(*[action(x) for x in items], return_exceptions=True)
 
         This pattern is converted to a SpreadExpr in the IR.
         """
@@ -460,7 +460,7 @@ class TestAsyncioGatherDetection:
         assert targets == ["results"]
 
     def test_gather_tuple_unpacking(self) -> None:
-        """Test: a, b = await asyncio.gather(action1(), action2())
+        """Test: a, b = await asyncio.gather(action1(), action2(), return_exceptions=True)
 
         This tests tuple unpacking with asyncio.gather where results
         are unpacked into multiple variables.
@@ -1289,7 +1289,7 @@ class TestUnsupportedPatternDetection:
     """Test that unsupported patterns raise UnsupportedPatternError with recommendations."""
 
     def test_gather_variable_spread_raises_error(self) -> None:
-        """Test: asyncio.gather(*tasks) raises error with recommendation."""
+        """Test: asyncio.gather(*tasks, return_exceptions=True) raises error."""
         import pytest
 
         from rappel import UnsupportedPatternError
@@ -1306,6 +1306,38 @@ class TestUnsupportedPatternDetection:
         assert "gather" in error.message.lower(), "Error should mention gather"
         assert "list comprehension" in error.recommendation.lower(), (
             "Recommendation should suggest list comprehension"
+        )
+
+    def test_gather_requires_return_exceptions(self) -> None:
+        """Test: asyncio.gather without return_exceptions raises error."""
+        import asyncio
+
+        import pytest
+
+        from rappel import UnsupportedPatternError, action, workflow
+        from rappel.workflow import Workflow
+
+        @action
+        async def action_a() -> int:
+            return 1
+
+        @action
+        async def action_b() -> int:
+            return 2
+
+        @workflow
+        class GatherMissingReturnExceptionsWorkflow(Workflow):
+            async def run(self) -> tuple:
+                results = await asyncio.gather(action_a(), action_b())
+                return results
+
+        with pytest.raises(UnsupportedPatternError) as exc_info:
+            GatherMissingReturnExceptionsWorkflow.workflow_ir()
+
+        error = exc_info.value
+        assert isinstance(error, UnsupportedPatternError)
+        assert "return_exceptions" in error.message, (
+            "Error should mention return_exceptions requirement"
         )
 
     def test_fstring_raises_error(self) -> None:
@@ -2802,7 +2834,7 @@ class TestSpreadAction:
     """Test spread action detection - converts to SpreadExpr in IR."""
 
     def test_spread_pattern_converts_to_spread_expr(self) -> None:
-        """Test: asyncio.gather(*[action(item) for item in items]) -> SpreadExpr."""
+        """Test: asyncio.gather(*[action(item) for item in items], return_exceptions=True) -> SpreadExpr."""
         from tests.fixtures_gather.gather_listcomp import GatherListCompWorkflow
 
         program = GatherListCompWorkflow.workflow_ir()
@@ -2822,7 +2854,7 @@ class TestSpreadAction:
         assert spread_found, "Expected spread expression from asyncio.gather(*[...])"
 
     def test_spread_pattern_with_run_action(self) -> None:
-        """Test: asyncio.gather(*[self.run_action(action(x), retry=..., timeout=...) for x in items]).
+        """Test: asyncio.gather(*[self.run_action(action(x), retry=..., timeout=...) for x in items], return_exceptions=True).
 
         This tests the pattern where run_action wraps the action call to add
         retry and timeout policies in a spread pattern.

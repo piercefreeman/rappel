@@ -32,7 +32,8 @@ class SpreadHelperInputWorkflow(Workflow):
         ready = await check_ready()
         if ready:
             results = await asyncio.gather(
-                *[process_item(item=item) for item in items]
+                *[process_item(item=item) for item in items],
+                return_exceptions=True,
             )
             return results
         return []

@@ -58,6 +58,7 @@ class ParallelMathWorkflow(Workflow):
         factorial_value, fib_value = await asyncio.gather(
             compute_factorial(number),
             compute_fibonacci(number),
+            return_exceptions=True,
         )
         return await summarize_math(
             input_number=number,

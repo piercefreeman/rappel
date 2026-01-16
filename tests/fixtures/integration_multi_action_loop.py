@@ -43,6 +43,7 @@ class MultiActionLoopWorkflow(Workflow):
             load_order(order_id="A"),
             load_order(order_id="B"),
             load_order(order_id="C"),
+            return_exceptions=True,
         )
 
         # Process each order with multiple actions per iteration

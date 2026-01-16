@@ -20,9 +20,10 @@ async def compute_cube(n: int) -> int:
 class GatherWithArgsWorkflow(Workflow):
     """Gather actions that take arguments."""
 
-    async def run(self, value: int) -> tuple[int, int]:
+    async def run(self, value: int) -> tuple[int | BaseException, int | BaseException]:
         square, cube = await asyncio.gather(
             compute_square(n=value),
             compute_cube(n=value),
+            return_exceptions=True,
         )
         return square, cube

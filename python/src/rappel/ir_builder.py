@@ -181,6 +181,12 @@ RECOMMENDATIONS = {
     "match": (
         "Match statements are not supported in workflow code.\nUse if/elif/else chains instead."
     ),
+    "gather_return_exceptions": (
+        "asyncio.gather() must be called with return_exceptions=True so results and errors "
+        "are represented consistently in Rappel's IR.\n\n"
+        "Update your call:\n\n"
+        "    results = await asyncio.gather(task_a(), task_b(), return_exceptions=True)"
+    ),
     "gather_variable_spread": (
         "Spreading a variable in asyncio.gather() is not supported because it requires "
         "data flow analysis to determine the contents.\n"
@@ -189,9 +195,10 @@ RECOMMENDATIONS = {
         "    tasks = []\n"
         "    for i in range(count):\n"
         "        tasks.append(process(value=i))\n"
-        "    results = await asyncio.gather(*tasks)\n\n"
+        "    results = await asyncio.gather(*tasks, return_exceptions=True)\n\n"
         "    # Use:\n"
-        "    results = await asyncio.gather(*[process(value=i) for i in range(count)])"
+        "    results = await asyncio.gather(*[process(value=i) for i in range(count)], "
+        "return_exceptions=True)"
     ),
     "for_loop_append_pattern": (
         "Building a task list in a for loop then spreading in asyncio.gather() is not "
@@ -201,9 +208,10 @@ RECOMMENDATIONS = {
         "    tasks = []\n"
         "    for i in range(count):\n"
         "        tasks.append(process(value=i))\n"
-        "    results = await asyncio.gather(*tasks)\n\n"
+        "    results = await asyncio.gather(*tasks, return_exceptions=True)\n\n"
         "    # Use:\n"
-        "    results = await asyncio.gather(*[process(value=i) for i in range(count)])"
+        "    results = await asyncio.gather(*[process(value=i) for i in range(count)], "
+        "return_exceptions=True)"
     ),
     "global_statement": (
         "Global statements are not supported in workflow code.\n"
@@ -2771,6 +2779,34 @@ class IRBuilder(ast.NodeVisitor):
         Returns:
             A ParallelExpr, SpreadExpr, or None if conversion fails.
         """
+        return_exceptions_value: Optional[ast.expr] = None
+        for kw in node.keywords:
+            if kw.arg is None:
+                line = node.lineno if hasattr(node, "lineno") else None
+                col = node.col_offset if hasattr(node, "col_offset") else None
+                raise UnsupportedPatternError(
+                    "asyncio.gather() must be called with return_exceptions=True",
+                    RECOMMENDATIONS["gather_return_exceptions"],
+                    line=line,
+                    col=col,
+                )
+            if kw.arg == "return_exceptions":
+                return_exceptions_value = kw.value
+                break
+
+        if not (
+            isinstance(return_exceptions_value, ast.Constant)
+            and return_exceptions_value.value is True
+        ):
+            line = node.lineno if hasattr(node, "lineno") else None
+            col = node.col_offset if hasattr(node, "col_offset") else None
+            raise UnsupportedPatternError(
+                "asyncio.gather() must be called with return_exceptions=True",
+                RECOMMENDATIONS["gather_return_exceptions"],
+                line=line,
+                col=col,
+            )
+
         # Check for starred expressions - spread pattern
         if len(node.args) == 1 and isinstance(node.args[0], ast.Starred):
             starred = node.args[0]

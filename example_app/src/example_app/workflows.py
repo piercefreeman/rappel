@@ -430,6 +430,7 @@ class ParallelMathWorkflow(Workflow):
         factorial_value, fib_value = await asyncio.gather(
             compute_factorial(number),
             compute_fibonacci(number),
+            return_exceptions=True,
         )
         # Fan in: combine results
         result = await summarize_math(
@@ -1016,7 +1017,8 @@ class SpreadEmptyCollectionWorkflow(Workflow):
     async def run(self, items: list[str]) -> SpreadEmptyResult:
         # Spread over items - may be empty!
         results = await asyncio.gather(
-            *[process_spread_item(item=item) for item in items]
+            *[process_spread_item(item=item) for item in items],
+            return_exceptions=True,
         )
 
         return await build_spread_empty_result(results=results)
@@ -1084,10 +1086,13 @@ class NoOpWorkflow(Workflow):
     async def run(self, indices: list[int], complexity: int = 0) -> NoOpResult:
         _ = complexity
 
-        stage1 = await asyncio.gather(*[
-            noop_int(value=i)
-            for i in indices
-        ])
+        stage1 = await asyncio.gather(
+            *[
+                noop_int(value=i)
+                for i in indices
+            ],
+            return_exceptions=True,
+        )
 
         processed: list[int] = []
         for value in stage1:
@@ -1097,10 +1102,13 @@ class NoOpWorkflow(Workflow):
                 result = await noop_int(value=value)
             processed.append(result)
 
-        tagged = await asyncio.gather(*[
-            noop_tag_from_value(value=value)
-            for value in processed
-        ])
+        tagged = await asyncio.gather(
+            *[
+                noop_tag_from_value(value=value)
+                for value in processed
+            ],
+            return_exceptions=True,
+        )
 
         return await noop_combine(items=tagged)
 
