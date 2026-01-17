@@ -11,12 +11,12 @@ use prost::Message;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::completion::{
-    CompletionPlan, InlineContext, ReadinessIncrement, analyze_subgraph, execute_inline_subgraph,
-};
-use crate::dag::{DAG, EdgeType, convert_to_dag};
-use crate::dag_state::DAGHelper;
+use crate::completion::{CompletionPlan, ReadinessIncrement};
+use crate::dag::{DAG, convert_to_dag};
 use crate::db::{BackoffKind, WorkflowInstanceId};
+use crate::execution::context::ExecutionContext;
+use crate::execution::engine::CompletionEngine;
+use crate::execution::model::ExceptionHandlingOutcome;
 use crate::ir_validation::validate_program;
 use crate::messages::{ast as ir_ast, proto};
 use crate::parser::ast;
@@ -60,6 +60,52 @@ pub struct InMemoryWorkflowExecutor {
     next_sequence: u32,
 }
 
+#[tonic::async_trait]
+impl ExecutionContext for InMemoryWorkflowExecutor {
+    fn dag(&self) -> &DAG {
+        &self.dag
+    }
+
+    fn instance_id(&self) -> WorkflowInstanceId {
+        self.instance_id
+    }
+
+    async fn initial_scope(&self) -> Result<HashMap<String, WorkflowValue>> {
+        Ok(self.initial_scope.clone())
+    }
+
+    async fn load_inbox(
+        &self,
+        node_ids: &HashSet<String>,
+    ) -> Result<HashMap<String, HashMap<String, WorkflowValue>>> {
+        Ok(node_ids
+            .iter()
+            .filter_map(|node_id| {
+                self.inbox
+                    .get(node_id)
+                    .map(|vars| (node_id.clone(), vars.clone()))
+            })
+            .collect())
+    }
+
+    async fn read_inbox(&self, node_id: &str) -> Result<HashMap<String, WorkflowValue>> {
+        Ok(self.inbox.get(node_id).cloned().unwrap_or_default())
+    }
+
+    async fn read_spread_inbox(&self, node_id: &str) -> Result<Vec<(i32, WorkflowValue)>> {
+        Ok(self
+            .spread_inbox
+            .get(node_id)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(idx, value)| (*idx, value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+}
+
 impl InMemoryWorkflowExecutor {
     pub fn from_registration(registration: proto::WorkflowRegistration) -> Result<Self> {
         let program = ir_ast::Program::decode(&registration.ir[..]).context("invalid IR")?;
@@ -93,42 +139,10 @@ impl InMemoryWorkflowExecutor {
     }
 
     pub async fn start(&mut self) -> Result<ExecutionStep> {
-        let helper = DAGHelper::new(&self.dag);
-        let function_names = helper.get_function_names();
-
-        if function_names.is_empty() {
-            return Ok(ExecutionStep {
-                dispatches: Vec::new(),
-                completed_payload: None,
-            });
-        }
-
-        let entry_fn = function_names
-            .iter()
-            .find(|&&name| name == "main")
-            .or_else(|| function_names.iter().find(|&&name| !name.starts_with("__")))
-            .or(function_names.first())
-            .copied()
-            .context("no valid entry function found")?;
-
-        let input_node_id = helper
-            .find_input_node(entry_fn)
-            .context("input node not found")?
-            .id
-            .clone();
-        drop(helper);
-
-        let (_scope, inbox_writes) = seed_scope_and_inbox(
-            &self.initial_scope,
-            &self.dag,
-            &input_node_id,
-            self.instance_id,
-        );
-        self.apply_inbox_writes(inbox_writes);
-
-        let plan = self.build_completion_plan(&input_node_id, WorkflowValue::Null, None)?;
-
-        self.apply_plan(plan).await
+        let engine_plan = CompletionEngine::build_start_plan(self).await?;
+        self.initial_scope = engine_plan.initial_scope;
+        self.apply_inbox_writes(engine_plan.seed_inbox_writes);
+        self.apply_plan(engine_plan.plan).await
     }
 
     pub async fn handle_action_result(
@@ -147,65 +161,54 @@ impl InMemoryWorkflowExecutor {
             }
         };
 
+        let payload_bytes = result
+            .payload
+            .as_ref()
+            .map(|payload| payload.encode_to_vec())
+            .unwrap_or_default();
+
         if result.success {
-            let result_value = parse_action_payload(&result.payload, "result");
-            let (base_node_id, mut spread_index) = parse_spread_node_id(&state.node_id);
-            if spread_index.is_none() {
-                spread_index = parallel_list_index(base_node_id, &self.dag);
-            }
-            self.handle_completed_node(base_node_id, result_value, spread_index)
-                .await
+            let engine_plan =
+                CompletionEngine::build_success_plan(self, &state.node_id, &payload_bytes).await?;
+            self.apply_plan(engine_plan.plan).await
         } else {
-            if state.attempt_number < state.max_retries {
-                let mut next_state = state.clone();
-                next_state.attempt_number += 1;
-                self.maybe_backoff(&next_state).await;
-                let dispatch = self.dispatch_action(&action_id, &next_state)?;
-                self.action_states.insert(action_id, next_state);
-                return Ok(ExecutionStep {
-                    dispatches: vec![dispatch],
-                    completed_payload: None,
-                });
+            match CompletionEngine::handle_action_failure(
+                self,
+                &state.node_id,
+                &payload_bytes,
+                state.attempt_number as i32,
+                state.max_retries as i32,
+            )
+            .await?
+            {
+                ExceptionHandlingOutcome::Retry => {
+                    let mut next_state = state.clone();
+                    next_state.attempt_number += 1;
+                    self.maybe_backoff(&next_state).await;
+                    let dispatch = self.dispatch_action(&action_id, &next_state)?;
+                    self.action_states.insert(action_id, next_state);
+                    Ok(ExecutionStep {
+                        dispatches: vec![dispatch],
+                        completed_payload: None,
+                    })
+                }
+                ExceptionHandlingOutcome::Handled { plan, .. } => self.apply_plan(*plan).await,
+                ExceptionHandlingOutcome::Unhandled => {
+                    let fallback = proto::WorkflowArguments {
+                        arguments: Vec::new(),
+                    }
+                    .encode_to_vec();
+                    Ok(ExecutionStep {
+                        dispatches: Vec::new(),
+                        completed_payload: Some(if payload_bytes.is_empty() {
+                            fallback
+                        } else {
+                            payload_bytes
+                        }),
+                    })
+                }
             }
-
-            let payload = result.payload.map(|p| p.encode_to_vec());
-            let fallback = proto::WorkflowArguments {
-                arguments: Vec::new(),
-            }
-            .encode_to_vec();
-            Ok(ExecutionStep {
-                dispatches: Vec::new(),
-                completed_payload: Some(payload.unwrap_or(fallback)),
-            })
         }
-    }
-
-    async fn handle_completed_node(
-        &mut self,
-        node_id: &str,
-        result: WorkflowValue,
-        spread_index: Option<usize>,
-    ) -> Result<ExecutionStep> {
-        let plan = self.build_completion_plan(node_id, result, spread_index)?;
-        self.apply_plan(plan).await
-    }
-
-    fn build_completion_plan(
-        &self,
-        node_id: &str,
-        result: WorkflowValue,
-        spread_index: Option<usize>,
-    ) -> Result<CompletionPlan> {
-        let helper = DAGHelper::new(&self.dag);
-        let subgraph = analyze_subgraph(node_id, &self.dag, &helper);
-        let existing_inbox = self.collect_existing_inbox(&subgraph.all_node_ids);
-        let ctx = InlineContext {
-            initial_scope: &self.initial_scope,
-            existing_inbox: &existing_inbox,
-            spread_index,
-        };
-        execute_inline_subgraph(node_id, result, ctx, &subgraph, &self.dag, self.instance_id)
-            .context("failed to execute inline subgraph")
     }
 
     async fn apply_plan(&mut self, plan: CompletionPlan) -> Result<ExecutionStep> {
@@ -277,17 +280,16 @@ impl InMemoryWorkflowExecutor {
                         dispatches.push(dispatch);
                     }
                     ReadyNode::Barrier(node_id) => {
-                        let next_plan = self.build_barrier_plan(&node_id)?;
+                        let next_plan =
+                            CompletionEngine::build_barrier_plan(self, &node_id).await?;
                         plan_queue.push_back(next_plan);
                     }
                     ReadyNode::Sleep(increment) => {
                         self.sleep_from_increment(&increment).await;
-                        let next_plan = self.build_completion_plan(
-                            &increment.node_id,
-                            WorkflowValue::Null,
-                            None,
-                        )?;
-                        plan_queue.push_back(next_plan);
+                        let next_plan =
+                            CompletionEngine::build_success_plan(self, &increment.node_id, &[])
+                                .await?;
+                        plan_queue.push_back(next_plan.plan);
                     }
                 }
             }
@@ -297,11 +299,6 @@ impl InMemoryWorkflowExecutor {
             dispatches,
             completed_payload: None,
         })
-    }
-
-    fn build_barrier_plan(&self, node_id: &str) -> Result<CompletionPlan> {
-        let aggregated = self.aggregate_spread_results(node_id);
-        self.build_completion_plan(node_id, aggregated, None)
     }
 
     async fn sleep_from_increment(&self, increment: &ReadinessIncrement) {
@@ -371,30 +368,6 @@ impl InMemoryWorkflowExecutor {
         }
     }
 
-    fn collect_existing_inbox(
-        &self,
-        node_ids: &HashSet<String>,
-    ) -> HashMap<String, HashMap<String, WorkflowValue>> {
-        node_ids
-            .iter()
-            .filter_map(|node_id| {
-                self.inbox
-                    .get(node_id)
-                    .map(|vars| (node_id.clone(), vars.clone()))
-            })
-            .collect()
-    }
-
-    fn aggregate_spread_results(&self, node_id: &str) -> WorkflowValue {
-        let aggregated = self
-            .spread_inbox
-            .get(node_id)
-            .map(|entries| entries.values().cloned().collect::<Vec<WorkflowValue>>())
-            .unwrap_or_default();
-
-        WorkflowValue::List(aggregated)
-    }
-
     fn ready_from_increment(increment: ReadinessIncrement) -> ReadyNode {
         match increment.node_type {
             crate::completion::NodeType::Action => ReadyNode::Action(increment),
@@ -413,19 +386,6 @@ fn workflow_arguments_to_scope(args: &proto::WorkflowArguments) -> HashMap<Strin
                 .map(|value| (arg.key.clone(), WorkflowValue::from_proto(value)))
         })
         .collect()
-}
-
-fn parse_action_payload(payload: &Option<proto::WorkflowArguments>, key: &str) -> WorkflowValue {
-    payload
-        .as_ref()
-        .and_then(|args| {
-            args.arguments
-                .iter()
-                .find(|arg| arg.key == key)
-                .and_then(|arg| arg.value.as_ref())
-        })
-        .map(WorkflowValue::from_proto)
-        .unwrap_or(WorkflowValue::Null)
 }
 
 fn json_bytes_to_workflow_args(payload: &[u8]) -> proto::WorkflowArguments {
@@ -457,89 +417,4 @@ fn json_bytes_to_workflow_args(payload: &[u8]) -> proto::WorkflowArguments {
             proto::WorkflowArguments { arguments: vec![] }
         }
     }
-}
-
-fn parse_spread_node_id(node_id: &str) -> (&str, Option<usize>) {
-    if let Some(bracket_pos) = node_id.rfind('[')
-        && node_id.ends_with(']')
-    {
-        let base = &node_id[..bracket_pos];
-        let idx_str = &node_id[bracket_pos + 1..node_id.len() - 1];
-        if let Ok(idx) = idx_str.parse::<usize>() {
-            return (base, Some(idx));
-        }
-    }
-    (node_id, None)
-}
-
-fn parallel_list_index(node_id: &str, dag: &DAG) -> Option<usize> {
-    let node = dag.nodes.get(node_id)?;
-    let agg_id = node.aggregates_to.as_ref()?;
-    let agg_node = dag.nodes.get(agg_id)?;
-    let target_count = agg_node.targets.as_ref().map(|t| t.len()).unwrap_or(0);
-    if target_count != 1 {
-        return None;
-    }
-
-    dag.edges
-        .iter()
-        .filter(|edge| edge.edge_type == EdgeType::StateMachine)
-        .find_map(|edge| {
-            if edge.target != node_id {
-                return None;
-            }
-            let condition = edge.condition.as_deref()?;
-            let idx_str = condition.strip_prefix("parallel:")?;
-            idx_str.parse::<usize>().ok()
-        })
-}
-
-fn collect_inbox_writes_for_node_with_spread(
-    source_node_id: &str,
-    variable_name: &str,
-    value: &WorkflowValue,
-    dag: &DAG,
-    instance_id: WorkflowInstanceId,
-    spread_index: Option<usize>,
-    inbox_writes: &mut Vec<crate::completion::InboxWrite>,
-) {
-    for edge in dag.edges.iter() {
-        if edge.source == source_node_id
-            && edge.edge_type == EdgeType::DataFlow
-            && edge.variable.as_deref() == Some(variable_name)
-        {
-            inbox_writes.push(crate::completion::InboxWrite {
-                instance_id,
-                target_node_id: edge.target.clone(),
-                variable_name: variable_name.to_string(),
-                value: value.clone(),
-                source_node_id: source_node_id.to_string(),
-                spread_index: spread_index.map(|i| i as i32),
-            });
-        }
-    }
-}
-
-fn seed_scope_and_inbox(
-    initial_inputs: &HashMap<String, WorkflowValue>,
-    dag: &DAG,
-    source_node_id: &str,
-    instance_id: WorkflowInstanceId,
-) -> (
-    HashMap<String, WorkflowValue>,
-    Vec<crate::completion::InboxWrite>,
-) {
-    let mut inbox_writes = Vec::new();
-    for (var_name, value) in initial_inputs {
-        collect_inbox_writes_for_node_with_spread(
-            source_node_id,
-            var_name,
-            value,
-            dag,
-            instance_id,
-            None,
-            &mut inbox_writes,
-        );
-    }
-    (initial_inputs.clone(), inbox_writes)
 }

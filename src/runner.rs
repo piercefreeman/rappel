@@ -51,23 +51,28 @@ use chrono::{DateTime, Utc};
 use prost::Message;
 
 use crate::{
-    ast_evaluator::{EvaluationError, ExpressionEvaluator, Scope},
+    ast_evaluator::{EvaluationError, Scope},
     completion::{
         CompletionError, CompletionPlan, InlineContext, analyze_subgraph, execute_inline_subgraph,
     },
-    dag::{DAG, DAGConverter, DAGNode, EXCEPTION_SCOPE_VAR, EdgeType},
-    dag_state::{DAGHelper, ExecutionMode},
+    dag::{DAG, DAGConverter, EdgeType},
+    dag_state::DAGHelper,
     db::{
-        ActionId, BackoffKind, CompletionRecord, Database, NewAction, QueuedAction, ScheduleId,
+        ActionId, CompletionRecord, Database, NewAction, QueuedAction, ScheduleId,
         WorkerStatusUpdate, WorkflowInstanceId, WorkflowVersionId,
     },
+    execution::context::ExecutionContext,
+    execution::engine::CompletionEngine,
+    execution::model::ExceptionHandlingOutcome,
     messages::proto,
     parser::ast,
     schedule::{apply_jitter, next_cron_run, next_interval_run},
-    traversal::{LoopAwareTraversal, get_traversal_successors, select_guarded_edges},
     value::WorkflowValue,
     worker::{ActionDispatchPayload, PythonWorkerPool, RoundTripMetrics, WorkerThroughputSnapshot},
 };
+
+#[cfg(test)]
+use crate::ast_evaluator::ExpressionEvaluator;
 
 type InboxValues = HashMap<String, HashMap<String, WorkflowValue>>;
 
@@ -75,6 +80,79 @@ type InboxValues = HashMap<String, HashMap<String, WorkflowValue>>;
 pub(crate) struct InstanceInboxCache {
     values: InboxValues,
     updated_at: DateTime<Utc>,
+}
+
+struct DbExecutionContext<'a> {
+    db: &'a Database,
+    dag: &'a DAG,
+    instance_id: WorkflowInstanceId,
+    instance_contexts: &'a Arc<RwLock<HashMap<Uuid, Scope>>>,
+    instance_inboxes: &'a Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
+}
+
+#[tonic::async_trait]
+impl<'a> ExecutionContext for DbExecutionContext<'a> {
+    fn dag(&self) -> &DAG {
+        self.dag
+    }
+
+    fn instance_id(&self) -> WorkflowInstanceId {
+        self.instance_id
+    }
+
+    async fn initial_scope(&self) -> anyhow::Result<HashMap<String, WorkflowValue>> {
+        if let Some(scope) = self
+            .instance_contexts
+            .read()
+            .await
+            .get(&self.instance_id.0)
+            .cloned()
+        {
+            return Ok(scope);
+        }
+
+        let scope = load_initial_scope(self.db, self.instance_id)
+            .await
+            .map_err(anyhow::Error::new)?;
+        self.instance_contexts
+            .write()
+            .await
+            .insert(self.instance_id.0, scope.clone());
+        Ok(scope)
+    }
+
+    async fn load_inbox(
+        &self,
+        node_ids: &HashSet<String>,
+    ) -> anyhow::Result<HashMap<String, HashMap<String, WorkflowValue>>> {
+        DAGRunner::load_inbox_with_cache(self.db, self.instance_inboxes, self.instance_id, node_ids)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    async fn read_inbox(&self, node_id: &str) -> anyhow::Result<HashMap<String, WorkflowValue>> {
+        let inbox = self
+            .db
+            .read_inbox(self.instance_id, node_id)
+            .await
+            .map_err(anyhow::Error::new)?;
+        Ok(inbox
+            .into_iter()
+            .map(|(key, value)| (key, json_to_workflow_value(&value)))
+            .collect())
+    }
+
+    async fn read_spread_inbox(&self, node_id: &str) -> anyhow::Result<Vec<(i32, WorkflowValue)>> {
+        let inbox = self
+            .db
+            .read_inbox_for_aggregator(self.instance_id, node_id)
+            .await
+            .map_err(anyhow::Error::new)?;
+        Ok(inbox
+            .into_iter()
+            .map(|(idx, value)| (idx, json_to_workflow_value(&value)))
+            .collect())
+    }
 }
 
 // ============================================================================
@@ -1410,14 +1488,6 @@ struct StartPlan {
     inbox_writes: Vec<crate::completion::InboxWrite>,
 }
 
-/// Result of creating actions for a node.
-/// Includes actions to enqueue and any inbox writes needed.
-#[derive(Debug, Default)]
-struct NodeActionResult {
-    pub actions: Vec<NewAction>,
-    pub inbox_writes: Vec<InboxWrite>,
-}
-
 /// Exception information for error handling.
 #[derive(Debug, Clone)]
 pub struct ExceptionInfo {
@@ -2172,21 +2242,22 @@ impl DAGRunner {
 
                     tokio::spawn(async move {
                         // Use unified completion path for successful actions
-                        // Fall back to old path for failures (which handles exception routing)
                         if metrics.success {
                             if let Err(e) = Self::process_completion_unified(
                                 &handler.db,
                                 &dag_cache,
                                 &instance_contexts,
                                 &instance_inboxes,
-                                completion_batcher,
+                                completion_batcher.clone(),
                                 &in_flight,
                                 &metrics,
                                 WorkflowInstanceId(instance_id),
                                 Some(pool_id),
                                 Some(worker_id),
                                 runner_metrics.clone(),
-                            ).await {
+                            )
+                            .await
+                            {
                                 error!("Unified completion processing failed: {}", e);
 
                                 // Handle the error: mark action complete and fail the instance
@@ -2196,23 +2267,24 @@ impl DAGRunner {
                                     &metrics,
                                     WorkflowInstanceId(instance_id),
                                     &e,
-                                ).await;
+                                )
+                                .await;
                             }
-                        } else {
-                            // Failed actions use old path for exception handling
-                            if let Err(e) = Self::process_completion_task(
-                                handler,
-                                dag_cache,
-                                instance_contexts,
-                                instance_inboxes,
-                                in_flight,
-                                metrics,
-                                WorkflowInstanceId(instance_id),
-                                Some(pool_id),
-                                Some(worker_id),
-                            ).await {
-                                error!("Completion processing failed: {}", e);
-                            }
+                        } else if let Err(e) = Self::process_completion_task(
+                            &handler.db,
+                            &dag_cache,
+                            &instance_contexts,
+                            &instance_inboxes,
+                            completion_batcher.clone(),
+                            in_flight,
+                            metrics,
+                            WorkflowInstanceId(instance_id),
+                            Some(pool_id),
+                            Some(worker_id),
+                        )
+                        .await
+                        {
+                            error!("Completion processing failed: {}", e);
                         }
                     });
                 }
@@ -2393,70 +2465,21 @@ impl DAGRunner {
             }
         };
 
-        // Parse spread index if present
-        let (base_node_id, mut spread_index) = Self::parse_spread_node_id(node_id);
-        if spread_index.is_none() {
-            spread_index = Self::parallel_list_index(base_node_id, &dag);
-        }
-
-        // Merge initial workflow inputs into the inline scope so downstream actions can
-        // access them even if no intermediate node has rewritten them into the inbox.
-        let initial_scope = instance_contexts
-            .read()
-            .await
-            .get(&instance_id.0)
-            .cloned()
-            .unwrap_or_default();
-
-        // Parse result from response payload
-        let result: WorkflowValue = if metrics.response_payload.is_empty() {
-            WorkflowValue::Null
-        } else {
-            match proto::WorkflowArguments::decode(&metrics.response_payload[..]) {
-                Ok(args) => args
-                    .arguments
-                    .iter()
-                    .find(|arg| arg.key == "result")
-                    .and_then(|arg| arg.value.as_ref())
-                    .map(proto_value_to_workflow_value)
-                    .unwrap_or(WorkflowValue::Null),
-                Err(_) => serde_json::from_slice::<serde_json::Value>(&metrics.response_payload)
-                    .map(|value| json_to_workflow_value(&value))
-                    .unwrap_or(WorkflowValue::Null),
-            }
+        let ctx = DbExecutionContext {
+            db,
+            dag: &dag,
+            instance_id,
+            instance_contexts,
+            instance_inboxes,
         };
-
-        let helper = DAGHelper::new(&dag);
-
-        // Step 1: Analyze subgraph
-        let subgraph_start = std::time::Instant::now();
-        let subgraph = analyze_subgraph(base_node_id, &dag, &helper);
-        let subgraph_ms = subgraph_start.elapsed().as_micros() as u64;
-
-        debug!(
-            node_id = %node_id,
-            inline_nodes = subgraph.inline_nodes.len(),
-            frontier_nodes = subgraph.frontier_nodes.len(),
-            "analyzed subgraph for completion"
-        );
-
-        // Step 2: Batch fetch inbox for all nodes in subgraph
-        let inbox_start = std::time::Instant::now();
-        let existing_inbox =
-            Self::load_inbox_with_cache(db, instance_inboxes, instance_id, &subgraph.all_node_ids)
-                .await?;
-        let inbox_ms = inbox_start.elapsed().as_micros() as u64;
-
-        // Step 3: Execute inline subgraph and build completion plan
-        let inline_start = std::time::Instant::now();
-        let ctx = InlineContext {
-            initial_scope: &initial_scope,
-            existing_inbox: &existing_inbox,
-            spread_index,
-        };
-        let mut plan =
-            execute_inline_subgraph(base_node_id, result, ctx, &subgraph, &dag, instance_id)
+        let engine_plan =
+            CompletionEngine::build_success_plan(&ctx, node_id, &metrics.response_payload)
+                .await
                 .map_err(|e| RunnerError::Dag(e.to_string()))?;
+        let subgraph_ms = engine_plan.subgraph_us;
+        let inbox_ms = engine_plan.inbox_us;
+        let inline_ms = engine_plan.inline_us;
+        let mut plan = engine_plan.plan;
 
         // Fill in action completion details
         plan = plan
@@ -2468,7 +2491,6 @@ impl DAGRunner {
                 metrics.error_message.clone(),
             )
             .with_worker(pool_id, worker_id);
-        let inline_ms = inline_start.elapsed().as_micros() as u64;
 
         debug!(
             node_id = %node_id,
@@ -2664,386 +2686,93 @@ impl DAGRunner {
         Ok(result)
     }
 
-    /// Process a completion in a tokio task (fully async with inbox pattern).
-    ///
-    /// When an action completes:
-    /// 1. Collect inbox writes for downstream nodes (via DATA_FLOW edges)
-    /// 2. Find ready successor nodes
-    /// 3. For inline nodes: execute immediately, collect their inbox writes too
-    /// 4. For delegated nodes: read inbox, create action, add to batch
-    /// 5. Write everything in one batch at the end
+    /// Process a failed completion and optionally route to exception handlers.
     #[allow(clippy::too_many_arguments)]
     async fn process_completion_task(
-        handler: WorkCompletionHandler,
-        dag_cache: Arc<DAGCache>,
-        instance_contexts: Arc<RwLock<HashMap<Uuid, Scope>>>,
-        instance_inboxes: Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
+        db: &Database,
+        dag_cache: &DAGCache,
+        instance_contexts: &Arc<RwLock<HashMap<Uuid, Scope>>>,
+        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
+        completion_batcher: Arc<CompletionBatcher>,
         in_flight: InFlightAction,
         metrics: RoundTripMetrics,
         instance_id: WorkflowInstanceId,
         pool_id: Option<Uuid>,
         worker_id: Option<i64>,
     ) -> RunnerResult<()> {
-        let mut batch = CompletionBatch::new();
+        let node_id = match in_flight.action.node_id.as_deref() {
+            Some(id) => id,
+            None => return Ok(()),
+        };
 
-        // Create completion record
-        batch.completions.push(CompletionRecord {
-            action_id: ActionId(in_flight.action.id),
-            success: metrics.success,
-            result_payload: metrics.response_payload.clone(),
-            delivery_token: in_flight.action.delivery_token,
-            error_message: metrics.error_message.clone(),
-            pool_id,
-            worker_id,
-        });
+        let mut plan = CompletionPlan::new(node_id.to_string());
+        let mut handled = false;
 
-        // If failed, check if this is an exception that should be caught
-        // Parse the result payload to see if it contains exception info
-        if !metrics.success {
-            let action_id_str = in_flight.action.id.to_string();
-            debug!(
-                action_id = %action_id_str,
-                response_payload_len = metrics.response_payload.len(),
-                "action failed, checking for exception info"
-            );
-
-            // Try to parse exception info from the response payload
-            // Note: Python uses "error" key for exception payloads, not "result"
-            let maybe_exception: Option<WorkflowValue> = if !metrics.response_payload.is_empty() {
-                match proto::WorkflowArguments::decode(&metrics.response_payload[..]) {
-                    Ok(args) => {
-                        debug!(
-                            action_id = %action_id_str,
-                            arg_count = args.arguments.len(),
-                            arg_keys = ?args.arguments.iter().map(|a| &a.key).collect::<Vec<_>>(),
-                            "parsed WorkflowArguments from response payload"
-                        );
-                        args.arguments
-                            .iter()
-                            .find(|arg| arg.key == "error")
-                            .and_then(|arg| arg.value.as_ref())
-                            .map(proto_value_to_workflow_value)
-                    }
-                    Err(e) => {
-                        debug!(
-                            action_id = %action_id_str,
-                            error = %e,
-                            "failed to decode WorkflowArguments, trying JSON"
-                        );
-                        serde_json::from_slice::<serde_json::Value>(&metrics.response_payload)
-                            .ok()
-                            .map(|value| json_to_workflow_value(&value))
-                    }
-                }
-            } else {
-                debug!(action_id = %action_id_str, "response payload is empty");
-                None
+        if let Some(dag) = dag_cache.get_dag_for_instance(instance_id).await? {
+            let ctx = DbExecutionContext {
+                db,
+                dag: &dag,
+                instance_id,
+                instance_contexts,
+                instance_inboxes,
             };
-
-            debug!(
-                action_id = %action_id_str,
-                maybe_exception = ?maybe_exception,
-                "parsed exception value"
-            );
-
-            // Check if this exception should be caught
-            if let Some(ref exc_value) = maybe_exception
-                && let Some((exception_type, type_hierarchy)) = Self::is_exception_result(exc_value)
+            match CompletionEngine::handle_action_failure(
+                &ctx,
+                node_id,
+                &metrics.response_payload,
+                in_flight.action.attempt_number,
+                in_flight.action.max_retries,
+            )
+            .await
+            .map_err(|e| RunnerError::Dag(e.to_string()))?
             {
-                // Get DAG for this workflow instance
-                if let Some(dag) = dag_cache.get_dag_for_instance(instance_id).await? {
-                    let node_id = match in_flight.action.node_id.as_deref() {
-                        Some(id) => id,
-                        None => {
-                            let _ = handler.write_batch(batch).await?;
-                            return Ok(());
-                        }
-                    };
-
-                    let helper = DAGHelper::new(&dag);
-                    let (base_node_id, _spread_index) = Self::parse_spread_node_id(node_id);
-
-                    debug!(
-                        node_id = %node_id,
-                        exception_type = %exception_type,
-                        type_hierarchy = ?type_hierarchy,
-                        attempt_number = in_flight.action.attempt_number,
-                        max_retries = in_flight.action.max_retries,
-                        "action failed with exception, checking retry status"
-                    );
-
-                    // Only check for exception handlers if retries are exhausted.
-                    // If retries are still available, let the retry logic handle it.
-                    // The exception handler should only run after ALL retries have failed.
-                    let retries_exhausted =
-                        in_flight.action.attempt_number >= in_flight.action.max_retries;
-
-                    if !retries_exhausted {
-                        debug!(
-                            node_id = %node_id,
-                            attempt_number = in_flight.action.attempt_number,
-                            max_retries = in_flight.action.max_retries,
-                            "retries still available, not checking for exception handlers yet"
-                        );
-                        Self::write_batch_and_update_cache(
-                            &handler,
-                            batch,
-                            &instance_inboxes,
-                            instance_id,
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-
-                    // Look for exception handlers on this node
-                    if let Some(handler_id) = Self::get_exception_handlers_from_node(
-                        &dag,
-                        base_node_id,
-                        &exception_type,
-                        &type_hierarchy,
-                    ) {
-                        debug!(
-                            node_id = %node_id,
-                            handler_id = %handler_id,
-                            "found exception handler on current node"
-                        );
-                        // Initialize inline scope by gathering variables from multiple sources.
-                        // This is critical for exception handling inside for loops - we need:
-                        // 1. Loop variables (like __loop_loop_N_i) from the action's inbox
-                        // 2. Variables defined before the loop that the handler might use
-                        //
-                        // We gather from: the action's inbox, the handler's inbox, and
-                        // the exception handler's data flow predecessors.
-                        let mut inline_scope: Scope = HashMap::new();
-
-                        if let Some(initial_scope) =
-                            instance_contexts.read().await.get(&instance_id.0).cloned()
-                        {
-                            inline_scope.extend(initial_scope);
-                        }
-
-                        // Read from action's inbox (has loop variables)
-                        let action_inbox = handler.db.read_inbox(instance_id, base_node_id).await?;
-                        for (k, v) in action_inbox {
-                            inline_scope.insert(k, json_to_workflow_value(&v));
-                        }
-
-                        // Also read from the exception handler node's inbox
-                        // (may have variables via dataflow edges)
-                        let handler_inbox = handler.db.read_inbox(instance_id, &handler_id).await?;
-                        for (k, v) in handler_inbox {
-                            inline_scope
-                                .entry(k)
-                                .or_insert_with(|| json_to_workflow_value(&v));
-                        }
-
-                        // Also try to get variables from data flow predecessors of the handler
-                        for edge in dag.edges.iter() {
-                            if edge.target == handler_id
-                                && edge.edge_type == EdgeType::DataFlow
-                                && let Some(var_name) = &edge.variable
-                                && !inline_scope.contains_key(var_name)
-                            {
-                                // Try to read this variable from the source node's inbox
-                                let source_inbox =
-                                    handler.db.read_inbox(instance_id, &edge.source).await?;
-                                if let Some(value) = source_inbox.get(var_name) {
-                                    inline_scope
-                                        .insert(var_name.clone(), json_to_workflow_value(value));
-                                }
-                            }
-                        }
-
-                        debug!(
-                            node_id = %node_id,
-                            handler_id = %handler_id,
-                            inline_scope_keys = ?inline_scope.keys().collect::<Vec<_>>(),
-                            "initialized inline scope from multiple sources for exception handler"
-                        );
-                        Self::process_exception_handler(
-                            &handler_id,
-                            exc_value,
-                            &dag,
-                            &helper,
-                            &mut inline_scope,
-                            &mut batch,
-                            instance_id,
-                            &handler.db,
-                        )
-                        .await?;
-                        Self::write_batch_and_update_cache(
-                            &handler,
-                            batch,
-                            &instance_inboxes,
-                            instance_id,
-                        )
-                        .await?;
-                        // Mark the failed action as caught so fail_instances_with_exhausted_actions
-                        // doesn't mark the workflow as failed. This must be AFTER write_batch
-                        // because the action is still 'dispatched' until write_batch completes.
-                        handler.db.mark_action_caught(instance_id, node_id).await?;
-                        return Ok(());
-                    }
-
-                    // Check if we're inside a synthetic try body function
-                    if let Some(fn_call_id) = Self::find_enclosing_fn_call(&dag, base_node_id) {
-                        debug!(
-                            node_id = %node_id,
-                            fn_call_id = %fn_call_id,
-                            "node is inside try body function, checking fn_call for handlers"
-                        );
-                        if let Some(handler_id) = Self::get_exception_handlers_from_node(
-                            &dag,
-                            &fn_call_id,
-                            &exception_type,
-                            &type_hierarchy,
-                        ) {
-                            debug!(
-                                fn_call_id = %fn_call_id,
-                                handler_id = %handler_id,
-                                "found exception handler on enclosing fn_call"
-                            );
-                            // Initialize inline scope with variables from multiple sources.
-                            // This is critical for exception handling inside for loops where
-                            // we need:
-                            // 1. Loop variables (like __loop_loop_N_i) from the action's inbox
-                            // 2. Variables defined before the loop that the handler might use
-                            //
-                            // We gather from: the action's inbox, the handler's inbox, and
-                            // the exception handler's data flow predecessors.
-                            let mut inline_scope: Scope = HashMap::new();
-
-                            if let Some(initial_scope) =
-                                instance_contexts.read().await.get(&instance_id.0).cloned()
-                            {
-                                inline_scope.extend(initial_scope);
-                            }
-
-                            // Read from action's inbox (has loop variables)
-                            let action_inbox =
-                                handler.db.read_inbox(instance_id, base_node_id).await?;
-                            for (k, v) in action_inbox {
-                                inline_scope.insert(k, json_to_workflow_value(&v));
-                            }
-
-                            // Also read from the exception handler node's inbox
-                            // (may have variables via dataflow edges)
-                            let handler_inbox =
-                                handler.db.read_inbox(instance_id, &handler_id).await?;
-                            for (k, v) in handler_inbox {
-                                inline_scope
-                                    .entry(k)
-                                    .or_insert_with(|| json_to_workflow_value(&v));
-                            }
-
-                            // Also try to get variables from data flow predecessors of the handler
-                            for edge in dag.edges.iter() {
-                                if edge.target == handler_id
-                                    && edge.edge_type == EdgeType::DataFlow
-                                    && let Some(var_name) = &edge.variable
-                                    && !inline_scope.contains_key(var_name)
-                                {
-                                    // Try to read this variable from the source node's inbox
-                                    let source_inbox =
-                                        handler.db.read_inbox(instance_id, &edge.source).await?;
-                                    if let Some(value) = source_inbox.get(var_name) {
-                                        inline_scope.insert(
-                                            var_name.clone(),
-                                            json_to_workflow_value(value),
-                                        );
-                                    }
-                                }
-                            }
-
-                            debug!(
-                                fn_call_id = %fn_call_id,
-                                handler_id = %handler_id,
-                                inline_scope_keys = ?inline_scope.keys().collect::<Vec<_>>(),
-                                "initialized inline scope from multiple sources for exception handler"
-                            );
-                            Self::process_exception_handler(
-                                &handler_id,
-                                exc_value,
-                                &dag,
-                                &helper,
-                                &mut inline_scope,
-                                &mut batch,
-                                instance_id,
-                                &handler.db,
-                            )
-                            .await?;
-                            Self::write_batch_and_update_cache(
-                                &handler,
-                                batch,
-                                &instance_inboxes,
-                                instance_id,
-                            )
-                            .await?;
-                            // Mark the failed action as caught so fail_instances_with_exhausted_actions
-                            // doesn't mark the workflow as failed. This must be AFTER write_batch
-                            // because the action is still 'dispatched' until write_batch completes.
-                            handler.db.mark_action_caught(instance_id, node_id).await?;
-                            return Ok(());
-                        }
-                    }
-
-                    warn!(
-                        node_id = %node_id,
-                        exception_type = %exception_type,
-                        "no exception handler found for failed action"
-                    );
+                ExceptionHandlingOutcome::Handled {
+                    plan: handler_plan, ..
+                } => {
+                    plan = *handler_plan;
+                    handled = true;
                 }
+                ExceptionHandlingOutcome::Retry | ExceptionHandlingOutcome::Unhandled => {}
             }
-
-            Self::write_batch_and_update_cache(&handler, batch, &instance_inboxes, instance_id)
-                .await?;
-            return Ok(());
         }
 
-        // If we get here, the action failed but no exception handler was found
-        // Just write the completion record
-        Self::write_batch_and_update_cache(&handler, batch, &instance_inboxes, instance_id).await?;
+        plan = plan
+            .with_action_completion(
+                ActionId(in_flight.action.id),
+                in_flight.action.delivery_token,
+                metrics.success,
+                metrics.response_payload.clone(),
+                metrics.error_message.clone(),
+            )
+            .with_worker(pool_id, worker_id);
+
+        let inbox_writes = plan.inbox_writes.clone();
+        let result = completion_batcher.execute(instance_id, plan).await?;
+
+        if !result.was_stale {
+            if !inbox_writes.is_empty() {
+                let updated_at = match result.inbox_updated_at {
+                    Some(updated_at) => updated_at,
+                    None => db.get_inbox_updated_at(instance_id).await?,
+                };
+                Self::apply_inbox_writes_to_cache(
+                    instance_inboxes,
+                    instance_id,
+                    &inbox_writes,
+                    updated_at,
+                )
+                .await;
+            }
+            if result.workflow_completed {
+                Self::clear_inbox_cache(instance_inboxes, instance_id).await;
+            }
+        }
+
+        if handled {
+            db.mark_action_caught(instance_id, node_id).await?;
+        }
+
         Ok(())
-    }
-
-    /// Parse a node_id that might contain a spread index suffix.
-    /// Returns (base_node_id, optional_spread_index).
-    ///
-    /// Example: "spread_action_1[2]" -> ("spread_action_1", Some(2))
-    /// Example: "action_1" -> ("action_1", None)
-    fn parse_spread_node_id(node_id: &str) -> (&str, Option<usize>) {
-        if let Some(bracket_pos) = node_id.rfind('[')
-            && node_id.ends_with(']')
-        {
-            let base = &node_id[..bracket_pos];
-            let idx_str = &node_id[bracket_pos + 1..node_id.len() - 1];
-            if let Ok(idx) = idx_str.parse::<usize>() {
-                return (base, Some(idx));
-            }
-        }
-        (node_id, None)
-    }
-
-    fn parallel_list_index(node_id: &str, dag: &DAG) -> Option<usize> {
-        let node = dag.nodes.get(node_id)?;
-        let agg_id = node.aggregates_to.as_ref()?;
-        let agg_node = dag.nodes.get(agg_id)?;
-        let target_count = agg_node.targets.as_ref().map(|t| t.len()).unwrap_or(0);
-        if target_count != 1 {
-            return None;
-        }
-
-        dag.edges
-            .iter()
-            .filter(|edge| edge.edge_type == EdgeType::StateMachine)
-            .find_map(|edge| {
-                if edge.target != node_id {
-                    return None;
-                }
-                let condition = edge.condition.as_deref()?;
-                let idx_str = condition.strip_prefix("parallel:")?;
-                idx_str.parse::<usize>().ok()
-            })
     }
 
     /// Collect inbox writes for a node's result via DATA_FLOW edges, with spread index support.
@@ -3115,619 +2844,6 @@ impl DAGRunner {
         (initial_inputs.clone(), inbox_writes)
     }
 
-    /// Check if all parallel actions are complete and enqueue the barrier when ready.
-    #[allow(clippy::too_many_arguments)]
-    async fn check_and_process_parallel_aggregator(
-        agg_node: &DAGNode,
-        dag: &DAG,
-        batch: &mut CompletionBatch,
-        instance_id: WorkflowInstanceId,
-        db: &Database,
-    ) -> RunnerResult<()> {
-        let agg_id = &agg_node.id;
-
-        // Get the parallel entry node this aggregator is collecting from
-        let parallel_entry_id = match &agg_node.aggregates_from {
-            Some(id) => id,
-            None => return Ok(()), // Not a valid aggregator
-        };
-
-        // Find all parallel action node IDs (successors of the parallel entry node)
-        let parallel_action_ids: Vec<String> = dag
-            .edges
-            .iter()
-            .filter(|e| e.source == *parallel_entry_id && e.edge_type == EdgeType::StateMachine)
-            .map(|e| e.target.clone())
-            .collect();
-
-        let expected_count = parallel_action_ids.len() as i32;
-
-        // Collect inbox writes that need to be committed atomically with the counter
-        // These are writes from the current parallel action completion
-        let inbox_writes_for_tx: Vec<(String, String, serde_json::Value, String, Option<i32>)> =
-            batch
-                .inbox_writes
-                .drain(..)
-                .map(|w| {
-                    (
-                        w.target_node_id,
-                        w.variable_name,
-                        w.value.to_json(),
-                        w.source_node_id,
-                        w.spread_index,
-                    )
-                })
-                .collect();
-
-        // Atomically write inbox entries, increment readiness counter, and enqueue
-        // the barrier when the last precursor arrives.
-        let readiness = db
-            .write_inbox_batch_and_increment_readiness(
-                instance_id,
-                agg_id,
-                expected_count,
-                &inbox_writes_for_tx,
-            )
-            .await?;
-
-        debug!(
-            aggregator_id = %agg_id,
-            expected_count = expected_count,
-            completed_count = readiness.completed_count,
-            is_now_ready = readiness.is_now_ready,
-            parallel_action_ids = ?parallel_action_ids,
-            inbox_writes_committed = inbox_writes_for_tx.len(),
-            "updated parallel barrier readiness"
-        );
-
-        if readiness.is_now_ready {
-            debug!(aggregator_id = %agg_id, "parallel barrier ready and enqueued");
-        }
-
-        Ok(())
-    }
-
-    /// Check if a result represents an exception.
-    /// Returns the exception type and the full type hierarchy (MRO) if it is an exception.
-    fn is_exception_result(result: &WorkflowValue) -> Option<(String, Vec<String>)> {
-        match result {
-            WorkflowValue::Exception {
-                exc_type,
-                type_hierarchy,
-                ..
-            } => Some((exc_type.clone(), type_hierarchy.clone())),
-            _ => None,
-        }
-    }
-
-    /// Find the fn_call node that encloses a node within a synthetic try body function.
-    /// Returns the fn_call node ID if found.
-    fn find_enclosing_fn_call(dag: &DAG, node_id: &str) -> Option<String> {
-        // Check if this node is inside a try body function (starts with __try_body_)
-        let node = dag.nodes.get(node_id)?;
-        let fn_name = node.function_name.as_ref()?;
-        if !fn_name.starts_with("__try_body_") {
-            return None;
-        }
-
-        // Find the fn_call node that calls this function
-        for (fn_call_id, fn_call_node) in &dag.nodes {
-            if fn_call_node.is_fn_call && fn_call_node.called_function.as_ref() == Some(fn_name) {
-                return Some(fn_call_id.clone());
-            }
-        }
-        None
-    }
-
-    /// Get exception handlers from a node's outgoing edges.
-    ///
-    /// Handler matching priority:
-    /// 1. Exact match on the exception type itself
-    /// 2. Match on any superclass in the type hierarchy (e.g., `except LookupError:` catches KeyError)
-    /// 3. Catch-all handler (empty exception_types, from `except:` or `except Exception:`)
-    ///
-    /// The type_hierarchy contains the MRO (Method Resolution Order) from Python,
-    /// e.g., for KeyError: ["KeyError", "LookupError", "Exception", "BaseException"]
-    ///
-    /// Note: `except Exception:` is normalized to catch-all in the DAG construction,
-    /// so we don't need special handling for it here.
-    fn get_exception_handlers_from_node(
-        dag: &DAG,
-        node_id: &str,
-        exception_type: &str,
-        type_hierarchy: &[String],
-    ) -> Option<String> {
-        let mut catch_all_handler = None;
-        let mut superclass_handler: Option<(String, usize)> = None; // (handler_id, hierarchy_index)
-
-        for edge in &dag.edges {
-            if edge.source != node_id {
-                continue;
-            }
-            if let Some(ref exc_types) = edge.exception_types {
-                if exc_types.is_empty() {
-                    // Catch-all handler (bare except: or except Exception:)
-                    catch_all_handler = Some(edge.target.clone());
-                } else if exc_types.iter().any(|t| t == exception_type) {
-                    // Exact match on the exception type - return immediately
-                    return Some(edge.target.clone());
-                } else {
-                    // Check if any handler type matches a superclass in the hierarchy
-                    // Pick the most specific match (lowest index in hierarchy)
-                    for handler_type in exc_types {
-                        if let Some(pos) = type_hierarchy.iter().position(|t| t == handler_type) {
-                            match &superclass_handler {
-                                None => {
-                                    superclass_handler = Some((edge.target.clone(), pos));
-                                }
-                                Some((_, existing_pos)) if pos < *existing_pos => {
-                                    // This handler is more specific (closer in the hierarchy)
-                                    superclass_handler = Some((edge.target.clone(), pos));
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Priority: superclass match > catch-all
-        superclass_handler
-            .map(|(handler, _)| handler)
-            .or(catch_all_handler)
-    }
-
-    /// Process successor nodes with optional condition result for branching.
-    ///
-    /// Uses BFS traversal to process inline nodes and their successors iteratively.
-    /// Guard expressions are evaluated as we encounter edges during traversal.
-    #[allow(clippy::too_many_arguments)]
-    async fn process_successors_with_condition(
-        node_id: &str,
-        result: &WorkflowValue,
-        dag: &DAG,
-        helper: &DAGHelper<'_>,
-        inline_scope: &mut Scope,
-        batch: &mut CompletionBatch,
-        instance_id: WorkflowInstanceId,
-        db: &Database,
-        _condition_result: Option<bool>,
-    ) -> RunnerResult<()> {
-        // Check if result is an exception
-        if let Some((exception_type, type_hierarchy)) = Self::is_exception_result(result) {
-            debug!(
-                node_id = %node_id,
-                exception_type = %exception_type,
-                type_hierarchy = ?type_hierarchy,
-                "result is an exception, looking for exception handlers"
-            );
-
-            // Look for exception handlers on this node
-            if let Some(handler_id) = Self::get_exception_handlers_from_node(
-                dag,
-                node_id,
-                &exception_type,
-                &type_hierarchy,
-            ) {
-                debug!(
-                    node_id = %node_id,
-                    handler_id = %handler_id,
-                    exception_type = %exception_type,
-                    "found exception handler on current node"
-                );
-                // Route to exception handler
-                return Self::process_exception_handler(
-                    &handler_id,
-                    result,
-                    dag,
-                    helper,
-                    inline_scope,
-                    batch,
-                    instance_id,
-                    db,
-                )
-                .await;
-            }
-
-            // Check if we're inside a synthetic try body function
-            if let Some(fn_call_id) = Self::find_enclosing_fn_call(dag, node_id) {
-                debug!(
-                    node_id = %node_id,
-                    fn_call_id = %fn_call_id,
-                    exception_type = %exception_type,
-                    "node is inside try body function, checking fn_call for handlers"
-                );
-                // Look for exception handlers on the enclosing fn_call
-                if let Some(handler_id) = Self::get_exception_handlers_from_node(
-                    dag,
-                    &fn_call_id,
-                    &exception_type,
-                    &type_hierarchy,
-                ) {
-                    debug!(
-                        fn_call_id = %fn_call_id,
-                        handler_id = %handler_id,
-                        exception_type = %exception_type,
-                        "found exception handler on enclosing fn_call"
-                    );
-                    return Self::process_exception_handler(
-                        &handler_id,
-                        result,
-                        dag,
-                        helper,
-                        inline_scope,
-                        batch,
-                        instance_id,
-                        db,
-                    )
-                    .await;
-                }
-            }
-
-            // No handler found - propagate exception (mark workflow as failed)
-            warn!(
-                node_id = %node_id,
-                exception_type = %exception_type,
-                "no exception handler found, exception will propagate"
-            );
-            // Action stays marked as failed. The retry loop will eventually
-            // exhaust retries and fail_instances_with_exhausted_actions
-            // will mark the workflow as failed.
-            return Ok(());
-        }
-
-        // Store result in inline scope for potential inline successors
-        if let Some(node) = dag.nodes.get(node_id)
-            && let Some(ref target) = node.target
-            && !(Self::is_exception_binding_node(node) && inline_scope.contains_key(target))
-        {
-            inline_scope.insert(target.clone(), result.clone());
-        }
-
-        // BFS work queue: (node_id, result to pass forward, via_loop_back)
-        // This replaces recursive calls with an iterative loop.
-        // We use loop-aware traversal to properly handle for loops - when an exception
-        // is caught inside a loop, we need to follow loop-back edges to continue iteration.
-        use std::collections::VecDeque;
-
-        let mut work_queue: VecDeque<(String, WorkflowValue, bool)> = VecDeque::new();
-        let mut traversal_state = LoopAwareTraversal::new();
-
-        // Initialize queue with immediate successors from the starting node
-        // Use get_traversal_successors which includes loop-back edges (unlike get_ready_successors)
-        let mut guard_errors = Vec::new();
-        let raw_edges = get_traversal_successors(helper, node_id);
-        let edge_targets: Vec<_> = raw_edges.iter().map(|e| &e.target).collect();
-        debug!(
-            node_id = %node_id,
-            raw_edge_count = raw_edges.len(),
-            raw_edges = ?edge_targets,
-            "process_successors_with_condition: getting traversal successors (loop-aware)"
-        );
-        for edge in select_guarded_edges(raw_edges, inline_scope, &mut guard_errors) {
-            work_queue.push_back((edge.target.clone(), result.clone(), edge.is_loop_back));
-        }
-
-        // Process work queue iteratively (BFS) with loop-aware visited tracking
-        while let Some((current_node_id, current_result, via_loop_back)) = work_queue.pop_front() {
-            // Check if we should visit this node (handles loop iteration limits)
-            if !traversal_state.should_visit(&current_node_id, via_loop_back) {
-                continue;
-            }
-            let succ_node = match dag.nodes.get(&current_node_id) {
-                Some(n) => n,
-                None => continue,
-            };
-
-            // Skip aggregator nodes during normal successor processing.
-            // Parallel aggregators need all predecessors to complete before processing.
-            // Instead, check if all predecessors are complete and process if ready.
-            if succ_node.is_aggregator {
-                // Check if all parallel actions feeding this aggregator are complete
-                Self::check_and_process_parallel_aggregator(succ_node, dag, batch, instance_id, db)
-                    .await?;
-                continue;
-            }
-
-            let exec_mode = helper.get_execution_mode(succ_node);
-            match exec_mode {
-                ExecutionMode::Inline => {
-                    // Check if this is the output node of the entry function (workflow completion)
-                    if succ_node.is_output || succ_node.node_type == "return" {
-                        // This is the final node - mark the workflow as complete
-                        // The result is the value from the inline_scope (the action result that just completed)
-                        // We wrap it in a "result" key to match Python's expected format
-                        let mut result_map = HashMap::new();
-                        result_map.insert("result".to_string(), current_result.clone());
-
-                        // Serialize the result as WorkflowArguments protobuf
-                        let result_payload = Self::serialize_workflow_result(&result_map);
-
-                        debug!(
-                            instance_id = %instance_id.0,
-                            output_node = %current_node_id,
-                            result = ?current_result,
-                            "workflow reached output node, marking complete"
-                        );
-
-                        batch.instance_completion = Some(InstanceCompletion {
-                            instance_id,
-                            result_payload,
-                        });
-                        continue;
-                    }
-
-                    // Execute inline node with in-memory scope
-                    let inline_result = Self::execute_inline_node(succ_node, inline_scope)?;
-                    tracing::debug!(
-                        node_id = %succ_node.id,
-                        node_type = %succ_node.node_type,
-                        target = ?succ_node.target,
-                        result = ?inline_result,
-                        scope_keys = ?inline_scope.keys().collect::<Vec<_>>(),
-                        "executed inline node"
-                    );
-
-                    // Update inline scope with the result (so subsequent nodes see the updated value)
-                    // This is critical for loop increments and assignments to work correctly
-                    if let Some(ref target) = succ_node.target {
-                        inline_scope.insert(target.clone(), inline_result.clone());
-                    }
-
-                    // Collect inbox writes for inline node's result
-                    if let Some(ref target) = succ_node.target {
-                        Self::collect_inbox_writes_for_node(
-                            &current_node_id,
-                            target,
-                            &inline_result,
-                            dag,
-                            instance_id,
-                            &mut batch.inbox_writes,
-                        );
-                    }
-
-                    // Determine what result to pass to successors:
-                    // - Control-flow nodes (join, branch) pass through the incoming result
-                    // - Value-producing nodes use their own inline_result
-                    let passthrough_result = match succ_node.node_type.as_str() {
-                        "join" | "branch" => current_result.clone(),
-                        _ => inline_result,
-                    };
-
-                    // Add successors to work queue (instead of recursive call)
-                    // Use loop-aware traversal to properly follow loop-back edges
-                    let mut guard_errors = Vec::new();
-                    let successor_edges = get_traversal_successors(helper, &current_node_id);
-                    for edge in
-                        select_guarded_edges(successor_edges, inline_scope, &mut guard_errors)
-                    {
-                        // Propagate loop-back context: if we're already in a loop-back context
-                        // OR this edge is a loop-back edge, mark the successor accordingly
-                        let successor_via_loop_back = via_loop_back || edge.is_loop_back;
-                        work_queue.push_back((
-                            edge.target.clone(),
-                            passthrough_result.clone(),
-                            successor_via_loop_back,
-                        ));
-                    }
-                }
-                ExecutionMode::Delegated => {
-                    // Read inbox for this node from database
-                    // This includes data from ANY upstream node, not just the one that just completed
-                    let mut inbox = db
-                        .read_inbox(instance_id, &current_node_id)
-                        .await?
-                        .into_iter()
-                        .map(|(key, value)| (key, json_to_workflow_value(&value)))
-                        .collect::<HashMap<_, _>>();
-
-                    // Merge pending inbox writes for this node (not yet committed to DB)
-                    for pending_write in &batch.inbox_writes {
-                        if pending_write.target_node_id == current_node_id {
-                            inbox.insert(
-                                pending_write.variable_name.clone(),
-                                pending_write.value.clone(),
-                            );
-                        }
-                    }
-
-                    // Merge inline scope variables (from parent inline nodes like `if`).
-                    // Inline scope holds fresh values from the current traversal (e.g. loop updates),
-                    // so it should override stale inbox entries.
-                    for (var_name, var_value) in inline_scope.iter() {
-                        inbox.insert(var_name.clone(), var_value.clone());
-                    }
-
-                    // Create actions (may be multiple for spread nodes)
-                    let action_result =
-                        Self::create_actions_for_node(succ_node, instance_id, &inbox, dag)?;
-                    batch.new_actions.extend(action_result.actions);
-                    batch.inbox_writes.extend(action_result.inbox_writes);
-
-                    if succ_node.node_type == "action_call" && !succ_node.is_spread {
-                        for (var_name, value) in &inbox {
-                            if let Some(existing) = batch.inbox_writes.iter_mut().find(|write| {
-                                write.target_node_id == current_node_id
-                                    && write.variable_name == *var_name
-                            }) {
-                                existing.value = value.clone();
-                                continue;
-                            }
-
-                            batch.inbox_writes.push(InboxWrite {
-                                instance_id,
-                                target_node_id: current_node_id.clone(),
-                                variable_name: var_name.clone(),
-                                value: value.clone(),
-                                source_node_id: current_node_id.clone(),
-                                spread_index: None,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Process an exception handler node and its successors.
-    /// This is called when an exception is caught and we need to execute the handler.
-    #[allow(clippy::too_many_arguments)]
-    async fn process_exception_handler(
-        handler_node_id: &str,
-        exception_result: &WorkflowValue,
-        dag: &DAG,
-        helper: &DAGHelper<'_>,
-        inline_scope: &mut Scope,
-        batch: &mut CompletionBatch,
-        instance_id: WorkflowInstanceId,
-        db: &Database,
-    ) -> RunnerResult<()> {
-        let (handler_node_id, handler_node) = match dag.nodes.get_key_value(handler_node_id) {
-            Some((id, node)) => (id.as_str(), node),
-            None => {
-                // Some DAG conversions append suffixes to fn_call nodes; try a prefix match fallback.
-                if let Some((id, node)) = dag
-                    .nodes
-                    .iter()
-                    .find(|(id, _)| id.starts_with(handler_node_id))
-                {
-                    debug!(
-                        original_handler_id = %handler_node_id,
-                        handler_node_id = %id,
-                        "exception handler not found by exact id; using prefix match fallback"
-                    );
-                    (id.as_str(), node)
-                } else {
-                    warn!(handler_node_id = %handler_node_id, "exception handler node not found");
-                    return Ok(());
-                }
-            }
-        };
-
-        debug!(
-            handler_node_id = %handler_node_id,
-            handler_type = %handler_node.node_type,
-            "processing exception handler"
-        );
-
-        let is_binding = Self::is_exception_binding_node(handler_node);
-        if is_binding {
-            inline_scope.insert(EXCEPTION_SCOPE_VAR.to_string(), exception_result.clone());
-        }
-
-        let exec_mode = helper.get_execution_mode(handler_node);
-        match exec_mode {
-            ExecutionMode::Inline => {
-                // Execute inline handler and continue to its successors
-                let inline_result = Self::execute_inline_node(handler_node, inline_scope)?;
-                if let Some(ref target) = handler_node.target {
-                    inline_scope.insert(target.clone(), inline_result.clone());
-
-                    // CRITICAL: Persist the updated variable to the database.
-                    // Exception handler assignments don't have DataFlow edges to downstream consumers,
-                    // so we need to find ALL nodes that have DataFlow edges for this variable
-                    // (from any source) and write the updated value to their inboxes.
-                    // This ensures that when the completion handler runs later, it sees the updated value.
-                    for edge in dag.edges.iter() {
-                        if edge.edge_type == EdgeType::DataFlow
-                            && edge.variable.as_deref() == Some(target)
-                        {
-                            batch.inbox_writes.push(InboxWrite {
-                                instance_id,
-                                target_node_id: edge.target.clone(),
-                                variable_name: target.clone(),
-                                value: inline_result.clone(),
-                                source_node_id: handler_node_id.to_string(),
-                                spread_index: None,
-                            });
-                        }
-                    }
-                }
-                if is_binding {
-                    inline_scope.remove(EXCEPTION_SCOPE_VAR);
-                }
-                let successor_result = if is_binding {
-                    WorkflowValue::Null
-                } else {
-                    inline_result.clone()
-                };
-                // Continue to handler's successors
-                debug!(
-                    handler_node_id = %handler_node_id,
-                    inline_scope_keys = ?inline_scope.keys().collect::<Vec<_>>(),
-                    "about to process successors of exception binding node"
-                );
-                Box::pin(Self::process_successors_with_condition(
-                    handler_node_id,
-                    &successor_result,
-                    dag,
-                    helper,
-                    inline_scope,
-                    batch,
-                    instance_id,
-                    db,
-                    None,
-                ))
-                .await
-            }
-            ExecutionMode::Delegated => {
-                // Handler is an action call - create action for it
-                // Read inbox for this node from database
-                let mut inbox = db
-                    .read_inbox(instance_id, handler_node_id)
-                    .await?
-                    .into_iter()
-                    .map(|(key, value)| (key, json_to_workflow_value(&value)))
-                    .collect::<HashMap<_, _>>();
-
-                // Merge pending inbox writes
-                for pending_write in &batch.inbox_writes {
-                    if pending_write.target_node_id == handler_node_id {
-                        inbox.insert(
-                            pending_write.variable_name.clone(),
-                            pending_write.value.clone(),
-                        );
-                    }
-                }
-
-                // Merge inline scope variables
-                for (var_name, var_value) in inline_scope.iter() {
-                    inbox
-                        .entry(var_name.clone())
-                        .or_insert_with(|| var_value.clone());
-                }
-
-                // Create actions for the handler node
-                let result = Self::create_actions_for_node(handler_node, instance_id, &inbox, dag)?;
-                batch.new_actions.extend(result.actions);
-                batch.inbox_writes.extend(result.inbox_writes);
-                Ok(())
-            }
-        }
-    }
-
-    fn is_exception_binding_node(node: &DAGNode) -> bool {
-        if node.id.starts_with("exc_bind") {
-            return true;
-        }
-        if node.node_type != "assignment" {
-            return false;
-        }
-        if node.label.contains(EXCEPTION_SCOPE_VAR) {
-            return true;
-        }
-        let Some(assign_expr) = node.assign_expr.as_ref() else {
-            return false;
-        };
-        let Some(ast::expr::Kind::Variable(var)) = assign_expr.kind.as_ref() else {
-            return false;
-        };
-        var.name == EXCEPTION_SCOPE_VAR
-    }
-
     /// Serialize workflow result (inbox values) as protobuf WorkflowArguments.
     fn serialize_workflow_result(inbox: &HashMap<String, WorkflowValue>) -> Vec<u8> {
         use prost::Message;
@@ -3751,64 +2867,6 @@ impl DAGRunner {
             .collect::<Vec<_>>()
             .join("; ");
         format!("Guard evaluation failed during startup: {details}")
-    }
-
-    /// Execute an inline node with in-memory scope (non-durable).
-    fn execute_inline_node(node: &DAGNode, scope: &mut Scope) -> RunnerResult<WorkflowValue> {
-        match node.node_type.as_str() {
-            "assignment" | "fn_call" => {
-                // Evaluate the assignment expression
-                if let Some(ref expr) = node.assign_expr {
-                    match ExpressionEvaluator::evaluate(expr, scope) {
-                        Ok(val) => {
-                            if let Some(ref target) = node.target
-                                && target.starts_with("__loop_")
-                            {
-                                tracing::debug!(
-                                    node_id = %node.id,
-                                    target,
-                                    scope_value = ?scope.get(target),
-                                    result = ?val,
-                                    "loop assignment evaluation"
-                                );
-                            }
-                            Ok(val)
-                        }
-                        Err(e) => {
-                            warn!(
-                                node_id = %node.id,
-                                error = %e,
-                                "failed to evaluate assignment expression"
-                            );
-                            Ok(WorkflowValue::Null)
-                        }
-                    }
-                } else {
-                    Ok(WorkflowValue::Null)
-                }
-            }
-            "return" => {
-                if let Some(ref expr) = node.assign_expr {
-                    match ExpressionEvaluator::evaluate(expr, scope) {
-                        Ok(val) => Ok(val),
-                        Err(e) => {
-                            warn!(
-                                node_id = %node.id,
-                                error = %e,
-                                "failed to evaluate return expression"
-                            );
-                            Ok(WorkflowValue::Null)
-                        }
-                    }
-                } else {
-                    Ok(WorkflowValue::Null)
-                }
-            }
-            "input" | "output" => Ok(WorkflowValue::Null),
-            "conditional" => Ok(WorkflowValue::Bool(true)),
-            "aggregator" => Ok(WorkflowValue::List(vec![])),
-            _ => Ok(WorkflowValue::Null),
-        }
     }
 
     /// Request shutdown.
@@ -3926,37 +2984,6 @@ impl DAGRunner {
         }
     }
 
-    /// Update inbox cache with newly written non-spread values from completion batches.
-    async fn apply_batch_inbox_writes_to_cache(
-        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
-        instance_id: WorkflowInstanceId,
-        inbox_writes: &[InboxWrite],
-        inbox_updated_at: DateTime<Utc>,
-    ) {
-        if inbox_writes.is_empty() {
-            return;
-        }
-
-        let mut cache = instance_inboxes.write().await;
-        let instance_cache = cache
-            .entry(instance_id.0)
-            .or_insert_with(|| InstanceInboxCache {
-                values: HashMap::new(),
-                updated_at: inbox_updated_at,
-            });
-        instance_cache.updated_at = inbox_updated_at;
-        for write in inbox_writes {
-            if write.spread_index.is_some() {
-                continue;
-            }
-            let node_cache = instance_cache
-                .values
-                .entry(write.target_node_id.clone())
-                .or_default();
-            node_cache.insert(write.variable_name.clone(), write.value.clone());
-        }
-    }
-
     /// Drop cached inbox data for an instance.
     async fn clear_inbox_cache(
         instance_inboxes: &Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
@@ -3964,36 +2991,6 @@ impl DAGRunner {
     ) {
         let mut cache = instance_inboxes.write().await;
         cache.remove(&instance_id.0);
-    }
-
-    async fn write_batch_and_update_cache(
-        handler: &WorkCompletionHandler,
-        batch: CompletionBatch,
-        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
-        instance_id: WorkflowInstanceId,
-    ) -> RunnerResult<()> {
-        let inbox_writes = batch.inbox_writes.clone();
-        let completed = batch.instance_completion.is_some();
-
-        let updated_at_by_instance = handler.write_batch(batch).await?;
-        if !inbox_writes.is_empty() {
-            let updated_at = match updated_at_by_instance.get(&instance_id.0) {
-                Some(updated_at) => *updated_at,
-                None => handler.db.get_inbox_updated_at(instance_id).await?,
-            };
-            Self::apply_batch_inbox_writes_to_cache(
-                instance_inboxes,
-                instance_id,
-                &inbox_writes,
-                updated_at,
-            )
-            .await;
-        }
-        if completed {
-            Self::clear_inbox_cache(instance_inboxes, instance_id).await;
-        }
-
-        Ok(())
     }
 
     /// Get count of in-flight actions.
@@ -4320,229 +3317,89 @@ impl DAGRunner {
             plan,
         })
     }
+}
 
-    /// Create action(s) for a node using inbox values.
-    /// For spread nodes, this returns multiple actions (one per collection item) plus inbox writes.
-    /// For regular action nodes, returns 0 or 1 action.
-    fn create_actions_for_node(
-        node: &DAGNode,
-        instance_id: WorkflowInstanceId,
-        inbox: &std::collections::HashMap<String, WorkflowValue>,
+// ============================================================================
+// Test Helpers
+// ============================================================================
+
+#[cfg(test)]
+impl DAGRunner {
+    /// Check if a result represents an exception.
+    /// Returns the exception type and the full type hierarchy (MRO) if it is an exception.
+    fn is_exception_result(result: &WorkflowValue) -> Option<(String, Vec<String>)> {
+        match result {
+            WorkflowValue::Exception {
+                exc_type,
+                type_hierarchy,
+                ..
+            } => Some((exc_type.clone(), type_hierarchy.clone())),
+            _ => None,
+        }
+    }
+
+    /// Get exception handlers from a node's outgoing edges.
+    ///
+    /// Handler matching priority:
+    /// 1. Exact match on the exception type itself
+    /// 2. Match on any superclass in the type hierarchy (e.g., `except LookupError:` catches KeyError)
+    /// 3. Catch-all handler (empty exception_types, from `except:` or `except Exception:`)
+    ///
+    /// The type_hierarchy contains the MRO (Method Resolution Order) from Python,
+    /// e.g., for KeyError: ["KeyError", "LookupError", "Exception", "BaseException"]
+    ///
+    /// Note: `except Exception:` is normalized to catch-all in the DAG construction,
+    /// so we don't need special handling for it here.
+    fn get_exception_handlers_from_node(
         dag: &DAG,
-    ) -> RunnerResult<NodeActionResult> {
-        // Handle for_loop nodes - they create a special action for the runner
-        if node.node_type == "for_loop" {
-            // For-loop nodes are added to the action queue so they can be dispatched
-            // to the runner for loop index management
-            let action = NewAction {
-                instance_id,
-                module_name: "".to_string(), // No module for internal nodes
-                action_name: "".to_string(), // No action name for internal nodes
-                dispatch_payload: Vec::new(), // Empty payload for control flow nodes
-                timeout_seconds: 300,
-                max_retries: 0, // No retries for control flow nodes
-                backoff_kind: BackoffKind::None,
-                backoff_base_delay_ms: 0,
-                node_id: Some(node.id.clone()),
-                node_type: Some("for_loop".to_string()),
-            };
+        node_id: &str,
+        exception_type: &str,
+        type_hierarchy: &[String],
+    ) -> Option<String> {
+        let mut catch_all_handler = None;
+        let mut superclass_handler: Option<(String, usize)> = None; // (handler_id, hierarchy_index)
 
-            // Write all inbox/scope values to the for_loop's inbox
-            // These are needed for the loop to access its input variables
-            let mut inbox_writes = Vec::new();
-            for (var_name, value) in inbox {
-                // Find the source node for this variable from dataflow edges
-                let source_node_id = dag
-                    .edges
-                    .iter()
-                    .find(|e| {
-                        e.target == node.id
-                            && e.edge_type == EdgeType::DataFlow
-                            && e.variable.as_ref() == Some(var_name)
-                    })
-                    .map(|e| e.source.clone())
-                    .unwrap_or_else(|| "initial_scope".to_string());
-
-                inbox_writes.push(InboxWrite {
-                    instance_id,
-                    target_node_id: node.id.clone(),
-                    variable_name: var_name.clone(),
-                    value: value.clone(),
-                    source_node_id,
-                    spread_index: None,
-                });
+        for edge in &dag.edges {
+            if edge.source != node_id {
+                continue;
             }
-
-            return Ok(NodeActionResult {
-                actions: vec![action],
-                inbox_writes,
-            });
-        }
-
-        if node.node_type != "action_call" {
-            return Ok(NodeActionResult::default());
-        }
-
-        // Handle spread nodes specially - they create multiple actions plus inbox writes
-        if node.is_spread {
-            return Self::create_spread_node_result(node, instance_id, inbox, dag);
-        }
-
-        // Regular action node - 0 or 1 action
-        match Self::create_action_for_node_from_inbox(node, instance_id, inbox)? {
-            Some(action) => Ok(NodeActionResult {
-                actions: vec![action],
-                inbox_writes: vec![],
-            }),
-            None => Ok(NodeActionResult::default()),
-        }
-    }
-
-    /// Create actions and inbox writes for a spread node.
-    /// For empty spreads (0 items in collection), this returns:
-    /// - No actions
-    /// - An inbox write of empty array to the aggregator
-    fn create_spread_node_result(
-        node: &DAGNode,
-        instance_id: WorkflowInstanceId,
-        inbox: &std::collections::HashMap<String, WorkflowValue>,
-        _dag: &DAG,
-    ) -> RunnerResult<NodeActionResult> {
-        let actions = Self::create_actions_for_spread_node(node, instance_id, inbox)?;
-        let spread_count = actions.len();
-
-        // Use the aggregates_to field to find the aggregator node
-        // This is set during DAG conversion and propagated during function expansion
-        let aggregator_id = node.aggregates_to.clone();
-
-        // Handle empty spreads specially - write empty result and mark for immediate completion
-        if spread_count == 0
-            && let Some(ref agg_id) = aggregator_id
-        {
-            let result_var = node
-                .target
-                .clone()
-                .unwrap_or_else(|| "_spread_result".to_string());
-
-            info!(
-                node_id = %node.id,
-                aggregator_id = %agg_id,
-                result_var = %result_var,
-                "spread has empty collection, writing empty result to aggregator"
-            );
-
-            return Ok(NodeActionResult {
-                actions: vec![],
-                inbox_writes: vec![InboxWrite {
-                    instance_id,
-                    target_node_id: agg_id.clone(),
-                    variable_name: result_var,
-                    value: WorkflowValue::List(vec![]),
-                    source_node_id: node.id.clone(),
-                    spread_index: None,
-                }],
-            });
-        }
-
-        Ok(NodeActionResult {
-            actions,
-            inbox_writes: vec![],
-        })
-    }
-
-    /// Create a new action for a node using inbox values instead of shared context.
-    fn create_action_for_node_from_inbox(
-        node: &DAGNode,
-        instance_id: WorkflowInstanceId,
-        inbox: &std::collections::HashMap<String, WorkflowValue>,
-    ) -> RunnerResult<Option<NewAction>> {
-        if node.node_type != "action_call" {
-            return Ok(None);
-        }
-
-        // Get action_name from node metadata (preferred) or fallback to parsing label
-        let action_name = match &node.action_name {
-            Some(name) => name.clone(),
-            None => {
-                // Fallback: extract from label (format: "@action_name(...)")
-                if node.label.starts_with('@') {
-                    let end = node.label.find('(').unwrap_or(node.label.len());
-                    node.label[1..end].to_string()
+            if let Some(ref exc_types) = edge.exception_types {
+                if exc_types.is_empty() {
+                    // Catch-all handler (bare except: or except Exception:)
+                    catch_all_handler = Some(edge.target.clone());
+                } else if exc_types.iter().any(|t| t == exception_type) {
+                    // Exact match on the exception type - return immediately
+                    return Some(edge.target.clone());
                 } else {
-                    return Ok(None);
-                }
-            }
-        };
-
-        // Get module_name from node metadata (default to "default" for backwards compatibility)
-        let module_name = node
-            .module_name
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
-
-        // Build kwargs from node metadata, resolving variable references from inbox
-        let payload = Self::build_action_payload_from_inbox(node, inbox)?;
-
-        // Extract retry and timeout settings from policies
-        let mut max_retries = 3i32; // default
-        let backoff_kind = BackoffKind::Exponential;
-        let mut backoff_base_delay_ms = 1000i32;
-        let mut timeout_seconds = 300i32;
-
-        debug!(
-            node_id = %node.id,
-            action_name = %action_name,
-            policies_count = node.policies.len(),
-            "creating action from node - checking policies"
-        );
-
-        for policy in &node.policies {
-            match &policy.kind {
-                Some(crate::parser::ast::policy_bracket::Kind::Retry(retry)) => {
-                    debug!(
-                        node_id = %node.id,
-                        max_retries = retry.max_retries,
-                        "found retry policy on node"
-                    );
-                    max_retries = retry.max_retries as i32;
-                    if let Some(ref backoff) = retry.backoff {
-                        // Convert seconds to milliseconds
-                        backoff_base_delay_ms = (backoff.seconds as i32) * 1000;
+                    // Check if any handler type matches a superclass in the hierarchy
+                    // Pick the most specific match (lowest index in hierarchy)
+                    for handler_type in exc_types {
+                        if let Some(pos) = type_hierarchy.iter().position(|t| t == handler_type) {
+                            match &superclass_handler {
+                                None => {
+                                    superclass_handler = Some((edge.target.clone(), pos));
+                                }
+                                Some((_, existing_pos)) if pos < *existing_pos => {
+                                    // This handler is more specific (closer in the hierarchy)
+                                    superclass_handler = Some((edge.target.clone(), pos));
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
-                Some(crate::parser::ast::policy_bracket::Kind::Timeout(timeout_policy)) => {
-                    if let Some(ref duration) = timeout_policy.timeout {
-                        timeout_seconds = duration.seconds as i32;
-                    }
-                }
-                None => {}
             }
         }
 
-        debug!(
-            node_id = %node.id,
-            action_name = %action_name,
-            final_max_retries = max_retries,
-            "action created with max_retries"
-        );
-
-        Ok(Some(NewAction {
-            instance_id,
-            module_name,
-            action_name,
-            dispatch_payload: payload,
-            timeout_seconds,
-            max_retries,
-            backoff_kind,
-            backoff_base_delay_ms,
-            node_id: Some(node.id.clone()),
-            node_type: Some("action".to_string()),
-        }))
+        // Priority: superclass match > catch-all
+        superclass_handler
+            .map(|(handler, _)| handler)
+            .or(catch_all_handler)
     }
 
     /// Build action payload from node kwargs, resolving variable references from inbox.
     fn build_action_payload_from_inbox(
-        node: &DAGNode,
+        node: &crate::dag::DAGNode,
         inbox: &std::collections::HashMap<String, WorkflowValue>,
     ) -> RunnerResult<Vec<u8>> {
         let mut payload_map = serde_json::Map::new();
@@ -4628,116 +3485,6 @@ impl DAGRunner {
                 }
             }
         }
-    }
-
-    /// Create actions for a spread node by expanding the collection.
-    ///
-    /// For a spread like `results = spread items:item -> @fetch(id=item)`:
-    /// 1. Evaluate `items` from inbox to get [1, 2, 3]
-    /// 2. Create 3 actions with `item` bound to 1, 2, 3 respectively
-    /// 3. Each action gets a `spread_index` for result ordering
-    ///
-    /// Returns multiple NewActions, one per iteration.
-    fn create_actions_for_spread_node(
-        node: &DAGNode,
-        instance_id: WorkflowInstanceId,
-        inbox: &std::collections::HashMap<String, WorkflowValue>,
-    ) -> RunnerResult<Vec<NewAction>> {
-        if !node.is_spread {
-            return Ok(vec![]);
-        }
-
-        let loop_var = node
-            .spread_loop_var
-            .as_ref()
-            .ok_or_else(|| RunnerError::Dag("Spread node missing loop_var".to_string()))?;
-
-        let collection_expr = node.spread_collection_expr.as_ref().ok_or_else(|| {
-            RunnerError::Dag("Spread node missing collection expression".to_string())
-        })?;
-
-        // Evaluate the collection expression using the expression evaluator
-        let collection = ExpressionEvaluator::evaluate(collection_expr, inbox)?;
-
-        let items = match &collection {
-            WorkflowValue::List(arr) | WorkflowValue::Tuple(arr) => arr.clone(),
-            _ => {
-                return Err(EvaluationError::Evaluation(format!(
-                    "Spread collection is not a list or tuple: {:?}",
-                    collection
-                ))
-                .into());
-            }
-        };
-
-        debug!(
-            node_id = %node.id,
-            loop_var = %loop_var,
-            item_count = items.len(),
-            "expanding spread action"
-        );
-
-        let action_name = node
-            .action_name
-            .as_ref()
-            .ok_or_else(|| RunnerError::Dag("Spread node missing action_name".to_string()))?
-            .clone();
-
-        let module_name = node
-            .module_name
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
-
-        // Extract retry and timeout settings from policies
-        let mut max_retries = 3i32; // default
-        let backoff_kind = BackoffKind::Exponential;
-        let mut backoff_base_delay_ms = 1000i32;
-        let mut timeout_seconds = 300i32;
-
-        for policy in &node.policies {
-            match &policy.kind {
-                Some(crate::parser::ast::policy_bracket::Kind::Retry(retry)) => {
-                    max_retries = retry.max_retries as i32;
-                    if let Some(ref backoff) = retry.backoff {
-                        backoff_base_delay_ms = (backoff.seconds as i32) * 1000;
-                    }
-                }
-                Some(crate::parser::ast::policy_bracket::Kind::Timeout(timeout_policy)) => {
-                    if let Some(ref duration) = timeout_policy.timeout {
-                        timeout_seconds = duration.seconds as i32;
-                    }
-                }
-                None => {}
-            }
-        }
-
-        let mut actions = Vec::new();
-        for (idx, item) in items.into_iter().enumerate() {
-            // Create a modified inbox with the loop variable bound to this item
-            let mut iteration_inbox = inbox.clone();
-            iteration_inbox.insert(loop_var.clone(), item);
-
-            // Build payload with the loop variable available
-            let payload = Self::build_action_payload_from_inbox(node, &iteration_inbox)?;
-
-            // Create node_id that includes the spread index for tracking
-            let spread_node_id = format!("{}[{}]", node.id, idx);
-
-            actions.push(NewAction {
-                instance_id,
-                module_name: module_name.clone(),
-                action_name: action_name.clone(),
-                dispatch_payload: payload,
-                timeout_seconds,
-                max_retries,
-                backoff_kind,
-                backoff_base_delay_ms,
-                node_id: Some(spread_node_id),
-                node_type: Some("action".to_string()),
-            });
-        }
-
-        Ok(actions)
     }
 }
 

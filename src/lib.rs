@@ -26,6 +26,7 @@ pub mod config;
 pub mod dag;
 pub mod dag_state;
 pub mod db;
+pub mod execution;
 pub mod in_memory;
 pub mod ir_printer;
 pub mod ir_validation;
@@ -89,9 +90,9 @@ pub use runner::{
 // Completion (unified readiness model)
 pub use completion::{
     CompletionError, CompletionPlan, CompletionResult, FrontierCategory, FrontierNode, GuardResult,
-    InlineScope, InstanceCompletion, NodeType, ReadinessIncrement, SubgraphAnalysis,
-    analyze_subgraph, evaluate_guard, execute_inline_subgraph, find_direct_predecessor_in_path,
-    is_direct_predecessor,
+    InlineExecutionOptions, InlineScope, InstanceCompletion, NodeType, ReadinessIncrement,
+    SubgraphAnalysis, analyze_subgraph, evaluate_guard, execute_inline_subgraph,
+    execute_inline_subgraph_with_options, find_direct_predecessor_in_path, is_direct_predecessor,
 };
 
 // Webapp server

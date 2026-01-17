@@ -46,6 +46,15 @@ pub struct InlineContext<'a> {
     pub spread_index: Option<usize>,
 }
 
+/// Options for customizing inline subgraph execution.
+#[derive(Debug, Clone, Default)]
+pub struct InlineExecutionOptions {
+    /// Override the initial traversal nodes (bypasses successor guard evaluation).
+    pub start_nodes: Option<Vec<String>>,
+    /// Skip inserting the completed result into scope or writing spread aggregation.
+    pub skip_completed_result_insertion: bool,
+}
+
 /// A frontier node where inline traversal stops.
 #[derive(Debug, Clone)]
 pub struct FrontierNode {
@@ -617,6 +626,26 @@ pub fn execute_inline_subgraph(
     dag: &DAG,
     instance_id: WorkflowInstanceId,
 ) -> Result<CompletionPlan, CompletionError> {
+    execute_inline_subgraph_with_options(
+        completed_node_id,
+        completed_result,
+        ctx,
+        subgraph,
+        dag,
+        instance_id,
+        InlineExecutionOptions::default(),
+    )
+}
+
+pub fn execute_inline_subgraph_with_options(
+    completed_node_id: &str,
+    completed_result: WorkflowValue,
+    ctx: InlineContext<'_>,
+    subgraph: &SubgraphAnalysis,
+    dag: &DAG,
+    instance_id: WorkflowInstanceId,
+    options: InlineExecutionOptions,
+) -> Result<CompletionPlan, CompletionError> {
     info!(
         completed_node_id = %completed_node_id,
         completed_result = ?completed_result,
@@ -638,7 +667,8 @@ pub fn execute_inline_subgraph(
     // Initialize inline scope with completed node's result
     let mut inline_scope: InlineScope = initial_scope.clone();
     let mut updated_vars: HashSet<String> = HashSet::new();
-    if let Some(node) = dag.nodes.get(completed_node_id)
+    if !options.skip_completed_result_insertion
+        && let Some(node) = dag.nodes.get(completed_node_id)
         && let Some(ref target) = node.target
     {
         // For aggregator nodes with multiple targets (parallel blocks with tuple unpacking),
@@ -657,8 +687,8 @@ pub fn execute_inline_subgraph(
         }
     }
 
-    // If this is a spread action, write the result to the aggregator with spread_index
-    if let Some(spread_idx) = spread_index
+    if !options.skip_completed_result_insertion
+        && let Some(spread_idx) = spread_index
         && let Some(node) = dag.nodes.get(completed_node_id)
         && let Some(ref aggregator_id) = node.aggregates_to
     {
@@ -712,18 +742,24 @@ pub fn execute_inline_subgraph(
     // Track frontiers and whether they were reached via a loop-back edge
     let mut reachable_frontiers: HashMap<String, bool> = HashMap::new();
 
-    // Queue holds (node_id, reached_via_loop_back)
-    // Start with successors of the completed node
-    // Use get_state_machine_successors to include loop-back edges (needed for for-loop iteration)
-    let mut queue: VecDeque<(String, bool)> = VecDeque::new();
     let mut guard_errors: Vec<(String, String)> = Vec::new();
-    let initial_edges = select_guarded_successors(
-        helper.get_state_machine_successors(completed_node_id),
-        &inline_scope,
-        &mut guard_errors,
-    );
-    for edge in initial_edges {
-        queue.push_back((edge.target.clone(), edge.is_loop_back));
+    // Queue holds (node_id, reached_via_loop_back)
+    // Start with successors of the completed node unless overridden.
+    let mut queue: VecDeque<(String, bool)> = VecDeque::new();
+    if let Some(start_nodes) = options.start_nodes {
+        for node_id in start_nodes {
+            queue.push_back((node_id, false));
+        }
+    } else {
+        // Use get_state_machine_successors to include loop-back edges (needed for for-loop iteration)
+        let initial_edges = select_guarded_successors(
+            helper.get_state_machine_successors(completed_node_id),
+            &inline_scope,
+            &mut guard_errors,
+        );
+        for edge in initial_edges {
+            queue.push_back((edge.target.clone(), edge.is_loop_back));
+        }
     }
 
     // Track loop iteration counts to prevent infinite loops
