@@ -5,8 +5,9 @@ use anyhow::{Context, Result};
 use prost::Message;
 
 use crate::completion::{
-    CompletionError, CompletionPlan, InlineContext, InlineExecutionOptions, analyze_subgraph,
-    execute_inline_subgraph, execute_inline_subgraph_with_options,
+    CompletionError, CompletionPlan, FrontierCategory, FrontierNode, InlineContext,
+    InlineExecutionOptions, analyze_subgraph, execute_inline_subgraph,
+    execute_inline_subgraph_with_options,
 };
 use crate::dag::{DAG, EXCEPTION_SCOPE_VAR, EdgeType};
 use crate::dag_state::DAGHelper;
@@ -199,7 +200,32 @@ impl CompletionEngine {
             build_exception_inline_scope(ctx, base_node_id, &handler_id, &exception).await?;
 
         let helper = DAGHelper::new(dag);
-        let subgraph = analyze_subgraph(&handler_id, dag, &helper);
+        let mut subgraph = analyze_subgraph(&handler_id, dag, &helper);
+        if let Some(node) = dag.nodes.get(&handler_id) {
+            let is_action = node.node_type == "action_call" && !node.is_fn_call;
+            let is_output = node.is_output;
+            let is_barrier = node.is_aggregator
+                || (node.node_type == "join" && node.join_required_count != Some(1));
+            if (is_action || is_barrier || is_output)
+                && !subgraph
+                    .frontier_nodes
+                    .iter()
+                    .any(|frontier| frontier.node_id == handler_id)
+            {
+                let category = if is_action {
+                    FrontierCategory::Action
+                } else if is_barrier {
+                    FrontierCategory::Barrier
+                } else {
+                    FrontierCategory::Output
+                };
+                subgraph.frontier_nodes.push(FrontierNode {
+                    node_id: handler_id.clone(),
+                    category,
+                    required_count: 1,
+                });
+            }
+        }
         let existing_inbox = ctx.load_inbox(&subgraph.all_node_ids).await?;
 
         let inline_ctx = InlineContext {
@@ -211,8 +237,8 @@ impl CompletionEngine {
             start_nodes: Some(vec![handler_id.clone()]),
             skip_completed_result_insertion: true,
         };
-        let plan = execute_inline_subgraph_with_options(
-            &handler_id,
+        let mut plan = execute_inline_subgraph_with_options(
+            base_node_id,
             WorkflowValue::Null,
             inline_ctx,
             &subgraph,
@@ -221,6 +247,11 @@ impl CompletionEngine {
             options,
         )
         .context("failed to execute exception handler subgraph")?;
+        for increment in &mut plan.readiness_increments {
+            if increment.node_id == handler_id && increment.required_count == 0 {
+                increment.required_count = 1;
+            }
+        }
 
         Ok(ExceptionHandlingOutcome::Handled {
             plan: Box::new(plan),

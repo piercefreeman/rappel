@@ -667,6 +667,7 @@ pub fn execute_inline_subgraph_with_options(
     // Initialize inline scope with completed node's result
     let mut inline_scope: InlineScope = initial_scope.clone();
     let mut updated_vars: HashSet<String> = HashSet::new();
+    let mut completed_inbox_vars: HashSet<String> = HashSet::new();
     if !options.skip_completed_result_insertion
         && let Some(node) = dag.nodes.get(completed_node_id)
         && let Some(ref target) = node.target
@@ -731,6 +732,7 @@ pub fn execute_inline_subgraph_with_options(
             // values computed during this BFS traversal
             if !inline_scope.contains_key(var) {
                 inline_scope.insert(var.clone(), val.clone());
+                completed_inbox_vars.insert(var.clone());
             }
         }
     }
@@ -994,10 +996,12 @@ pub fn execute_inline_subgraph_with_options(
                         .unwrap_or_default();
 
                     // Merge inline scope via DataFlow edges
+                    let mut override_vars = updated_vars.clone();
+                    override_vars.extend(completed_inbox_vars.iter().cloned());
                     merge_data_flow_into_inbox(
                         &frontier.node_id,
                         &inline_scope,
-                        &updated_vars,
+                        &override_vars,
                         dag,
                         &mut action_inbox,
                     );
@@ -1007,7 +1011,7 @@ pub fn execute_inline_subgraph_with_options(
                     // updates), which must take precedence over stale values from existing_inbox.
                     // This is critical for for-loops where variables like `processed` accumulate
                     // across iterations - we need the updated value, not the stale DB value.
-                    for var in &updated_vars {
+                    for var in &override_vars {
                         if let Some(val) = inline_scope.get(var) {
                             action_inbox.insert(var.clone(), val.clone());
                         }
