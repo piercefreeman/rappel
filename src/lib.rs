@@ -26,6 +26,7 @@ pub mod config;
 pub mod dag;
 pub mod dag_state;
 pub mod db;
+pub mod in_memory;
 pub mod ir_printer;
 pub mod ir_validation;
 pub mod lexer;

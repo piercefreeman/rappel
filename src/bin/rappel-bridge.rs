@@ -8,6 +8,8 @@
 //! - RAPPEL_DATABASE_URL: PostgreSQL connection string (required)
 //! - RAPPEL_BRIDGE_GRPC_ADDR: gRPC server bind address (default: 127.0.0.1:24117)
 
+use std::env;
+
 use anyhow::Result;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -24,6 +26,11 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    if in_memory_mode() {
+        let grpc_addr = grpc_addr_from_env();
+        return server_client::run_in_memory_server(grpc_addr).await;
+    }
+
     // Load configuration from global cache
     let config = get_config();
 
@@ -34,4 +41,21 @@ async fn main() -> Result<()> {
 
     // Run the server
     server_client::run_server(server_config).await
+}
+
+fn in_memory_mode() -> bool {
+    env::var("RAPPEL_BRIDGE_IN_MEMORY")
+        .ok()
+        .map(|value| {
+            let lowered = value.trim().to_ascii_lowercase();
+            !lowered.is_empty() && lowered != "0" && lowered != "false" && lowered != "no"
+        })
+        .unwrap_or(false)
+}
+
+fn grpc_addr_from_env() -> std::net::SocketAddr {
+    env::var("RAPPEL_BRIDGE_GRPC_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:24117".to_string())
+        .parse()
+        .expect("invalid RAPPEL_BRIDGE_GRPC_ADDR")
 }

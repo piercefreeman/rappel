@@ -28,6 +28,7 @@ use tokio::{
     task::JoinHandle,
     time::{Duration, timeout},
 };
+use tokio_stream::Stream;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tracing::info;
@@ -57,6 +58,14 @@ impl TestWorkflowService {
 
 #[tonic::async_trait]
 impl proto::workflow_service_server::WorkflowService for TestWorkflowService {
+    type ExecuteWorkflowStream = std::pin::Pin<
+        Box<
+            dyn Stream<Item = Result<proto::WorkflowStreamResponse, tonic::Status>>
+                + Send
+                + 'static,
+        >,
+    >;
+
     async fn register_workflow(
         &self,
         request: tonic::Request<proto::RegisterWorkflowRequest>,
@@ -240,6 +249,13 @@ impl proto::workflow_service_server::WorkflowService for TestWorkflowService {
         Ok(tonic::Response::new(proto::ListSchedulesResponse {
             schedules: schedule_infos,
         }))
+    }
+
+    async fn execute_workflow(
+        &self,
+        _request: tonic::Request<tonic::Streaming<proto::WorkflowStreamRequest>>,
+    ) -> Result<tonic::Response<Self::ExecuteWorkflowStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not implemented"))
     }
 }
 

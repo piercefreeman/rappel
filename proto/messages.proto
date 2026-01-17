@@ -191,6 +191,31 @@ message WaitForInstanceResponse {
 }
 
 // =============================================================================
+// In-memory workflow execution (local broker)
+// =============================================================================
+
+// Client -> server messages for workflow execution streaming.
+message WorkflowStreamRequest {
+  oneof kind {
+    WorkflowRegistration registration = 1;
+    ActionResult action_result = 2;
+  }
+}
+
+// Server -> client final workflow result payload.
+message WorkflowExecutionResult {
+  bytes payload = 1;
+}
+
+// Server -> client messages for workflow execution streaming.
+message WorkflowStreamResponse {
+  oneof kind {
+    ActionDispatch action_dispatch = 1;
+    WorkflowExecutionResult workflow_result = 2;
+  }
+}
+
+// =============================================================================
 // Workflow Schedules
 // =============================================================================
 // Messages for scheduling workflows to run on a recurring basis.
@@ -302,6 +327,8 @@ service WorkflowService {
   rpc RegisterWorkflowBatch(RegisterWorkflowBatchRequest)
       returns (RegisterWorkflowBatchResponse);
   rpc WaitForInstance(WaitForInstanceRequest) returns (WaitForInstanceResponse);
+  rpc ExecuteWorkflow(stream WorkflowStreamRequest)
+      returns (stream WorkflowStreamResponse);
   // Schedule management
   rpc RegisterSchedule(RegisterScheduleRequest) returns (RegisterScheduleResponse);
   rpc UpdateScheduleStatus(UpdateScheduleStatusRequest) returns (UpdateScheduleStatusResponse);

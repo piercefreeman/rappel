@@ -1012,6 +1012,110 @@ class WaitForInstanceResponse(google.protobuf.message.Message):
 Global___WaitForInstanceResponse: typing_extensions.TypeAlias = WaitForInstanceResponse
 
 @typing.final
+class WorkflowStreamRequest(google.protobuf.message.Message):
+    """=============================================================================
+    In-memory workflow execution (local broker)
+    =============================================================================
+
+    Client -> server messages for workflow execution streaming.
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    REGISTRATION_FIELD_NUMBER: builtins.int
+    ACTION_RESULT_FIELD_NUMBER: builtins.int
+    @property
+    def registration(self) -> Global___WorkflowRegistration: ...
+    @property
+    def action_result(self) -> Global___ActionResult: ...
+    def __init__(
+        self,
+        *,
+        registration: Global___WorkflowRegistration | None = ...,
+        action_result: Global___ActionResult | None = ...,
+    ) -> None: ...
+    def HasField(
+        self,
+        field_name: typing.Literal[
+            "action_result", b"action_result", "kind", b"kind", "registration", b"registration"
+        ],
+    ) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing.Literal[
+            "action_result", b"action_result", "kind", b"kind", "registration", b"registration"
+        ],
+    ) -> None: ...
+    def WhichOneof(
+        self, oneof_group: typing.Literal["kind", b"kind"]
+    ) -> typing.Literal["registration", "action_result"] | None: ...
+
+Global___WorkflowStreamRequest: typing_extensions.TypeAlias = WorkflowStreamRequest
+
+@typing.final
+class WorkflowExecutionResult(google.protobuf.message.Message):
+    """Server -> client final workflow result payload."""
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    PAYLOAD_FIELD_NUMBER: builtins.int
+    payload: builtins.bytes
+    def __init__(
+        self,
+        *,
+        payload: builtins.bytes = ...,
+    ) -> None: ...
+    def ClearField(self, field_name: typing.Literal["payload", b"payload"]) -> None: ...
+
+Global___WorkflowExecutionResult: typing_extensions.TypeAlias = WorkflowExecutionResult
+
+@typing.final
+class WorkflowStreamResponse(google.protobuf.message.Message):
+    """Server -> client messages for workflow execution streaming."""
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    ACTION_DISPATCH_FIELD_NUMBER: builtins.int
+    WORKFLOW_RESULT_FIELD_NUMBER: builtins.int
+    @property
+    def action_dispatch(self) -> Global___ActionDispatch: ...
+    @property
+    def workflow_result(self) -> Global___WorkflowExecutionResult: ...
+    def __init__(
+        self,
+        *,
+        action_dispatch: Global___ActionDispatch | None = ...,
+        workflow_result: Global___WorkflowExecutionResult | None = ...,
+    ) -> None: ...
+    def HasField(
+        self,
+        field_name: typing.Literal[
+            "action_dispatch",
+            b"action_dispatch",
+            "kind",
+            b"kind",
+            "workflow_result",
+            b"workflow_result",
+        ],
+    ) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing.Literal[
+            "action_dispatch",
+            b"action_dispatch",
+            "kind",
+            b"kind",
+            "workflow_result",
+            b"workflow_result",
+        ],
+    ) -> None: ...
+    def WhichOneof(
+        self, oneof_group: typing.Literal["kind", b"kind"]
+    ) -> typing.Literal["action_dispatch", "workflow_result"] | None: ...
+
+Global___WorkflowStreamResponse: typing_extensions.TypeAlias = WorkflowStreamResponse
+
+@typing.final
 class ScheduleDefinition(google.protobuf.message.Message):
     DESCRIPTOR: google.protobuf.descriptor.Descriptor
 

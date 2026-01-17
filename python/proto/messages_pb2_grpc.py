@@ -140,6 +140,11 @@ class WorkflowServiceStub(object):
                 request_serializer=messages__pb2.WaitForInstanceRequest.SerializeToString,
                 response_deserializer=messages__pb2.WaitForInstanceResponse.FromString,
                 _registered_method=True)
+        self.ExecuteWorkflow = channel.stream_stream(
+                '/rappel.messages.WorkflowService/ExecuteWorkflow',
+                request_serializer=messages__pb2.WorkflowStreamRequest.SerializeToString,
+                response_deserializer=messages__pb2.WorkflowStreamResponse.FromString,
+                _registered_method=True)
         self.RegisterSchedule = channel.unary_unary(
                 '/rappel.messages.WorkflowService/RegisterSchedule',
                 request_serializer=messages__pb2.RegisterScheduleRequest.SerializeToString,
@@ -179,6 +184,12 @@ class WorkflowServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def WaitForInstance(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ExecuteWorkflow(self, request_iterator, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -226,6 +237,11 @@ def add_WorkflowServiceServicer_to_server(servicer, server):
                     servicer.WaitForInstance,
                     request_deserializer=messages__pb2.WaitForInstanceRequest.FromString,
                     response_serializer=messages__pb2.WaitForInstanceResponse.SerializeToString,
+            ),
+            'ExecuteWorkflow': grpc.stream_stream_rpc_method_handler(
+                    servicer.ExecuteWorkflow,
+                    request_deserializer=messages__pb2.WorkflowStreamRequest.FromString,
+                    response_serializer=messages__pb2.WorkflowStreamResponse.SerializeToString,
             ),
             'RegisterSchedule': grpc.unary_unary_rpc_method_handler(
                     servicer.RegisterSchedule,
@@ -330,6 +346,33 @@ class WorkflowService(object):
             '/rappel.messages.WorkflowService/WaitForInstance',
             messages__pb2.WaitForInstanceRequest.SerializeToString,
             messages__pb2.WaitForInstanceResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ExecuteWorkflow(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_stream(
+            request_iterator,
+            target,
+            '/rappel.messages.WorkflowService/ExecuteWorkflow',
+            messages__pb2.WorkflowStreamRequest.SerializeToString,
+            messages__pb2.WorkflowStreamResponse.FromString,
             options,
             channel_credentials,
             insecure,

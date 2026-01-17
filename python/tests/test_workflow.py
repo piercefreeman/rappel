@@ -35,6 +35,12 @@ def test_workflow_decorator_registers_and_caches_ir(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(workflow_module, "build_workflow_ir", fake_build)
 
+    async def fake_execute_workflow(_payload: bytes) -> bytes:
+        payload = serialize_result_payload("done")
+        return payload.SerializeToString()
+
+    monkeypatch.setattr(bridge, "execute_workflow", fake_execute_workflow)
+
     @workflow_decorator
     class DemoWorkflow(Workflow):
         async def run(self) -> str:

@@ -1,7 +1,7 @@
 """Tests for dependency injection in workflows running under pytest.
 
 This module tests that Depend() markers are properly resolved when workflows
-are run directly under pytest (bypassing the gRPC bridge).
+are executed through the in-memory broker during pytest runs.
 """
 
 import asyncio
@@ -101,7 +101,7 @@ class TestWorkflowDependencyResolution:
         wf = WorkflowWithDependentAction()
 
         # This should work if dependencies are properly resolved
-        # Under pytest, workflow.run() directly executes the original run_impl
+        # Under pytest, workflow.run() executes through the in-memory broker
         result = asyncio.run(wf.run(value=42))
 
         assert result == "processed 42 with db://localhost:5432/test"

@@ -3,11 +3,12 @@ import os
 import shlex
 import subprocess
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, RLock
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, NoReturn, Optional
 
 import grpc
 from grpc import aio  # type: ignore[attr-defined]
@@ -15,6 +16,9 @@ from grpc import aio  # type: ignore[attr-defined]
 from proto import messages_pb2 as pb2
 from proto import messages_pb2_grpc as pb2_grpc
 from rappel.logger import configure as configure_logger
+
+from .actions import serialize_error_payload, serialize_result_payload
+from .workflow_runtime import execute_action
 
 DEFAULT_HOST = "127.0.0.1"
 LOGGER = configure_logger("rappel.bridge")
@@ -170,6 +174,10 @@ def _grpc_target() -> str:
     return f"{host}:{port}"
 
 
+def assert_never(value: object) -> NoReturn:
+    raise AssertionError(f"Unhandled value: {value!r}")
+
+
 async def _workflow_stub() -> pb2_grpc.WorkflowServiceStub:
     global _GRPC_TARGET, _GRPC_CHANNEL, _GRPC_STUB, _GRPC_LOOP
     target = _grpc_target()
@@ -252,6 +260,70 @@ async def run_instances_batch(
         workflow_instance_ids=list(response.workflow_instance_ids),
         queued=response.queued,
     )
+
+
+async def execute_workflow(payload: bytes) -> bytes:
+    """Execute a workflow via the in-memory workflow streaming API."""
+    os.environ.setdefault("RAPPEL_BRIDGE_IN_MEMORY", "1")
+    async with ensure_singleton():
+        stub = await _workflow_stub()
+
+    registration = pb2.WorkflowRegistration()
+    registration.ParseFromString(payload)
+
+    queue: asyncio.Queue[Optional[pb2.WorkflowStreamRequest]] = asyncio.Queue()
+    await queue.put(pb2.WorkflowStreamRequest(registration=registration))
+
+    async def request_stream() -> AsyncIterator[pb2.WorkflowStreamRequest]:
+        while True:
+            item = await queue.get()
+            if item is None:
+                return
+            yield item
+
+    call = stub.ExecuteWorkflow(request_stream(), timeout=300.0)
+    result_payload: Optional[bytes] = None
+
+    async for response in call:
+        kind = response.WhichOneof("kind")
+        match kind:
+            case "action_dispatch":
+                dispatch = response.action_dispatch
+                start_ns = time.monotonic_ns()
+                execution = await execute_action(dispatch)
+                end_ns = time.monotonic_ns()
+                action_result = pb2.ActionResult(
+                    action_id=dispatch.action_id,
+                    success=execution.exception is None,
+                    payload=(
+                        serialize_result_payload(execution.result)
+                        if execution.exception is None
+                        else serialize_error_payload(dispatch.action_name, execution.exception)
+                    ),
+                    worker_start_ns=start_ns,
+                    worker_end_ns=end_ns,
+                    error_type=(
+                        type(execution.exception).__name__
+                        if execution.exception is not None
+                        else ""
+                    ),
+                    error_message=str(execution.exception)
+                    if execution.exception is not None
+                    else "",
+                )
+                await queue.put(pb2.WorkflowStreamRequest(action_result=action_result))
+            case "workflow_result":
+                result_payload = response.workflow_result.payload
+                await queue.put(None)
+                break
+            case None:
+                continue
+            case _:
+                assert_never(kind)
+
+    if result_payload is None:
+        raise RuntimeError("workflow stream ended without a result")
+    return result_payload
 
 
 async def wait_for_instance(

@@ -5,11 +5,14 @@
 //! - gRPC health check for singleton discovery
 //! - Configuration and server lifecycle management
 
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, pin::Pin, time::Duration};
 
 use anyhow::{Context, Result};
 use prost::Message;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio_stream::Stream;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tonic_health::server::health_reporter;
@@ -17,6 +20,7 @@ use tracing::info;
 
 use crate::{
     db::{Database, ScheduleType},
+    in_memory::{ExecutionStep, InMemoryWorkflowExecutor},
     ir_printer,
     ir_validation::validate_program,
     messages::ast as ir_ast,
@@ -54,6 +58,17 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
     run_grpc_server(grpc_listener, database).await
 }
 
+/// Run an in-memory gRPC server with no database backing.
+pub async fn run_in_memory_server(grpc_addr: SocketAddr) -> Result<()> {
+    let grpc_listener = TcpListener::bind(grpc_addr)
+        .await
+        .with_context(|| format!("failed to bind grpc listener on {grpc_addr}"))?;
+
+    info!(?grpc_addr, "rappel in-memory bridge server listening");
+
+    run_in_memory_grpc_server(grpc_listener).await
+}
+
 // ============================================================================
 // gRPC Server
 // ============================================================================
@@ -79,6 +94,26 @@ async fn run_grpc_server(listener: TcpListener, database: Database) -> Result<()
     Ok(())
 }
 
+async fn run_in_memory_grpc_server(listener: TcpListener) -> Result<()> {
+    use proto::workflow_service_server::WorkflowServiceServer;
+
+    let (mut health_reporter, health_service) = health_reporter();
+    health_reporter
+        .set_serving::<WorkflowServiceServer<InMemoryWorkflowGrpcService>>()
+        .await;
+
+    let incoming = TcpListenerStream::new(listener);
+    let service = InMemoryWorkflowGrpcService::new();
+
+    Server::builder()
+        .add_service(health_service)
+        .add_service(WorkflowServiceServer::new(service))
+        .serve_with_incoming(incoming)
+        .await?;
+
+    Ok(())
+}
+
 #[derive(Clone)]
 struct WorkflowGrpcService {
     database: Database,
@@ -87,6 +122,15 @@ struct WorkflowGrpcService {
 impl WorkflowGrpcService {
     fn new(database: Database) -> Self {
         Self { database }
+    }
+}
+
+#[derive(Clone)]
+struct InMemoryWorkflowGrpcService;
+
+impl InMemoryWorkflowGrpcService {
+    fn new() -> Self {
+        Self
     }
 }
 
@@ -107,8 +151,113 @@ pub(crate) fn sanitize_interval(value: Option<f64>) -> Duration {
     Duration::from_secs_f64(clamped)
 }
 
+type WorkflowStreamResult = Result<proto::WorkflowStreamResponse, tonic::Status>;
+type WorkflowStream = Pin<Box<dyn Stream<Item = WorkflowStreamResult> + Send + 'static>>;
+
+async fn execute_workflow_stream(
+    request: tonic::Request<tonic::Streaming<proto::WorkflowStreamRequest>>,
+) -> Result<tonic::Response<WorkflowStream>, tonic::Status> {
+    let mut stream = request.into_inner();
+    let (tx, rx) = mpsc::channel(32);
+
+    tokio::spawn(async move {
+        let result = async {
+            let first = stream
+                .message()
+                .await?
+                .ok_or_else(|| tonic::Status::invalid_argument("registration missing"))?;
+
+            let registration = match first.kind {
+                Some(proto::workflow_stream_request::Kind::Registration(registration)) => {
+                    registration
+                }
+                Some(_) | None => {
+                    return Err(tonic::Status::invalid_argument(
+                        "first message must be a registration",
+                    ));
+                }
+            };
+
+            let mut executor = InMemoryWorkflowExecutor::from_registration(registration)
+                .map_err(|err| tonic::Status::invalid_argument(format!("{err}")))?;
+
+            let step = executor
+                .start()
+                .await
+                .map_err(|err| tonic::Status::internal(format!("{err}")))?;
+            let completed = step.completed_payload.is_some();
+            send_stream_step(&tx, step).await?;
+
+            if completed {
+                return Ok(());
+            }
+
+            while let Some(message) = stream.message().await? {
+                let action_result = match message.kind {
+                    Some(proto::workflow_stream_request::Kind::ActionResult(result)) => result,
+                    Some(_) | None => {
+                        return Err(tonic::Status::invalid_argument(
+                            "expected action_result message",
+                        ));
+                    }
+                };
+
+                let step = executor
+                    .handle_action_result(action_result)
+                    .await
+                    .map_err(|err| tonic::Status::internal(format!("{err}")))?;
+                let completed = step.completed_payload.is_some();
+                send_stream_step(&tx, step).await?;
+                if completed {
+                    break;
+                }
+            }
+
+            Ok::<(), tonic::Status>(())
+        }
+        .await;
+
+        if let Err(status) = result {
+            let _ = tx.send(Err(status)).await;
+        }
+    });
+
+    Ok(tonic::Response::new(Box::pin(ReceiverStream::new(rx))))
+}
+
+async fn send_stream_step(
+    tx: &mpsc::Sender<WorkflowStreamResult>,
+    step: ExecutionStep,
+) -> Result<(), tonic::Status> {
+    for dispatch in step.dispatches {
+        let response = proto::WorkflowStreamResponse {
+            kind: Some(proto::workflow_stream_response::Kind::ActionDispatch(
+                dispatch,
+            )),
+        };
+        tx.send(Ok(response))
+            .await
+            .map_err(|_| tonic::Status::internal("workflow stream closed"))?;
+    }
+
+    if let Some(payload) = step.completed_payload {
+        let response = proto::WorkflowStreamResponse {
+            kind: Some(proto::workflow_stream_response::Kind::WorkflowResult(
+                proto::WorkflowExecutionResult { payload },
+            )),
+        };
+        tx.send(Ok(response))
+            .await
+            .map_err(|_| tonic::Status::internal("workflow stream closed"))?;
+    }
+
+    Ok(())
+}
+
 #[tonic::async_trait]
 impl proto::workflow_service_server::WorkflowService for WorkflowGrpcService {
+    type ExecuteWorkflowStream = WorkflowStream;
+
     async fn register_workflow(
         &self,
         request: tonic::Request<proto::RegisterWorkflowRequest>,
@@ -578,6 +727,88 @@ impl proto::workflow_service_server::WorkflowService for WorkflowGrpcService {
         Ok(tonic::Response::new(proto::ListSchedulesResponse {
             schedules: schedule_infos,
         }))
+    }
+
+    async fn execute_workflow(
+        &self,
+        request: tonic::Request<tonic::Streaming<proto::WorkflowStreamRequest>>,
+    ) -> Result<tonic::Response<Self::ExecuteWorkflowStream>, tonic::Status> {
+        execute_workflow_stream(request).await
+    }
+}
+
+#[tonic::async_trait]
+impl proto::workflow_service_server::WorkflowService for InMemoryWorkflowGrpcService {
+    type ExecuteWorkflowStream = WorkflowStream;
+
+    async fn register_workflow(
+        &self,
+        _request: tonic::Request<proto::RegisterWorkflowRequest>,
+    ) -> Result<tonic::Response<proto::RegisterWorkflowResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "register_workflow is unavailable in in-memory mode",
+        ))
+    }
+
+    async fn register_workflow_batch(
+        &self,
+        _request: tonic::Request<proto::RegisterWorkflowBatchRequest>,
+    ) -> Result<tonic::Response<proto::RegisterWorkflowBatchResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "register_workflow_batch is unavailable in in-memory mode",
+        ))
+    }
+
+    async fn wait_for_instance(
+        &self,
+        _request: tonic::Request<proto::WaitForInstanceRequest>,
+    ) -> Result<tonic::Response<proto::WaitForInstanceResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "wait_for_instance is unavailable in in-memory mode",
+        ))
+    }
+
+    async fn register_schedule(
+        &self,
+        _request: tonic::Request<proto::RegisterScheduleRequest>,
+    ) -> Result<tonic::Response<proto::RegisterScheduleResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "register_schedule is unavailable in in-memory mode",
+        ))
+    }
+
+    async fn update_schedule_status(
+        &self,
+        _request: tonic::Request<proto::UpdateScheduleStatusRequest>,
+    ) -> Result<tonic::Response<proto::UpdateScheduleStatusResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "update_schedule_status is unavailable in in-memory mode",
+        ))
+    }
+
+    async fn delete_schedule(
+        &self,
+        _request: tonic::Request<proto::DeleteScheduleRequest>,
+    ) -> Result<tonic::Response<proto::DeleteScheduleResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "delete_schedule is unavailable in in-memory mode",
+        ))
+    }
+
+    async fn list_schedules(
+        &self,
+        _request: tonic::Request<proto::ListSchedulesRequest>,
+    ) -> Result<tonic::Response<proto::ListSchedulesResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "list_schedules is unavailable in in-memory mode",
+        ))
+    }
+
+    async fn execute_workflow(
+        &self,
+        request: tonic::Request<tonic::Streaming<proto::WorkflowStreamRequest>>,
+    ) -> Result<tonic::Response<Self::ExecuteWorkflowStream>, tonic::Status> {
+        execute_workflow_stream(request).await
     }
 }
 

@@ -19,6 +19,7 @@ use prost::Message;
 use serde::Serialize;
 use tempfile::TempDir;
 use tokio::{net::TcpListener, process::Command, sync::oneshot, task::JoinHandle};
+use tokio_stream::Stream;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tracing::{error, info};
@@ -178,6 +179,14 @@ impl BenchmarkWorkflowService {
 
 #[tonic::async_trait]
 impl proto::workflow_service_server::WorkflowService for BenchmarkWorkflowService {
+    type ExecuteWorkflowStream = std::pin::Pin<
+        Box<
+            dyn Stream<Item = Result<proto::WorkflowStreamResponse, tonic::Status>>
+                + Send
+                + 'static,
+        >,
+    >;
+
     async fn register_workflow(
         &self,
         request: tonic::Request<proto::RegisterWorkflowRequest>,
@@ -269,6 +278,13 @@ impl proto::workflow_service_server::WorkflowService for BenchmarkWorkflowServic
         _request: tonic::Request<proto::ListSchedulesRequest>,
     ) -> Result<tonic::Response<proto::ListSchedulesResponse>, tonic::Status> {
         // Not used in benchmarks
+        Err(tonic::Status::unimplemented("not implemented"))
+    }
+
+    async fn execute_workflow(
+        &self,
+        _request: tonic::Request<tonic::Streaming<proto::WorkflowStreamRequest>>,
+    ) -> Result<tonic::Response<Self::ExecuteWorkflowStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("not implemented"))
     }
 }

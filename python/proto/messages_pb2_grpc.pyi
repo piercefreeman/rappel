@@ -154,6 +154,22 @@ _WorkflowServiceWaitForInstanceType = typing_extensions.TypeVar(
     ],
 )
 
+_WorkflowServiceExecuteWorkflowType = typing_extensions.TypeVar(
+    "_WorkflowServiceExecuteWorkflowType",
+    grpc.StreamStreamMultiCallable[
+        messages_pb2.WorkflowStreamRequest,
+        messages_pb2.WorkflowStreamResponse,
+    ],
+    grpc.aio.StreamStreamMultiCallable[
+        messages_pb2.WorkflowStreamRequest,
+        messages_pb2.WorkflowStreamResponse,
+    ],
+    default=grpc.StreamStreamMultiCallable[
+        messages_pb2.WorkflowStreamRequest,
+        messages_pb2.WorkflowStreamResponse,
+    ],
+)
+
 _WorkflowServiceRegisterScheduleType = typing_extensions.TypeVar(
     "_WorkflowServiceRegisterScheduleType",
     grpc.UnaryUnaryMultiCallable[
@@ -223,6 +239,7 @@ class WorkflowServiceStub(
         _WorkflowServiceRegisterWorkflowType,
         _WorkflowServiceRegisterWorkflowBatchType,
         _WorkflowServiceWaitForInstanceType,
+        _WorkflowServiceExecuteWorkflowType,
         _WorkflowServiceRegisterScheduleType,
         _WorkflowServiceUpdateScheduleStatusType,
         _WorkflowServiceDeleteScheduleType,
@@ -245,6 +262,10 @@ class WorkflowServiceStub(
             grpc.UnaryUnaryMultiCallable[
                 messages_pb2.WaitForInstanceRequest,
                 messages_pb2.WaitForInstanceResponse,
+            ],
+            grpc.StreamStreamMultiCallable[
+                messages_pb2.WorkflowStreamRequest,
+                messages_pb2.WorkflowStreamResponse,
             ],
             grpc.UnaryUnaryMultiCallable[
                 messages_pb2.RegisterScheduleRequest,
@@ -280,6 +301,10 @@ class WorkflowServiceStub(
                 messages_pb2.WaitForInstanceRequest,
                 messages_pb2.WaitForInstanceResponse,
             ],
+            grpc.aio.StreamStreamMultiCallable[
+                messages_pb2.WorkflowStreamRequest,
+                messages_pb2.WorkflowStreamResponse,
+            ],
             grpc.aio.UnaryUnaryMultiCallable[
                 messages_pb2.RegisterScheduleRequest,
                 messages_pb2.RegisterScheduleResponse,
@@ -306,6 +331,8 @@ class WorkflowServiceStub(
 
     WaitForInstance: _WorkflowServiceWaitForInstanceType
 
+    ExecuteWorkflow: _WorkflowServiceExecuteWorkflowType
+
     RegisterSchedule: _WorkflowServiceRegisterScheduleType
     """Schedule management"""
 
@@ -327,6 +354,10 @@ WorkflowServiceAsyncStub: typing_extensions.TypeAlias = WorkflowServiceStub[
     grpc.aio.UnaryUnaryMultiCallable[
         messages_pb2.WaitForInstanceRequest,
         messages_pb2.WaitForInstanceResponse,
+    ],
+    grpc.aio.StreamStreamMultiCallable[
+        messages_pb2.WorkflowStreamRequest,
+        messages_pb2.WorkflowStreamResponse,
     ],
     grpc.aio.UnaryUnaryMultiCallable[
         messages_pb2.RegisterScheduleRequest,
@@ -375,6 +406,15 @@ class WorkflowServiceServicer(metaclass=abc.ABCMeta):
     ) -> typing.Union[
         messages_pb2.WaitForInstanceResponse,
         collections.abc.Awaitable[messages_pb2.WaitForInstanceResponse],
+    ]: ...
+    @abc.abstractmethod
+    def ExecuteWorkflow(
+        self,
+        request_iterator: _MaybeAsyncIterator[messages_pb2.WorkflowStreamRequest],
+        context: _ServicerContext,
+    ) -> typing.Union[
+        collections.abc.Iterator[messages_pb2.WorkflowStreamResponse],
+        collections.abc.AsyncIterator[messages_pb2.WorkflowStreamResponse],
     ]: ...
     @abc.abstractmethod
     def RegisterSchedule(
