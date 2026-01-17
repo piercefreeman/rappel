@@ -1,6 +1,7 @@
 import asyncio
 import os
 import shlex
+import shutil
 import subprocess
 import tempfile
 import time
@@ -56,6 +57,48 @@ def _boot_command() -> list[str]:
     return [binary]
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _resolve_boot_binary(binary: str) -> str:
+    if Path(binary).is_absolute():
+        return binary
+    resolved = shutil.which(binary)
+    if resolved:
+        return resolved
+    repo_root = _repo_root()
+    for profile in ("debug", "release"):
+        candidate = repo_root / "target" / profile / binary
+        if candidate.exists():
+            return str(candidate)
+    return binary
+
+
+def _ensure_boot_binary(binary: str) -> str:
+    resolved = _resolve_boot_binary(binary)
+    if Path(resolved).exists():
+        return resolved
+    repo_root = _repo_root()
+    cargo_toml = repo_root / "Cargo.toml"
+    if cargo_toml.exists():
+        LOGGER.info("boot binary %s not found; building via cargo", binary)
+        subprocess.run(
+            [
+                "cargo",
+                "build",
+                "--bin",
+                "boot-rappel-singleton",
+                "--bin",
+                "rappel-bridge",
+            ],
+            cwd=repo_root,
+            check=True,
+        )
+        resolved = _resolve_boot_binary(binary)
+    return resolved
+
+
 def _remember_grpc_port(port: int) -> int:
     global _CACHED_GRPC_PORT
     with _PORT_LOCK:
@@ -82,6 +125,8 @@ def _env_grpc_port_override() -> Optional[int]:
 def _boot_singleton_blocking() -> int:
     """Boot the singleton and return the gRPC port."""
     command = _boot_command()
+    if os.environ.get("RAPPEL_BOOT_COMMAND") is None:
+        command[0] = _ensure_boot_binary(command[0])
     with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt") as f:
         output_file = Path(f.name)
 

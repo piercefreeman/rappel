@@ -253,14 +253,19 @@ async def execute_action(dispatch: pb2.ActionDispatch) -> ActionExecutionResult:
     action_name = dispatch.action_name
     module_name = dispatch.module_name
 
-    # Import the module if specified (this registers actions via @action decorator)
+    module = None
     if module_name:
         import importlib
 
-        importlib.import_module(module_name)
+        module = importlib.import_module(module_name)
 
     # Get the action handler using both module and name
     handler = registry.get(module_name, action_name)
+    if handler is None and module is not None:
+        import importlib
+
+        module = importlib.reload(module)
+        handler = registry.get(module_name, action_name)
     if handler is None:
         return ActionExecutionResult(
             result=None,
