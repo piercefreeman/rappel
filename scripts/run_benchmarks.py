@@ -6,11 +6,14 @@
 
 import json
 import os
-import re
 import subprocess
 import sys
+import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
+from threading import Event, Thread
+from urllib.parse import unquote, urlparse
 
 import click
 from pydantic import BaseModel
@@ -168,6 +171,7 @@ class TextFormatter(OutputFormatter):
             f"  Hosts:            {data.config['hosts']}",
             f"  Instances:        {data.config['instances']}",
             f"  Workers/host:     {data.config['workers_per_host']}",
+            f"  Max slots/worker: {data.config['max_slots_per_worker']}",
         ]
 
         # Show per-benchmark config if available, otherwise show global
@@ -482,28 +486,145 @@ FORMATTERS: dict[str, OutputFormatter] = {
     "csv": CsvFormatter(),
 }
 
+# =============================================================================
+# Database Configuration
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class DatabaseConfig:
+    """Postgres connection parameters for benchmarks."""
+
+    user: str
+    password: str
+    host: str
+    port: int
+    dbname: str
+
+
+# Defaults align with docker-compose.yml for local runs.
+DEFAULT_DB_CONFIG = DatabaseConfig(
+    user="mountaineer",
+    password="mountaineer",
+    host="localhost",
+    port=5433,
+    dbname="mountaineer_daemons",
+)
+
+DEFAULT_DB_URL = (
+    f"postgresql://{DEFAULT_DB_CONFIG.user}:{DEFAULT_DB_CONFIG.password}@"
+    f"{DEFAULT_DB_CONFIG.host}:{DEFAULT_DB_CONFIG.port}/{DEFAULT_DB_CONFIG.dbname}"
+)
+
+STATUS_LOG_INTERVAL_S = 5.0
+STATUS_QUERY_TIMEOUT_S = 3
+COMPLETED_ACTIONS_QUERY = (
+    "SELECT (SELECT COUNT(*) FROM action_logs)"
+    " + (SELECT COUNT(*) FROM action_log_queue)"
+    " + (SELECT COUNT(*) FROM action_queue WHERE status = 'completed')"
+)
+
 
 # =============================================================================
 # Benchmark Runner
 # =============================================================================
 
 
-def reset_database():
-    """Reset the database tables for clean benchmark runs."""
-    db_url = os.environ.get(
-        "RAPPEL_DATABASE_URL",
-        "postgresql://mountaineer:mountaineer@localhost:5432/mountaineer_daemons",
+def get_database_url() -> str:
+    """Return the database URL from the environment or defaults."""
+    db_url = os.environ.get("RAPPEL_DATABASE_URL")
+    return db_url if db_url else DEFAULT_DB_URL
+
+
+def parse_database_url(db_url: str) -> DatabaseConfig:
+    """Parse a postgres URL into a DatabaseConfig."""
+    parsed = urlparse(db_url)
+    if parsed.scheme not in {"postgresql", "postgres"}:
+        raise ValueError("unsupported scheme (expected postgresql)")
+    if not parsed.username or not parsed.password or not parsed.hostname or not parsed.port:
+        raise ValueError("missing username, password, host, or port")
+    dbname = parsed.path.lstrip("/")
+    if not dbname:
+        raise ValueError("missing database name")
+    return DatabaseConfig(
+        user=unquote(parsed.username),
+        password=unquote(parsed.password),
+        host=parsed.hostname,
+        port=parsed.port,
+        dbname=dbname,
     )
 
-    match = re.match(r"postgresql://([^:]+):([^@]+)@([^:]+):(\d+)/(.+)", db_url)
-    if not match:
-        print(f"Warning: Could not parse RAPPEL_DATABASE_URL: {db_url}", file=sys.stderr)
-        return
 
-    user, password, host, port, dbname = match.groups()
-
+def check_database_connection(config: DatabaseConfig, timeout: int = 5) -> tuple[bool, str | None]:
+    """Verify we can connect to Postgres before running benchmarks."""
     env = os.environ.copy()
-    env["PGPASSWORD"] = password
+    env["PGPASSWORD"] = config.password
+
+    cmd = [
+        "psql",
+        "-h",
+        config.host,
+        "-p",
+        str(config.port),
+        "-U",
+        config.user,
+        "-d",
+        config.dbname,
+        "-c",
+        "SELECT 1;",
+    ]
+
+    try:
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return False, "psql not found (install postgresql-client)"
+    except subprocess.TimeoutExpired:
+        return False, f"connection timed out after {timeout}s"
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        return False, detail
+
+    return True, None
+
+
+def ensure_database_available() -> DatabaseConfig:
+    """Exit early if Postgres is not reachable."""
+    db_url = get_database_url()
+    try:
+        config = parse_database_url(db_url)
+    except ValueError as exc:
+        print(
+            f"Invalid RAPPEL_DATABASE_URL: {db_url}",
+            file=sys.stderr,
+        )
+        print(
+            f"Details: {exc}. Expected format: postgresql://USER:PASSWORD@HOST:PORT/DBNAME",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    ok, error = check_database_connection(config)
+    if not ok:
+        print(
+            f"Database is not reachable at {config.host}:{config.port}/{config.dbname}.",
+            file=sys.stderr,
+        )
+        if error:
+            print(f"Details: {error}", file=sys.stderr)
+        print(
+            "Start Postgres with: docker compose up -d postgres",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    return config
+
+
+def reset_database(config: DatabaseConfig) -> None:
+    """Reset the database tables for clean benchmark runs."""
+    env = os.environ.copy()
+    env["PGPASSWORD"] = config.password
 
     tables = [
         "action_queue",
@@ -516,13 +637,13 @@ def reset_database():
     cmd = [
         "psql",
         "-h",
-        host,
+        config.host,
         "-p",
-        port,
+        str(config.port),
         "-U",
-        user,
+        config.user,
         "-d",
-        dbname,
+        config.dbname,
         "-c",
         f"TRUNCATE {', '.join(tables)} CASCADE;",
     ]
@@ -530,6 +651,88 @@ def reset_database():
     result = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"Warning: Database reset failed: {result.stderr}", file=sys.stderr)
+
+
+def fetch_completed_actions(
+    config: DatabaseConfig, timeout: int = STATUS_QUERY_TIMEOUT_S
+) -> int | None:
+    """Query the database for completed action count using a dedicated connection."""
+    env = os.environ.copy()
+    env["PGPASSWORD"] = config.password
+
+    cmd = [
+        "psql",
+        "-X",
+        "-A",
+        "-t",
+        "-h",
+        config.host,
+        "-p",
+        str(config.port),
+        "-U",
+        config.user,
+        "-d",
+        config.dbname,
+        "-c",
+        COMPLETED_ACTIONS_QUERY,
+    ]
+
+    try:
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return None
+
+
+class BenchmarkStatusLogger:
+    """Log periodic progress updates during benchmark runs."""
+
+    def __init__(self, config: DatabaseConfig, interval_s: float) -> None:
+        self._config = config
+        self._interval_s = interval_s
+        self._stop_event = Event()
+        self._thread = Thread(target=self._run, name="benchmark-status", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=self._interval_s + STATUS_QUERY_TIMEOUT_S)
+
+    def _run(self) -> None:
+        start_time = time.monotonic()
+        last_time = start_time
+        last_completed: int | None = None
+
+        while not self._stop_event.wait(self._interval_s):
+            completed = fetch_completed_actions(self._config)
+            if completed is None:
+                continue
+            now = time.monotonic()
+            interval = max(0.001, now - last_time)
+            if last_completed is None:
+                throughput = 0.0
+            else:
+                throughput = max(0, completed - last_completed) / interval
+            last_completed = completed
+            last_time = now
+
+            elapsed = now - start_time
+            print(
+                "benchmark status completed_actions=%s elapsed=%.1fs throughput=%.1f actions/s"
+                % (completed, elapsed, throughput),
+                file=sys.stderr,
+            )
 
 
 def check_benchmark_available() -> bool:
@@ -550,32 +753,59 @@ def check_benchmark_available() -> bool:
         return False
 
 
-def run_benchmark(args: list[str], timeout: int = 300) -> BenchmarkResult | BenchmarkError:
+def run_benchmark(
+    args: list[str],
+    timeout: int = 300,
+    db_config: DatabaseConfig | None = None,
+    status_interval_s: float = STATUS_LOG_INTERVAL_S,
+) -> BenchmarkResult | BenchmarkError:
     """Run the benchmark binary with --json flag and parse the JSON output."""
     cmd = ["./target/release/benchmark", "--json"] + args
+    env = os.environ.copy()
+    env["RAPPEL_DATABASE_URL"] = get_database_url()
 
     print(f"Running: {' '.join(cmd)}", file=sys.stderr)
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        process = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
     except FileNotFoundError:
         return BenchmarkError(error="binary_not_found")
-    except subprocess.TimeoutExpired:
-        print(f"Benchmark timed out after {timeout}s", file=sys.stderr)
-        return BenchmarkError(error="timeout")
 
-    if result.returncode != 0:
-        print(f"Benchmark failed with exit code {result.returncode}", file=sys.stderr)
-        print(f"stderr: {result.stderr[-2000:]}", file=sys.stderr)
+    status_logger = None
+    if db_config is not None and status_interval_s > 0:
+        status_logger = BenchmarkStatusLogger(db_config, status_interval_s)
+        status_logger.start()
+
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            print(f"Benchmark timed out after {timeout}s", file=sys.stderr)
+            return BenchmarkError(error="timeout")
+    finally:
+        if status_logger is not None:
+            status_logger.stop()
+
+    if process.returncode != 0:
+        print(f"Benchmark failed with exit code {process.returncode}", file=sys.stderr)
+        print(f"stderr: {stderr[-2000:]}", file=sys.stderr)
         return BenchmarkError(
             error="benchmark_failed",
-            exit_code=result.returncode,
-            stderr=result.stderr[-2000:] if result.stderr else None,
+            exit_code=process.returncode,
+            stderr=stderr[-2000:] if stderr else None,
         )
 
     try:
         json_line = None
-        for line in reversed(result.stdout.strip().split("\n")):
+        for line in reversed(stdout.strip().split("\n")):
             line = line.strip()
             if line.startswith("{") and line.endswith("}"):
                 json_line = line
@@ -589,8 +819,8 @@ def run_benchmark(args: list[str], timeout: int = 300) -> BenchmarkResult | Benc
         print(f"Failed to parse JSON output: {e}", file=sys.stderr)
         return BenchmarkError(
             error="json_parse_failed",
-            stdout=result.stdout[-2000:] if result.stdout else None,
-            stderr=result.stderr[-2000:] if result.stderr else None,
+            stdout=stdout[-2000:] if stdout else None,
+            stderr=stderr[-2000:] if stderr else None,
         )
 
 
@@ -631,6 +861,11 @@ def cli():
 )
 @click.option("--complexity", default=1000, help="CPU complexity per action (hash iterations)")
 @click.option("--workers-per-host", default=4, help="Number of Python workers per host")
+@click.option(
+    "--max-slots-per-worker",
+    default=10,
+    help="Maximum concurrent actions per worker",
+)
 @click.option("--hosts", default=1, help="Number of hosts")
 @click.option("--instances", default=1, help="Number of workflow instances")
 def single(
@@ -640,6 +875,7 @@ def single(
     loop_size: int,
     complexity: int,
     workers_per_host: int,
+    max_slots_per_worker: int,
     hosts: int,
     instances: int,
 ):
@@ -648,8 +884,10 @@ def single(
         print("Benchmark binary not found. Run 'cargo build --release' first.", file=sys.stderr)
         sys.exit(1)
 
+    db_config = ensure_database_available()
+
     print(f"=== Running {benchmark} Benchmark ===", file=sys.stderr)
-    reset_database()
+    reset_database(db_config)
 
     result = run_benchmark(
         [
@@ -661,13 +899,16 @@ def single(
             str(complexity),
             "--workers-per-host",
             str(workers_per_host),
+            "--max-slots-per-worker",
+            str(max_slots_per_worker),
             "--hosts",
             str(hosts),
             "--instances",
             str(instances),
             "--log-interval",
             "0",
-        ]
+        ],
+        db_config=db_config,
     )
 
     data = SingleData(benchmark=benchmark, result=result)
@@ -705,6 +946,11 @@ def single(
 )
 @click.option("--complexity", default=1000, help="CPU complexity per action (hash iterations)")
 @click.option("--workers-per-host", default=4, help="Number of Python workers per host")
+@click.option(
+    "--max-slots-per-worker",
+    default=10,
+    help="Maximum concurrent actions per worker",
+)
 @click.option("--hosts", default=1, help="Number of hosts")
 @click.option("--instances", default=1, help="Number of workflow instances")
 @click.option("--timeout", default=300, help="Timeout per benchmark run in seconds")
@@ -721,6 +967,7 @@ def suite(
     loop_size: int,
     complexity: int,
     workers_per_host: int,
+    max_slots_per_worker: int,
     hosts: int,
     instances: int,
     timeout: int,
@@ -751,11 +998,13 @@ def suite(
         if bench not in benchmark_configs:
             benchmark_configs[bench] = {"loop_size": loop_size, "complexity": complexity}
 
+    db_config = ensure_database_available()
+
     results: dict[str, BenchmarkResult | BenchmarkError] = {}
     for benchmark in benchmark_types:
         bench_cfg = benchmark_configs[benchmark]
         print(f"=== Running {benchmark} Benchmark ===", file=sys.stderr)
-        reset_database()
+        reset_database(db_config)
         result = run_benchmark(
             [
                 "--benchmark",
@@ -766,6 +1015,8 @@ def suite(
                 str(bench_cfg["complexity"]),
                 "--workers-per-host",
                 str(workers_per_host),
+                "--max-slots-per-worker",
+                str(max_slots_per_worker),
                 "--hosts",
                 str(hosts),
                 "--instances",
@@ -774,6 +1025,7 @@ def suite(
                 "0",
             ],
             timeout=timeout,
+            db_config=db_config,
         )
         results[benchmark] = result
 
@@ -783,6 +1035,7 @@ def suite(
             "loop_size": loop_size,
             "complexity": complexity,
             "workers_per_host": workers_per_host,
+            "max_slots_per_worker": max_slots_per_worker,
             "hosts": hosts,
             "instances": instances,
             "timeout": timeout,
@@ -836,6 +1089,11 @@ def parse_benchmark_config(config_str: str) -> dict[str, dict[str, int]]:
 @click.option("--instances", default="1,2,4,8", help="Comma-separated list of instance counts")
 @click.option("--workers-per-host", default=4, help="Number of Python workers per host")
 @click.option(
+    "--max-slots-per-worker",
+    default=10,
+    help="Maximum concurrent actions per worker",
+)
+@click.option(
     "--benchmarks",
     default="for-loop,fan-out",
     help="Comma-separated list of benchmark types",
@@ -857,6 +1115,7 @@ def grid(
     hosts: str,
     instances: str,
     workers_per_host: int,
+    max_slots_per_worker: int,
     benchmarks: str,
     loop_size: int,
     complexity: int,
@@ -893,6 +1152,8 @@ def grid(
         print("Benchmark binary not found. Run 'cargo build --release' first.", file=sys.stderr)
         sys.exit(1)
 
+    db_config = ensure_database_available()
+
     total_runs = len(benchmark_types) * len(host_counts) * len(instance_counts)
     current_run = 0
 
@@ -903,6 +1164,7 @@ def grid(
     print(f"Hosts: {host_counts}", file=sys.stderr)
     print(f"Instances: {instance_counts}", file=sys.stderr)
     print(f"Workers per host: {workers_per_host}", file=sys.stderr)
+    print(f"Max slots per worker: {max_slots_per_worker}", file=sys.stderr)
     for bench, cfg in benchmark_configs.items():
         print(
             f"  {bench}: loop_size={cfg['loop_size']}, complexity={cfg['complexity']}",
@@ -928,7 +1190,7 @@ def grid(
                     file=sys.stderr,
                 )
 
-                reset_database()
+                reset_database(db_config)
 
                 result = run_benchmark(
                     [
@@ -942,6 +1204,8 @@ def grid(
                         str(host_count),
                         "--workers-per-host",
                         str(workers_per_host),
+                        "--max-slots-per-worker",
+                        str(max_slots_per_worker),
                         "--instances",
                         str(instance_count),
                         "--log-interval",
@@ -950,6 +1214,7 @@ def grid(
                         str(timeout),
                     ],
                     timeout=timeout + 30,
+                    db_config=db_config,
                 )
 
                 cell = GridCell(
@@ -976,6 +1241,7 @@ def grid(
         "hosts": host_counts,
         "instances": instance_counts,
         "workers_per_host": workers_per_host,
+        "max_slots_per_worker": max_slots_per_worker,
         "benchmarks": benchmark_types,
         "benchmark_configs": benchmark_configs,
     }
