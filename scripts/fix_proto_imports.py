@@ -3,7 +3,8 @@
 
 from pathlib import Path
 
-PROTO_DIR = Path("python/proto")
+ROOT_DIR = Path(__file__).resolve().parent.parent
+PROTO_DIR = ROOT_DIR / "python" / "proto"
 
 
 def _rewrite_messages_pb2_grpc() -> None:

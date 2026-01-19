@@ -6,6 +6,7 @@ The tests are organized by category:
 - TestAsyncioGatherDetection: asyncio.gather() -> ParallelBlock/SpreadAction
 - TestPolicyParsing: RetryPolicy and TimeoutPolicy extraction
 - TestForLoopConversion: for loop IR generation
+- TestWhileLoopConversion: while loop IR generation
 - TestConditionalConversion: if/elif/else IR generation
 - TestTryExceptConversion: try/except IR generation
 - TestActionCallExtraction: action call detection and kwargs
@@ -53,6 +54,9 @@ def iter_block_statements(block: ir.Block) -> Iterator[ir.Statement]:
 
         if stmt.HasField("for_loop") and stmt.for_loop.HasField("block_body"):
             yield from iter_block_statements(stmt.for_loop.block_body)
+
+        if stmt.HasField("while_loop") and stmt.while_loop.HasField("block_body"):
+            yield from iter_block_statements(stmt.while_loop.block_body)
 
         if stmt.HasField("try_except"):
             te = stmt.try_except
@@ -552,6 +556,30 @@ class TestForLoopConversion:
         assert for_loop is not None, "Expected for_loop in IR"
         assert for_loop.HasField("block_body"), "Expected block_body in for loop body"
         assert len(for_loop.block_body.statements) >= 2, "Expected multi-statement loop body"
+
+
+class TestWhileLoopConversion:
+    """Test while loop conversion to IR."""
+
+    def _find_while_loop(self, program: ir.Program) -> ir.WhileLoop | None:
+        """Find a while loop in the program."""
+        for fn in program.functions:
+            for stmt in fn.body.statements:
+                if stmt.HasField("while_loop"):
+                    return stmt.while_loop
+        return None
+
+    def test_simple_while_loop_structure(self) -> None:
+        """Test: Simple while loop has correct structure."""
+        from tests.fixtures_control_flow.while_simple import WhileSimpleWorkflow
+
+        program = WhileSimpleWorkflow.workflow_ir()
+
+        while_loop = self._find_while_loop(program)
+        assert while_loop is not None, "Expected while_loop in IR"
+        assert while_loop.HasField("condition"), "Expected condition in while loop"
+        assert while_loop.condition.HasField("binary_op"), "Expected binary condition in while loop"
+        assert while_loop.HasField("block_body"), "Expected block_body in while loop"
 
 
 class TestForLoopAccumulatorDetection:
@@ -1364,34 +1392,6 @@ class TestUnsupportedPatternDetection:
         assert isinstance(error, UnsupportedPatternError)
         assert "F-string" in error.message, "Error should mention f-strings"
         assert "@action" in error.recommendation, "Recommendation should suggest using @action"
-
-    def test_while_loop_raises_error(self) -> None:
-        """Test: while loops raise error with recommendation."""
-        import pytest
-
-        from rappel import UnsupportedPatternError, action, workflow
-        from rappel.workflow import Workflow
-
-        @action(name="while_test_action")
-        async def while_action() -> int:
-            return 1
-
-        @workflow
-        class WhileWorkflow(Workflow):
-            async def run(self, count: int) -> int:
-                i = 0
-                while i < count:
-                    await while_action()
-                    i += 1
-                return i
-
-        with pytest.raises(UnsupportedPatternError) as exc_info:
-            WhileWorkflow.workflow_ir()
-
-        error = exc_info.value
-        assert isinstance(error, UnsupportedPatternError)
-        assert "While" in error.message, "Error should mention while loops"
-        assert "for loop" in error.recommendation.lower(), "Recommendation should suggest for loop"
 
     def test_with_statement_raises_error(self) -> None:
         """Test: with statements raise error with recommendation."""
@@ -3147,22 +3147,6 @@ class TestUnsupportedPatternValidation:
         error = cast(UnsupportedPatternError, exc_info.value)
         assert "f-string" in error.message.lower() or "F-string" in error.message
         assert "@action" in error.recommendation
-
-    def test_while_loop_raises_error(self) -> None:
-        """Test: while loops raise UnsupportedPatternError."""
-        from typing import cast
-
-        import pytest
-
-        from rappel.ir_builder import UnsupportedPatternError
-
-        with pytest.raises(UnsupportedPatternError) as exc_info:
-            from tests.fixtures_unsupported.while_loop import WhileLoopWorkflow
-
-            WhileLoopWorkflow.workflow_ir()
-
-        error = cast(UnsupportedPatternError, exc_info.value)
-        assert "while" in error.message.lower()
 
     def test_list_comprehension_return_raises_error(self) -> None:
         """Test: list comprehensions returned directly raise UnsupportedPatternError."""

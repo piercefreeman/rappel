@@ -264,6 +264,7 @@ class Statement(google.protobuf.message.Message):
     EXPR_STMT_FIELD_NUMBER: builtins.int
     BREAK_STMT_FIELD_NUMBER: builtins.int
     CONTINUE_STMT_FIELD_NUMBER: builtins.int
+    WHILE_LOOP_FIELD_NUMBER: builtins.int
     SPAN_FIELD_NUMBER: builtins.int
     @property
     def assignment(self) -> Global___Assignment: ...
@@ -288,6 +289,8 @@ class Statement(google.protobuf.message.Message):
     @property
     def continue_stmt(self) -> Global___ContinueStmt: ...
     @property
+    def while_loop(self) -> Global___WhileLoop: ...
+    @property
     def span(self) -> Global___Span: ...
     def __init__(
         self,
@@ -303,6 +306,7 @@ class Statement(google.protobuf.message.Message):
         expr_stmt: Global___ExprStmt | None = ...,
         break_stmt: Global___BreakStmt | None = ...,
         continue_stmt: Global___ContinueStmt | None = ...,
+        while_loop: Global___WhileLoop | None = ...,
         span: Global___Span | None = ...,
     ) -> None: ...
     def HasField(
@@ -334,6 +338,8 @@ class Statement(google.protobuf.message.Message):
             b"spread_action",
             "try_except",
             b"try_except",
+            "while_loop",
+            b"while_loop",
         ],
     ) -> builtins.bool: ...
     def ClearField(
@@ -365,6 +371,8 @@ class Statement(google.protobuf.message.Message):
             b"spread_action",
             "try_except",
             b"try_except",
+            "while_loop",
+            b"while_loop",
         ],
     ) -> None: ...
     def WhichOneof(
@@ -382,6 +390,7 @@ class Statement(google.protobuf.message.Message):
             "expr_stmt",
             "break_stmt",
             "continue_stmt",
+            "while_loop",
         ]
         | None
     ): ...
@@ -635,6 +644,33 @@ class ForLoop(google.protobuf.message.Message):
     ) -> None: ...
 
 Global___ForLoop: typing_extensions.TypeAlias = ForLoop
+
+@typing.final
+class WhileLoop(google.protobuf.message.Message):
+    """While loop: while condition: ..."""
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    CONDITION_FIELD_NUMBER: builtins.int
+    BLOCK_BODY_FIELD_NUMBER: builtins.int
+    @property
+    def condition(self) -> Global___Expr: ...
+    @property
+    def block_body(self) -> Global___Block: ...
+    def __init__(
+        self,
+        *,
+        condition: Global___Expr | None = ...,
+        block_body: Global___Block | None = ...,
+    ) -> None: ...
+    def HasField(
+        self, field_name: typing.Literal["block_body", b"block_body", "condition", b"condition"]
+    ) -> builtins.bool: ...
+    def ClearField(
+        self, field_name: typing.Literal["block_body", b"block_body", "condition", b"condition"]
+    ) -> None: ...
+
+Global___WhileLoop: typing_extensions.TypeAlias = WhileLoop
 
 @typing.final
 class Conditional(google.protobuf.message.Message):

@@ -195,6 +195,22 @@ fn validate_statement(
                 current.extend(loop_result);
             }
         }
+        Kind::WhileLoop(while_loop) => {
+            if let Some(condition) = while_loop.condition.as_ref() {
+                validate_expr(
+                    condition,
+                    &current,
+                    fn_name,
+                    function_names,
+                    function_signatures,
+                )?;
+            }
+            if let Some(body) = while_loop.block_body.as_ref() {
+                let loop_result =
+                    validate_block(body, &current, fn_name, function_names, function_signatures)?;
+                current.extend(loop_result);
+            }
+        }
         Kind::Conditional(cond) => {
             if let Some(if_branch) = cond.if_branch.as_ref()
                 && let Some(condition) = if_branch.condition.as_ref()

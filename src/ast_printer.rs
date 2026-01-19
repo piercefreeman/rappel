@@ -88,6 +88,7 @@ impl AstPrinter {
                 self.print_parallel_block(parallel)
             }
             Some(ast::statement::Kind::ForLoop(for_loop)) => self.print_for_loop(for_loop),
+            Some(ast::statement::Kind::WhileLoop(while_loop)) => self.print_while_loop(while_loop),
             Some(ast::statement::Kind::Conditional(cond)) => self.print_conditional(cond),
             Some(ast::statement::Kind::TryExcept(try_except)) => self.print_try_except(try_except),
             Some(ast::statement::Kind::ReturnStmt(ret)) => self.print_return(ret),
@@ -182,6 +183,22 @@ impl AstPrinter {
             .unwrap_or_default();
 
         format!("for {} in {}:\n{}", loop_vars, iterable, body)
+    }
+
+    /// Print a while loop.
+    fn print_while_loop(&mut self, while_loop: &ast::WhileLoop) -> String {
+        let condition = while_loop
+            .condition
+            .as_ref()
+            .map(|c| self.print_expr(c))
+            .unwrap_or_default();
+        let body = while_loop
+            .block_body
+            .as_ref()
+            .map(|b| self.print_block(b))
+            .unwrap_or_default();
+
+        format!("while {}:\n{}", condition, body)
     }
 
     /// Print a conditional (if/elif/else).

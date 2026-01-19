@@ -210,9 +210,24 @@
       <div class="result" id="loop-result" hidden></div>
     </section>
 
+    <!-- While Loop -->
+    <section class="workflow-section">
+      <h3>5. While Loop</h3>
+      <p>
+        Increment a counter until it reaches a limit. Demonstrates while-loop iteration.
+      </p>
+      <form id="while-loop-form">
+        <label for="while-loop-limit">Limit (1-10):</label>
+        <input type="number" id="while-loop-limit" name="limit" min="1" max="10" value="4" />
+        <button type="submit">Run While</button>
+      </form>
+      <div class="status" id="while-loop-status"></div>
+      <div class="result" id="while-loop-result" hidden></div>
+    </section>
+
     <!-- Return Inside Loop -->
     <section class="workflow-section">
-      <h3>5. Return Inside a Loop</h3>
+      <h3>6. Return Inside a Loop</h3>
       <p>
         Search a list for a number and return early when the needle is found.
         Enter comma-separated integers (max 10).
@@ -230,7 +245,7 @@
 
     <!-- Loop with Exception Handling -->
     <section class="workflow-section">
-      <h3>6. Loop with Exception Handling</h3>
+      <h3>7. Loop with Exception Handling</h3>
       <p>
         Process items in a loop where some may fail. Exceptions are caught,
         an error counter is incremented, and the loop continues.
@@ -248,7 +263,7 @@
 
     <!-- Error Handling -->
     <section class="workflow-section">
-      <h3>7. Error Handling (try/except)</h3>
+      <h3>8. Error Handling (try/except)</h3>
       <p>
         Demonstrate exception handling in workflows. Toggle failure to see recovery in action.
       </p>
@@ -265,7 +280,7 @@
 
     <!-- Exception Metadata -->
     <section class="workflow-section">
-      <h3>8. Exception Metadata (except as)</h3>
+      <h3>9. Exception Metadata (except as)</h3>
       <p>
         Capture exception attributes in the handler and surface them in the workflow result.
       </p>
@@ -282,7 +297,7 @@
 
     <!-- Durable Sleep -->
     <section class="workflow-section">
-      <h3>9. Durable Sleep</h3>
+      <h3>10. Durable Sleep</h3>
       <p>
         Pause workflow execution. Unlike regular sleep, this survives worker restarts.
       </p>
@@ -297,7 +312,7 @@
 
     <!-- Guard Fallback -->
     <section class="workflow-section">
-      <h3>10. Guard Fallback (if without else)</h3>
+      <h3>11. Guard Fallback (if without else)</h3>
       <p>
         Skip an action when the guard is falsy, then continue to the next step.
         Use "empty" to simulate no notes returned.
@@ -314,7 +329,7 @@
 
     <!-- Early Return with Loop -->
     <section class="workflow-section">
-      <h3>11. Early Return + Loop Pattern</h3>
+      <h3>12. Early Return + Loop Pattern</h3>
       <p>
         Demonstrates if-with-early-return followed by for-loop. Common in data processing:
         parse input, return early if invalid, otherwise loop over items.
@@ -332,7 +347,7 @@
 
     <!-- Spread Empty Collection -->
     <section class="workflow-section">
-      <h3>12. Spread Over Empty Collection</h3>
+      <h3>13. Spread Over Empty Collection</h3>
       <p>
         Tests spread (asyncio.gather) over collections that may be empty.
         Enter comma-separated items, or leave empty to test empty spread handling.
@@ -349,7 +364,7 @@
 
     <!-- Kw-only Inputs -->
     <section class="workflow-section">
-      <h3>13. Kw-only Inputs</h3>
+      <h3>14. Kw-only Inputs</h3>
       <p>
         Demonstrates keyword-only workflow inputs flowing into a request model.
         Leave fields empty to use defaults.
@@ -367,7 +382,7 @@
 
     <!-- Undefined Variable Validation -->
     <section class="workflow-section">
-      <h3>14. Undefined Variable Validation</h3>
+      <h3>15. Undefined Variable Validation</h3>
       <p>
         This workflow intentionally references a module-level variable to show
         IR validation errors before execution.
@@ -384,7 +399,7 @@
 
     <!-- Scheduled Workflows -->
     <section class="workflow-section">
-      <h3>15. Batch Workflow Runs</h3>
+      <h3>16. Batch Workflow Runs</h3>
       <p>
         Queue a large number of workflow instances without blocking on execution.
         Uses the bridge batch enqueue API under the hood.
@@ -414,7 +429,7 @@
     </section>
 
     <section class="workflow-section">
-      <h3>16. Scheduled Workflows</h3>
+      <h3>17. Scheduled Workflows</h3>
       <p>
         Register a workflow to run automatically on a cron schedule or at fixed intervals.
         Schedules persist across server restarts.
@@ -545,7 +560,18 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
-      // 5. Return Inside Loop
+      // 5. While Loop
+      runWorkflow(
+        "while-loop-form",
+        "/api/while-loop",
+        (form) => {
+          const limit = Number(form.querySelector("#while-loop-limit").value);
+          return Number.isFinite(limit) && limit >= 1 && limit <= 10 ? { limit } : null;
+        },
+        (data) => JSON.stringify(data, null, 2)
+      );
+
+      // 6. Return Inside Loop
       runWorkflow(
         "loop-return-form",
         "/api/loop-return",
@@ -564,7 +590,7 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
-      // 6. Loop Exception
+      // 7. Loop Exception
       runWorkflow(
         "loop-exception-form",
         "/api/loop-exception",
@@ -576,7 +602,7 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
-      // 7. Error
+      // 8. Error
       runWorkflow(
         "error-form",
         "/api/error",
@@ -587,7 +613,7 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
-      // 8. Exception Metadata
+      // 9. Exception Metadata
       runWorkflow(
         "exception-metadata-form",
         "/api/exception-metadata",
@@ -598,7 +624,7 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
-      // 9. Sleep
+      // 10. Sleep
       runWorkflow(
         "sleep-form",
         "/api/sleep",
@@ -611,7 +637,7 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
-      // 10. Guard Fallback
+      // 11. Guard Fallback
       runWorkflow(
         "guard-fallback-form",
         "/api/guard-fallback",
@@ -622,7 +648,7 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
-      // 11. Early Return + Loop
+      // 12. Early Return + Loop
       runWorkflow(
         "early-return-form",
         "/api/early-return-loop",
@@ -633,7 +659,7 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
-      // 12. Spread Empty Collection
+      // 13. Spread Empty Collection
       runWorkflow(
         "spread-empty-form",
         "/api/spread-empty",
@@ -646,7 +672,7 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
-      // 13. Kw-only Inputs
+      // 14. Kw-only Inputs
       runWorkflow(
         "kw-only-form",
         "/api/kw-only",
@@ -662,7 +688,7 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
-      // 14. Undefined Variable Validation
+      // 15. Undefined Variable Validation
       runWorkflow(
         "undefined-variable-form",
         "/api/undefined-variable",
@@ -673,8 +699,7 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
-
-      // 15. Batch workflow runs
+      // 16. Batch workflow runs
       const batchForm = document.getElementById("batch-form");
       const batchStatus = document.getElementById("batch-status");
       const batchResult = document.getElementById("batch-result");
@@ -809,7 +834,7 @@
         }
       });
 
-      // 16. Schedule - toggle between cron and interval inputs
+      // 17. Schedule - toggle between cron and interval inputs
       const scheduleTypeSelect = document.getElementById("schedule-type");
       const intervalInput = document.getElementById("schedule-interval");
       const cronInput = document.getElementById("schedule-cron");
@@ -824,7 +849,7 @@
         }
       });
 
-      // 16. Schedule - register schedule
+      // 17. Schedule - register schedule
       runWorkflow(
         "schedule-form",
         "/api/schedule",
@@ -848,7 +873,7 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
-      // 16. Schedule actions - pause, resume, delete
+      // 17. Schedule actions - pause, resume, delete
       async function scheduleAction(endpoint, action) {
         const workflow_name = document.getElementById("action-workflow").value;
         const status = document.getElementById("schedule-action-status");

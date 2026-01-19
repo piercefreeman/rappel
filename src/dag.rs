@@ -1790,6 +1790,9 @@ impl DAGConverter {
             ast::statement::Kind::ForLoop(for_loop) => {
                 return self.convert_for_loop(for_loop);
             }
+            ast::statement::Kind::WhileLoop(while_loop) => {
+                return self.convert_while_loop(while_loop);
+            }
             ast::statement::Kind::Conditional(cond) => {
                 return self.convert_conditional(cond);
             }
@@ -2674,6 +2677,138 @@ impl DAGConverter {
         })
     }
 
+    /// Convert a while loop to normalized DAG nodes.
+    ///
+    /// While loops are decomposed into primitive nodes:
+    /// 1. loop_cond (branch): Condition check with guarded edges
+    /// 2. body nodes: The actual loop body (action_call, fn_call, etc.)
+    /// 3. loop_continue (assignment): No-op node for continue/back-edge wiring
+    /// 4. Back-edge from loop_continue to loop_cond
+    /// 5. loop_exit (join): Exit path when condition is false
+    ///
+    /// The structure is:
+    ///                         ┌──────────────────────────────────────────────┐
+    ///                         │                                              │
+    ///                         ▼                                              │
+    ///   loop_cond ──[guard: condition]──> body ──> loop_continue ─────────────┘
+    ///        │
+    ///        └──[guard: NOT(condition)]──> loop_exit
+    fn convert_while_loop(
+        &mut self,
+        while_loop: &ast::WhileLoop,
+    ) -> Result<ConvertedSubgraph, String> {
+        let mut nodes: Vec<String> = Vec::new();
+
+        let condition = while_loop
+            .condition
+            .as_ref()
+            .ok_or_else(|| "while loop missing condition".to_string())?;
+        let condition_str = self.expr_to_string(condition);
+
+        let cond_id = self.next_id("loop_cond");
+        let cond_label = format!("while {}", condition_str);
+        let mut cond_node = DAGNode::new(cond_id.clone(), "branch".to_string(), cond_label);
+        if let Some(ref fn_name) = self.current_function {
+            cond_node = cond_node.with_function_name(fn_name);
+        }
+        self.dag.add_node(cond_node);
+        nodes.push(cond_id.clone());
+
+        let continue_guard = condition.clone();
+        let break_guard = ast::Expr {
+            span: None,
+            kind: Some(ast::expr::Kind::UnaryOp(Box::new(ast::UnaryOp {
+                op: ast::UnaryOperator::UnaryOpNot as i32,
+                operand: Some(Box::new(condition.clone())),
+            }))),
+        };
+
+        // Pre-generate exit_id so break statements can wire to it
+        let exit_id = self.next_id("loop_exit");
+        self.loop_exit_stack.push(exit_id.clone());
+
+        // Pre-generate continue_id so continue statements can wire to it
+        let continue_id = self.next_id("loop_continue");
+        self.loop_incr_stack.push(continue_id.clone());
+
+        let mut body_targets: Vec<String> = Vec::new();
+        let body_graph = match while_loop.block_body.as_ref() {
+            Some(block_body) => {
+                Self::collect_assigned_targets(&block_body.statements, &mut body_targets);
+                self.convert_block(block_body)?
+            }
+            None => ConvertedSubgraph::noop(),
+        };
+
+        self.loop_incr_stack.pop();
+        self.loop_exit_stack.pop();
+        nodes.extend(body_graph.nodes.clone());
+
+        let mut continue_node = DAGNode::new(
+            continue_id.clone(),
+            "assignment".to_string(),
+            "loop_continue".to_string(),
+        );
+        if let Some(ref fn_name) = self.current_function {
+            continue_node = continue_node.with_function_name(fn_name);
+        }
+        self.dag.add_node(continue_node);
+        nodes.push(continue_id.clone());
+
+        if body_graph.is_noop {
+            self.dag.add_edge(DAGEdge::state_machine_with_guard(
+                cond_id.clone(),
+                continue_id.clone(),
+                continue_guard.clone(),
+            ));
+        } else if let Some(ref body_entry) = body_graph.entry {
+            self.dag.add_edge(DAGEdge::state_machine_with_guard(
+                cond_id.clone(),
+                body_entry.clone(),
+                continue_guard.clone(),
+            ));
+        }
+
+        if !body_graph.is_noop {
+            for exit in &body_graph.exits {
+                self.dag
+                    .add_edge(DAGEdge::state_machine(exit.clone(), continue_id.clone()));
+            }
+        }
+
+        self.dag.add_edge(
+            DAGEdge::state_machine(continue_id.clone(), cond_id.clone()).with_loop_back(true),
+        );
+
+        let exit_label = format!("end while {}", condition_str);
+        let mut exit_node = DAGNode::new(exit_id.clone(), "join".to_string(), exit_label)
+            .with_join_required_count(1);
+        if let Some(ref fn_name) = self.current_function {
+            exit_node = exit_node.with_function_name(fn_name);
+        }
+        if !body_targets.is_empty() {
+            exit_node.targets = Some(body_targets.clone());
+            for target in &body_targets {
+                self.track_var_definition(target, &exit_id);
+            }
+        }
+        self.dag.add_node(exit_node);
+        nodes.push(exit_id.clone());
+
+        self.dag.add_edge(DAGEdge::state_machine_with_guard(
+            cond_id.clone(),
+            exit_id.clone(),
+            break_guard,
+        ));
+
+        Ok(ConvertedSubgraph {
+            entry: Some(cond_id),
+            exits: vec![exit_id],
+            nodes,
+            is_noop: false,
+        })
+    }
+
     /// Convert a conditional (if/elif/else)
     ///
     /// The DAG structure is "flat" - there's no explicit "if" container node.
@@ -3272,6 +3407,11 @@ impl DAGConverter {
                 }
                 ast::statement::Kind::ForLoop(for_loop) => {
                     if let Some(body) = &for_loop.block_body {
+                        Self::collect_assigned_targets(&body.statements, targets);
+                    }
+                }
+                ast::statement::Kind::WhileLoop(while_loop) => {
+                    if let Some(body) = &while_loop.block_body {
                         Self::collect_assigned_targets(&body.statements, targets);
                     }
                 }
@@ -5045,6 +5185,111 @@ fn main(input: [], output: [result]):
             assert!(targets.contains(&"processed_x".to_string()));
             assert!(targets.contains(&"processed_y".to_string()));
         }
+    }
+
+    #[test]
+    fn test_while_loop_structure() {
+        let init_stmt = ast::Statement {
+            kind: Some(ast::statement::Kind::Assignment(ast::Assignment {
+                targets: vec!["i".to_string()],
+                value: Some(ast::Expr {
+                    kind: Some(ast::expr::Kind::Literal(ast::Literal {
+                        value: Some(ast::literal::Value::IntValue(0)),
+                    })),
+                    span: None,
+                }),
+            })),
+            span: None,
+        };
+
+        let condition = ast::Expr {
+            kind: Some(ast::expr::Kind::BinaryOp(Box::new(ast::BinaryOp {
+                left: Some(Box::new(ast::Expr {
+                    kind: Some(ast::expr::Kind::Variable(ast::Variable {
+                        name: "i".to_string(),
+                    })),
+                    span: None,
+                })),
+                op: ast::BinaryOperator::BinaryOpLt as i32,
+                right: Some(Box::new(ast::Expr {
+                    kind: Some(ast::expr::Kind::Literal(ast::Literal {
+                        value: Some(ast::literal::Value::IntValue(3)),
+                    })),
+                    span: None,
+                })),
+            }))),
+            span: None,
+        };
+
+        let incr_stmt = ast::Statement {
+            kind: Some(ast::statement::Kind::Assignment(ast::Assignment {
+                targets: vec!["i".to_string()],
+                value: Some(ast::Expr {
+                    kind: Some(ast::expr::Kind::BinaryOp(Box::new(ast::BinaryOp {
+                        left: Some(Box::new(ast::Expr {
+                            kind: Some(ast::expr::Kind::Variable(ast::Variable {
+                                name: "i".to_string(),
+                            })),
+                            span: None,
+                        })),
+                        op: ast::BinaryOperator::BinaryOpAdd as i32,
+                        right: Some(Box::new(ast::Expr {
+                            kind: Some(ast::expr::Kind::Literal(ast::Literal {
+                                value: Some(ast::literal::Value::IntValue(1)),
+                            })),
+                            span: None,
+                        })),
+                    }))),
+                    span: None,
+                }),
+            })),
+            span: None,
+        };
+
+        let loop_body = ast::Block {
+            statements: vec![incr_stmt],
+            span: None,
+        };
+
+        let while_loop = ast::WhileLoop {
+            condition: Some(condition),
+            block_body: Some(loop_body),
+        };
+
+        let while_stmt = ast::Statement {
+            kind: Some(ast::statement::Kind::WhileLoop(while_loop)),
+            span: None,
+        };
+
+        let func = make_test_function("test_while", vec![init_stmt, while_stmt]);
+        let program = ast::Program {
+            functions: vec![func],
+        };
+
+        let dag = convert_to_dag(&program).unwrap();
+
+        let loop_cond = dag
+            .nodes
+            .values()
+            .find(|n| n.node_type == "branch" && n.label.contains("while"))
+            .expect("Should have branch node for while condition");
+        let loop_exit = dag
+            .nodes
+            .values()
+            .find(|n| n.node_type == "join" && n.label.contains("end while"))
+            .expect("Should have join node for while exit");
+        assert!(!loop_cond.id.is_empty());
+        assert!(!loop_exit.id.is_empty());
+
+        let back_edges: Vec<_> = dag.edges.iter().filter(|e| e.is_loop_back).collect();
+        assert!(!back_edges.is_empty(), "Should have a loop-back edge");
+
+        let continue_node = dag
+            .nodes
+            .values()
+            .find(|n| n.id.contains("loop_continue"))
+            .expect("Should have loop_continue node");
+        assert_eq!(continue_node.node_type, "assignment");
     }
 
     #[test]

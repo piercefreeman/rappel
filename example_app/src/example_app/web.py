@@ -56,6 +56,9 @@ from example_app.workflows import (
     SpreadEmptyRequest,
     SpreadEmptyResult,
     UndefinedVariableWorkflow,
+    WhileLoopRequest,
+    WhileLoopResult,
+    WhileLoopWorkflow,
 )
 
 app = FastAPI(title="Rappel Example")
@@ -119,6 +122,18 @@ async def run_loop_workflow(payload: LoopRequest) -> LoopResult:
     """Run the loop workflow demonstrating iteration."""
     workflow = LoopProcessingWorkflow()
     return await workflow.run(items=payload.items)
+
+
+# =============================================================================
+# While Loop Processing
+# =============================================================================
+
+
+@app.post("/api/while-loop", response_model=WhileLoopResult)
+async def run_while_loop_workflow(payload: WhileLoopRequest) -> WhileLoopResult:
+    """Run the while-loop workflow demonstrating counter-based iteration."""
+    workflow = WhileLoopWorkflow()
+    return await workflow.run(limit=payload.limit)
 
 
 # =============================================================================
@@ -284,6 +299,7 @@ WORKFLOW_REGISTRY = {
     "SequentialChainWorkflow": SequentialChainWorkflow,
     "ConditionalBranchWorkflow": ConditionalBranchWorkflow,
     "LoopProcessingWorkflow": LoopProcessingWorkflow,
+    "WhileLoopWorkflow": WhileLoopWorkflow,
     "LoopExceptionWorkflow": LoopExceptionWorkflow,
     "ErrorHandlingWorkflow": ErrorHandlingWorkflow,
     "ExceptionMetadataWorkflow": ExceptionMetadataWorkflow,

@@ -47,7 +47,7 @@ message Block {
 // -----------------------------------------------------------------------------
 // Control Flow Bodies
 // -----------------------------------------------------------------------------
-// Control flow structures (for, try, if) use full blocks so they can contain
+// Control flow structures (for, while, try, if) use full blocks so they can contain
 // arbitrary statements and `return` semantics are unambiguous.
 
 // -----------------------------------------------------------------------------
@@ -67,6 +67,7 @@ message Statement {
     ExprStmt expr_stmt = 9;
     BreakStmt break_stmt = 11;
     ContinueStmt continue_stmt = 12;
+    WhileLoop while_loop = 13;
   }
   Span span = 10;
 }
@@ -123,6 +124,12 @@ message ForLoop {
   repeated string loop_vars = 1;     // Loop variable(s) for unpacking
   Expr iterable = 2;
   Block block_body = 3;
+}
+
+// While loop: while condition: ...
+message WhileLoop {
+  Expr condition = 1;
+  Block block_body = 2;
 }
 
 // Conditional: if/elif/else

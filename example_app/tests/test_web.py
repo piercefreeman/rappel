@@ -55,3 +55,17 @@ def test_early_return_loop_workflow_early_return(
     assert payload["had_session"] is False
     assert payload["processed_count"] == 0
     assert payload["all_items"] == []
+
+
+def test_while_loop_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test the while loop workflow executes until the limit."""
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    client = TestClient(app)
+    response = client.post("/api/while-loop", json={"limit": 4})
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert payload["limit"] == 4
+    assert payload["final"] == 4
+    assert payload["iterations"] == 4

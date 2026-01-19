@@ -289,6 +289,7 @@ impl<'source> Parser<'source> {
         let kind = match self.peek() {
             Token::If => Some(ast::statement::Kind::Conditional(self.parse_conditional()?)),
             Token::For => Some(ast::statement::Kind::ForLoop(self.parse_for_loop()?)),
+            Token::While => Some(ast::statement::Kind::WhileLoop(self.parse_while_loop()?)),
             Token::Try => Some(ast::statement::Kind::TryExcept(self.parse_try_except()?)),
             Token::Return => Some(ast::statement::Kind::ReturnStmt(self.parse_return()?)),
             Token::Break => {
@@ -527,6 +528,18 @@ impl<'source> Parser<'source> {
         Ok(ast::ForLoop {
             loop_vars,
             iterable: Some(iterable),
+            block_body: Some(body),
+        })
+    }
+
+    fn parse_while_loop(&mut self) -> Result<ast::WhileLoop, ParseError> {
+        self.expect(&Token::While)?;
+        let condition = self.parse_expr()?;
+        self.expect(&Token::Colon)?;
+        let body = self.parse_block()?;
+
+        Ok(ast::WhileLoop {
+            condition: Some(condition),
             block_body: Some(body),
         })
     }
@@ -1410,6 +1423,27 @@ fn runner(input: [], output: [result]):
         let func = &program.functions[0];
         let body = func.body.as_ref().unwrap();
         assert_eq!(body.statements.len(), 3); // assignment, for loop, return
+    }
+
+    #[test]
+    fn test_parse_while_loop() {
+        let source = r#"fn count(input: [], output: [result]):
+    i = 0
+    while i < 3:
+        i = i + 1
+    return i"#;
+
+        let program = parse(source).unwrap();
+        let func = &program.functions[0];
+        let body = func.body.as_ref().unwrap();
+        assert_eq!(body.statements.len(), 3);
+
+        if let Some(ast::statement::Kind::WhileLoop(while_loop)) = &body.statements[1].kind {
+            assert!(while_loop.condition.is_some());
+            assert!(while_loop.block_body.is_some());
+        } else {
+            panic!("expected while loop");
+        }
     }
 
     #[test]

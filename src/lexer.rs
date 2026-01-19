@@ -64,6 +64,8 @@ pub enum Token {
     Else,
     #[token("for")]
     For,
+    #[token("while")]
+    While,
     #[token("in")]
     In,
     #[token("try")]
@@ -200,6 +202,7 @@ impl fmt::Display for Token {
             Token::Elif => write!(f, "elif"),
             Token::Else => write!(f, "else"),
             Token::For => write!(f, "for"),
+            Token::While => write!(f, "while"),
             Token::In => write!(f, "in"),
             Token::Try => write!(f, "try"),
             Token::Except => write!(f, "except"),
@@ -487,7 +490,7 @@ mod tests {
 
     #[test]
     fn test_keywords() {
-        let tokens = token_types("fn if elif else for in return");
+        let tokens = token_types("fn if elif else for while in return");
         assert_eq!(
             tokens,
             vec![
@@ -496,6 +499,7 @@ mod tests {
                 Token::Elif,
                 Token::Else,
                 Token::For,
+                Token::While,
                 Token::In,
                 Token::Return,
                 Token::Eof,

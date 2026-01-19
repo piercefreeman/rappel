@@ -5,8 +5,8 @@ This module parses Python workflow classes and produces the IR representation
 that can be sent to the Rust runtime for execution.
 
 The IR builder performs deep transformations to convert Python patterns into
-valid Rappel IR structures. Control flow bodies (try, for, if branches) are
-represented as full blocks, so they can contain arbitrary statements and
+valid Rappel IR structures. Control flow bodies (try, for, while, if branches)
+are represented as full blocks, so they can contain arbitrary statements and
 `return` behaves consistently with Python (returns from the entry function end
 the workflow).
 
@@ -927,6 +927,8 @@ class IRBuilder(ast.NodeVisitor):
             return [result] if result else []
         elif isinstance(node, ast.For):
             return self._visit_for(node)
+        elif isinstance(node, ast.While):
+            return self._visit_while(node)
         elif isinstance(node, ast.If):
             return self._visit_if(node)
         elif isinstance(node, ast.Try):
@@ -958,14 +960,7 @@ class IRBuilder(ast.NodeVisitor):
         line = getattr(node, "lineno", None)
         col = getattr(node, "col_offset", None)
 
-        if isinstance(node, ast.While):
-            raise UnsupportedPatternError(
-                "While loops are not supported",
-                RECOMMENDATIONS["while_loop"],
-                line=line,
-                col=col,
-            )
-        elif isinstance(node, (ast.With, ast.AsyncWith)):
+        if isinstance(node, (ast.With, ast.AsyncWith)):
             raise UnsupportedPatternError(
                 "Context managers (with statements) are not supported",
                 RECOMMENDATIONS["with_statement"],
@@ -1438,6 +1433,29 @@ class IRBuilder(ast.NodeVisitor):
         stmt.for_loop.CopyFrom(for_loop)
         return [stmt]
 
+    def _visit_while(self, node: ast.While) -> List[ir.Statement]:
+        """Convert while loop to IR.
+
+        The loop body is emitted as a full block so it can contain multiple
+        statements/calls and early `return`.
+        """
+        condition = self._expr_to_ir_with_model_coercion(node.test)
+        if not condition:
+            return []
+
+        body_stmts: List[ir.Statement] = []
+        for body_node in node.body:
+            stmts = self._visit_statement(body_node)
+            body_stmts.extend(stmts)
+
+        stmt = ir.Statement(span=_make_span(node))
+        while_loop = ir.WhileLoop(
+            condition=condition,
+            block_body=ir.Block(statements=body_stmts, span=_make_span(node)),
+        )
+        stmt.while_loop.CopyFrom(while_loop)
+        return [stmt]
+
     def _detect_accumulator_targets(
         self, stmts: List[ir.Statement], in_scope_vars: set
     ) -> List[str]:
@@ -1764,6 +1782,14 @@ class IRBuilder(ast.NodeVisitor):
                         seen.add(target)
                         assigned.append(target)
 
+            if stmt.HasField("while_loop") and stmt.while_loop.HasField("block_body"):
+                for target in self._collect_assigned_vars_in_order(
+                    list(stmt.while_loop.block_body.statements)
+                ):
+                    if target not in seen:
+                        seen.add(target)
+                        assigned.append(target)
+
             if stmt.HasField("try_except"):
                 try_block = stmt.try_except.try_block
                 if try_block.HasField("span"):
@@ -1855,6 +1881,19 @@ class IRBuilder(ast.NodeVisitor):
                             vars_found.append(var)
                 if fl.HasField("block_body"):
                     for var in self._collect_variables_from_block(fl.block_body):
+                        if var not in seen:
+                            seen.add(var)
+                            vars_found.append(var)
+
+            if stmt.HasField("while_loop"):
+                wl = stmt.while_loop
+                if wl.HasField("condition"):
+                    for var in self._collect_variables_from_expr(wl.condition):
+                        if var not in seen:
+                            seen.add(var)
+                            vars_found.append(var)
+                if wl.HasField("block_body"):
+                    for var in self._collect_variables_from_block(wl.block_body):
                         if var not in seen:
                             seen.add(var)
                             vars_found.append(var)

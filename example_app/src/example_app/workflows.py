@@ -6,9 +6,10 @@ This module contains example workflows demonstrating:
 2. Sequential chaining
 3. Conditional branching (if/else)
 4. Loop iteration
-5. Return inside a loop
-6. Error handling with try/except
-7. Durable sleep
+5. While loops
+6. Return inside a loop
+7. Error handling with try/except
+8. Durable sleep
 """
 
 import asyncio
@@ -74,6 +75,18 @@ class LoopRequest(BaseModel):
     items: list[str] = Field(
         min_length=1, max_length=5, description="Items to process in a loop"
     )
+
+
+class WhileLoopResult(BaseModel):
+    """Result from the while loop workflow."""
+
+    limit: int
+    final: int
+    iterations: int
+
+
+class WhileLoopRequest(BaseModel):
+    limit: int = Field(ge=1, le=10, description="Upper bound for the while loop")
 
 
 class LoopReturnResult(BaseModel):
@@ -325,6 +338,28 @@ async def build_loop_return_result(
 
 
 # =============================================================================
+# Actions - While Loop Workflow
+# =============================================================================
+
+
+@action
+async def increment_counter(value: int) -> int:
+    """Increment the loop counter."""
+    await asyncio.sleep(0.05)
+    return value + 1
+
+
+@action
+async def build_while_result(
+    limit: int,
+    final: int,
+    iterations: int,
+) -> WhileLoopResult:
+    """Build the final while loop result."""
+    await asyncio.sleep(0.05)
+    return WhileLoopResult(limit=limit, final=final, iterations=iterations)
+
+# =============================================================================
 # Actions - Error Handling Workflow
 # =============================================================================
 
@@ -500,6 +535,21 @@ class LoopProcessingWorkflow(Workflow):
 
         # Build the result in an action (constructors aren't supported in return)
         return await build_loop_result(items, processed)
+
+
+@workflow
+class WhileLoopWorkflow(Workflow):
+    """Demonstrates while-loop iteration with a counter."""
+
+    async def run(self, limit: int) -> WhileLoopResult:
+        current = 0
+        iterations = 0
+
+        while current < limit:
+            current = await increment_counter(current)
+            iterations = iterations + 1
+
+        return await build_while_result(limit=limit, final=current, iterations=iterations)
 
 
 @workflow

@@ -1554,6 +1554,7 @@ async fn dead_end_conditional_guard_reaches_followup_action() -> Result<()> {
 // =============================================================================
 
 const LOOP_WORKFLOW_MODULE: &str = include_str!("fixtures/loop_workflow.py");
+const WHILE_LOOP_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_while_loop.py");
 const HELPER_LOOP_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_helper_loop.py");
 
 const REGISTER_LOOP_SCRIPT: &str = r#"
@@ -1566,6 +1567,21 @@ async def main():
     os.environ.pop("PYTEST_CURRENT_TEST", None)
     wf = LoopWorkflow()
     result = await wf.run(items=["apple", "banana", "cherry"])
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+const REGISTER_WHILE_LOOP_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_while_loop import WhileLoopWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = WhileLoopWorkflow()
+    result = await wf.run(limit=3)
     print(f"Registration result: {result}")
 
 asyncio.run(main())
@@ -1624,6 +1640,46 @@ async fn loop_workflow_executes_all_iterations() -> Result<()> {
     assert_eq!(
         message,
         Some("APPLE,BANANA,CHERRY".to_string()),
+        "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test that while-loop workflows execute until the condition becomes false.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn while_loop_workflow_executes_until_limit() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("integration_while_loop.py", WHILE_LOOP_WORKFLOW_MODULE),
+            ("register.py", REGISTER_WHILE_LOOP_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "whileloopworkflow",
+        user_module: "integration_while_loop",
+        inputs: &[("limit", "3")],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("done:3".to_string()),
         "unexpected workflow result"
     );
 
