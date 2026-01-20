@@ -1334,6 +1334,23 @@ impl DAGConverter {
         // success path. Exception edges are conditional (only taken when an exception occurs),
         // so for data flow purposes, a modification reachable only via exception edges is
         // effectively on a parallel branch.
+        //
+        // Treat successors of action nodes that have exception edges as conditional as well.
+        // If an action can throw, downstream modifications are not guaranteed to execute, so
+        // they should not block propagation of earlier values to nodes after a try/except.
+        let exception_action_sources: HashSet<String> = dag
+            .edges
+            .iter()
+            .filter(|e| e.exception_types.is_some())
+            .filter_map(|e| {
+                let node = dag.nodes.get(&e.source)?;
+                if node.node_type == "action_call" && !node.is_fn_call {
+                    Some(e.source.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
         let reachable_via_normal_edges: HashMap<String, HashSet<String>> = {
             let mut result: HashMap<String, HashSet<String>> = HashMap::new();
             // Build adjacency list from state machine edges, excluding loop-back AND exception edges
@@ -1352,6 +1369,9 @@ impl DAGConverter {
                 let mut reachable = HashSet::new();
                 let mut queue = vec![start.clone()];
                 while let Some(node) = queue.pop() {
+                    if exception_action_sources.contains(&node) {
+                        continue;
+                    }
                     if let Some(neighbors) = adj.get(&node) {
                         for neighbor in neighbors {
                             if reachable.insert(neighbor.clone()) {

@@ -2331,6 +2331,8 @@ async fn durable_sleep_workflow_executes() -> Result<()> {
 const LOOP_EXCEPTION_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_loop_exception.py");
 const RETRY_EXHAUSTED_BREAK_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_retry_exhausted_break.py");
+const TRY_BREAK_DATAFLOW_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_try_break_dataflow.py");
 
 const REGISTER_LOOP_EXCEPTION_SCRIPT: &str = r#"
 import asyncio
@@ -2355,6 +2357,20 @@ from integration_retry_exhausted_break import RetryExhaustedBreakWorkflow
 async def main():
     os.environ.pop("PYTEST_CURRENT_TEST", None)
     wf = RetryExhaustedBreakWorkflow()
+    result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_TRY_BREAK_DATAFLOW_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_try_break_dataflow import TryBreakDataflowWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = TryBreakDataflowWorkflow()
     result = await wf.run()
     print(f"Registration result: {result}")
 
@@ -2487,6 +2503,45 @@ async fn retry_exhausted_break_allows_followup_loop() -> Result<()> {
         .expect("workflow should have a result");
     let message = parse_result(&stored_payload)?;
     assert_eq!(message, Some("wrap:seed".to_string()));
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test that a try/except break preserves pre-loop data for a followup guard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn try_break_dataflow_allows_followup_guard() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_try_break_dataflow.py",
+                TRY_BREAK_DATAFLOW_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_TRY_BREAK_DATAFLOW_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "trybreakdataflowworkflow",
+        user_module: "integration_try_break_dataflow",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(message, Some("".to_string()));
 
     harness.shutdown().await?;
     Ok(())
