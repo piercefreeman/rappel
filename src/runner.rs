@@ -710,6 +710,7 @@ pub struct WorkQueueHandler {
     in_flight: Arc<Mutex<InFlightTracker>>,
     dag_cache: Arc<DAGCache>,
     instance_inboxes: Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
+    completion_batcher: Arc<CompletionBatcher>,
     metrics: Option<Arc<RunnerMetrics>>,
 }
 
@@ -721,6 +722,7 @@ impl WorkQueueHandler {
         in_flight: Arc<Mutex<InFlightTracker>>,
         dag_cache: Arc<DAGCache>,
         instance_inboxes: Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
+        completion_batcher: Arc<CompletionBatcher>,
         metrics: Option<Arc<RunnerMetrics>>,
     ) -> Self {
         Self {
@@ -730,6 +732,7 @@ impl WorkQueueHandler {
             in_flight,
             dag_cache,
             instance_inboxes,
+            completion_batcher,
             metrics,
         }
     }
@@ -958,17 +961,14 @@ impl WorkQueueHandler {
         let inbox_writes = plan.inbox_writes.clone();
         let inline_us = inline_start.elapsed().as_micros() as u64;
 
-        // Execute completion plan in single atomic transaction
+        // Execute completion plan through the batcher
         let db_start = std::time::Instant::now();
-        let result = self.db.execute_completion_plan(instance_id, plan).await?;
+        let result = self.completion_batcher.execute(instance_id, plan).await?;
         let db_us = db_start.elapsed().as_micros() as u64;
 
         if !result.was_stale {
             if !inbox_writes.is_empty() {
-                let updated_at = match result.inbox_updated_at {
-                    Some(updated_at) => updated_at,
-                    None => self.db.get_inbox_updated_at(instance_id).await?,
-                };
+                let updated_at = result.inbox_updated_at.unwrap_or_else(Utc::now);
                 self.apply_inbox_writes_to_cache(instance_id, &inbox_writes, updated_at)
                     .await;
             }
@@ -1064,15 +1064,12 @@ impl WorkQueueHandler {
         );
         let inbox_writes = plan.inbox_writes.clone();
 
-        // Execute completion plan in single atomic transaction
-        let result = self.db.execute_completion_plan(instance_id, plan).await?;
+        // Execute completion plan through the batcher
+        let result = self.completion_batcher.execute(instance_id, plan).await?;
 
         if !result.was_stale {
             if !inbox_writes.is_empty() {
-                let updated_at = match result.inbox_updated_at {
-                    Some(updated_at) => updated_at,
-                    None => self.db.get_inbox_updated_at(instance_id).await?,
-                };
+                let updated_at = result.inbox_updated_at.unwrap_or_else(Utc::now);
                 self.apply_inbox_writes_to_cache(instance_id, &inbox_writes, updated_at)
                     .await;
             }
@@ -1318,7 +1315,7 @@ struct CompletionFlushRequest {
 }
 
 #[derive(Clone)]
-struct CompletionBatcher {
+pub(crate) struct CompletionBatcher {
     db: Arc<Database>,
     sender: Option<mpsc::Sender<CompletionFlushRequest>>,
     batching_enabled: bool,
@@ -1711,8 +1708,8 @@ impl Default for RunnerConfig {
             worker_status_interval_ms: 10000,
             action_log_flush_interval_ms: 200,
             action_log_flush_batch_size: 1000,
-            completion_batch_size: 1,
-            completion_flush_interval_ms: 1,
+            completion_batch_size: 200,
+            completion_flush_interval_ms: 5,
             gc_interval_ms: None,
             gc_retention_seconds: 86400, // 24 hours
             gc_batch_size: 100,
@@ -1771,6 +1768,11 @@ impl DAGRunner {
         let dag_cache = Arc::new(DAGCache::new(Arc::clone(&db)));
         let instance_contexts = Arc::new(RwLock::new(HashMap::new()));
         let instance_inboxes = Arc::new(RwLock::new(HashMap::new()));
+        let completion_batcher = Arc::new(CompletionBatcher::new(
+            Arc::clone(&db),
+            config.completion_batch_size,
+            config.completion_flush_interval_ms,
+        ));
         let work_handler = Arc::new(WorkQueueHandler::new(
             Arc::clone(&db),
             worker_pool,
@@ -1778,6 +1780,7 @@ impl DAGRunner {
             in_flight,
             Arc::clone(&dag_cache),
             Arc::clone(&instance_inboxes),
+            Arc::clone(&completion_batcher),
             metrics.clone(),
         ));
         let completion_handler = WorkCompletionHandler::new(db);
@@ -1802,11 +1805,8 @@ impl DAGRunner {
         // Channel for completion results
         let (completion_tx, mut completion_rx) =
             mpsc::channel::<(InFlightAction, RoundTripMetrics)>(1000);
-        let completion_batcher = Arc::new(CompletionBatcher::new(
-            Arc::clone(&self.completion_handler.db),
-            self.config.completion_batch_size,
-            self.config.completion_flush_interval_ms,
-        ));
+        // Use the completion batcher from the work handler (shared with barrier/sleep processing)
+        let completion_batcher = Arc::clone(&self.work_handler.completion_batcher);
 
         let make_interval = |ms: u64, name: &'static str| {
             let clamped = ms.max(1);
@@ -2510,7 +2510,7 @@ impl DAGRunner {
             if !inbox_writes.is_empty() {
                 let updated_at = match result.inbox_updated_at {
                     Some(updated_at) => updated_at,
-                    None => db.get_inbox_updated_at(instance_id).await?,
+                    None => Utc::now(),
                 };
                 Self::apply_inbox_writes_to_cache(
                     instance_inboxes,
@@ -2753,7 +2753,7 @@ impl DAGRunner {
             if !inbox_writes.is_empty() {
                 let updated_at = match result.inbox_updated_at {
                     Some(updated_at) => updated_at,
-                    None => db.get_inbox_updated_at(instance_id).await?,
+                    None => Utc::now(),
                 };
                 Self::apply_inbox_writes_to_cache(
                     instance_inboxes,
@@ -2896,21 +2896,13 @@ impl DAGRunner {
             return Ok(InboxValues::new());
         }
 
-        let db_updated_at = db.get_inbox_updated_at(instance_id).await?;
         let mut merged: InboxValues = InboxValues::new();
         let mut missing: std::collections::HashSet<String> = node_ids.clone();
-        let mut cache_valid = false;
 
+        // First, check cache without any DB call.
+        // Trust the cache if it exists - in single-runner-per-pool architecture,
+        // we maintain cache consistency via apply_inbox_writes_to_cache.
         {
-            let cache = instance_inboxes.read().await;
-            if let Some(instance_cache) = cache.get(&instance_id.0)
-                && db_updated_at <= instance_cache.updated_at
-            {
-                cache_valid = true;
-            }
-        }
-
-        if cache_valid {
             let cache = instance_inboxes.read().await;
             if let Some(instance_cache) = cache.get(&instance_id.0) {
                 for node_id in node_ids {
@@ -2920,13 +2912,9 @@ impl DAGRunner {
                     }
                 }
             }
-        } else {
-            let mut cache = instance_inboxes.write().await;
-            cache.remove(&instance_id.0);
-            missing = node_ids.clone();
-            merged.clear();
         }
 
+        // Only fetch from DB if we have cache misses
         if !missing.is_empty() {
             let fetched = inbox_json_to_workflow(db.batch_read_inbox(instance_id, &missing).await?);
             {
@@ -2936,9 +2924,8 @@ impl DAGRunner {
                         .entry(instance_id.0)
                         .or_insert_with(|| InstanceInboxCache {
                             values: HashMap::new(),
-                            updated_at: db_updated_at,
+                            updated_at: Utc::now(),
                         });
-                instance_cache.updated_at = db_updated_at;
                 for (node_id, values) in &fetched {
                     instance_cache
                         .values
@@ -3135,7 +3122,7 @@ impl DAGRunner {
                     if !writes.is_empty() {
                         let updated_at = match result.inbox_updated_at {
                             Some(updated_at) => updated_at,
-                            None => db.get_inbox_updated_at(instance_id).await?,
+                            None => Utc::now(),
                         };
                         Self::apply_inbox_writes_to_cache(
                             &self.instance_inboxes,
@@ -3185,7 +3172,7 @@ impl DAGRunner {
         if !inbox_writes.is_empty() {
             let updated_at = match result.inbox_updated_at {
                 Some(updated_at) => updated_at,
-                None => db.get_inbox_updated_at(instance_id).await?,
+                None => Utc::now(),
             };
             Self::apply_inbox_writes_to_cache(
                 &self.instance_inboxes,

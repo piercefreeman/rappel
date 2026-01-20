@@ -111,6 +111,14 @@ pub struct Config {
 
     /// Maximum age in milliseconds for a start claim before reclaiming it.
     pub start_claim_timeout_ms: u64,
+
+    /// Maximum completion plans to batch before flushing.
+    /// Higher values reduce DB round-trips but increase latency.
+    pub completion_batch_size: usize,
+
+    /// Completion flush interval in milliseconds.
+    /// Completions are flushed when batch is full OR this interval elapses.
+    pub completion_flush_interval_ms: u64,
 }
 
 /// Webapp server configuration
@@ -355,6 +363,16 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(60000);
 
+        let completion_batch_size = env::var("RAPPEL_COMPLETION_BATCH_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200);
+
+        let completion_flush_interval_ms = env::var("RAPPEL_COMPLETION_FLUSH_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
+
         let webapp = WebappConfig::from_env();
         let gc = GcConfig::from_env();
         let inbox_compaction = InboxCompactionConfig::from_env();
@@ -380,6 +398,8 @@ impl Config {
             gc,
             inbox_compaction,
             start_claim_timeout_ms,
+            completion_batch_size,
+            completion_flush_interval_ms,
         })
     }
 
@@ -409,6 +429,8 @@ impl Config {
             gc: GcConfig::default(),
             inbox_compaction: InboxCompactionConfig::default(),
             start_claim_timeout_ms: 60000,
+            completion_batch_size: 200,
+            completion_flush_interval_ms: 5,
         }
     }
 }
