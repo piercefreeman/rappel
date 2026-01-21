@@ -1711,8 +1711,8 @@ impl Default for RunnerConfig {
             worker_status_interval_ms: 10000,
             action_log_flush_interval_ms: 200,
             action_log_flush_batch_size: 1000,
-            completion_batch_size: 1,
-            completion_flush_interval_ms: 1,
+            completion_batch_size: 200,
+            completion_flush_interval_ms: 10,
             gc_interval_ms: None,
             gc_retention_seconds: 86400, // 24 hours
             gc_batch_size: 100,
