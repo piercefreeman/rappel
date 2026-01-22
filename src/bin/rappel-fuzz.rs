@@ -188,7 +188,24 @@ fn generate_case(rng: &mut StdRng, max_steps: usize) -> FuzzCase {
         &mut var_counter,
     );
 
-    emit_for_loop(rng, &mut lines, &mut list_vars, &mut trace_counter);
+    emit_for_loop(
+        rng,
+        &mut lines,
+        &mut list_vars,
+        &mut trace_counter,
+        &mut var_counter,
+    );
+
+    if rng.gen_bool(0.6) {
+        emit_while_loop(
+            rng,
+            &mut lines,
+            &mut int_vars,
+            &mut list_vars,
+            &mut trace_counter,
+            &mut var_counter,
+        );
+    }
 
     emit_try_except(
         rng,
@@ -369,6 +386,11 @@ fn next_var(counter: &mut usize) -> String {
     format!("v{counter}")
 }
 
+fn next_named_var(counter: &mut usize, prefix: &str) -> String {
+    *counter += 1;
+    format!("{prefix}_{counter}")
+}
+
 fn next_trace_id(counter: &mut i64) -> i64 {
     let trace_id = *counter;
     *counter += 1;
@@ -533,28 +555,84 @@ fn emit_for_loop(
     lines: &mut Vec<String>,
     list_vars: &mut Vec<String>,
     trace_counter: &mut i64,
+    var_counter: &mut usize,
 ) {
     let results_var = "loop_results".to_string();
     let trace_base = reserve_trace_block(trace_counter, 10_000);
     push_line(lines, 2, format!("{results_var} = []"));
-    push_line(lines, 2, "for item in items:");
-    let nested = rng.gen_bool(0.5);
+
+    let loop_variant = rng.gen_range(0..=2);
+    let mut trace_key = "item".to_string();
+    match loop_variant {
+        0 => {
+            push_line(lines, 2, "for item in items:");
+        }
+        1 => {
+            let idx_var = next_named_var(var_counter, "idx");
+            trace_key = idx_var.clone();
+            push_line(
+                lines,
+                2,
+                format!("for {idx_var}, item in enumerate(items):"),
+            );
+        }
+        _ => {
+            let idx_var = next_named_var(var_counter, "idx");
+            trace_key = idx_var.clone();
+            push_line(lines, 2, format!("for {idx_var} in range(len(items)):"));
+            push_line(lines, 3, format!("item = items[{idx_var}]"));
+        }
+    }
+
+    let nested = rng.gen_bool(0.45);
     if nested {
         push_line(lines, 3, "inner_sum = 0");
         push_line(lines, 3, "for other in items:");
-        let trace_expr = format!("{trace_base} + 5000 + item * 100 + other");
+        let trace_expr = format!("{trace_base} + 5000 + {trace_key} * 100 + other");
         let call = format!("add(a=inner_sum, b=other, trace_id={trace_expr})");
         push_line(lines, 4, format!("inner_sum = await {call}"));
         push_line(lines, 3, format!("{results_var}.append(inner_sum)"));
+    } else if rng.gen_bool(0.35) {
+        let trace_a = format!("{trace_base} + 6200 + {trace_key}");
+        let trace_b = format!("{trace_base} + 6400 + {trace_key}");
+        push_line(lines, 3, "proc_a, proc_b = await asyncio.gather(");
+        push_line(
+            lines,
+            4,
+            format!("add(a=item, b=factor, trace_id={trace_a}),"),
+        );
+        push_line(lines, 4, format!("negate(value=item, trace_id={trace_b}),"));
+        push_line(lines, 4, "return_exceptions=True,");
+        push_line(lines, 3, ")");
+        push_line(lines, 3, format!("{results_var}.append(proc_a)"));
+        push_line(lines, 3, format!("{results_var}.append(proc_b)"));
     } else {
-        let trace_expr = format!("{trace_base} + 5000 + item");
-        let call = format!("add(a=item, b=factor, trace_id={trace_expr})");
-        push_line(lines, 3, format!("processed = await {call}"));
+        if rng.gen_bool(0.4) {
+            let trace_pos = format!("{trace_base} + 5200 + {trace_key}");
+            let trace_neg = format!("{trace_base} + 5400 + {trace_key}");
+            push_line(lines, 3, "if item > 0:");
+            push_line(
+                lines,
+                4,
+                format!("processed = await add(a=item, b=factor, trace_id={trace_pos})"),
+            );
+            push_line(lines, 3, "else:");
+            push_line(
+                lines,
+                4,
+                format!("processed = await add(a=item, b=-factor, trace_id={trace_neg})"),
+            );
+        } else {
+            let trace_expr = format!("{trace_base} + 5600 + {trace_key}");
+            let call = format!("add(a=item, b=factor, trace_id={trace_expr})");
+            push_line(lines, 3, format!("processed = await {call}"));
+        }
         push_line(lines, 3, format!("{results_var}.append(processed)"));
     }
+
     if rng.gen_bool(0.6) {
-        let trace_raise = format!("{trace_base} + 9000 + item");
-        let trace_fallback = format!("{trace_base} + 9500 + item");
+        let trace_raise = format!("{trace_base} + 9000 + {trace_key}");
+        let trace_fallback = format!("{trace_base} + 9500 + {trace_key}");
         push_line(lines, 3, "try:");
         push_line(
             lines,
@@ -571,6 +649,88 @@ fn emit_for_loop(
         );
         push_line(lines, 3, format!("{results_var}.append(failed)"));
     }
+    list_vars.push(results_var);
+}
+
+fn emit_while_loop(
+    rng: &mut StdRng,
+    lines: &mut Vec<String>,
+    int_vars: &mut Vec<String>,
+    list_vars: &mut Vec<String>,
+    trace_counter: &mut i64,
+    var_counter: &mut usize,
+) {
+    let results_var = next_named_var(var_counter, "while_results");
+    let idx_var = next_named_var(var_counter, "idx");
+    let limit_var = next_named_var(var_counter, "limit");
+    let trace_base = reserve_trace_block(trace_counter, 15_000);
+
+    push_line(lines, 2, format!("{results_var} = []"));
+    push_line(lines, 2, format!("{idx_var} = 0"));
+    push_line(lines, 2, format!("{limit_var} = len(items)"));
+    push_line(lines, 2, format!("while {idx_var} < {limit_var}:"));
+    push_line(lines, 3, format!("current = items[{idx_var}]"));
+
+    if rng.gen_bool(0.4) {
+        push_line(lines, 3, "if current < 0:");
+        push_line(lines, 4, format!("{idx_var} = {idx_var} + 1"));
+        push_line(lines, 4, "continue");
+    }
+
+    if rng.gen_bool(0.3) {
+        push_line(lines, 3, format!("if {idx_var} == 2:"));
+        push_line(lines, 4, "break");
+    }
+
+    if rng.gen_bool(0.35) {
+        let trace_a = format!("{trace_base} + 12000 + {idx_var}");
+        let trace_b = format!("{trace_base} + 12200 + {idx_var}");
+        push_line(lines, 3, "proc_a, proc_b = await asyncio.gather(");
+        push_line(
+            lines,
+            4,
+            format!("add(a=current, b=factor, trace_id={trace_a}),"),
+        );
+        push_line(
+            lines,
+            4,
+            format!("negate(value=current, trace_id={trace_b}),"),
+        );
+        push_line(lines, 4, "return_exceptions=True,");
+        push_line(lines, 3, ")");
+        push_line(lines, 3, format!("{results_var}.append(proc_a)"));
+        push_line(lines, 3, format!("{results_var}.append(proc_b)"));
+    } else {
+        let trace_expr = format!("{trace_base} + 12400 + {idx_var}");
+        let call = format!("add(a=current, b=factor, trace_id={trace_expr})");
+        push_line(lines, 3, format!("processed = await {call}"));
+        push_line(lines, 3, format!("{results_var}.append(processed)"));
+    }
+
+    if rng.gen_bool(0.5) {
+        let trace_raise = format!("{trace_base} + 13000 + {idx_var}");
+        let trace_fallback = format!("{trace_base} + 13500 + {idx_var}");
+        push_line(lines, 3, "try:");
+        push_line(
+            lines,
+            4,
+            format!(
+                "failed = await self.run_action(raise_error(kind=0, trace_id={trace_raise}), retry=RetryPolicy(attempts=1))"
+            ),
+        );
+        push_line(lines, 3, "except ValueError:");
+        push_line(
+            lines,
+            4,
+            format!("failed = await add(a=current, b=factor, trace_id={trace_fallback})"),
+        );
+        push_line(lines, 3, format!("{results_var}.append(failed)"));
+    }
+
+    push_line(lines, 3, format!("{idx_var} = {idx_var} + 1"));
+
+    int_vars.push(idx_var);
+    int_vars.push(limit_var);
     list_vars.push(results_var);
 }
 

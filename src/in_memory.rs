@@ -285,6 +285,16 @@ impl InMemoryWorkflowExecutor {
                         dispatches.push(dispatch);
                     }
                     ReadyNode::Barrier(node_id) => {
+                        if let Some(node) = self.dag.nodes.get(&node_id)
+                            && node.is_aggregator
+                            && node
+                                .aggregates_from
+                                .as_ref()
+                                .and_then(|source| self.dag.nodes.get(source))
+                                .is_some_and(|source_node| source_node.node_type == "parallel")
+                        {
+                            self.readiness_counts.insert(node_id.clone(), 0);
+                        }
                         let next_plan =
                             CompletionEngine::build_barrier_plan(self, &node_id).await?;
                         plan_queue.push_back(next_plan);

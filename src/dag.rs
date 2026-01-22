@@ -1625,7 +1625,9 @@ impl DAGConverter {
 
         // Ensure loop-exit join nodes forward loop-carried values to downstream uses.
         for node in dag.nodes.values() {
-            if node.node_type != "join" || !node.label.starts_with("end for ") {
+            if node.node_type != "join"
+                || !(node.label.starts_with("end for ") || node.label.starts_with("end while "))
+            {
                 continue;
             }
             let Some(targets) = node.targets.as_ref() else {
