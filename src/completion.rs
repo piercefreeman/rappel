@@ -5,7 +5,7 @@
 //! `completed_count == required_count`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -657,7 +657,7 @@ pub fn execute_inline_subgraph_with_options(
     instance_id: WorkflowInstanceId,
     options: InlineExecutionOptions,
 ) -> Result<CompletionPlan, CompletionError> {
-    info!(
+    debug!(
         completed_node_id = %completed_node_id,
         completed_result = ?completed_result,
         spread_index = ?ctx.spread_index,
@@ -665,7 +665,7 @@ pub fn execute_inline_subgraph_with_options(
         existing_inbox_keys = ?ctx.existing_inbox.keys().collect::<Vec<_>>(),
         subgraph_inline_nodes = ?subgraph.inline_nodes,
         subgraph_frontier_nodes = ?subgraph.frontier_nodes.iter().map(|f| &f.node_id).collect::<Vec<_>>(),
-        "DEBUG: execute_inline_subgraph START"
+        "execute_inline_subgraph START"
     );
     let mut plan = CompletionPlan::new(completed_node_id.to_string());
     let helper = DAGHelper::new(dag);
@@ -825,24 +825,24 @@ pub fn execute_inline_subgraph_with_options(
 
         if is_frontier {
             // Mark as reachable frontier with loop-back info
-            info!(
+            debug!(
                 node_id = %node_id,
                 reached_via_loop_back = reached_via_loop_back,
                 node_type = %node.node_type,
-                "DEBUG: reached frontier node"
+                "reached frontier node"
             );
             reachable_frontiers.insert(node_id.clone(), reached_via_loop_back);
             // Don't traverse past frontier nodes
         } else {
             // This is an inline node - execute it
             let result = execute_inline_node(node, &inline_scope);
-            info!(
+            debug!(
                 node_id = %node.id,
                 node_type = %node.node_type,
                 target = ?node.target,
                 result = ?result,
                 scope_keys = ?inline_scope.keys().collect::<Vec<_>>(),
-                "DEBUG: executed inline node (completion)"
+                "executed inline node (completion)"
             );
             let mut inserted_targets = false;
             if (node.node_type == "assignment" || node.node_type == "fn_call")
@@ -863,12 +863,12 @@ pub fn execute_inline_subgraph_with_options(
 
                 for (idx, target) in targets.iter().enumerate() {
                     let value = values.get(idx).cloned().unwrap_or(WorkflowValue::Null);
-                    info!(
+                    debug!(
                         node_id = %node.id,
                         target = %target,
                         old_value = ?inline_scope.get(target),
                         new_value = ?value,
-                        "DEBUG: scope update (multi-target)"
+                        "scope update (multi-target)"
                     );
                     inline_scope.insert(target.clone(), value);
                     updated_vars.insert(target.clone());
@@ -882,20 +882,20 @@ pub fn execute_inline_subgraph_with_options(
                     || node.node_type == "fn_call")
                 && let Some(ref target) = node.target
             {
-                info!(
+                debug!(
                     node_id = %node.id,
                     target = %target,
                     old_value = ?inline_scope.get(target),
                     new_value = ?result,
-                    "DEBUG: scope update"
+                    "scope update"
                 );
                 inline_scope.insert(target.clone(), result);
                 updated_vars.insert(target.clone());
-                info!(
+                debug!(
                     node_id = %node.id,
                     target = %target,
                     inserted_value = ?inline_scope.get(target),
-                    "DEBUG: scope after insert"
+                    "scope after insert"
                 );
             }
             executed_inline.push(node_id.clone());
@@ -923,21 +923,21 @@ pub fn execute_inline_subgraph_with_options(
         }
     }
 
-    info!(
+    debug!(
         completed_node_id = %completed_node_id,
         executed_inline_count = executed_inline.len(),
         executed_inline_nodes = ?executed_inline,
         reachable_frontiers_count = reachable_frontiers.len(),
         reachable_frontiers = ?reachable_frontiers.keys().collect::<Vec<_>>(),
         inline_scope_keys = ?inline_scope.keys().collect::<Vec<_>>(),
-        "DEBUG: BFS traversal complete"
+        "BFS traversal complete"
     );
     // Log the full inline scope after traversal
     for (var, val) in &inline_scope {
-        info!(
+        debug!(
             variable = %var,
             value = ?val,
-            "DEBUG: inline scope variable after BFS"
+            "inline scope variable after BFS"
         );
     }
 

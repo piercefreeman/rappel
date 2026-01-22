@@ -4,8 +4,8 @@
 //! with rolling window statistics (configurable, default 60 seconds).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// A single timing sample with timestamp.
@@ -139,31 +139,22 @@ pub struct LifecycleStatsSnapshot {
 }
 
 impl LifecycleStatsSnapshot {
-    /// Log all stats at info level.
-    pub fn log(&self) {
-        tracing::info!(
-            db_fetch = %self.db_fetch.format(),
-            dispatch = %self.dispatch_to_worker.format(),
-            "dequeue_stats"
-        );
-        tracing::info!(
-            roundtrip = %self.worker_roundtrip.format(),
-            execution = %self.worker_execution.format(),
-            "worker_stats"
-        );
-        tracing::info!(
-            channel = %self.channel_wait.format(),
-            batcher = %self.batcher_wait.format(),
-            db_write = %self.completion_db_write.format(),
-            inline = %self.inline_execution.format(),
-            subgraph = %self.subgraph_analysis.format(),
-            "completion_stats"
-        );
-        tracing::info!(
-            dequeue = %self.total_dequeue.format(),
-            completion = %self.total_completion.format(),
-            "total_stats"
-        );
+    /// Format all stats as a multi-line string for logging.
+    pub fn format(&self) -> String {
+        format!(
+            "\n  dequeue:     db_fetch={} dispatch={}\n  worker:      roundtrip={} execution={}\n  completion:  channel={} batcher={} db_write={} inline={} subgraph={}\n  totals:      dequeue={} completion={}",
+            self.db_fetch.format(),
+            self.dispatch_to_worker.format(),
+            self.worker_roundtrip.format(),
+            self.worker_execution.format(),
+            self.channel_wait.format(),
+            self.batcher_wait.format(),
+            self.completion_db_write.format(),
+            self.inline_execution.format(),
+            self.subgraph_analysis.format(),
+            self.total_dequeue.format(),
+            self.total_completion.format(),
+        )
     }
 }
 
@@ -316,7 +307,11 @@ impl LifecycleStats {
     /// Get a snapshot of all current statistics.
     pub fn snapshot(&self) -> LifecycleStatsSnapshot {
         LifecycleStatsSnapshot {
-            db_fetch: self.db_fetch.lock().map(|mut m| m.stats()).unwrap_or_default(),
+            db_fetch: self
+                .db_fetch
+                .lock()
+                .map(|mut m| m.stats())
+                .unwrap_or_default(),
             dispatch_to_worker: self
                 .dispatch_to_worker
                 .lock()
@@ -385,13 +380,12 @@ impl LifecycleStats {
         let (processed, stale, dispatched) = self.take_counters();
 
         tracing::info!(
-            completions_processed = processed,
-            completions_stale = stale,
-            actions_dispatched = dispatched,
-            "lifecycle_counters"
+            "lifecycle_stats: processed={} stale={} dispatched={}{}",
+            processed,
+            stale,
+            dispatched,
+            snapshot.format()
         );
-
-        snapshot.log();
     }
 }
 

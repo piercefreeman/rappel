@@ -716,6 +716,7 @@ pub struct WorkQueueHandler {
 }
 
 impl WorkQueueHandler {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         db: Arc<Database>,
         worker_pool: Arc<PythonWorkerPool>,
@@ -844,11 +845,13 @@ impl WorkQueueHandler {
 
         // Record lifecycle stats
         let total_duration = total_start.elapsed();
-        self.lifecycle_stats.record_db_fetch(Duration::from_micros(db_us));
+        self.lifecycle_stats
+            .record_db_fetch(Duration::from_micros(db_us));
         self.lifecycle_stats
             .record_dispatch_to_worker(Duration::from_micros(dispatch_us));
         self.lifecycle_stats.record_total_dequeue(total_duration);
-        self.lifecycle_stats.increment_actions_dispatched(action_count as u64);
+        self.lifecycle_stats
+            .increment_actions_dispatched(action_count as u64);
 
         Ok(dispatched)
     }
@@ -989,7 +992,7 @@ impl WorkQueueHandler {
             }
         }
 
-        info!(
+        debug!(
             barrier_id = %node_id,
             total_us = total_start.elapsed().as_micros() as u64,
             inbox_us = inbox_us,
