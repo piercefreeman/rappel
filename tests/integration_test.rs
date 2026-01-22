@@ -60,6 +60,8 @@ const PARALLEL_BLOCK_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_
 const ISEXCEPTION_WORKFLOW_MODULE: &str = include_str!("fixtures/integration_isexception.py");
 const NESTED_TRY_LOOP_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_nested_try_loop.py");
+const HELPER_EARLY_RETURN_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_helper_early_return.py");
 const EXCEPTION_WITH_SUCCESS_FAILURE_SCRIPT: &str = r#"
 import asyncio
 import os
@@ -3532,6 +3534,87 @@ async fn isexception_workflow_executes() -> Result<()> {
         message,
         Some("value:boom:True".to_string()),
         "unexpected workflow result"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Helper Early Return Test
+// =============================================================================
+// This test reproduces a bug where helper functions with multiple early-return
+// branches cause the continuation to wait for ALL branches instead of just ONE.
+
+const REGISTER_HELPER_EARLY_RETURN_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_helper_early_return import HelperEarlyReturnWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = HelperEarlyReturnWorkflow()
+    # Pass valid items and user_id - should take the "process_items" path
+    # and NOT wait for raise_validation_error or raise_auth_error
+    result = await wf.run(items=["a", "b", "c"], user_id="valid")
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that helper functions with early returns don't block the continuation.
+///
+/// This reproduces a bug where:
+/// 1. Helper function `do_processing` has 3 mutually exclusive paths:
+///    - raise_validation_error (if no items)
+///    - raise_auth_error (if no auth)
+///    - process_items (main path)
+/// 2. When the helper is inlined, ALL 3 paths get edges to the continuation
+/// 3. The continuation `format_result` incorrectly waits for ALL 3 to complete
+/// 4. Since only ONE path executes, the workflow stalls
+///
+/// Expected: With items=["a","b","c"] and user_id="valid", the workflow should
+/// execute: check_has_items -> check_has_auth -> process_items -> format_result
+/// Result should be "final:processed:3"
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn helper_early_return_workflow_does_not_stall() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_helper_early_return.py",
+                HELPER_EARLY_RETURN_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_HELPER_EARLY_RETURN_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "helperearlyreturnworkflow",
+        user_module: "integration_helper_early_return",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // This will stall if the bug is present - the continuation (format_result)
+    // will wait for raise_validation_error and raise_auth_error which never execute
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("final:processed:3".to_string()),
+        "unexpected workflow result - workflow may have stalled waiting for early-return branches"
     );
 
     harness.shutdown().await?;
