@@ -1351,4 +1351,31 @@ mod tests {
 
         bridge.shutdown().await;
     }
+
+    #[test]
+    fn test_action_result_success_false_deserialize() {
+        use prost::Message;
+
+        // These are the bytes from Python when success=False is set
+        // The success field is NOT included because it's the default value in proto3
+        let success_false_bytes: &[u8] = &[0x0a, 0x04, 0x74, 0x65, 0x73, 0x74];
+
+        // These are the bytes from Python when success=True is set
+        let success_true_bytes: &[u8] = &[0x0a, 0x04, 0x74, 0x65, 0x73, 0x74, 0x10, 0x01];
+
+        // Deserialize success=False case
+        let result_false =
+            proto::ActionResult::decode(success_false_bytes).expect("decode success=false");
+        assert_eq!(result_false.action_id, "test");
+        assert!(
+            !result_false.success,
+            "success should be false when field is omitted (proto3 default)"
+        );
+
+        // Deserialize success=True case
+        let result_true =
+            proto::ActionResult::decode(success_true_bytes).expect("decode success=true");
+        assert_eq!(result_true.action_id, "test");
+        assert!(result_true.success, "success should be true when field is 1");
+    }
 }
