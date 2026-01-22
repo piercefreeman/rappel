@@ -1376,6 +1376,9 @@ mod tests {
         let result_true =
             proto::ActionResult::decode(success_true_bytes).expect("decode success=true");
         assert_eq!(result_true.action_id, "test");
-        assert!(result_true.success, "success should be true when field is 1");
+        assert!(
+            result_true.success,
+            "success should be true when field is 1"
+        );
     }
 }

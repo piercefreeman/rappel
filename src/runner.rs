@@ -975,7 +975,10 @@ impl WorkQueueHandler {
 
         // Execute completion plan in single atomic transaction
         let db_start = std::time::Instant::now();
-        let results = self.db.execute_completion_plans_batch(vec![(instance_id, plan)]).await?;
+        let results = self
+            .db
+            .execute_completion_plans_batch(vec![(instance_id, plan)])
+            .await?;
         let result = results.into_iter().next().unwrap_or_default();
         let db_us = db_start.elapsed().as_micros() as u64;
 
@@ -1081,7 +1084,10 @@ impl WorkQueueHandler {
         let inbox_writes = plan.inbox_writes.clone();
 
         // Execute completion plan in single atomic transaction
-        let results = self.db.execute_completion_plans_batch(vec![(instance_id, plan)]).await?;
+        let results = self
+            .db
+            .execute_completion_plans_batch(vec![(instance_id, plan)])
+            .await?;
         let result = results.into_iter().next().unwrap_or_default();
 
         if !result.was_stale {
@@ -2748,7 +2754,9 @@ impl DAGRunner {
         );
 
         // Execute completion plan
-        let results = db.execute_completion_plans_batch(vec![(instance_id, plan)]).await?;
+        let results = db
+            .execute_completion_plans_batch(vec![(instance_id, plan)])
+            .await?;
         let result = results.into_iter().next().unwrap_or_default();
 
         info!(
