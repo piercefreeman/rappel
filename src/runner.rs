@@ -975,7 +975,11 @@ impl WorkQueueHandler {
 
         // Execute completion plan in single atomic transaction
         let db_start = std::time::Instant::now();
-        let result = self.db.execute_completion_plan(instance_id, plan).await?;
+        let results = self
+            .db
+            .execute_completion_plans_batch(vec![(instance_id, plan)])
+            .await?;
+        let result = results.into_iter().next().unwrap_or_default();
         let db_us = db_start.elapsed().as_micros() as u64;
 
         if !result.was_stale {
@@ -1080,7 +1084,11 @@ impl WorkQueueHandler {
         let inbox_writes = plan.inbox_writes.clone();
 
         // Execute completion plan in single atomic transaction
-        let result = self.db.execute_completion_plan(instance_id, plan).await?;
+        let results = self
+            .db
+            .execute_completion_plans_batch(vec![(instance_id, plan)])
+            .await?;
+        let result = results.into_iter().next().unwrap_or_default();
 
         if !result.was_stale {
             if !inbox_writes.is_empty() {
@@ -1400,11 +1408,12 @@ impl CompletionBatcher {
         plan: CompletionPlan,
     ) -> RunnerResult<crate::completion::CompletionResult> {
         if !self.batching_enabled {
-            return self
+            let results = self
                 .db
-                .execute_completion_plan(instance_id, plan)
+                .execute_completion_plans_batch(vec![(instance_id, plan)])
                 .await
-                .map_err(RunnerError::Database);
+                .map_err(RunnerError::Database)?;
+            return Ok(results.into_iter().next().unwrap_or_default());
         }
 
         let (response_tx, response_rx) = oneshot::channel();
@@ -1473,7 +1482,10 @@ impl CompletionBatcher {
                     err
                 );
                 for req in batch_requests {
-                    let result = db.execute_completion_plan(req.instance_id, req.plan).await;
+                    let result = db
+                        .execute_completion_plans_batch(vec![(req.instance_id, req.plan)])
+                        .await
+                        .map(|r| r.into_iter().next().unwrap_or_default());
                     let _ = req.response_tx.send(result);
                 }
             }
@@ -2742,7 +2754,10 @@ impl DAGRunner {
         );
 
         // Execute completion plan
-        let result = db.execute_completion_plan(instance_id, plan).await?;
+        let results = db
+            .execute_completion_plans_batch(vec![(instance_id, plan)])
+            .await?;
+        let result = results.into_iter().next().unwrap_or_default();
 
         info!(
             barrier_id = %node_id,
@@ -3249,9 +3264,10 @@ impl DAGRunner {
 
         let db = &self.completion_handler.db;
         let inbox_writes = start_plan.inbox_writes.clone();
-        let result = db
-            .execute_completion_plan(instance_id, start_plan.plan)
+        let results = db
+            .execute_completion_plans_batch(vec![(instance_id, start_plan.plan)])
             .await?;
+        let result = results.into_iter().next().unwrap_or_default();
         if !inbox_writes.is_empty() {
             let updated_at = match result.inbox_updated_at {
                 Some(updated_at) => updated_at,

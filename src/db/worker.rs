@@ -1889,21 +1889,31 @@ impl Database {
         let mut timings = BatchDbTimings::default();
 
         let mut batch_plans = Vec::with_capacity(plans.len());
-        let mut action_update_plan_indices = Vec::new();
-        let mut action_ids = Vec::new();
-        let mut delivery_tokens = Vec::new();
-        let mut result_payloads = Vec::new();
-        let mut pool_ids = Vec::new();
-        let mut worker_ids = Vec::new();
-        let mut worker_duration_ms_vec = Vec::new();
+        // Separate success and failure action updates
+        let mut success_action_plan_indices = Vec::new();
+        let mut success_action_ids = Vec::new();
+        let mut success_delivery_tokens = Vec::new();
+        let mut success_result_payloads = Vec::new();
+        let mut success_pool_ids = Vec::new();
+        let mut success_worker_ids = Vec::new();
+        let mut success_worker_duration_ms_vec = Vec::new();
+
+        let mut failure_action_plan_indices = Vec::new();
+        let mut failure_action_ids = Vec::new();
+        let mut failure_delivery_tokens = Vec::new();
+        let mut failure_result_payloads = Vec::new();
+        let mut failure_error_messages: Vec<Option<String>> = Vec::new();
+        let mut failure_pool_ids = Vec::new();
+        let mut failure_worker_ids = Vec::new();
+        let mut failure_worker_duration_ms_vec = Vec::new();
 
         for (index, (instance_id, plan)) in plans.into_iter().enumerate() {
             let CompletionPlan {
                 completed_action_id,
                 delivery_token,
-                success: _,
+                success,
                 result_payload,
-                error_message: _,
+                error_message,
                 pool_id,
                 worker_id,
                 worker_duration_ms,
@@ -1941,13 +1951,24 @@ impl Database {
                 .collect();
 
             if let (Some(action_id), Some(token)) = (completed_action_id, delivery_token) {
-                action_update_plan_indices.push(index);
-                action_ids.push(action_id.0);
-                delivery_tokens.push(token);
-                result_payloads.push(result_payload);
-                pool_ids.push(pool_id);
-                worker_ids.push(worker_id);
-                worker_duration_ms_vec.push(worker_duration_ms);
+                if success {
+                    success_action_plan_indices.push(index);
+                    success_action_ids.push(action_id.0);
+                    success_delivery_tokens.push(token);
+                    success_result_payloads.push(result_payload);
+                    success_pool_ids.push(pool_id);
+                    success_worker_ids.push(worker_id);
+                    success_worker_duration_ms_vec.push(worker_duration_ms);
+                } else {
+                    failure_action_plan_indices.push(index);
+                    failure_action_ids.push(action_id.0);
+                    failure_delivery_tokens.push(token);
+                    failure_result_payloads.push(result_payload);
+                    failure_error_messages.push(error_message);
+                    failure_pool_ids.push(pool_id);
+                    failure_worker_ids.push(worker_id);
+                    failure_worker_duration_ms_vec.push(worker_duration_ms);
+                }
             }
 
             batch_plans.push(BatchPlan {
@@ -1965,7 +1986,8 @@ impl Database {
 
         let mut is_fresh = vec![true; batch_plans.len()];
 
-        if !action_ids.is_empty() {
+        // Process successful action completions: DELETE from queue, INSERT log with success=true
+        if !success_action_ids.is_empty() {
             let step_start = std::time::Instant::now();
             let rows = sqlx::query(
                 r#"
@@ -2012,17 +2034,17 @@ impl Database {
                 SELECT ord FROM deleted
                 "#,
             )
-            .bind(&action_ids)
-            .bind(&delivery_tokens)
-            .bind(&result_payloads)
-            .bind(&pool_ids)
-            .bind(&worker_ids)
-            .bind(&worker_duration_ms_vec)
+            .bind(&success_action_ids)
+            .bind(&success_delivery_tokens)
+            .bind(&success_result_payloads)
+            .bind(&success_pool_ids)
+            .bind(&success_worker_ids)
+            .bind(&success_worker_duration_ms_vec)
             .fetch_all(&mut *tx)
             .await?;
             timings.action_complete_us = step_start.elapsed().as_micros() as u64;
 
-            let mut updated = vec![false; action_update_plan_indices.len()];
+            let mut updated = vec![false; success_action_plan_indices.len()];
             for row in rows {
                 let ord: i64 = row.get(0);
                 if ord >= 1 {
@@ -2033,7 +2055,91 @@ impl Database {
                 }
             }
 
-            for (update_idx, plan_index) in action_update_plan_indices.iter().enumerate() {
+            for (update_idx, plan_index) in success_action_plan_indices.iter().enumerate() {
+                if !updated[update_idx] {
+                    is_fresh[*plan_index] = false;
+                    results[*plan_index] = CompletionResult::stale();
+                }
+            }
+        }
+
+        // Process failed action completions: UPDATE queue to status='failed', INSERT log with success=false
+        if !failure_action_ids.is_empty() {
+            let step_start = std::time::Instant::now();
+            let rows = sqlx::query(
+                r#"
+                WITH updates AS (
+                    SELECT * FROM UNNEST($1::uuid[], $2::uuid[], $3::bytea[], $4::text[], $5::uuid[], $6::bigint[], $7::bigint[])
+                        WITH ORDINALITY
+                        AS u(action_id, delivery_token, result_payload, error_message, pool_id, worker_id, worker_duration_ms, ord)
+                ),
+                updated AS (
+                    UPDATE action_queue aq
+                    SET status = 'failed',
+                        success = false,
+                        result_payload = updates.result_payload,
+                        last_error = updates.error_message,
+                        completed_at = NOW()
+                    FROM updates
+                    WHERE aq.id = updates.action_id
+                      AND aq.delivery_token = updates.delivery_token
+                      AND aq.status = 'dispatched'
+                    RETURNING updates.ord,
+                              aq.id,
+                              aq.instance_id,
+                              aq.attempt_number,
+                              aq.dispatched_at,
+                              aq.module_name,
+                              aq.action_name,
+                              aq.node_id,
+                              aq.dispatch_payload,
+                              aq.enqueued_at,
+                              updates.result_payload,
+                              updates.error_message,
+                              updates.pool_id,
+                              updates.worker_id,
+                              updates.worker_duration_ms
+                ),
+                log_insert AS (
+                    INSERT INTO action_log_queue (
+                        action_id, instance_id, attempt_number, dispatched_at,
+                        completed_at, success, result_payload, error_message, duration_ms,
+                        module_name, action_name, node_id, dispatch_payload,
+                        pool_id, worker_id, enqueued_at, worker_duration_ms
+                    )
+                    SELECT id, instance_id, attempt_number, dispatched_at,
+                           NOW(), false, result_payload, error_message,
+                           EXTRACT(EPOCH FROM (NOW() - dispatched_at)) * 1000,
+                           module_name, action_name, node_id, dispatch_payload,
+                           pool_id, worker_id, enqueued_at, worker_duration_ms
+                    FROM updated
+                )
+                SELECT ord FROM updated
+                "#,
+            )
+            .bind(&failure_action_ids)
+            .bind(&failure_delivery_tokens)
+            .bind(&failure_result_payloads)
+            .bind(&failure_error_messages)
+            .bind(&failure_pool_ids)
+            .bind(&failure_worker_ids)
+            .bind(&failure_worker_duration_ms_vec)
+            .fetch_all(&mut *tx)
+            .await?;
+            timings.action_complete_us += step_start.elapsed().as_micros() as u64;
+
+            let mut updated = vec![false; failure_action_plan_indices.len()];
+            for row in rows {
+                let ord: i64 = row.get(0);
+                if ord >= 1 {
+                    let idx = (ord - 1) as usize;
+                    if idx < updated.len() {
+                        updated[idx] = true;
+                    }
+                }
+            }
+
+            for (update_idx, plan_index) in failure_action_plan_indices.iter().enumerate() {
                 if !updated[update_idx] {
                     is_fresh[*plan_index] = false;
                     results[*plan_index] = CompletionResult::stale();
@@ -2611,7 +2717,8 @@ impl Database {
 
         debug!(
             plans = results.len(),
-            actions = action_ids.len(),
+            success_actions = success_action_ids.len(),
+            failure_actions = failure_action_ids.len(),
             inbox_writes = inbox_write_count,
             readiness_resets = readiness_reset_count,
             readiness_inits = readiness_init_count,
@@ -2633,426 +2740,6 @@ impl Database {
         );
 
         Ok(results)
-    }
-
-    /// Execute a completion plan in a single atomic transaction.
-    ///
-    /// This is the core operation of the unified readiness model. It atomically:
-    /// 1. Marks the completed action as complete (with idempotency check)
-    /// 2. Writes inbox entries for all frontier nodes
-    /// 3. Increments readiness counters for frontier nodes
-    /// 4. Enqueues nodes when their readiness reaches the required count
-    /// 5. Completes the workflow instance if output node was reached
-    ///
-    /// If the completion is stale (duplicate delivery), the transaction is rolled
-    /// back and `CompletionResult::stale()` is returned.
-    pub async fn execute_completion_plan(
-        &self,
-        instance_id: WorkflowInstanceId,
-        plan: CompletionPlan,
-    ) -> DbResult<CompletionResult> {
-        let start = std::time::Instant::now();
-        let mut tx = self.pool.begin().await?;
-        let mut result = CompletionResult::default();
-
-        let CompletionPlan {
-            completed_action_id,
-            delivery_token,
-            success,
-            result_payload,
-            error_message,
-            pool_id,
-            worker_id,
-            worker_duration_ms,
-            inbox_writes,
-            readiness_resets,
-            readiness_inits,
-            readiness_increments,
-            barrier_enqueues,
-            instance_completion,
-            ..
-        } = plan;
-
-        let mut direct_increments = Vec::new();
-        let mut tracked_increments = Vec::new();
-        for increment in readiness_increments {
-            if increment.required_count == 1 && !increment.is_aggregator {
-                direct_increments.push(increment);
-            } else {
-                tracked_increments.push(increment);
-            }
-        }
-
-        let mut direct_nodes = HashSet::new();
-        for increment in &direct_increments {
-            direct_nodes.insert(increment.node_id.clone());
-        }
-
-        let readiness_resets: Vec<String> = readiness_resets
-            .into_iter()
-            .filter(|node_id| !direct_nodes.contains(node_id))
-            .collect();
-        let readiness_inits: Vec<_> = readiness_inits
-            .into_iter()
-            .filter(|init| !direct_nodes.contains(&init.node_id))
-            .collect();
-
-        // 1. Mark the completed action as complete (idempotent guard).
-        // On success: delete action row and enqueue log entry.
-        // On failure: update status to 'failed' so retry logic can process it.
-        if let Some(action_id) = completed_action_id
-            && let Some(delivery_token) = delivery_token
-        {
-            let row = if success {
-                // Success: delete action row and enqueue log entry.
-                sqlx::query(
-                    r#"
-                    WITH deleted AS (
-                        DELETE FROM action_queue
-                        WHERE id = $1 AND delivery_token = $2 AND status = 'dispatched'
-                        RETURNING id, instance_id, attempt_number, dispatched_at,
-                                  module_name, action_name, node_id, dispatch_payload, enqueued_at
-                    ),
-                    log_insert AS (
-                        INSERT INTO action_log_queue (action_id, instance_id, attempt_number, dispatched_at,
-                                                completed_at, success, result_payload, error_message, duration_ms,
-                                                module_name, action_name, node_id, dispatch_payload,
-                                                pool_id, worker_id, enqueued_at, worker_duration_ms)
-                        SELECT id, instance_id, attempt_number, dispatched_at, NOW(), true, $3, NULL,
-                               EXTRACT(EPOCH FROM (NOW() - dispatched_at)) * 1000,
-                               module_name, action_name, node_id, dispatch_payload,
-                               $4, $5, enqueued_at, $6
-                        FROM deleted
-                    )
-                    SELECT COUNT(*) FROM deleted
-                    "#,
-                )
-                .bind(action_id.0)
-                .bind(delivery_token)
-                .bind(&result_payload)
-                .bind(pool_id)
-                .bind(worker_id)
-                .bind(worker_duration_ms)
-                .fetch_one(&mut *tx)
-                .await?
-            } else {
-                // Failure: UPDATE status so retry logic can process, INSERT log with full context
-                sqlx::query(
-                    r#"
-                    WITH updated AS (
-                        UPDATE action_queue
-                        SET status = 'failed',
-                            success = false,
-                            result_payload = $3,
-                            last_error = $4,
-                            completed_at = NOW()
-                        WHERE id = $1 AND delivery_token = $2 AND status = 'dispatched'
-                        RETURNING id, instance_id, attempt_number, dispatched_at,
-                                  module_name, action_name, node_id, dispatch_payload, enqueued_at
-                    ),
-                    log_insert AS (
-                        INSERT INTO action_log_queue (action_id, instance_id, attempt_number, dispatched_at,
-                                                completed_at, success, result_payload, error_message, duration_ms,
-                                                module_name, action_name, node_id, dispatch_payload,
-                                                pool_id, worker_id, enqueued_at, worker_duration_ms)
-                        SELECT id, instance_id, attempt_number, dispatched_at, NOW(), false, $3, $4,
-                               EXTRACT(EPOCH FROM (NOW() - dispatched_at)) * 1000,
-                               module_name, action_name, node_id, dispatch_payload,
-                               $5, $6, enqueued_at, $7
-                        FROM updated
-                    )
-                    SELECT COUNT(*) FROM updated
-                    "#,
-                )
-                .bind(action_id.0)
-                .bind(delivery_token)
-                .bind(&result_payload)
-                .bind(&error_message)
-                .bind(pool_id)
-                .bind(worker_id)
-                .bind(worker_duration_ms)
-                .fetch_one(&mut *tx)
-                .await?
-            };
-
-            let count: i64 = row.get(0);
-            if count == 0 {
-                // Stale or duplicate completion
-                return Ok(CompletionResult::stale());
-            }
-        }
-
-        // 2. Write inbox entries for all frontier nodes
-        for write in &inbox_writes {
-            if write.variable_name == "__loop_loop_8_i" {
-                debug!(
-                    target_node_id = %write.target_node_id,
-                    variable_name = %write.variable_name,
-                    value = ?write.value,
-                    source_node_id = %write.source_node_id,
-                    "DB writing __loop_loop_8_i to inbox"
-                );
-            }
-        }
-        if !inbox_writes.is_empty() {
-            let mut builder = QueryBuilder::<Postgres>::new(
-                "INSERT INTO node_inputs (instance_id, target_node_id, variable_name, value, source_node_id, spread_index)",
-            );
-            builder.push_values(&inbox_writes, |mut row, write| {
-                row.push_bind(instance_id.0)
-                    .push_bind(&write.target_node_id)
-                    .push_bind(&write.variable_name)
-                    .push_bind(write.value.to_json())
-                    .push_bind(&write.source_node_id)
-                    .push_bind(write.spread_index);
-            });
-            builder.build().execute(&mut *tx).await?;
-
-            let row = sqlx::query(
-                r#"
-                UPDATE workflow_instances
-                SET inbox_updated_at = NOW()
-                WHERE id = $1
-                RETURNING inbox_updated_at
-                "#,
-            )
-            .bind(instance_id.0)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(row) = row {
-                let updated_at: DateTime<Utc> = row.get(0);
-                result.inbox_updated_at = Some(updated_at);
-            }
-        }
-
-        // 2.5. Reset readiness for loop re-triggering (before increments)
-        if !readiness_resets.is_empty() {
-            sqlx::query(
-                r#"
-                UPDATE node_readiness
-                SET completed_count = 0, updated_at = NOW()
-                WHERE instance_id = $1 AND node_id = ANY($2)
-                "#,
-            )
-            .bind(instance_id.0)
-            .bind(&readiness_resets)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        // 2.75. Initialize readiness for frontier nodes (before increments)
-        if !readiness_inits.is_empty() {
-            let mut builder = QueryBuilder::<Postgres>::new(
-                "INSERT INTO node_readiness (instance_id, node_id, required_count, completed_count)",
-            );
-            builder.push_values(&readiness_inits, |mut row, init| {
-                row.push_bind(instance_id.0)
-                    .push_bind(&init.node_id)
-                    .push_bind(init.required_count)
-                    .push_bind(0i32);
-            });
-            builder.push(
-                " ON CONFLICT (instance_id, node_id) DO UPDATE SET required_count = EXCLUDED.required_count, completed_count = 0, updated_at = NOW()",
-            );
-            builder.build().execute(&mut *tx).await?;
-        }
-
-        #[derive(Debug)]
-        struct PendingEnqueue {
-            node_id: String,
-            module_name: String,
-            action_name: String,
-            dispatch_payload: Vec<u8>,
-            timeout_seconds: i32,
-            max_retries: i32,
-            backoff_kind: BackoffKind,
-            backoff_base_delay_ms: i32,
-            node_type: crate::completion::NodeType,
-            scheduled_at: Option<DateTime<Utc>>,
-        }
-
-        let mut pending_enqueues: Vec<PendingEnqueue> = Vec::new();
-
-        for increment in &direct_increments {
-            pending_enqueues.push(PendingEnqueue {
-                node_id: increment.node_id.clone(),
-                module_name: increment
-                    .module_name
-                    .clone()
-                    .unwrap_or_else(|| "__internal__".to_string()),
-                action_name: increment
-                    .action_name
-                    .clone()
-                    .unwrap_or_else(|| "__barrier__".to_string()),
-                dispatch_payload: increment.dispatch_payload.clone().unwrap_or_default(),
-                timeout_seconds: increment.timeout_seconds,
-                max_retries: increment.max_retries,
-                backoff_kind: increment.backoff_kind,
-                backoff_base_delay_ms: increment.backoff_base_delay_ms,
-                node_type: increment.node_type,
-                scheduled_at: increment.scheduled_at,
-            });
-        }
-
-        // 3. Increment readiness for frontier nodes, enqueue if ready
-        if !tracked_increments.is_empty() {
-            let mut builder = QueryBuilder::<Postgres>::new(
-                "INSERT INTO node_readiness (instance_id, node_id, required_count, completed_count)",
-            );
-            builder.push_values(&tracked_increments, |mut row, increment| {
-                row.push_bind(instance_id.0)
-                    .push_bind(&increment.node_id)
-                    .push_bind(increment.required_count)
-                    .push_bind(1i32);
-            });
-            builder.push(
-                " ON CONFLICT (instance_id, node_id) DO UPDATE SET completed_count = node_readiness.completed_count + 1, updated_at = NOW() RETURNING node_id, completed_count, required_count",
-            );
-            let rows: Vec<(String, i32, i32)> =
-                builder.build_query_as().fetch_all(&mut *tx).await?;
-
-            let mut increment_by_node: HashMap<String, &crate::completion::ReadinessIncrement> =
-                HashMap::new();
-            for increment in &tracked_increments {
-                increment_by_node.insert(increment.node_id.clone(), increment);
-            }
-
-            for (node_id, completed_count, required_count) in rows {
-                // Check for overflow (indicates a bug)
-                if completed_count > required_count {
-                    tx.rollback().await?;
-                    return Err(DbError::NotFound(format!(
-                        "Readiness overflow for node {}: {} > {}",
-                        node_id, completed_count, required_count
-                    )));
-                }
-
-                if completed_count == required_count
-                    && let Some(increment) = increment_by_node.get(&node_id)
-                {
-                    pending_enqueues.push(PendingEnqueue {
-                        node_id: increment.node_id.clone(),
-                        module_name: increment
-                            .module_name
-                            .clone()
-                            .unwrap_or_else(|| "__internal__".to_string()),
-                        action_name: increment
-                            .action_name
-                            .clone()
-                            .unwrap_or_else(|| "__barrier__".to_string()),
-                        dispatch_payload: increment.dispatch_payload.clone().unwrap_or_default(),
-                        timeout_seconds: increment.timeout_seconds,
-                        max_retries: increment.max_retries,
-                        backoff_kind: increment.backoff_kind,
-                        backoff_base_delay_ms: increment.backoff_base_delay_ms,
-                        node_type: increment.node_type,
-                        scheduled_at: increment.scheduled_at,
-                    });
-                }
-            }
-        }
-
-        // 3.5. Enqueue barriers directly (no readiness tracking)
-        for node_id in &barrier_enqueues {
-            pending_enqueues.push(PendingEnqueue {
-                node_id: node_id.clone(),
-                module_name: "__internal__".to_string(),
-                action_name: "__barrier__".to_string(),
-                dispatch_payload: Vec::new(),
-                timeout_seconds: 300,
-                max_retries: 3,
-                backoff_kind: BackoffKind::Exponential,
-                backoff_base_delay_ms: 1000,
-                node_type: crate::completion::NodeType::Barrier,
-                scheduled_at: Some(Utc::now()),
-            });
-        }
-
-        if !pending_enqueues.is_empty() {
-            let row = sqlx::query(
-                r#"
-                UPDATE workflow_instances
-                SET next_action_seq = next_action_seq + $2
-                WHERE id = $1
-                RETURNING next_action_seq - $2, priority
-                "#,
-            )
-            .bind(instance_id.0)
-            .bind(pending_enqueues.len() as i32)
-            .fetch_one(&mut *tx)
-            .await?;
-            let mut next_action_seq: i32 = row.get(0);
-            let priority: i32 = row.get(1);
-            let default_scheduled_at = Utc::now();
-
-            let mut builder = QueryBuilder::<Postgres>::new(
-                "INSERT INTO action_queue (instance_id, action_seq, module_name, action_name, dispatch_payload, timeout_seconds, max_retries, backoff_kind, backoff_base_delay_ms, node_id, node_type, scheduled_at, priority)",
-            );
-            builder.push_values(&pending_enqueues, |mut row, enqueue| {
-                let action_seq = next_action_seq;
-                next_action_seq += 1;
-                let scheduled_at = enqueue.scheduled_at.unwrap_or(default_scheduled_at);
-                row.push_bind(instance_id.0)
-                    .push_bind(action_seq)
-                    .push_bind(&enqueue.module_name)
-                    .push_bind(&enqueue.action_name)
-                    .push_bind(&enqueue.dispatch_payload)
-                    .push_bind(enqueue.timeout_seconds)
-                    .push_bind(enqueue.max_retries)
-                    .push_bind(enqueue.backoff_kind.as_str())
-                    .push_bind(enqueue.backoff_base_delay_ms)
-                    .push_bind(&enqueue.node_id)
-                    .push_bind(enqueue.node_type.as_str())
-                    .push_bind(scheduled_at)
-                    .push_bind(priority);
-            });
-            builder.build().execute(&mut *tx).await?;
-
-            for enqueue in &pending_enqueues {
-                result.newly_ready_nodes.push(enqueue.node_id.clone());
-            }
-        }
-
-        // 4. Complete workflow instance if output node was reached
-        if let Some(completion) = &instance_completion {
-            let rows = sqlx::query(
-                r#"
-                UPDATE workflow_instances
-                SET status = 'completed',
-                    result_payload = $2,
-                    completed_at = NOW()
-                WHERE id = $1 AND status = 'running'
-                "#,
-            )
-            .bind(instance_id.0)
-            .bind(&completion.result_payload)
-            .execute(&mut *tx)
-            .await?;
-
-            if rows.rows_affected() > 0 {
-                result.workflow_completed = true;
-                debug!(
-                    instance_id = %instance_id.0,
-                    "workflow instance completed"
-                );
-            }
-            // If rows_affected == 0, another path already completed it (ok)
-        }
-
-        // 5. Commit the transaction
-        tx.commit().await?;
-
-        tracing::debug!(
-            elapsed_ms = start.elapsed().as_millis() as u64,
-            inbox_writes = inbox_writes.len(),
-            readiness_inits = readiness_inits.len(),
-            readiness_increments = tracked_increments.len(),
-            direct_enqueues = direct_increments.len(),
-            barrier_enqueues = barrier_enqueues.len(),
-            "execute_completion_plan"
-        );
-
-        Ok(result)
     }
 
     // ========================================================================
