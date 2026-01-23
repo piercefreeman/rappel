@@ -131,7 +131,8 @@ By default we will only try explicit actions one time if there is an explicit ex
 
 ## Project Status
 
-_NOTE: Right now you shouldn't use rappel in any production applications. The spec is changing too quickly and we don't guarantee backwards compatibility before 1.0.0. But we would love if you try it out in your side project and see how you find it._
+> [!IMPORTANT]
+> Right now you shouldn't use rappel in any production applications. The spec is changing too quickly and we don't guarantee backwards compatibility before 1.0.0. But we would love if you try it out in your side project and see how you find it.
 
 Rappel is in an early alpha. Particular areas of focus include:
 
@@ -156,6 +157,8 @@ These are the primary environment parameters that you'll likely want to customiz
 | `RAPPEL_USER_MODULE` | Python module preloaded into each worker | none | `my_app.actions` |
 | `RAPPEL_POLL_INTERVAL_MS` | Poll interval for the dispatch loop (ms) | `100` | `50` |
 | `RAPPEL_MAX_ACTION_LIFECYCLE` | Max actions per worker before recycling (see below) | none (no limit) | `1000` |
+| `RAPPEL_INSTANCE_CLAIM_BATCH_SIZE` | Max workflow instances to claim per DB query | `50` | `25` |
+| `RAPPEL_MAX_CONCURRENT_INSTANCES` | Max workflow instances a runner can hold concurrently | `100` | `200` |
 | `RAPPEL_WEBAPP_ENABLED` | Enable the web dashboard | `false` | `true` |
 | `RAPPEL_WEBAPP_ADDR` | Web dashboard bind address | `0.0.0.0:24119` | `0.0.0.0:8080` |
 | `RAPPEL_WEBAPP_DB_MAX_CONNECTIONS` | Max DB connections for the webapp pool | `2` | `4` |

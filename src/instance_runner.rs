@@ -77,7 +77,7 @@ pub const DEFAULT_LEASE_SECONDS: i64 = 60;
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Default batch size for claiming instances
-pub const DEFAULT_CLAIM_BATCH_SIZE: i32 = 10;
+pub const DEFAULT_CLAIM_BATCH_SIZE: i32 = 50;
 
 /// Default completion batch size
 pub const DEFAULT_COMPLETION_BATCH_SIZE: usize = 100;
@@ -131,8 +131,10 @@ pub struct InstanceRunnerConfig {
     pub lease_seconds: i64,
     /// Heartbeat interval
     pub heartbeat_interval: Duration,
-    /// Max instances to claim per batch
+    /// Max instances to claim per DB query (to avoid starving worker pool)
     pub claim_batch_size: i32,
+    /// Max instances this runner can hold concurrently
+    pub max_concurrent_instances: usize,
     /// Max completions to batch before persisting
     pub completion_batch_size: usize,
     /// How long to wait if no work is available
@@ -140,6 +142,9 @@ pub struct InstanceRunnerConfig {
     /// Interval for reporting worker status to DB
     pub status_report_interval: Duration,
 }
+
+/// Default max concurrent instances
+pub const DEFAULT_MAX_CONCURRENT_INSTANCES: usize = 100;
 
 impl Default for InstanceRunnerConfig {
     fn default() -> Self {
@@ -149,6 +154,7 @@ impl Default for InstanceRunnerConfig {
             lease_seconds: DEFAULT_LEASE_SECONDS,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             claim_batch_size: DEFAULT_CLAIM_BATCH_SIZE,
+            max_concurrent_instances: DEFAULT_MAX_CONCURRENT_INSTANCES,
             completion_batch_size: DEFAULT_COMPLETION_BATCH_SIZE,
             idle_poll_interval: Duration::from_millis(100),
             status_report_interval: Duration::from_secs(5),
@@ -541,24 +547,45 @@ impl InstanceRunner {
         })
     }
 
-    /// Claim new instances from the database
+    /// Claim new instances from the database.
+    ///
+    /// Loops claiming batches until we reach `max_concurrent_instances` or
+    /// no more instances are available. Each batch is limited to
+    /// `min(spots_available, claim_batch_size)` to avoid long DB queries
+    /// that could starve the worker pool.
     async fn claim_instances(&self) -> InstanceRunnerResult<()> {
-        let current_count = self.active_instances.read().await.len();
-        let capacity = self.config.claim_batch_size as usize;
+        loop {
+            let current_count = self.active_instances.read().await.len();
+            let max_instances = self.config.max_concurrent_instances;
 
-        if current_count >= capacity {
-            return Ok(());
-        }
+            if current_count >= max_instances {
+                break;
+            }
 
-        let to_claim = (capacity - current_count) as i32;
-        let claimed = self
-            .db
-            .claim_instances_batch(&self.config.runner_id, self.config.lease_seconds, to_claim)
-            .await?;
+            let spots_available = max_instances - current_count;
+            let batch_size = self.config.claim_batch_size as usize;
+            let to_claim = spots_available.min(batch_size) as i32;
 
-        for instance in claimed {
-            if let Err(e) = self.initialize_instance(instance).await {
-                error!(error = %e, "Failed to initialize claimed instance");
+            let claimed = self
+                .db
+                .claim_instances_batch(&self.config.runner_id, self.config.lease_seconds, to_claim)
+                .await?;
+
+            if claimed.is_empty() {
+                // No more instances available
+                break;
+            }
+
+            let claimed_count = claimed.len();
+            for instance in claimed {
+                if let Err(e) = self.initialize_instance(instance).await {
+                    error!(error = %e, "Failed to initialize claimed instance");
+                }
+            }
+
+            // If we got fewer than requested, no point trying again
+            if claimed_count < to_claim as usize {
+                break;
             }
         }
 
@@ -1634,6 +1661,7 @@ mod tests {
             lease_seconds: 120,
             heartbeat_interval: Duration::from_secs(20),
             claim_batch_size: 50,
+            max_concurrent_instances: 200,
             completion_batch_size: 200,
             idle_poll_interval: Duration::from_millis(500),
             status_report_interval: Duration::from_secs(10),
@@ -1642,6 +1670,7 @@ mod tests {
         assert_eq!(config.lease_seconds, 120);
         assert_eq!(config.heartbeat_interval, Duration::from_secs(20));
         assert_eq!(config.claim_batch_size, 50);
+        assert_eq!(config.max_concurrent_instances, 200);
         assert_eq!(config.completion_batch_size, 200);
     }
 
@@ -1688,7 +1717,8 @@ mod tests {
         // Verify constants are reasonable values
         assert_eq!(DEFAULT_LEASE_SECONDS, 60);
         assert_eq!(DEFAULT_HEARTBEAT_INTERVAL, Duration::from_secs(10));
-        assert_eq!(DEFAULT_CLAIM_BATCH_SIZE, 10);
+        assert_eq!(DEFAULT_CLAIM_BATCH_SIZE, 50);
+        assert_eq!(DEFAULT_MAX_CONCURRENT_INSTANCES, 100);
         assert_eq!(DEFAULT_COMPLETION_BATCH_SIZE, 100);
 
         // Heartbeat should be significantly less than lease to prevent expiration

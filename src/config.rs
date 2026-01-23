@@ -24,6 +24,8 @@
 //! - `RAPPEL_GC_RETENTION_SECONDS`: Minimum age of completed/failed instances before cleanup (default: 86400 = 24 hours)
 //! - `RAPPEL_COMPLETION_BATCH_SIZE`: Max completion plans to batch before flushing (default: 200)
 //! - `RAPPEL_COMPLETION_FLUSH_INTERVAL_MS`: Max wait time before flushing partial batch (default: 10)
+//! - `RAPPEL_INSTANCE_CLAIM_BATCH_SIZE`: Max instances to claim per DB query (default: 50)
+//! - `RAPPEL_MAX_CONCURRENT_INSTANCES`: Max instances a runner can hold concurrently (default: 100)
 
 use std::{
     env,
@@ -111,6 +113,14 @@ pub struct Config {
     /// Maximum time in milliseconds to wait before flushing a partial completion batch.
     /// Only relevant when completion_batch_size > 1. Default is 10ms.
     pub completion_flush_interval_ms: u64,
+
+    /// Maximum instances to claim per DB query. Default is 50.
+    /// Smaller batches prevent starving the worker pool while waiting for DB.
+    pub instance_claim_batch_size: i32,
+
+    /// Maximum instances a runner can hold concurrently. Default is 100.
+    /// The runner will loop claiming batches until reaching this limit.
+    pub max_concurrent_instances: usize,
 }
 
 /// Webapp server configuration
@@ -310,6 +320,16 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(10);
 
+        let instance_claim_batch_size = env::var("RAPPEL_INSTANCE_CLAIM_BATCH_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50);
+
+        let max_concurrent_instances = env::var("RAPPEL_MAX_CONCURRENT_INSTANCES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+
         let webapp = WebappConfig::from_env();
         let gc = GcConfig::from_env();
 
@@ -334,6 +354,8 @@ impl Config {
             gc,
             completion_batch_size,
             completion_flush_interval_ms,
+            instance_claim_batch_size,
+            max_concurrent_instances,
         })
     }
 
@@ -363,6 +385,8 @@ impl Config {
             gc: GcConfig::default(),
             completion_batch_size: 200,
             completion_flush_interval_ms: 10,
+            instance_claim_batch_size: 50,
+            max_concurrent_instances: 100,
         }
     }
 }
