@@ -1,6 +1,7 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -10,10 +11,19 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tempfile::TempDir;
+use uuid::Uuid;
 
-use rappel::in_memory::InMemoryWorkflowExecutor;
-use rappel::messages::{json_to_workflow_argument_value, proto, workflow_argument_value_to_json};
+use rappel::ir_ast;
+use rappel::messages::{
+    decode_message, encode_message, json_to_workflow_argument_value, proto,
+    workflow_argument_value_to_json,
+};
+use rappel::value::workflow_value_from_proto_bytes;
 use rappel::workflow_arguments_to_json;
+use rappel::{
+    Completion, DAGConverter, DAGHelper, DAGNode, EdgeType, ExecutionState, ExpressionEvaluator,
+    WorkflowValue, validate_program,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "rappel-fuzz")]
@@ -75,6 +85,305 @@ struct FuzzError {
 enum ActionOutcome {
     Ok(Value),
     Err(FuzzError),
+}
+
+#[derive(Debug)]
+struct ExecutionStep {
+    dispatches: Vec<proto::ActionDispatch>,
+    completed_payload: Option<Vec<u8>>,
+}
+
+struct InMemoryWorkflowExecutor {
+    instance_id: Uuid,
+    dag: rappel::DAG,
+    state: ExecutionState,
+    in_flight: HashSet<String>,
+    pending_completions: Vec<Completion>,
+    action_seq: u32,
+    skip_sleep: bool,
+}
+
+impl InMemoryWorkflowExecutor {
+    pub fn from_registration(
+        registration: proto::WorkflowRegistration,
+        skip_sleep: bool,
+    ) -> Result<Self> {
+        let program = ir_ast::Program::decode(&registration.ir[..]).context("invalid IR")?;
+        validate_program(&program)
+            .map_err(|err| anyhow::anyhow!(err))
+            .context("invalid IR")?;
+
+        let ast_program =
+            decode_message::<rappel::ast::Program>(&registration.ir).context("invalid IR")?;
+        let dag = DAGConverter::new()
+            .convert(&ast_program)
+            .map_err(|err| anyhow::anyhow!(err))
+            .context("failed to convert IR to DAG")?;
+
+        let inputs = registration.initial_context.unwrap_or_default();
+        let mut state = ExecutionState::new();
+        state.initialize_from_dag(&dag, &inputs);
+
+        Ok(Self {
+            instance_id: Uuid::new_v4(),
+            dag,
+            state,
+            in_flight: HashSet::new(),
+            pending_completions: Vec::new(),
+            action_seq: 0,
+            skip_sleep,
+        })
+    }
+
+    pub async fn start(&mut self) -> Result<ExecutionStep> {
+        self.advance().await
+    }
+
+    pub async fn handle_action_result(
+        &mut self,
+        result: proto::ActionResult,
+    ) -> Result<ExecutionStep> {
+        let duration_ns = result.worker_end_ns.saturating_sub(result.worker_start_ns);
+        let duration_ms = (duration_ns / 1_000_000) as i64;
+        let payload_bytes = encode_message(
+            result
+                .payload
+                .as_ref()
+                .unwrap_or(&proto::WorkflowArguments::default()),
+        );
+
+        self.in_flight.remove(&result.action_id);
+        self.pending_completions.push(Completion {
+            node_id: result.action_id,
+            success: result.success,
+            result: Some(payload_bytes),
+            error: result.error_message,
+            error_type: result.error_type,
+            worker_id: "in_memory".to_string(),
+            duration_ms,
+        });
+
+        self.advance().await
+    }
+
+    async fn advance(&mut self) -> Result<ExecutionStep> {
+        loop {
+            let mut dispatches: Vec<proto::ActionDispatch> = Vec::new();
+            self.dispatch_ready_nodes(&mut dispatches).await?;
+
+            if !self.pending_completions.is_empty() {
+                let completions = std::mem::take(&mut self.pending_completions);
+                let result = self.state.apply_completions_batch(completions, &self.dag);
+
+                if result.workflow_completed || result.workflow_failed {
+                    let payload = if let Some(payload) = result.result_payload {
+                        payload
+                    } else if let Some(message) = result.error_message {
+                        build_workflow_error_payload(&message)
+                    } else if result.workflow_failed {
+                        build_workflow_error_payload("workflow failed")
+                    } else {
+                        build_null_result_payload()
+                    };
+
+                    return Ok(ExecutionStep {
+                        dispatches: Vec::new(),
+                        completed_payload: Some(payload),
+                    });
+                }
+            }
+
+            if !dispatches.is_empty() {
+                return Ok(ExecutionStep {
+                    dispatches,
+                    completed_payload: None,
+                });
+            }
+
+            if self.state.graph.ready_queue.is_empty()
+                && self.pending_completions.is_empty()
+                && self.in_flight.is_empty()
+            {
+                bail!("workflow stalled without pending work");
+            }
+        }
+    }
+
+    async fn dispatch_ready_nodes(
+        &mut self,
+        dispatches: &mut Vec<proto::ActionDispatch>,
+    ) -> Result<()> {
+        let ready_nodes = self.state.drain_ready_queue();
+
+        for node_id in ready_nodes {
+            if self.in_flight.contains(&node_id) {
+                continue;
+            }
+
+            let exec_node = match self.state.graph.nodes.get(&node_id) {
+                Some(node) => node.clone(),
+                None => continue,
+            };
+            let template_id = exec_node.template_id.clone();
+            let dag_node = match self.dag.nodes.get(&template_id) {
+                Some(node) => node.clone(),
+                None => continue,
+            };
+
+            if dag_node.is_spread && exec_node.spread_index.is_none() {
+                let mut completion_error = None;
+                let items = match dag_node.spread_collection_expr.as_ref() {
+                    Some(expr) => match ExpressionEvaluator::evaluate(
+                        expr,
+                        &self.state.build_scope_for_node(&node_id),
+                    ) {
+                        Ok(WorkflowValue::List(items)) | Ok(WorkflowValue::Tuple(items)) => items,
+                        Ok(WorkflowValue::Null) => Vec::new(),
+                        Ok(other) => {
+                            completion_error = Some(format!(
+                                "Spread collection must be list or tuple, got {:?}",
+                                other
+                            ));
+                            Vec::new()
+                        }
+                        Err(e) => {
+                            completion_error =
+                                Some(format!("Spread collection evaluation error: {}", e));
+                            Vec::new()
+                        }
+                    },
+                    None => {
+                        completion_error =
+                            Some("Spread node missing collection expression".to_string());
+                        Vec::new()
+                    }
+                };
+
+                if completion_error.is_none() {
+                    self.state.expand_spread(&template_id, items, &self.dag);
+                }
+
+                self.pending_completions.push(Completion {
+                    node_id: node_id.clone(),
+                    success: completion_error.is_none(),
+                    result: None,
+                    error: completion_error.clone(),
+                    error_type: completion_error
+                        .as_ref()
+                        .map(|_| "SpreadEvaluationError".to_string()),
+                    worker_id: "inline".to_string(),
+                    duration_ms: 0,
+                });
+                continue;
+            }
+
+            if dag_node.action_name.as_deref() == Some("sleep") {
+                self.handle_sleep_node(&node_id).await?;
+                continue;
+            }
+
+            if dag_node.module_name.is_some() && dag_node.action_name.is_some() {
+                let dispatch = self.build_action_dispatch(&node_id, &dag_node)?;
+                dispatches.push(dispatch);
+            } else {
+                let result = execute_inline_node(self, &node_id, &dag_node);
+                self.pending_completions.push(Completion {
+                    node_id: node_id.clone(),
+                    success: result.is_ok(),
+                    result: result.ok(),
+                    error: None,
+                    error_type: None,
+                    worker_id: "inline".to_string(),
+                    duration_ms: 0,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn build_action_dispatch(
+        &mut self,
+        node_id: &str,
+        dag_node: &DAGNode,
+    ) -> Result<proto::ActionDispatch> {
+        let module_name = dag_node
+            .module_name
+            .clone()
+            .context("missing module name")?;
+        let action_name = dag_node
+            .action_name
+            .clone()
+            .context("missing action name")?;
+
+        let inputs_bytes = self.state.get_inputs_for_node(node_id, &self.dag);
+        let inputs: proto::WorkflowArguments = inputs_bytes
+            .as_ref()
+            .and_then(|bytes| decode_message(bytes).ok())
+            .unwrap_or_default();
+
+        let timeout_seconds = self.state.get_timeout_seconds(node_id);
+        let max_retries = self.state.get_max_retries(node_id);
+        let attempt_number = self.state.get_attempt_number(node_id);
+
+        let dispatch = proto::ActionDispatch {
+            action_id: node_id.to_string(),
+            instance_id: self.instance_id.to_string(),
+            sequence: self.action_seq,
+            action_name,
+            module_name,
+            kwargs: Some(inputs),
+            timeout_seconds: Some(timeout_seconds),
+            max_retries: Some(max_retries),
+            attempt_number: Some(attempt_number),
+            dispatch_token: None,
+        };
+        self.action_seq = self.action_seq.wrapping_add(1);
+
+        self.state.mark_running(node_id, "in_memory", inputs_bytes);
+        self.in_flight.insert(node_id.to_string());
+
+        Ok(dispatch)
+    }
+
+    async fn handle_sleep_node(&mut self, node_id: &str) -> Result<()> {
+        let inputs_bytes = self.state.get_inputs_for_node(node_id, &self.dag);
+        let inputs = decode_workflow_arguments(inputs_bytes.as_deref());
+        let duration_ms = if self.skip_sleep {
+            0
+        } else {
+            sleep_duration_ms_from_args(&inputs)
+        };
+
+        if duration_ms <= 0 {
+            self.pending_completions.push(Completion {
+                node_id: node_id.to_string(),
+                success: true,
+                result: Some(build_null_result_payload()),
+                error: None,
+                error_type: None,
+                worker_id: "sleep".to_string(),
+                duration_ms: 0,
+            });
+            return Ok(());
+        }
+
+        self.state.mark_running(node_id, "sleep", inputs_bytes);
+        self.in_flight.insert(node_id.to_string());
+        tokio::time::sleep(Duration::from_millis(duration_ms as u64)).await;
+        self.in_flight.remove(node_id);
+        self.pending_completions.push(Completion {
+            node_id: node_id.to_string(),
+            success: true,
+            result: Some(build_null_result_payload()),
+            error: None,
+            error_type: None,
+            worker_id: "sleep".to_string(),
+            duration_ms: duration_ms as i64,
+        });
+
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -1104,6 +1413,234 @@ fn build_exception_value(err: &FuzzError) -> proto::WorkflowArgumentValue {
 
 fn exception_json(err: &FuzzError) -> Value {
     workflow_argument_value_to_json(&build_exception_value(err))
+}
+
+fn decode_workflow_arguments(bytes: Option<&[u8]>) -> proto::WorkflowArguments {
+    bytes
+        .and_then(|b| decode_message(b).ok())
+        .unwrap_or_default()
+}
+
+fn sleep_duration_ms_from_args(inputs: &proto::WorkflowArguments) -> i64 {
+    let mut duration_secs: Option<f64> = None;
+    for arg in &inputs.arguments {
+        if arg.key != "duration" && arg.key != "seconds" {
+            continue;
+        }
+        let Some(value) = arg.value.as_ref() else {
+            continue;
+        };
+        match WorkflowValue::from_proto(value) {
+            WorkflowValue::Int(i) => {
+                duration_secs = Some(i as f64);
+            }
+            WorkflowValue::Float(f) => {
+                duration_secs = Some(f);
+            }
+            WorkflowValue::String(s) => {
+                if let Ok(parsed) = s.parse::<f64>() {
+                    duration_secs = Some(parsed);
+                }
+            }
+            _ => {}
+        }
+        break;
+    }
+
+    let secs = duration_secs.unwrap_or(0.0);
+    if secs <= 0.0 {
+        0
+    } else {
+        (secs * 1000.0).ceil() as i64
+    }
+}
+
+fn build_null_result_payload() -> Vec<u8> {
+    let args = proto::WorkflowArguments {
+        arguments: vec![proto::WorkflowArgument {
+            key: "result".to_string(),
+            value: Some(WorkflowValue::Null.to_proto()),
+        }],
+    };
+    encode_message(&args)
+}
+
+fn build_workflow_error_payload(message: &str) -> Vec<u8> {
+    let args = proto::WorkflowArguments {
+        arguments: vec![proto::WorkflowArgument {
+            key: "error".to_string(),
+            value: Some(WorkflowValue::String(message.to_string()).to_proto()),
+        }],
+    };
+    encode_message(&args)
+}
+
+fn execute_inline_node(
+    instance: &mut InMemoryWorkflowExecutor,
+    node_id: &str,
+    dag_node: &DAGNode,
+) -> Result<Vec<u8>, String> {
+    let scope = instance.state.build_scope_for_node(node_id);
+
+    match dag_node.node_type.as_str() {
+        "assignment" | "fn_call" => {
+            if let Some(assign_expr) = &dag_node.assign_expr {
+                match ExpressionEvaluator::evaluate(assign_expr, &scope) {
+                    Ok(value) => {
+                        let result_bytes = value.to_proto().encode_to_vec();
+
+                        if let Some(targets) = &dag_node.targets {
+                            if targets.len() > 1 {
+                                match &value {
+                                    WorkflowValue::Tuple(items) | WorkflowValue::List(items) => {
+                                        for (target, item) in targets.iter().zip(items.iter()) {
+                                            instance.state.store_variable_for_node(
+                                                node_id,
+                                                &dag_node.node_type,
+                                                target,
+                                                item,
+                                            );
+                                        }
+                                    }
+                                    _ => {
+                                        for target in targets {
+                                            instance.state.store_variable_for_node(
+                                                node_id,
+                                                &dag_node.node_type,
+                                                target,
+                                                &value,
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                for target in targets {
+                                    instance.state.store_variable_for_node(
+                                        node_id,
+                                        &dag_node.node_type,
+                                        target,
+                                        &value,
+                                    );
+                                }
+                            }
+                        } else if let Some(target) = &dag_node.target {
+                            instance.state.store_variable_for_node(
+                                node_id,
+                                &dag_node.node_type,
+                                target,
+                                &value,
+                            );
+                        }
+
+                        Ok(result_bytes)
+                    }
+                    Err(e) => Err(format!("Assignment evaluation error: {}", e)),
+                }
+            } else {
+                Ok(vec![])
+            }
+        }
+        "branch" | "if" | "elif" => Ok(vec![]),
+        "join" | "else" => Ok(vec![]),
+        "aggregator" => {
+            let helper = DAGHelper::new(&instance.dag);
+            let exec_node = instance.state.graph.nodes.get(node_id);
+            let source_is_spread = dag_node
+                .aggregates_from
+                .as_ref()
+                .and_then(|id| instance.dag.nodes.get(id))
+                .map(|n| n.is_spread)
+                .unwrap_or(false);
+
+            let source_ids: Vec<String> = if source_is_spread {
+                exec_node.map(|n| n.waiting_for.clone()).unwrap_or_default()
+            } else if let Some(exec_node) = exec_node
+                && !exec_node.waiting_for.is_empty()
+            {
+                exec_node.waiting_for.clone()
+            } else {
+                helper
+                    .get_incoming_edges(&dag_node.id)
+                    .iter()
+                    .filter(|edge| edge.edge_type == EdgeType::StateMachine)
+                    .filter(|edge| edge.exception_types.is_none())
+                    .map(|edge| edge.source.clone())
+                    .collect()
+            };
+
+            let mut values = Vec::new();
+            for source_id in source_ids {
+                if let Some(source_node) = instance.state.graph.nodes.get(&source_id) {
+                    if let Some(result_bytes) = &source_node.result {
+                        let value =
+                            extract_result_value(result_bytes).unwrap_or(WorkflowValue::Null);
+                        values.push(value);
+                    } else {
+                        values.push(WorkflowValue::Null);
+                    }
+                }
+            }
+
+            let should_store_list = dag_node
+                .targets
+                .as_ref()
+                .map(|targets| targets.len() == 1)
+                .unwrap_or(false);
+
+            if should_store_list {
+                let list_value = WorkflowValue::List(values);
+                let args = proto::WorkflowArguments {
+                    arguments: vec![proto::WorkflowArgument {
+                        key: "result".to_string(),
+                        value: Some(list_value.to_proto()),
+                    }],
+                };
+                Ok(encode_message(&args))
+            } else {
+                Ok(encode_message(&proto::WorkflowArguments {
+                    arguments: vec![],
+                }))
+            }
+        }
+        "input" | "output" => Ok(vec![]),
+        "return" => {
+            if let Some(assign_expr) = &dag_node.assign_expr {
+                match ExpressionEvaluator::evaluate(assign_expr, &scope) {
+                    Ok(value) => {
+                        let result_bytes = value.to_proto().encode_to_vec();
+                        if let Some(target) = &dag_node.target {
+                            instance.state.store_variable_for_node(
+                                node_id,
+                                &dag_node.node_type,
+                                target,
+                                &value,
+                            );
+                        }
+                        Ok(result_bytes)
+                    }
+                    Err(e) => Err(format!("Return evaluation error: {}", e)),
+                }
+            } else {
+                Ok(vec![])
+            }
+        }
+        _ => Ok(vec![]),
+    }
+}
+
+fn extract_result_value(result_bytes: &[u8]) -> Option<WorkflowValue> {
+    if let Ok(args) = decode_message::<proto::WorkflowArguments>(result_bytes) {
+        for arg in args.arguments {
+            if arg.key == "result" {
+                if let Some(value) = arg.value {
+                    return Some(WorkflowValue::from_proto(&value));
+                }
+                return None;
+            }
+        }
+    }
+
+    workflow_value_from_proto_bytes(result_bytes)
 }
 
 fn execute_action(action: &str, inputs: &Value) -> Result<ActionOutcome> {
