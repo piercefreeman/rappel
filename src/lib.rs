@@ -48,8 +48,7 @@ pub use config::{
 
 // Database
 pub use db::{
-    ActionId, ActionStatus, BackoffKind, ClaimedInstance, CompletionRecord, Database, DbError,
-    DbResult, InstanceStatus, NewAction, QueuedAction, RetryKind, ScheduleId, ScheduleStatus,
+    ClaimedInstance, Database, DbError, DbResult, InstanceStatus, ScheduleId, ScheduleStatus,
     ScheduleType, WorkflowInstance, WorkflowInstanceId, WorkflowSchedule, WorkflowVersion,
     WorkflowVersionId, WorkflowVersionSummary,
 };

@@ -571,12 +571,10 @@ async fn main() -> Result<()> {
     let database = Arc::new(Database::connect_with_pool_size(&database_url, pool_size).await?);
     info!(%database_url, pool_size, "database connected");
 
-    // Clean up database - only tables that exist in new architecture
-    sqlx::query(
-        "TRUNCATE workflow_instances, workflow_versions, workflow_schedules, action_logs CASCADE",
-    )
-    .execute(database.pool())
-    .await?;
+    // Clean up database
+    sqlx::query("TRUNCATE workflow_instances, workflow_versions, workflow_schedules CASCADE")
+        .execute(database.pool())
+        .await?;
 
     // Start gRPC server
     let (grpc_addr, grpc_shutdown, _grpc_handle) = start_grpc_server((*database).clone()).await?;

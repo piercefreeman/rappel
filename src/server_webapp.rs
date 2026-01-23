@@ -275,36 +275,26 @@ async fn workflow_run_detail(
         }
     };
 
-    // Load actions for this instance
-    let actions = state
+    // Synthesize action logs from execution graph
+    let action_logs = if let Ok(Some(graph_bytes)) = state
         .database
-        .get_instance_actions(crate::db::WorkflowInstanceId(instance_id))
+        .get_instance_execution_graph(crate::db::WorkflowInstanceId(instance_id))
         .await
-        .unwrap_or_default();
-
-    // Load action logs for this instance
-    let mut action_logs = state
-        .database
-        .get_instance_action_logs(crate::db::WorkflowInstanceId(instance_id))
-        .await
-        .unwrap_or_default();
-
-    if action_logs.is_empty()
-        && let Ok(Some(graph_bytes)) = state
-            .database
-            .get_instance_execution_graph(crate::db::WorkflowInstanceId(instance_id))
-            .await
-        && let Some(graph) = decode_execution_graph(&graph_bytes)
     {
-        let dag = decode_dag_from_proto(&version.program_proto);
-        action_logs = synthesize_action_logs_from_execution_graph(instance.id, &dag, &graph);
-    }
+        if let Some(graph) = decode_execution_graph(&graph_bytes) {
+            let dag = decode_dag_from_proto(&version.program_proto);
+            synthesize_action_logs_from_execution_graph(instance.id, &dag, &graph)
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
 
     Html(render_workflow_run_page(
         &state.templates,
         &version,
         &instance,
-        &actions,
         &action_logs,
     ))
 }
@@ -959,7 +949,6 @@ fn render_workflow_run_page(
     templates: &Tera,
     version: &crate::db::WorkflowVersion,
     instance: &crate::db::WorkflowInstance,
-    actions: &[crate::db::QueuedAction],
     action_logs: &[crate::db::ActionLog],
 ) -> String {
     let workflow = WorkflowDetailMetadata {
@@ -1014,88 +1003,56 @@ fn render_workflow_run_page(
         result_payload: format_payload(&instance.result_payload),
     };
 
-    // Build nodes from action_queue if available, otherwise from action_logs.
-    // Completed/failed instances prefer logs for full attempt history.
-    let use_logs =
-        matches!(instance.status.as_str(), "completed" | "failed") && !action_logs.is_empty();
-    let nodes: Vec<NodeExecutionContext> = if !use_logs && !actions.is_empty() {
-        // Build from action_queue (active/in-progress workflows or recent completions)
-        actions
-            .iter()
-            .map(|a| NodeExecutionContext {
-                id: a.node_id.clone().unwrap_or_else(|| a.id.to_string()),
-                action_id: a.id.to_string(),
-                module: a.module_name.clone(),
-                action: a.action_name.clone(),
-                status: a.status.clone(),
-                request_payload: format_binary_payload(&a.dispatch_payload),
-                response_payload: a
-                    .result_payload
-                    .as_ref()
-                    .map(|p| format_binary_payload(p))
-                    .unwrap_or_else(|| "(pending)".to_string()),
-                attempt_number: a.attempt_number,
-                max_retries: a.max_retries,
-                timeout_retry_limit: a.timeout_retry_limit,
-                retry_kind: a.retry_kind.clone(),
-                scheduled_at: a
-                    .scheduled_at
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string()),
-                last_error: a.last_error.clone(),
-            })
-            .collect()
-    } else {
-        // Build from action_logs (completed workflows or when queue is empty)
-        // Group by action_id to get the latest attempt for each action
-        let mut latest_by_action: std::collections::HashMap<String, &crate::db::ActionLog> =
-            std::collections::HashMap::new();
-        for log in action_logs.iter() {
-            let key = log.action_id.to_string();
-            if let Some(existing) = latest_by_action.get(&key) {
-                if log.attempt_number > existing.attempt_number {
-                    latest_by_action.insert(key, log);
-                }
-            } else {
+    // Build nodes from action_logs (synthesized from execution_graph)
+    // Group by action_id to get the latest attempt for each action
+    let mut latest_by_action: std::collections::HashMap<String, &crate::db::ActionLog> =
+        std::collections::HashMap::new();
+    for log in action_logs.iter() {
+        let key = log.action_id.to_string();
+        if let Some(existing) = latest_by_action.get(&key) {
+            if log.attempt_number > existing.attempt_number {
                 latest_by_action.insert(key, log);
             }
+        } else {
+            latest_by_action.insert(key, log);
         }
+    }
 
-        latest_by_action
-            .values()
-            .map(|log| NodeExecutionContext {
-                id: log
-                    .node_id
-                    .clone()
-                    .unwrap_or_else(|| log.action_id.to_string()),
-                action_id: log.action_id.to_string(),
-                module: log.module_name.clone().unwrap_or_default(),
-                action: log.action_name.clone().unwrap_or_default(),
-                status: if log.success == Some(true) {
-                    "completed".to_string()
-                } else if log.success == Some(false) {
-                    "failed".to_string()
-                } else {
-                    "unknown".to_string()
-                },
-                request_payload: log
-                    .dispatch_payload
-                    .as_ref()
-                    .map(|p| format_binary_payload(p))
-                    .unwrap_or_else(|| "(not recorded)".to_string()),
-                response_payload: log
-                    .result_payload
-                    .as_ref()
-                    .map(|p| format_binary_payload(p))
-                    .unwrap_or_else(|| "(not recorded)".to_string()),
-                attempt_number: log.attempt_number,
-                max_retries: 0,
-                timeout_retry_limit: 0,
-                retry_kind: String::new(),
-                scheduled_at: None,
-                last_error: log.error_message.clone(),
-            })
-            .collect()
-    };
+    let nodes: Vec<NodeExecutionContext> = latest_by_action
+        .values()
+        .map(|log| NodeExecutionContext {
+            id: log
+                .node_id
+                .clone()
+                .unwrap_or_else(|| log.action_id.to_string()),
+            action_id: log.action_id.to_string(),
+            module: log.module_name.clone().unwrap_or_default(),
+            action: log.action_name.clone().unwrap_or_default(),
+            status: if log.success == Some(true) {
+                "completed".to_string()
+            } else if log.success == Some(false) {
+                "failed".to_string()
+            } else {
+                "running".to_string()
+            },
+            request_payload: log
+                .dispatch_payload
+                .as_ref()
+                .map(|p| format_binary_payload(p))
+                .unwrap_or_else(|| "(not recorded)".to_string()),
+            response_payload: log
+                .result_payload
+                .as_ref()
+                .map(|p| format_binary_payload(p))
+                .unwrap_or_else(|| "(not recorded)".to_string()),
+            attempt_number: log.attempt_number,
+            max_retries: 0,
+            timeout_retry_limit: 0,
+            retry_kind: String::new(),
+            scheduled_at: None,
+            last_error: log.error_message.clone(),
+        })
+        .collect();
 
     // Build a map of node_id -> status from the nodes
     let action_status: std::collections::HashMap<String, String> = nodes
@@ -2067,11 +2024,9 @@ mod tests {
             priority: 0,
         };
 
-        let actions: Vec<crate::db::QueuedAction> = vec![];
         let action_logs: Vec<crate::db::ActionLog> = vec![];
 
-        let html =
-            render_workflow_run_page(&templates, &version, &instance, &actions, &action_logs);
+        let html = render_workflow_run_page(&templates, &version, &instance, &action_logs);
 
         assert!(html.contains("test_workflow"));
         assert!(html.contains("completed"));
@@ -2082,7 +2037,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_workflow_run_page_with_actions() {
+    fn test_render_workflow_run_page_with_action_logs() {
         let templates = test_templates();
         let version_id = Uuid::new_v4();
         let instance_id = Uuid::new_v4();
@@ -2111,32 +2066,27 @@ mod tests {
             priority: 0,
         };
 
-        let actions = vec![crate::db::QueuedAction {
+        let action_logs = vec![crate::db::ActionLog {
             id: Uuid::new_v4(),
+            action_id: Uuid::new_v4(),
             instance_id,
-            partition_id: 0,
-            action_seq: 1,
-            module_name: "my_module".to_string(),
-            action_name: "do_something".to_string(),
-            dispatch_payload: b"{\"x\": 1}".to_vec(),
-            timeout_seconds: 30,
-            max_retries: 3,
             attempt_number: 1,
-            delivery_token: Uuid::new_v4(),
-            timeout_retry_limit: 2,
-            retry_kind: "exponential".to_string(),
-            node_id: Some("action_0".to_string()),
-            node_type: "action".to_string(),
-            result_payload: Some(b"{\"result\": 42}".to_vec()),
+            dispatched_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
             success: Some(true),
-            status: "completed".to_string(),
-            scheduled_at: None,
-            last_error: None,
+            result_payload: Some(b"{\"result\": 42}".to_vec()),
+            error_message: None,
+            duration_ms: Some(100),
+            pool_id: None,
+            worker_id: None,
+            enqueued_at: None,
+            module_name: Some("my_module".to_string()),
+            action_name: Some("do_something".to_string()),
+            node_id: Some("action_0".to_string()),
+            dispatch_payload: Some(b"{\"x\": 1}".to_vec()),
         }];
-        let action_logs: Vec<crate::db::ActionLog> = vec![];
 
-        let html =
-            render_workflow_run_page(&templates, &version, &instance, &actions, &action_logs);
+        let html = render_workflow_run_page(&templates, &version, &instance, &action_logs);
 
         assert!(html.contains("action_workflow"));
         assert!(html.contains("running"));

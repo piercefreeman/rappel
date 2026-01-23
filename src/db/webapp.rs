@@ -9,11 +9,9 @@ use sqlx::Row;
 use sqlx::{Postgres, QueryBuilder};
 
 use super::{
-    ActionLog, Database, DbError, DbResult, QueuedAction, ScheduleId, WorkerStatus,
-    WorkflowInstance, WorkflowInstanceId, WorkflowSchedule, WorkflowVersionId,
-    WorkflowVersionSummary,
+    Database, DbError, DbResult, ScheduleId, WorkerStatus, WorkflowInstance, WorkflowInstanceId,
+    WorkflowSchedule, WorkflowVersionId, WorkflowVersionSummary,
 };
-use uuid::Uuid;
 
 impl Database {
     // ========================================================================
@@ -194,146 +192,6 @@ impl Database {
         .await?;
 
         Ok(row.and_then(|row| row.get("execution_graph")))
-    }
-
-    // ========================================================================
-    // Webapp: Action Queries
-    // ========================================================================
-
-    /// Get all actions for an instance (for execution detail view)
-    pub async fn get_instance_actions(
-        &self,
-        instance_id: WorkflowInstanceId,
-    ) -> DbResult<Vec<QueuedAction>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                id,
-                instance_id,
-                partition_id,
-                action_seq,
-                module_name,
-                action_name,
-                dispatch_payload,
-                timeout_seconds,
-                max_retries,
-                attempt_number,
-                COALESCE(delivery_token, gen_random_uuid()) as delivery_token,
-                timeout_retry_limit,
-                retry_kind,
-                node_id,
-                COALESCE(node_type, 'action') as node_type,
-                result_payload,
-                success,
-                status,
-                scheduled_at,
-                last_error
-            FROM action_queue
-            WHERE instance_id = $1
-            ORDER BY action_seq
-            "#,
-        )
-        .bind(instance_id.0)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let actions = rows
-            .into_iter()
-            .map(|row| QueuedAction {
-                id: row.get("id"),
-                instance_id: row.get("instance_id"),
-                partition_id: row.get("partition_id"),
-                action_seq: row.get("action_seq"),
-                module_name: row.get("module_name"),
-                action_name: row.get("action_name"),
-                dispatch_payload: row.get("dispatch_payload"),
-                timeout_seconds: row.get("timeout_seconds"),
-                max_retries: row.get("max_retries"),
-                attempt_number: row.get("attempt_number"),
-                delivery_token: row.get("delivery_token"),
-                timeout_retry_limit: row.get("timeout_retry_limit"),
-                retry_kind: row.get("retry_kind"),
-                node_id: row.get("node_id"),
-                node_type: row.get("node_type"),
-                result_payload: row.get("result_payload"),
-                success: row.get("success"),
-                status: row.get("status"),
-                scheduled_at: row.get("scheduled_at"),
-                last_error: row.get("last_error"),
-            })
-            .collect();
-
-        Ok(actions)
-    }
-
-    // ========================================================================
-    // Webapp: Action Log Queries
-    // ========================================================================
-
-    /// Get all execution logs for a specific action (to see retry history)
-    pub async fn get_action_logs(&self, action_id: Uuid) -> DbResult<Vec<ActionLog>> {
-        let logs = sqlx::query_as::<_, ActionLog>(
-            r#"
-            SELECT id, action_id, instance_id, attempt_number,
-                   dispatched_at, completed_at, success,
-                   result_payload, error_message, duration_ms,
-                   pool_id, worker_id, enqueued_at,
-                   module_name, action_name, node_id, dispatch_payload
-            FROM action_logs
-            WHERE action_id = $1
-            ORDER BY attempt_number
-            "#,
-        )
-        .bind(action_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(logs)
-    }
-
-    /// Get all execution logs for a workflow instance (full execution history)
-    pub async fn get_instance_action_logs(
-        &self,
-        instance_id: WorkflowInstanceId,
-    ) -> DbResult<Vec<ActionLog>> {
-        let logs = sqlx::query_as::<_, ActionLog>(
-            r#"
-            SELECT id, action_id, instance_id, attempt_number,
-                   dispatched_at, completed_at, success,
-                   result_payload, error_message, duration_ms,
-                   pool_id, worker_id, enqueued_at,
-                   module_name, action_name, node_id, dispatch_payload
-            FROM action_logs
-            WHERE instance_id = $1
-            ORDER BY dispatched_at, attempt_number, id
-            "#,
-        )
-        .bind(instance_id.0)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(logs)
-    }
-
-    /// Get recent action logs across all instances (for dashboard/monitoring)
-    pub async fn get_recent_action_logs(&self, limit: i64) -> DbResult<Vec<ActionLog>> {
-        let logs = sqlx::query_as::<_, ActionLog>(
-            r#"
-            SELECT id, action_id, instance_id, attempt_number,
-                   dispatched_at, completed_at, success,
-                   result_payload, error_message, duration_ms,
-                   pool_id, worker_id, enqueued_at,
-                   module_name, action_name, node_id, dispatch_payload
-            FROM action_logs
-            ORDER BY dispatched_at DESC
-            LIMIT $1
-            "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(logs)
     }
 
     // ========================================================================
