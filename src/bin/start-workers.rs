@@ -83,13 +83,14 @@ async fn main() -> Result<()> {
         worker_config = worker_config.with_user_module(module);
     }
 
-    // Create worker pool
+    // Create worker pool with concurrency limit
     let worker_pool = Arc::new(
-        PythonWorkerPool::new(
+        PythonWorkerPool::new_with_concurrency(
             worker_config,
             config.worker_count,
             Arc::clone(&worker_bridge),
             config.max_action_lifecycle,
+            config.concurrent_per_worker,
         )
         .await?,
     );

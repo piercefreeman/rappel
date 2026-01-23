@@ -311,6 +311,7 @@ fn handle_action_result(instance: &mut InMemoryInstance, result: proto::ActionRe
         error_type: result.error_type.clone(),
         worker_id: "in_memory".to_string(),
         duration_ms,
+        worker_duration_ms: Some(duration_ms), // In-memory execution time
     };
 
     handle_completion(instance, completion);
@@ -389,6 +390,7 @@ async fn dispatch_ready_nodes(
                     .map(|_| "SpreadEvaluationError".to_string()),
                 worker_id: "inline".to_string(),
                 duration_ms: 0,
+                worker_duration_ms: Some(0),
             };
             instance.pending_completions.push(completion);
             continue;
@@ -411,6 +413,7 @@ async fn dispatch_ready_nodes(
                 error_type: None,
                 worker_id: "inline".to_string(),
                 duration_ms: 0,
+                worker_duration_ms: Some(0),
             };
             instance.pending_completions.push(completion);
         }
@@ -501,6 +504,7 @@ async fn schedule_sleep_action(
             error_type: None,
             worker_id: SLEEP_WORKER_ID.to_string(),
             duration_ms: 0,
+            worker_duration_ms: Some(0),
         };
         instance.pending_completions.push(completion);
         return;
@@ -523,6 +527,7 @@ async fn schedule_sleep_action(
             error_type: None,
             worker_id: SLEEP_WORKER_ID.to_string(),
             duration_ms: duration_ms as i64,
+            worker_duration_ms: Some(duration_ms as i64),
         };
         let _ = sleep_tx.send(completion).await;
     });

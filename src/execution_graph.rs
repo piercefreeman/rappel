@@ -51,7 +51,10 @@ pub struct Completion {
     pub error: Option<String>,
     pub error_type: Option<String>,
     pub worker_id: String,
+    /// Total round-trip time from dispatch to result (for metrics)
     pub duration_ms: i64,
+    /// Actual time spent executing on the worker (for accurate started_at calculation)
+    pub worker_duration_ms: Option<i64>,
 }
 
 /// Wrapper around ExecutionGraph with high-level operations
@@ -184,12 +187,17 @@ impl ExecutionState {
         (max_retries, timeout_seconds, backoff)
     }
 
-    /// Mark a node as running (being executed by a worker)
+    /// Mark a node as running (dispatched to a worker).
+    ///
+    /// Note: `started_at_ms` is NOT set here - it will be set when the completion
+    /// arrives, computed from `completed_at_ms - worker_duration_ms`. This ensures
+    /// the recorded start time reflects when the worker actually started executing,
+    /// not when we dispatched the action.
     pub fn mark_running(&mut self, node_id: &str, worker_id: &str, inputs: Option<Vec<u8>>) {
         if let Some(node) = self.graph.nodes.get_mut(node_id) {
             node.status = NodeStatus::Running as i32;
             node.worker_id = Some(worker_id.to_string());
-            node.started_at_ms = Some(Utc::now().timestamp_millis());
+            // started_at_ms is set on completion with accurate worker timing
             node.inputs = inputs;
         }
 
@@ -661,7 +669,19 @@ impl ExecutionState {
                 .unwrap_or_default();
 
             if let Some(node) = self.graph.nodes.get_mut(&completion.node_id) {
-                let started_at = node.started_at_ms.unwrap_or(now_ms);
+                // Compute started_at from worker_duration if available (most accurate),
+                // otherwise fall back to previously set value or current time
+                let started_at = completion
+                    .worker_duration_ms
+                    .map(|wd| now_ms - wd)
+                    .or(node.started_at_ms)
+                    .unwrap_or(now_ms);
+
+                // Set started_at_ms now that we have accurate timing
+                if node.started_at_ms.is_none() {
+                    node.started_at_ms = Some(started_at);
+                }
+
                 let attempt = AttemptRecord {
                     attempt_number: node.attempt_number,
                     worker_id: completion.worker_id.clone(),

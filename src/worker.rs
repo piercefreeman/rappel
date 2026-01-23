@@ -183,11 +183,16 @@ pub struct RoundTripMetrics {
     pub error_message: Option<String>,
 }
 
+/// Throughput snapshot for a single worker.
 #[derive(Debug, Clone)]
-pub(crate) struct WorkerThroughputSnapshot {
+pub struct WorkerThroughputSnapshot {
+    /// Worker ID
     pub worker_id: u64,
+    /// Throughput in actions per minute
     pub throughput_per_min: f64,
+    /// Total actions completed since pool start
     pub total_completed: u64,
+    /// Timestamp of last completed action
     pub last_action_at: Option<DateTime<Utc>>,
 }
 
@@ -725,6 +730,10 @@ pub struct PythonWorkerPool {
     throughput: StdMutex<WorkerThroughputTracker>,
     /// Action counts per worker slot (for lifecycle tracking)
     action_counts: Vec<AtomicU64>,
+    /// In-flight action counts per worker slot (for concurrency control)
+    in_flight_counts: Vec<AtomicUsize>,
+    /// Maximum concurrent actions per worker
+    max_concurrent_per_worker: usize,
     /// Maximum actions per worker before recycling (None = no limit)
     max_action_lifecycle: Option<u64>,
     /// Bridge server for spawning replacement workers
@@ -745,6 +754,7 @@ impl PythonWorkerPool {
     /// * `count` - Number of workers to spawn (minimum 1)
     /// * `bridge` - The WorkerBridge server workers will connect to
     /// * `max_action_lifecycle` - Maximum actions per worker before recycling (None = no limit)
+    /// * `max_concurrent_per_worker` - Maximum concurrent actions per worker (default 10)
     ///
     /// # Errors
     ///
@@ -754,6 +764,17 @@ impl PythonWorkerPool {
         count: usize,
         bridge: Arc<WorkerBridgeServer>,
         max_action_lifecycle: Option<u64>,
+    ) -> AnyResult<Self> {
+        Self::new_with_concurrency(config, count, bridge, max_action_lifecycle, 10).await
+    }
+
+    /// Create a new worker pool with explicit concurrency limit.
+    pub async fn new_with_concurrency(
+        config: PythonWorkerConfig,
+        count: usize,
+        bridge: Arc<WorkerBridgeServer>,
+        max_action_lifecycle: Option<u64>,
+        max_concurrent_per_worker: usize,
     ) -> AnyResult<Self> {
         let worker_count = count.max(1);
         info!(
@@ -789,6 +810,7 @@ impl PythonWorkerPool {
 
         let worker_ids = workers.iter().map(|worker| worker.worker_id()).collect();
         let action_counts = (0..worker_count).map(|_| AtomicU64::new(0)).collect();
+        let in_flight_counts = (0..worker_count).map(|_| AtomicUsize::new(0)).collect();
         Ok(Self {
             workers: RwLock::new(workers),
             cursor: AtomicUsize::new(0),
@@ -797,6 +819,8 @@ impl PythonWorkerPool {
                 Duration::from_secs(60),
             )),
             action_counts,
+            in_flight_counts,
+            max_concurrent_per_worker: max_concurrent_per_worker.max(1),
             max_action_lifecycle,
             bridge,
             config,
@@ -829,17 +853,124 @@ impl PythonWorkerPool {
         self.action_counts.is_empty()
     }
 
+    /// Get the maximum concurrent actions per worker.
+    pub fn max_concurrent_per_worker(&self) -> usize {
+        self.max_concurrent_per_worker
+    }
+
+    /// Get total capacity (worker_count * max_concurrent_per_worker).
+    pub fn total_capacity(&self) -> usize {
+        self.len() * self.max_concurrent_per_worker
+    }
+
+    /// Get total in-flight actions across all workers.
+    pub fn total_in_flight(&self) -> usize {
+        self.in_flight_counts
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Get available capacity (total_capacity - total_in_flight).
+    pub fn available_capacity(&self) -> usize {
+        self.total_capacity().saturating_sub(self.total_in_flight())
+    }
+
+    /// Try to acquire a slot for the next available worker.
+    ///
+    /// Returns `Some(worker_idx)` if a slot was acquired, `None` if all workers
+    /// are at capacity. Uses round-robin selection among workers with capacity.
+    pub fn try_acquire_slot(&self) -> Option<usize> {
+        let worker_count = self.len();
+        if worker_count == 0 {
+            return None;
+        }
+
+        // Try each worker starting from the current cursor position
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed);
+        for i in 0..worker_count {
+            let idx = (start + i) % worker_count;
+            if self.try_acquire_slot_for_worker(idx) {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// Try to acquire a slot for a specific worker.
+    ///
+    /// Returns `true` if the slot was acquired, `false` if the worker is at capacity.
+    pub fn try_acquire_slot_for_worker(&self, worker_idx: usize) -> bool {
+        let Some(counter) = self.in_flight_counts.get(worker_idx % self.len()) else {
+            return false;
+        };
+
+        // CAS loop to atomically increment if below limit
+        loop {
+            let current = counter.load(Ordering::Acquire);
+            if current >= self.max_concurrent_per_worker {
+                return false;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(_) => continue, // Retry
+            }
+        }
+    }
+
+    /// Release a slot for a worker.
+    ///
+    /// Should be called when an action completes (via `record_completion`).
+    pub fn release_slot(&self, worker_idx: usize) {
+        if let Some(counter) = self.in_flight_counts.get(worker_idx % self.len()) {
+            // Saturating sub to avoid underflow in case of bugs
+            let prev = counter.fetch_sub(1, Ordering::Release);
+            if prev == 0 {
+                warn!(worker_idx, "release_slot called with zero in-flight count");
+                counter.store(0, Ordering::Release);
+            }
+        }
+    }
+
+    /// Get in-flight count for a specific worker.
+    pub fn in_flight_for_worker(&self, worker_idx: usize) -> usize {
+        self.in_flight_counts
+            .get(worker_idx % self.len())
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
     /// Get a snapshot of all workers in the pool.
     pub async fn workers_snapshot(&self) -> Vec<Arc<PythonWorker>> {
         self.workers.read().await.clone()
     }
 
+    /// Get throughput snapshots for all workers.
+    ///
+    /// Returns worker throughput metrics including completion counts and rates.
+    pub fn throughput_snapshots(&self) -> Vec<WorkerThroughputSnapshot> {
+        if let Ok(mut tracker) = self.throughput.lock() {
+            tracker.snapshot_at(Instant::now())
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Record an action completion for a worker and trigger recycling if needed.
     ///
-    /// This increments the action count for the worker at the given index.
-    /// If `max_action_lifecycle` is set and the count reaches or exceeds the
-    /// threshold, a background task is spawned to recycle the worker.
+    /// This decrements the in-flight count and increments the action count for
+    /// the worker at the given index. If `max_action_lifecycle` is set and the
+    /// count reaches or exceeds the threshold, a background task is spawned to
+    /// recycle the worker.
     pub fn record_completion(&self, worker_idx: usize, pool: Arc<PythonWorkerPool>) {
+        // Release the in-flight slot
+        self.release_slot(worker_idx);
+
         // Update throughput tracking
         if let Ok(mut tracker) = self.throughput.lock() {
             tracker.record_completion(worker_idx);
@@ -1197,6 +1328,104 @@ mod tests {
         assert_eq!(worker_two.total_completed, 0);
         assert_eq!(worker_two.throughput_per_min, 0.0);
         assert!(worker_two.last_action_at.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Python environment
+    async fn test_worker_concurrency_control() {
+        let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
+        let config = PythonWorkerConfig::new();
+
+        // Create pool with 2 workers, max 3 concurrent per worker
+        let pool = PythonWorkerPool::new_with_concurrency(config, 2, Arc::clone(&bridge), None, 3)
+            .await
+            .expect("create pool");
+
+        // Initial state
+        assert_eq!(pool.total_capacity(), 6); // 2 workers * 3 concurrent
+        assert_eq!(pool.total_in_flight(), 0);
+        assert_eq!(pool.available_capacity(), 6);
+
+        // Acquire 3 slots for worker 0
+        assert!(pool.try_acquire_slot_for_worker(0));
+        assert!(pool.try_acquire_slot_for_worker(0));
+        assert!(pool.try_acquire_slot_for_worker(0));
+        // Worker 0 is now at capacity
+        assert!(!pool.try_acquire_slot_for_worker(0));
+
+        assert_eq!(pool.total_in_flight(), 3);
+        assert_eq!(pool.available_capacity(), 3);
+        assert_eq!(pool.in_flight_for_worker(0), 3);
+        assert_eq!(pool.in_flight_for_worker(1), 0);
+
+        // Acquire 2 slots for worker 1
+        assert!(pool.try_acquire_slot_for_worker(1));
+        assert!(pool.try_acquire_slot_for_worker(1));
+        assert_eq!(pool.in_flight_for_worker(1), 2);
+        assert_eq!(pool.available_capacity(), 1);
+
+        // try_acquire_slot should pick worker 1 (only one with capacity)
+        let idx = pool.try_acquire_slot().expect("should acquire slot");
+        assert_eq!(idx % 2, 1); // Worker 1
+        assert_eq!(pool.available_capacity(), 0);
+
+        // No more capacity
+        assert!(pool.try_acquire_slot().is_none());
+
+        // Release a slot from worker 0
+        pool.release_slot(0);
+        assert_eq!(pool.in_flight_for_worker(0), 2);
+        assert_eq!(pool.available_capacity(), 1);
+
+        // Now try_acquire_slot should work and pick worker 0
+        let idx = pool.try_acquire_slot().expect("should acquire slot");
+        assert_eq!(idx % 2, 0); // Worker 0
+        assert_eq!(pool.available_capacity(), 0);
+
+        pool.shutdown().await.expect("shutdown pool");
+        bridge.shutdown().await;
+    }
+
+    #[test]
+    fn test_concurrency_slot_logic() {
+        // Test the atomic slot logic without spawning workers
+        let in_flight = AtomicUsize::new(0);
+        let max_concurrent = 3;
+
+        // Helper to try acquire
+        let try_acquire = || {
+            loop {
+                let current = in_flight.load(Ordering::Acquire);
+                if current >= max_concurrent {
+                    return false;
+                }
+                match in_flight.compare_exchange_weak(
+                    current,
+                    current + 1,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    Err(_) => continue,
+                }
+            }
+        };
+
+        // Acquire up to max
+        assert!(try_acquire());
+        assert!(try_acquire());
+        assert!(try_acquire());
+        // At capacity
+        assert!(!try_acquire());
+        assert_eq!(in_flight.load(Ordering::Relaxed), 3);
+
+        // Release one
+        in_flight.fetch_sub(1, Ordering::Release);
+        assert_eq!(in_flight.load(Ordering::Relaxed), 2);
+
+        // Can acquire again
+        assert!(try_acquire());
+        assert!(!try_acquire());
     }
 
     #[tokio::test]

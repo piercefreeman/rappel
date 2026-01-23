@@ -2163,6 +2163,8 @@ mod tests {
             updated_at: chrono::Utc::now(),
             median_dequeue_ms: Some(15),
             median_handling_ms: Some(120),
+            dispatch_queue_size: Some(10),
+            total_in_flight: Some(5),
         }];
 
         let html = render_workers_page(&templates, &statuses, 5);

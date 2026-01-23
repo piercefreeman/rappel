@@ -143,6 +143,10 @@ pub struct WorkerStatusUpdate {
     pub median_dequeue_ms: Option<i64>,
     /// Median execution time from dispatch to completion in milliseconds
     pub median_handling_ms: Option<i64>,
+    /// Current size of the dispatch queue (pool-level metric, same for all workers)
+    pub dispatch_queue_size: i64,
+    /// Total in-flight actions across all workers (pool-level metric)
+    pub total_in_flight: i64,
 }
 
 /// Worker throughput status for webapp reporting.
@@ -158,6 +162,10 @@ pub struct WorkerStatus {
     pub median_dequeue_ms: Option<i64>,
     /// Median execution time from dispatch to completion in milliseconds
     pub median_handling_ms: Option<i64>,
+    /// Current size of the dispatch queue (pool-level metric)
+    pub dispatch_queue_size: Option<i64>,
+    /// Total in-flight actions across all workers (pool-level metric)
+    pub total_in_flight: Option<i64>,
 }
 
 /// A workflow instance (execution)

@@ -520,9 +520,11 @@ impl Database {
                     last_action_at,
                     updated_at,
                     median_dequeue_ms,
-                    median_handling_ms
+                    median_handling_ms,
+                    dispatch_queue_size,
+                    total_in_flight
                 )
-                VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7)
+                VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, $9)
                 ON CONFLICT (pool_id, worker_id)
                 DO UPDATE SET
                     throughput_per_min = EXCLUDED.throughput_per_min,
@@ -530,7 +532,9 @@ impl Database {
                     last_action_at = EXCLUDED.last_action_at,
                     updated_at = EXCLUDED.updated_at,
                     median_dequeue_ms = EXCLUDED.median_dequeue_ms,
-                    median_handling_ms = EXCLUDED.median_handling_ms
+                    median_handling_ms = EXCLUDED.median_handling_ms,
+                    dispatch_queue_size = EXCLUDED.dispatch_queue_size,
+                    total_in_flight = EXCLUDED.total_in_flight
                 "#,
             )
             .bind(pool_id)
@@ -540,6 +544,8 @@ impl Database {
             .bind(status.last_action_at)
             .bind(status.median_dequeue_ms)
             .bind(status.median_handling_ms)
+            .bind(status.dispatch_queue_size)
+            .bind(status.total_in_flight)
             .execute(&mut *tx)
             .await?;
         }
