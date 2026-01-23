@@ -47,7 +47,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::time::MissedTickBehavior;
@@ -1081,45 +1081,39 @@ impl InstanceRunner {
         // This ensures if we crash, the DB shows the actions were attempted
         {
             let instances = self.active_instances.read().await;
-            for instance_id in by_instance.keys() {
-                if let Some(instance) = instances.get(instance_id) {
-                    let graph_bytes = instance.state.to_bytes();
-                    let next_wakeup = instance
-                        .state
-                        .graph
-                        .next_wakeup_time
-                        .map(|ms| Utc.timestamp_millis_opt(ms).unwrap());
+            let updates: Vec<_> = by_instance
+                .keys()
+                .filter_map(|instance_id| {
+                    instances.get(instance_id).map(|instance| {
+                        let graph_bytes = instance.state.to_bytes();
+                        let next_wakeup = instance
+                            .state
+                            .graph
+                            .next_wakeup_time
+                            .map(|ms| Utc.timestamp_millis_opt(ms).unwrap());
+                        (instance.instance_id, graph_bytes, next_wakeup)
+                    })
+                })
+                .collect();
 
-                    match self
-                        .db
-                        .update_execution_graph(
-                            instance.instance_id,
-                            &self.config.runner_id,
-                            &graph_bytes,
-                            next_wakeup,
-                        )
-                        .await
-                    {
-                        Ok(true) => {
-                            debug!(
-                                instance_id = %instance.instance_id,
-                                "Synced running state to DB before dispatch"
-                            );
+            if !updates.is_empty() {
+                match self
+                    .db
+                    .update_execution_graphs_batch(&self.config.runner_id, &updates)
+                    .await
+                {
+                    Ok(updated_ids) => {
+                        for (id, _, _) in &updates {
+                            if updated_ids.contains(id) {
+                                debug!(instance_id = %id, "Synced running state to DB before dispatch");
+                            } else {
+                                warn!(instance_id = %id, "Lost lease while syncing state before dispatch");
+                                // TODO: Handle lost lease - re-enqueue actions
+                            }
                         }
-                        Ok(false) => {
-                            warn!(
-                                instance_id = %instance.instance_id,
-                                "Lost lease while syncing state before dispatch"
-                            );
-                            // TODO: Handle lost lease - re-enqueue actions
-                        }
-                        Err(e) => {
-                            error!(
-                                instance_id = %instance.instance_id,
-                                error = %e,
-                                "Failed to sync state to DB before dispatch"
-                            );
-                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Failed to sync state to DB before dispatch");
                     }
                 }
             }
@@ -1607,66 +1601,58 @@ impl InstanceRunner {
 
     /// Finalize completed instances
     async fn finalize_completed_instances(&self) -> InstanceRunnerResult<()> {
-        let mut completed_ids = Vec::new();
-        let mut released_ids = Vec::new();
-        let mut lost_lease_ids = Vec::new();
+        // Collect batches for different operation types
+        // (instance_id, result_payload, graph_bytes)
+        let mut to_complete: Vec<(WorkflowInstanceId, Option<Vec<u8>>, Vec<u8>)> = Vec::new();
+        let mut to_fail: Vec<(WorkflowInstanceId, Option<Vec<u8>>, Vec<u8>)> = Vec::new();
+        // (instance_id, graph_bytes, next_wakeup)
+        let mut to_release: Vec<(WorkflowInstanceId, Vec<u8>, Option<DateTime<Utc>>)> = Vec::new();
+        let mut to_update: Vec<(WorkflowInstanceId, Vec<u8>, Option<DateTime<Utc>>)> = Vec::new();
 
+        // Track metadata for logging after batch operations complete
+        let mut complete_meta: HashMap<WorkflowInstanceId, String> = HashMap::new();
+        let mut fail_meta: HashMap<WorkflowInstanceId, (String, Option<String>)> = HashMap::new();
+
+        // Phase 1: Apply completions and categorize instances
         {
             let mut instances = self.active_instances.write().await;
 
-            for (id, instance) in instances.iter_mut() {
+            for (_, instance) in instances.iter_mut() {
                 // Apply any remaining completions
-                if !instance.pending_completions.is_empty() {
+                let completion_result = if !instance.pending_completions.is_empty() {
                     let completions = std::mem::take(&mut instance.pending_completions);
-                    let result = instance
-                        .state
-                        .apply_completions_batch(completions, &instance.dag);
+                    Some(
+                        instance
+                            .state
+                            .apply_completions_batch(completions, &instance.dag),
+                    )
+                } else {
+                    None
+                };
 
+                // Check for workflow completion/failure
+                if let Some(ref result) = completion_result {
                     if result.workflow_completed {
-                        // Persist completed state
                         let graph_bytes = instance.state.to_bytes();
-                        let success = self
-                            .db
-                            .complete_instance_with_graph(
-                                instance.instance_id,
-                                &self.config.runner_id,
-                                result.result_payload.as_deref(),
-                                &graph_bytes,
-                            )
-                            .await?;
-
-                        if success {
-                            completed_ids.push(*id);
-                            self.metrics.lock().await.instances_completed += 1;
-                            info!(
-                                instance_id = %instance.instance_id,
-                                workflow = %instance.workflow_name,
-                                "Instance completed successfully"
-                            );
-                        }
+                        complete_meta.insert(instance.instance_id, instance.workflow_name.clone());
+                        to_complete.push((
+                            instance.instance_id,
+                            result.result_payload.clone(),
+                            graph_bytes,
+                        ));
+                        continue;
                     } else if result.workflow_failed {
-                        // Persist failed state
                         let graph_bytes = instance.state.to_bytes();
-                        let success = self
-                            .db
-                            .fail_instance_with_graph(
-                                instance.instance_id,
-                                &self.config.runner_id,
-                                result.result_payload.as_deref(),
-                                &graph_bytes,
-                            )
-                            .await?;
-
-                        if success {
-                            completed_ids.push(*id);
-                            self.metrics.lock().await.instances_failed += 1;
-                            warn!(
-                                instance_id = %instance.instance_id,
-                                workflow = %instance.workflow_name,
-                                error = ?result.error_message,
-                                "Instance failed"
-                            );
-                        }
+                        fail_meta.insert(
+                            instance.instance_id,
+                            (instance.workflow_name.clone(), result.error_message.clone()),
+                        );
+                        to_fail.push((
+                            instance.instance_id,
+                            result.result_payload.clone(),
+                            graph_bytes,
+                        ));
+                        continue;
                     }
                 }
 
@@ -1677,93 +1663,127 @@ impl InstanceRunner {
 
                 if fully_sleeping {
                     let graph_bytes = instance.state.to_bytes();
-                    let released = self
-                        .db
-                        .release_instance(
-                            instance.instance_id,
-                            &self.config.runner_id,
-                            &graph_bytes,
-                            next_wakeup,
-                        )
-                        .await?;
-                    if released {
-                        released_ids.push(*id);
-                    }
-                    continue;
-                }
-
-                // Check if instance is done (no pending work)
-                if !instance.state.has_pending_work() && instance.in_flight.is_empty() {
-                    // Persist current state
+                    to_release.push((instance.instance_id, graph_bytes, next_wakeup));
+                } else if !instance.state.has_pending_work() && instance.in_flight.is_empty() {
+                    // Instance is done (no pending work)
                     let graph_bytes = instance.state.to_bytes();
-                    match self
-                        .db
-                        .update_execution_graph(
-                            instance.instance_id,
-                            &self.config.runner_id,
-                            &graph_bytes,
-                            next_wakeup,
-                        )
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            warn!(
-                                instance_id = %instance.instance_id,
-                                "Lost lease while persisting execution graph"
-                            );
-                            lost_lease_ids.push(*id);
-                        }
-                        Err(err) => {
-                            error!(
-                                instance_id = %instance.instance_id,
-                                error = %err,
-                                "Failed to persist execution graph"
-                            );
-                        }
-                    }
+                    to_update.push((instance.instance_id, graph_bytes, next_wakeup));
                 } else if instance.state.graph.next_wakeup_time != previous_wakeup {
+                    // Wakeup time changed
                     let graph_bytes = instance.state.to_bytes();
-                    match self
-                        .db
-                        .update_execution_graph(
-                            instance.instance_id,
-                            &self.config.runner_id,
-                            &graph_bytes,
-                            next_wakeup,
-                        )
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            warn!(
-                                instance_id = %instance.instance_id,
-                                "Lost lease while updating wakeup time"
-                            );
-                            lost_lease_ids.push(*id);
-                        }
-                        Err(err) => {
-                            error!(
-                                instance_id = %instance.instance_id,
-                                error = %err,
-                                "Failed to update wakeup time"
-                            );
-                        }
-                    }
+                    to_update.push((instance.instance_id, graph_bytes, next_wakeup));
                 }
             }
         }
 
-        // Remove completed instances
+        // Phase 2: Execute batch operations
+        let mut completed_ids: HashSet<WorkflowInstanceId> = HashSet::new();
+        let mut released_ids: HashSet<WorkflowInstanceId> = HashSet::new();
+        let mut lost_lease_ids: HashSet<WorkflowInstanceId> = HashSet::new();
+
+        // Batch complete
+        if !to_complete.is_empty() {
+            match self
+                .db
+                .complete_instances_batch(&self.config.runner_id, &to_complete)
+                .await
+            {
+                Ok(succeeded) => {
+                    let mut metrics = self.metrics.lock().await;
+                    for id in &succeeded {
+                        completed_ids.insert(*id);
+                        metrics.instances_completed += 1;
+                        if let Some(workflow_name) = complete_meta.get(id) {
+                            info!(
+                                instance_id = %id,
+                                workflow = %workflow_name,
+                                "Instance completed successfully"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to complete instances batch");
+                }
+            }
+        }
+
+        // Batch fail
+        if !to_fail.is_empty() {
+            match self
+                .db
+                .fail_instances_batch(&self.config.runner_id, &to_fail)
+                .await
+            {
+                Ok(succeeded) => {
+                    let mut metrics = self.metrics.lock().await;
+                    for id in &succeeded {
+                        completed_ids.insert(*id);
+                        metrics.instances_failed += 1;
+                        if let Some((workflow_name, error_msg)) = fail_meta.get(id) {
+                            warn!(
+                                instance_id = %id,
+                                workflow = %workflow_name,
+                                error = ?error_msg,
+                                "Instance failed"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to fail instances batch");
+                }
+            }
+        }
+
+        // Batch release
+        if !to_release.is_empty() {
+            match self
+                .db
+                .release_instances_batch(&self.config.runner_id, &to_release)
+                .await
+            {
+                Ok(succeeded) => {
+                    released_ids = succeeded;
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to release instances batch");
+                }
+            }
+        }
+
+        // Batch update
+        if !to_update.is_empty() {
+            match self
+                .db
+                .update_execution_graphs_batch(&self.config.runner_id, &to_update)
+                .await
+            {
+                Ok(succeeded) => {
+                    // Track instances that lost their lease
+                    for (id, _, _) in &to_update {
+                        if !succeeded.contains(id) {
+                            warn!(instance_id = %id, "Lost lease while persisting execution graph");
+                            lost_lease_ids.insert(*id);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to update execution graphs batch");
+                }
+            }
+        }
+
+        // Phase 3: Remove finalized instances from active set
         let mut instances = self.active_instances.write().await;
         for id in completed_ids {
-            instances.remove(&id);
+            instances.remove(&id.0);
         }
         for id in released_ids {
-            instances.remove(&id);
+            instances.remove(&id.0);
         }
         for id in lost_lease_ids {
-            instances.remove(&id);
+            instances.remove(&id.0);
         }
 
         Ok(())
@@ -1773,27 +1793,35 @@ impl InstanceRunner {
     async fn release_all_instances(&self) -> InstanceRunnerResult<()> {
         let instances = std::mem::take(&mut *self.active_instances.write().await);
 
-        for (_, mut instance) in instances {
-            Self::refresh_sleep_state(&mut instance);
-            let next_wakeup = Self::sleep_wakeup_datetime_ms(instance.state.graph.next_wakeup_time);
-            let graph_bytes = instance.state.to_bytes();
-            if let Err(e) = self
+        let releases: Vec<_> = instances
+            .into_values()
+            .map(|mut instance| {
+                Self::refresh_sleep_state(&mut instance);
+                let next_wakeup =
+                    Self::sleep_wakeup_datetime_ms(instance.state.graph.next_wakeup_time);
+                let graph_bytes = instance.state.to_bytes();
+                (instance.instance_id, graph_bytes, next_wakeup)
+            })
+            .collect();
+
+        if !releases.is_empty() {
+            match self
                 .db
-                .release_instance(
-                    instance.instance_id,
-                    &self.config.runner_id,
-                    &graph_bytes,
-                    next_wakeup,
-                )
+                .release_instances_batch(&self.config.runner_id, &releases)
                 .await
             {
-                error!(
-                    instance_id = %instance.instance_id,
-                    error = %e,
-                    "Failed to release instance"
-                );
-            } else {
-                debug!(instance_id = %instance.instance_id, "Released instance");
+                Ok(released) => {
+                    for (id, _, _) in &releases {
+                        if released.contains(id) {
+                            debug!(instance_id = %id, "Released instance");
+                        } else {
+                            warn!(instance_id = %id, "Failed to release instance (lost lease?)");
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to release instances batch");
+                }
             }
         }
 
