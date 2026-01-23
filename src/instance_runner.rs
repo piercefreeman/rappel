@@ -208,6 +208,16 @@ struct QueuedAction {
     attempt_number: u32,
 }
 
+/// An action currently in-flight to a worker.
+/// Used for Rust-side timeout tracking.
+#[derive(Debug, Clone)]
+struct InFlightAction {
+    instance_id: Uuid,
+    node_id: String,
+    timeout_at_ms: i64,
+    worker_idx: usize,
+}
+
 /// The instance-local runner
 pub struct InstanceRunner {
     config: InstanceRunnerConfig,
@@ -224,6 +234,14 @@ pub struct InstanceRunner {
     /// Actions are enqueued when nodes become ready, and dequeued
     /// based on worker capacity.
     dispatch_queue: Mutex<VecDeque<QueuedAction>>,
+
+    /// In-flight actions indexed by timeout time for efficient timeout checking.
+    /// Key is timeout_at_ms, value is list of actions timing out at that time.
+    timeout_queue: Mutex<std::collections::BTreeMap<i64, Vec<InFlightAction>>>,
+
+    /// Reverse lookup from (instance_id, node_id) to timeout_at_ms.
+    /// Used to remove entries when actions complete normally.
+    timeout_lookup: Mutex<HashMap<(Uuid, String), i64>>,
 
     /// Shutdown signal
     shutdown: AtomicBool,
@@ -260,6 +278,8 @@ impl InstanceRunner {
             active_instances: RwLock::new(HashMap::new()),
             dag_cache: RwLock::new(HashMap::new()),
             dispatch_queue: Mutex::new(VecDeque::new()),
+            timeout_queue: Mutex::new(std::collections::BTreeMap::new()),
+            timeout_lookup: Mutex::new(HashMap::new()),
             shutdown: AtomicBool::new(false),
             metrics: Mutex::new(InstanceRunnerMetrics::default()),
             completion_tx,
@@ -308,16 +328,19 @@ impl InstanceRunner {
             // 2. Process any completions from workers
             self.process_worker_completions().await?;
 
-            // 3. Check for durable sleep wakeups
+            // 3. Check for action timeouts (Rust-side enforcement)
+            self.check_action_timeouts().await?;
+
+            // 4. Check for durable sleep wakeups
             self.process_sleeping_nodes().await?;
 
-            // 4. Collect ready actions from instances → enqueue to dispatch queue
+            // 5. Collect ready actions from instances → enqueue to dispatch queue
             self.collect_ready_actions().await?;
 
-            // 5. Dispatch from queue: dequeue → mark running → sync DB → send to workers
+            // 6. Dispatch from queue: dequeue → mark running → sync DB → send to workers
             self.dispatch_from_queue().await?;
 
-            // 6. Process completed instances
+            // 7. Process completed instances
             self.finalize_completed_instances().await?;
 
             // Small sleep to avoid tight loop when idle
@@ -344,6 +367,7 @@ impl InstanceRunner {
     /// Process completions received from worker tasks
     async fn process_worker_completions(&self) -> InstanceRunnerResult<()> {
         let mut rx = self.completion_rx.lock().await;
+        let mut completed_actions: Vec<(Uuid, String)> = Vec::new();
 
         // Drain all available completions without blocking
         loop {
@@ -351,10 +375,28 @@ impl InstanceRunner {
                 Ok(worker_completion) => {
                     let mut instances = self.active_instances.write().await;
                     if let Some(instance) = instances.get_mut(&worker_completion.instance_id) {
-                        // Remove from in-flight tracking
-                        instance
+                        // Only process if action is still in-flight
+                        // (Rust-side timeout may have already handled it)
+                        if !instance
                             .in_flight
-                            .remove(&worker_completion.completion.node_id);
+                            .remove(&worker_completion.completion.node_id)
+                        {
+                            // Action already completed (e.g., via timeout), ignore this response
+                            debug!(
+                                instance_id = %worker_completion.instance_id,
+                                node_id = %worker_completion.completion.node_id,
+                                "Ignoring late completion for action no longer in-flight"
+                            );
+                            // Still release worker slot
+                            self.worker_pool.release_slot(worker_completion.worker_idx);
+                            continue;
+                        }
+
+                        // Track for timeout removal
+                        completed_actions.push((
+                            worker_completion.instance_id,
+                            worker_completion.completion.node_id.clone(),
+                        ));
 
                         // Add to pending completions
                         instance
@@ -372,6 +414,114 @@ impl InstanceRunner {
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        // Remove completed actions from timeout tracking
+        if !completed_actions.is_empty() {
+            self.remove_from_timeout_tracking(&completed_actions).await;
+        }
+
+        Ok(())
+    }
+
+    /// Remove actions from timeout tracking (called when they complete normally)
+    async fn remove_from_timeout_tracking(&self, actions: &[(Uuid, String)]) {
+        let mut timeout_queue = self.timeout_queue.lock().await;
+        let mut timeout_lookup = self.timeout_lookup.lock().await;
+
+        for (instance_id, node_id) in actions {
+            if let Some(timeout_at_ms) = timeout_lookup.remove(&(*instance_id, node_id.clone())) {
+                if let Some(entries) = timeout_queue.get_mut(&timeout_at_ms) {
+                    entries.retain(|e| !(e.instance_id == *instance_id && e.node_id == *node_id));
+                    if entries.is_empty() {
+                        timeout_queue.remove(&timeout_at_ms);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check for timed-out actions and create synthetic failure completions.
+    ///
+    /// This is the Rust-side timeout enforcement - we don't rely on Python
+    /// to report timeouts. Any action that exceeds its timeout_seconds gets
+    /// a synthetic failure completion which will trigger retry logic.
+    async fn check_action_timeouts(&self) -> InstanceRunnerResult<()> {
+        let now_ms = Utc::now().timestamp_millis();
+        let mut timed_out: Vec<InFlightAction> = Vec::new();
+
+        // Find all timed-out actions
+        {
+            let mut timeout_queue = self.timeout_queue.lock().await;
+            let mut timeout_lookup = self.timeout_lookup.lock().await;
+
+            // Collect all entries with timeout_at_ms <= now
+            let expired_keys: Vec<i64> = timeout_queue
+                .range(..=now_ms)
+                .map(|(k, _)| *k)
+                .collect();
+
+            for key in expired_keys {
+                if let Some(entries) = timeout_queue.remove(&key) {
+                    for entry in entries {
+                        timeout_lookup.remove(&(entry.instance_id, entry.node_id.clone()));
+                        timed_out.push(entry);
+                    }
+                }
+            }
+        }
+
+        if timed_out.is_empty() {
+            return Ok(());
+        }
+
+        // Create synthetic completions for timed-out actions
+        let mut instances = self.active_instances.write().await;
+
+        for entry in timed_out {
+            if let Some(instance) = instances.get_mut(&entry.instance_id) {
+                // Only process if still in-flight (might have completed just before timeout)
+                if !instance.in_flight.remove(&entry.node_id) {
+                    continue;
+                }
+
+                // Get timeout duration for error message
+                let timeout_seconds = instance
+                    .state
+                    .graph
+                    .nodes
+                    .get(&entry.node_id)
+                    .map(|n| n.timeout_seconds)
+                    .unwrap_or(0);
+
+                let completion = Completion {
+                    node_id: entry.node_id.clone(),
+                    success: false,
+                    result: None,
+                    error: Some(format!(
+                        "Action timed out after {} seconds (Rust-side enforcement)",
+                        timeout_seconds
+                    )),
+                    error_type: Some("TimeoutError".to_string()),
+                    worker_id: format!("worker-{}", entry.worker_idx),
+                    duration_ms: (now_ms - entry.timeout_at_ms + (timeout_seconds as i64 * 1000)),
+                    worker_duration_ms: None, // Unknown - worker may still be running
+                };
+
+                instance.pending_completions.push(completion);
+
+                // Release worker slot
+                self.worker_pool.release_slot(entry.worker_idx);
+
+                self.metrics.lock().await.actions_completed += 1;
+
+                warn!(
+                    instance_id = %entry.instance_id,
+                    node_id = %entry.node_id,
+                    timeout_seconds,
+                    "Action timed out (Rust-side enforcement)"
+                );
             }
         }
 
@@ -862,7 +1012,10 @@ impl InstanceRunner {
                 .push(action);
         }
 
-        // Phase 1: Mark as Running in in-memory state
+        // Phase 1: Mark as Running in in-memory state and track timeouts
+        let now_ms = Utc::now().timestamp_millis();
+        let mut timeout_entries: Vec<(i64, InFlightAction)> = Vec::new();
+
         {
             let mut instances = self.active_instances.write().await;
             for (instance_id, actions) in &by_instance {
@@ -887,9 +1040,46 @@ impl InstanceRunner {
                             &worker_id,
                             action.inputs_bytes.clone(),
                         );
+
+                        // Set started_at_ms for timeout tracking
+                        if let Some(node) = instance.state.graph.nodes.get_mut(&action.node_id) {
+                            node.started_at_ms = Some(now_ms);
+                        }
+
                         instance.in_flight.insert(action.node_id.clone());
+
+                        // Track timeout (only if timeout is set)
+                        if action.timeout_seconds > 0 {
+                            let timeout_at_ms = now_ms + (action.timeout_seconds as i64 * 1000);
+                            timeout_entries.push((
+                                timeout_at_ms,
+                                InFlightAction {
+                                    instance_id: *instance_id,
+                                    node_id: action.node_id.clone(),
+                                    timeout_at_ms,
+                                    worker_idx,
+                                },
+                            ));
+                        }
                     }
                 }
+            }
+        }
+
+        // Add timeout entries to tracking structures
+        if !timeout_entries.is_empty() {
+            let mut timeout_queue = self.timeout_queue.lock().await;
+            let mut timeout_lookup = self.timeout_lookup.lock().await;
+
+            for (timeout_at_ms, entry) in timeout_entries {
+                timeout_lookup.insert(
+                    (entry.instance_id, entry.node_id.clone()),
+                    timeout_at_ms,
+                );
+                timeout_queue
+                    .entry(timeout_at_ms)
+                    .or_insert_with(Vec::new)
+                    .push(entry);
             }
         }
 
@@ -1723,5 +1913,196 @@ mod tests {
 
         // Heartbeat should be significantly less than lease to prevent expiration
         assert!(DEFAULT_HEARTBEAT_INTERVAL.as_secs() < DEFAULT_LEASE_SECONDS as u64 / 2);
+    }
+
+    #[test]
+    fn test_in_flight_action_construction() {
+        let instance_id = Uuid::new_v4();
+        let action = InFlightAction {
+            instance_id,
+            node_id: "action_0".to_string(),
+            timeout_at_ms: 1000,
+            worker_idx: 0,
+        };
+        assert_eq!(action.instance_id, instance_id);
+        assert_eq!(action.node_id, "action_0");
+        assert_eq!(action.timeout_at_ms, 1000);
+        assert_eq!(action.worker_idx, 0);
+    }
+
+    #[test]
+    fn test_timeout_queue_ordering() {
+        // BTreeMap should maintain entries sorted by timeout_at_ms
+        use std::collections::BTreeMap;
+
+        let mut timeout_queue: BTreeMap<i64, Vec<InFlightAction>> = BTreeMap::new();
+        let instance_id = Uuid::new_v4();
+
+        // Insert in non-sorted order
+        timeout_queue.insert(
+            3000,
+            vec![InFlightAction {
+                instance_id,
+                node_id: "action_c".to_string(),
+                timeout_at_ms: 3000,
+                worker_idx: 2,
+            }],
+        );
+        timeout_queue.insert(
+            1000,
+            vec![InFlightAction {
+                instance_id,
+                node_id: "action_a".to_string(),
+                timeout_at_ms: 1000,
+                worker_idx: 0,
+            }],
+        );
+        timeout_queue.insert(
+            2000,
+            vec![InFlightAction {
+                instance_id,
+                node_id: "action_b".to_string(),
+                timeout_at_ms: 2000,
+                worker_idx: 1,
+            }],
+        );
+
+        // Iteration should be in sorted order
+        let keys: Vec<i64> = timeout_queue.keys().cloned().collect();
+        assert_eq!(keys, vec![1000, 2000, 3000]);
+
+        // First entry should be the earliest timeout
+        let (first_key, first_actions) = timeout_queue.iter().next().unwrap();
+        assert_eq!(*first_key, 1000);
+        assert_eq!(first_actions[0].node_id, "action_a");
+    }
+
+    #[test]
+    fn test_timeout_queue_multiple_actions_same_deadline() {
+        // Multiple actions can timeout at the same time
+        use std::collections::BTreeMap;
+
+        let mut timeout_queue: BTreeMap<i64, Vec<InFlightAction>> = BTreeMap::new();
+        let instance_id = Uuid::new_v4();
+
+        let deadline = 5000_i64;
+
+        // Add first action at deadline
+        timeout_queue.insert(
+            deadline,
+            vec![InFlightAction {
+                instance_id,
+                node_id: "action_a".to_string(),
+                timeout_at_ms: deadline,
+                worker_idx: 0,
+            }],
+        );
+
+        // Add second action at same deadline
+        timeout_queue
+            .entry(deadline)
+            .or_default()
+            .push(InFlightAction {
+                instance_id,
+                node_id: "action_b".to_string(),
+                timeout_at_ms: deadline,
+                worker_idx: 1,
+            });
+
+        // Should have both actions under same key
+        let actions = timeout_queue.get(&deadline).unwrap();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].node_id, "action_a");
+        assert_eq!(actions[1].node_id, "action_b");
+    }
+
+    #[test]
+    fn test_timeout_lookup_and_removal() {
+        // Test the reverse lookup pattern used in remove_from_timeout_tracking
+        use std::collections::BTreeMap;
+
+        let mut timeout_queue: BTreeMap<i64, Vec<InFlightAction>> = BTreeMap::new();
+        let mut timeout_lookup: HashMap<(Uuid, String), i64> = HashMap::new();
+
+        let instance_id = Uuid::new_v4();
+        let timeout_at_ms = 5000_i64;
+
+        // Add action to both structures (simulating dispatch)
+        let action = InFlightAction {
+            instance_id,
+            node_id: "action_0".to_string(),
+            timeout_at_ms,
+            worker_idx: 0,
+        };
+
+        timeout_lookup.insert((instance_id, "action_0".to_string()), timeout_at_ms);
+        timeout_queue.entry(timeout_at_ms).or_default().push(action);
+
+        // Verify it exists
+        assert!(timeout_lookup.contains_key(&(instance_id, "action_0".to_string())));
+        assert_eq!(timeout_queue.get(&timeout_at_ms).unwrap().len(), 1);
+
+        // Simulate removal (when action completes normally)
+        if let Some(deadline) = timeout_lookup.remove(&(instance_id, "action_0".to_string())) {
+            if let Some(entries) = timeout_queue.get_mut(&deadline) {
+                entries.retain(|e| !(e.instance_id == instance_id && e.node_id == "action_0"));
+                if entries.is_empty() {
+                    timeout_queue.remove(&deadline);
+                }
+            }
+        }
+
+        // Verify it's removed from both structures
+        assert!(!timeout_lookup.contains_key(&(instance_id, "action_0".to_string())));
+        assert!(timeout_queue.get(&timeout_at_ms).is_none());
+    }
+
+    #[test]
+    fn test_timeout_expired_detection() {
+        // Test the pattern used in check_action_timeouts to find expired entries
+        use std::collections::BTreeMap;
+
+        let mut timeout_queue: BTreeMap<i64, Vec<InFlightAction>> = BTreeMap::new();
+        let instance_id = Uuid::new_v4();
+
+        // Add actions with different deadlines
+        for (i, deadline) in [1000_i64, 2000, 3000, 4000, 5000].iter().enumerate() {
+            timeout_queue.insert(
+                *deadline,
+                vec![InFlightAction {
+                    instance_id,
+                    node_id: format!("action_{}", i),
+                    timeout_at_ms: *deadline,
+                    worker_idx: i,
+                }],
+            );
+        }
+
+        // Current time is 2500ms - actions at 1000 and 2000 should be expired
+        let now_ms = 2500_i64;
+        let expired_keys: Vec<i64> = timeout_queue
+            .range(..=now_ms)
+            .map(|(k, _)| *k)
+            .collect();
+
+        assert_eq!(expired_keys, vec![1000, 2000]);
+
+        // Collect expired actions
+        let mut expired_actions = Vec::new();
+        for key in expired_keys {
+            if let Some(entries) = timeout_queue.remove(&key) {
+                expired_actions.extend(entries);
+            }
+        }
+
+        assert_eq!(expired_actions.len(), 2);
+        assert_eq!(expired_actions[0].node_id, "action_0");
+        assert_eq!(expired_actions[1].node_id, "action_1");
+
+        // Remaining queue should have actions at 3000, 4000, 5000
+        assert_eq!(timeout_queue.len(), 3);
+        assert!(timeout_queue.contains_key(&3000));
+        assert!(timeout_queue.contains_key(&4000));
+        assert!(timeout_queue.contains_key(&5000));
     }
 }

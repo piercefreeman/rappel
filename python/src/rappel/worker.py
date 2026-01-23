@@ -73,14 +73,19 @@ async def _handle_dispatch(
     dispatch.ParseFromString(envelope.payload)
     timeout_seconds = dispatch.timeout_seconds if dispatch.HasField("timeout_seconds") else 0
 
+    # Python-side timeout is a safety net for cleanup only.
+    # Rust handles the primary timeout enforcement.
+    # Add buffer so Rust always times out first.
+    python_timeout = timeout_seconds + 30 if timeout_seconds > 0 else 0
+
     worker_start = time.perf_counter_ns()
     success = True
     action_name = dispatch.action_name
     execution: workflow_runtime.ActionExecutionResult | None = None
     try:
-        if timeout_seconds > 0:
+        if python_timeout > 0:
             execution = await asyncio.wait_for(
-                workflow_runtime.execute_action(dispatch), timeout=timeout_seconds
+                workflow_runtime.execute_action(dispatch), timeout=python_timeout
             )
         else:
             execution = await workflow_runtime.execute_action(dispatch)
@@ -91,16 +96,21 @@ async def _handle_dispatch(
         else:
             response_payload = serialize_result_payload(execution.result)
     except asyncio.TimeoutError:
-        success = False
-        error = TimeoutError(f"action {action_name} timed out after {timeout_seconds} seconds")
-        response_payload = serialize_error_payload(action_name, error)
+        # Python-side timeout is just for cleanup - Rust already handled the timeout.
+        # Log internally but don't treat as special error type.
         LOGGER.warning(
-            "Action %s timed out after %ss for action_id=%s sequence=%s",
+            "Action %s hit Python cleanup timeout after %ss (Rust already timed out at %ss) "
+            "for action_id=%s sequence=%s",
             action_name,
+            python_timeout,
             timeout_seconds,
             dispatch.action_id,
             dispatch.sequence,
         )
+        success = False
+        # Return generic error - Rust will likely ignore this late response
+        error = Exception(f"action {action_name} cleanup timeout (Rust-side timeout already triggered)")
+        response_payload = serialize_error_payload(action_name, error)
     except Exception as exc:  # noqa: BLE001 - propagate structured errors
         success = False
         response_payload = serialize_error_payload(action_name, exc)
