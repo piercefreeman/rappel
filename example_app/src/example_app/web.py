@@ -47,6 +47,9 @@ from example_app.workflows import (
     LoopProcessingWorkflow,
     LoopRequest,
     LoopResult,
+    ManyActionsRequest,
+    ManyActionsResult,
+    ManyActionsWorkflow,
     NoOpWorkflow,
     ParallelMathWorkflow,
     SequentialChainWorkflow,
@@ -290,6 +293,22 @@ async def run_spread_empty_workflow(
 
 
 # =============================================================================
+# Many Actions (stress test)
+# =============================================================================
+
+
+@app.post("/api/many-actions", response_model=ManyActionsResult)
+async def run_many_actions_workflow(payload: ManyActionsRequest) -> ManyActionsResult:
+    """
+    Run the many actions workflow for stress testing.
+
+    Executes a configurable number of actions either in parallel or sequentially.
+    """
+    workflow = ManyActionsWorkflow()
+    return await workflow.run(action_count=payload.action_count, parallel=payload.parallel)
+
+
+# =============================================================================
 # Scheduled Workflows
 # =============================================================================
 
@@ -308,6 +327,7 @@ WORKFLOW_REGISTRY = {
     "EarlyReturnLoopWorkflow": EarlyReturnLoopWorkflow,
     "KwOnlyLocationWorkflow": KwOnlyLocationWorkflow,
     "SpreadEmptyCollectionWorkflow": SpreadEmptyCollectionWorkflow,
+    "ManyActionsWorkflow": ManyActionsWorkflow,
     "NoOpWorkflow": NoOpWorkflow,
 }
 

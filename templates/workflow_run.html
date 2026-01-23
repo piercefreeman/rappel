@@ -132,11 +132,26 @@
 
 {% block scripts %}
 <script>
-// Pass node data as JSON to avoid HTML entity escaping issues
-const nodeData = {{ nodes_json | safe }};
+const runDataUrl = "/api/workflows/{{ workflow.id }}/run/{{ instance.id }}/run-data";
+let nodeData = [];
 const graphData = {{ graph_data | json_encode | safe }};
-// Action logs keyed by action_id (UUID string)
-const actionLogs = {{ action_logs_json | safe }};
+let actionLogs = {};
+
+async function loadRunData() {
+  const emptyTimeline = document.querySelector('#timeline-empty p');
+  if (emptyTimeline) {
+    emptyTimeline.textContent = 'Loading execution logs...';
+  }
+
+  const response = await fetch(runDataUrl);
+  if (!response.ok) {
+    throw new Error(`Failed to load run data (${response.status})`);
+  }
+
+  const payload = await response.json();
+  nodeData = Array.isArray(payload.nodes) ? payload.nodes : [];
+  actionLogs = payload.action_logs || {};
+}
 
 function payloadHasException(payloadText) {
   if (!payloadText) return false;
@@ -453,6 +468,19 @@ class DAGLayout {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+  loadRunData()
+    .then(() => initRunPage())
+    .catch((err) => {
+      console.error(err);
+      const emptyTimeline = document.querySelector('#timeline-empty p');
+      if (emptyTimeline) {
+        emptyTimeline.textContent = 'Failed to load execution logs.';
+      }
+      initRunPage(true);
+    });
+});
+
+function initRunPage(loadError) {
   const container = document.getElementById('execution-graph');
   if (!container) return;
 
@@ -501,7 +529,15 @@ document.addEventListener('DOMContentLoaded', () => {
     dag.selectNode(nodeId);
 
     const node = nodeLookup[nodeId];
-    if (!node) return;
+    if (!node) {
+      if (loadError) {
+        const placeholder = document.getElementById('detail-placeholder');
+        if (placeholder) {
+          placeholder.textContent = 'Run details failed to load.';
+        }
+      }
+      return;
+    }
 
     // Update detail panel
     const placeholder = document.getElementById('detail-placeholder');
@@ -631,7 +667,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Render the full execution timeline
   renderTimeline();
-});
+}
 
 function renderTimeline() {
   const timelineEmpty = document.getElementById('timeline-empty');

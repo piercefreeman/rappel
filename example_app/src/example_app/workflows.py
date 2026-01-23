@@ -1164,6 +1164,82 @@ class NoOpWorkflow(Workflow):
 
 
 # =============================================================================
+# Many Actions Workflow (stress test)
+# =============================================================================
+
+
+class ManyActionsRequest(BaseModel):
+    """Request for the many actions workflow."""
+
+    action_count: int = Field(
+        default=50,
+        ge=1,
+        description="Number of actions to execute",
+    )
+    parallel: bool = Field(
+        default=True,
+        description="Whether to run actions in parallel (True) or sequentially (False)",
+    )
+
+
+class ManyActionsResult(BaseModel):
+    """Result from the many actions workflow."""
+
+    action_count: int
+    parallel: bool
+    results: list[int]
+    total: int
+
+
+@action
+async def compute_square(value: int) -> int:
+    """Return a constant to keep the action as a no-op."""
+    _ = value
+    return 1
+
+
+@action
+async def aggregate_squares(squares: list[int], action_count: int, parallel: bool) -> ManyActionsResult:
+    """Aggregate the square computation results."""
+    return ManyActionsResult(
+        action_count=action_count,
+        parallel=parallel,
+        results=squares,
+        total=sum(squares),
+    )
+
+
+@workflow
+class ManyActionsWorkflow(Workflow):
+    """
+    Workflow that executes many actions to stress test the system.
+
+    Can run actions in parallel (using asyncio.gather) or sequentially
+    based on the `parallel` configuration parameter.
+    """
+
+    async def run(self, action_count: int = 50, parallel: bool = True) -> ManyActionsResult:
+        if parallel:
+            # Fan out: run all actions in parallel
+            results = await asyncio.gather(
+                *[compute_square(value=i) for i in range(action_count)],
+                return_exceptions=True,
+            )
+        else:
+            # Run actions sequentially
+            results = []
+            for i in range(action_count):
+                result = await compute_square(value=i)
+                results.append(result)
+
+        return await aggregate_squares(
+            squares=results,
+            action_count=action_count,
+            parallel=parallel,
+        )
+
+
+# =============================================================================
 # Legacy alias for backwards compatibility
 # =============================================================================
 
