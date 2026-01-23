@@ -5,22 +5,29 @@
 //! database leases. Execution state is stored as a protobuf-encoded blob.
 //!
 //! ## Instance-Local Operations
-//! - `claim_instance` / `claim_instances_batch` - Claim instances with lease
-//! - `update_execution_graph` - Persist execution state
+//! - `claim_instances_batch` - Claim instances with lease
+//! - `update_execution_graphs_batch` - Persist execution state for multiple instances
 //! - `heartbeat_instances` - Extend leases
-//! - `complete_instance_with_graph` / `fail_instance_with_graph` - Complete with final state
-//! - `release_instance` - Release without completing
+//! - `complete_instances_batch` / `fail_instances_batch` - Complete/fail with final state
+//! - `release_instances_batch` - Release without completing
 //! - `count_orphaned_instances` - Monitor orphaned instances
 
-use sqlx::Row;
-use uuid::Uuid;
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
+use sqlx::Row;
+use uuid::Uuid;
 
 use super::{
     Database, DbError, DbResult, ScheduleId, ScheduleType, WorkerStatusUpdate, WorkflowInstanceId,
     WorkflowSchedule, WorkflowVersion, WorkflowVersionId,
 };
+
+/// Batch update for execution graphs: (instance_id, graph_bytes, next_wakeup_time)
+pub type ExecutionGraphUpdate = (WorkflowInstanceId, Vec<u8>, Option<DateTime<Utc>>);
+
+/// Batch completion/failure: (instance_id, result_payload, graph_bytes)
+pub type InstanceFinalization = (WorkflowInstanceId, Option<Vec<u8>>, Vec<u8>);
 
 impl Database {
     // ========================================================================
@@ -749,35 +756,50 @@ impl Database {
             .collect())
     }
 
-    /// Update the execution graph for an instance.
+    /// Update execution graphs for multiple instances in a single query.
     ///
-    /// Only succeeds if the caller still owns the instance (lease hasn't expired
-    /// and owner_id matches). This provides optimistic locking.
-    pub async fn update_execution_graph(
+    /// Only succeeds for instances where the caller still owns them (lease hasn't expired
+    /// and owner_id matches). Returns the set of instance IDs that were successfully updated.
+    pub async fn update_execution_graphs_batch(
         &self,
-        instance_id: WorkflowInstanceId,
         owner_id: &str,
-        execution_graph: &[u8],
-        next_wakeup_time: Option<DateTime<Utc>>,
-    ) -> DbResult<bool> {
-        let result = sqlx::query(
+        updates: &[ExecutionGraphUpdate],
+    ) -> DbResult<HashSet<WorkflowInstanceId>> {
+        if updates.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let ids: Vec<Uuid> = updates.iter().map(|(id, _, _)| id.0).collect();
+        let graphs: Vec<Vec<u8>> = updates.iter().map(|(_, g, _)| g.clone()).collect();
+        let wakeups: Vec<Option<DateTime<Utc>>> = updates.iter().map(|(_, _, w)| *w).collect();
+
+        let rows = sqlx::query(
             r#"
-            UPDATE workflow_instances
-            SET execution_graph = $3,
-                next_wakeup_time = $4
-            WHERE id = $1
-              AND owner_id = $2
-              AND lease_expires_at > NOW()
+            UPDATE workflow_instances i
+            SET execution_graph = u.execution_graph,
+                next_wakeup_time = u.next_wakeup_time
+            FROM (
+                SELECT unnest($1::uuid[]) as id,
+                       unnest($3::bytea[]) as execution_graph,
+                       unnest($4::timestamptz[]) as next_wakeup_time
+            ) u
+            WHERE i.id = u.id
+              AND i.owner_id = $2
+              AND i.lease_expires_at > NOW()
+            RETURNING i.id
             "#,
         )
-        .bind(instance_id.0)
+        .bind(&ids)
         .bind(owner_id)
-        .bind(execution_graph)
-        .bind(next_wakeup_time)
-        .execute(&self.pool)
+        .bind(&graphs)
+        .bind(&wakeups)
+        .fetch_all(&self.pool)
         .await?;
 
-        Ok(result.rows_affected() == 1)
+        Ok(rows
+            .iter()
+            .map(|row| WorkflowInstanceId(row.get("id")))
+            .collect())
     }
 
     /// Extend the lease for all instances owned by this owner.
@@ -805,105 +827,153 @@ impl Database {
         Ok(result.rows_affected() as i64)
     }
 
-    /// Complete an instance and update its execution graph atomically.
+    /// Complete multiple instances and update their execution graphs atomically.
     ///
-    /// Only succeeds if the caller still owns the instance.
-    pub async fn complete_instance_with_graph(
+    /// Only succeeds for instances where the caller still owns them.
+    /// Returns the set of instance IDs that were successfully completed.
+    pub async fn complete_instances_batch(
         &self,
-        instance_id: WorkflowInstanceId,
         owner_id: &str,
-        result_payload: Option<&[u8]>,
-        execution_graph: &[u8],
-    ) -> DbResult<bool> {
-        let result = sqlx::query(
+        completions: &[InstanceFinalization],
+    ) -> DbResult<HashSet<WorkflowInstanceId>> {
+        if completions.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let ids: Vec<Uuid> = completions.iter().map(|(id, _, _)| id.0).collect();
+        let results: Vec<Option<Vec<u8>>> = completions.iter().map(|(_, r, _)| r.clone()).collect();
+        let graphs: Vec<Vec<u8>> = completions.iter().map(|(_, _, g)| g.clone()).collect();
+
+        let rows = sqlx::query(
             r#"
-            UPDATE workflow_instances
+            UPDATE workflow_instances i
             SET status = 'completed',
-                result_payload = $3,
-                execution_graph = $4,
+                result_payload = u.result_payload,
+                execution_graph = u.execution_graph,
                 next_wakeup_time = NULL,
                 completed_at = NOW(),
                 owner_id = NULL,
                 lease_expires_at = NULL
-            WHERE id = $1
-              AND owner_id = $2
-              AND lease_expires_at > NOW()
+            FROM (
+                SELECT unnest($1::uuid[]) as id,
+                       unnest($3::bytea[]) as result_payload,
+                       unnest($4::bytea[]) as execution_graph
+            ) u
+            WHERE i.id = u.id
+              AND i.owner_id = $2
+              AND i.lease_expires_at > NOW()
+            RETURNING i.id
             "#,
         )
-        .bind(instance_id.0)
+        .bind(&ids)
         .bind(owner_id)
-        .bind(result_payload)
-        .bind(execution_graph)
-        .execute(&self.pool)
+        .bind(&results)
+        .bind(&graphs)
+        .fetch_all(&self.pool)
         .await?;
 
-        Ok(result.rows_affected() == 1)
+        Ok(rows
+            .iter()
+            .map(|row| WorkflowInstanceId(row.get("id")))
+            .collect())
     }
 
-    /// Fail an instance and update its execution graph atomically.
+    /// Fail multiple instances and update their execution graphs atomically.
     ///
-    /// Only succeeds if the caller still owns the instance.
-    pub async fn fail_instance_with_graph(
+    /// Only succeeds for instances where the caller still owns them.
+    /// Returns the set of instance IDs that were successfully failed.
+    pub async fn fail_instances_batch(
         &self,
-        instance_id: WorkflowInstanceId,
         owner_id: &str,
-        result_payload: Option<&[u8]>,
-        execution_graph: &[u8],
-    ) -> DbResult<bool> {
-        let result = sqlx::query(
+        failures: &[InstanceFinalization],
+    ) -> DbResult<HashSet<WorkflowInstanceId>> {
+        if failures.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let ids: Vec<Uuid> = failures.iter().map(|(id, _, _)| id.0).collect();
+        let results: Vec<Option<Vec<u8>>> = failures.iter().map(|(_, r, _)| r.clone()).collect();
+        let graphs: Vec<Vec<u8>> = failures.iter().map(|(_, _, g)| g.clone()).collect();
+
+        let rows = sqlx::query(
             r#"
-            UPDATE workflow_instances
+            UPDATE workflow_instances i
             SET status = 'failed',
-                result_payload = $3,
-                execution_graph = $4,
+                result_payload = u.result_payload,
+                execution_graph = u.execution_graph,
                 next_wakeup_time = NULL,
                 completed_at = NOW(),
                 owner_id = NULL,
                 lease_expires_at = NULL
-            WHERE id = $1
-              AND owner_id = $2
-              AND lease_expires_at > NOW()
+            FROM (
+                SELECT unnest($1::uuid[]) as id,
+                       unnest($3::bytea[]) as result_payload,
+                       unnest($4::bytea[]) as execution_graph
+            ) u
+            WHERE i.id = u.id
+              AND i.owner_id = $2
+              AND i.lease_expires_at > NOW()
+            RETURNING i.id
             "#,
         )
-        .bind(instance_id.0)
+        .bind(&ids)
         .bind(owner_id)
-        .bind(result_payload)
-        .bind(execution_graph)
-        .execute(&self.pool)
+        .bind(&results)
+        .bind(&graphs)
+        .fetch_all(&self.pool)
         .await?;
 
-        Ok(result.rows_affected() == 1)
+        Ok(rows
+            .iter()
+            .map(|row| WorkflowInstanceId(row.get("id")))
+            .collect())
     }
 
-    /// Release ownership of an instance without completing it.
+    /// Release ownership of multiple instances without completing them.
     ///
-    /// The instance will become available for other runners to claim.
-    pub async fn release_instance(
+    /// The instances will become available for other runners to claim.
+    /// Returns the set of instance IDs that were successfully released.
+    pub async fn release_instances_batch(
         &self,
-        instance_id: WorkflowInstanceId,
         owner_id: &str,
-        execution_graph: &[u8],
-        next_wakeup_time: Option<DateTime<Utc>>,
-    ) -> DbResult<bool> {
-        let result = sqlx::query(
+        releases: &[ExecutionGraphUpdate],
+    ) -> DbResult<HashSet<WorkflowInstanceId>> {
+        if releases.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let ids: Vec<Uuid> = releases.iter().map(|(id, _, _)| id.0).collect();
+        let graphs: Vec<Vec<u8>> = releases.iter().map(|(_, g, _)| g.clone()).collect();
+        let wakeups: Vec<Option<DateTime<Utc>>> = releases.iter().map(|(_, _, w)| *w).collect();
+
+        let rows = sqlx::query(
             r#"
-            UPDATE workflow_instances
-            SET execution_graph = $3,
-                next_wakeup_time = $4,
+            UPDATE workflow_instances i
+            SET execution_graph = u.execution_graph,
+                next_wakeup_time = u.next_wakeup_time,
                 owner_id = NULL,
                 lease_expires_at = NULL
-            WHERE id = $1
-              AND owner_id = $2
+            FROM (
+                SELECT unnest($1::uuid[]) as id,
+                       unnest($3::bytea[]) as execution_graph,
+                       unnest($4::timestamptz[]) as next_wakeup_time
+            ) u
+            WHERE i.id = u.id
+              AND i.owner_id = $2
+            RETURNING i.id
             "#,
         )
-        .bind(instance_id.0)
+        .bind(&ids)
         .bind(owner_id)
-        .bind(execution_graph)
-        .bind(next_wakeup_time)
-        .execute(&self.pool)
+        .bind(&graphs)
+        .bind(&wakeups)
+        .fetch_all(&self.pool)
         .await?;
 
-        Ok(result.rows_affected() == 1)
+        Ok(rows
+            .iter()
+            .map(|row| WorkflowInstanceId(row.get("id")))
+            .collect())
     }
 
     /// Count orphaned instances (running with expired leases).

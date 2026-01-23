@@ -47,7 +47,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::time::MissedTickBehavior;
@@ -208,6 +208,16 @@ struct QueuedAction {
     attempt_number: u32,
 }
 
+/// An action currently in-flight to a worker.
+/// Used for Rust-side timeout tracking.
+#[derive(Debug, Clone)]
+struct InFlightAction {
+    instance_id: Uuid,
+    node_id: String,
+    timeout_at_ms: i64,
+    worker_idx: usize,
+}
+
 /// The instance-local runner
 pub struct InstanceRunner {
     config: InstanceRunnerConfig,
@@ -224,6 +234,14 @@ pub struct InstanceRunner {
     /// Actions are enqueued when nodes become ready, and dequeued
     /// based on worker capacity.
     dispatch_queue: Mutex<VecDeque<QueuedAction>>,
+
+    /// In-flight actions indexed by timeout time for efficient timeout checking.
+    /// Key is timeout_at_ms, value is list of actions timing out at that time.
+    timeout_queue: Mutex<std::collections::BTreeMap<i64, Vec<InFlightAction>>>,
+
+    /// Reverse lookup from (instance_id, node_id) to timeout_at_ms.
+    /// Used to remove entries when actions complete normally.
+    timeout_lookup: Mutex<HashMap<(Uuid, String), i64>>,
 
     /// Shutdown signal
     shutdown: AtomicBool,
@@ -260,6 +278,8 @@ impl InstanceRunner {
             active_instances: RwLock::new(HashMap::new()),
             dag_cache: RwLock::new(HashMap::new()),
             dispatch_queue: Mutex::new(VecDeque::new()),
+            timeout_queue: Mutex::new(std::collections::BTreeMap::new()),
+            timeout_lookup: Mutex::new(HashMap::new()),
             shutdown: AtomicBool::new(false),
             metrics: Mutex::new(InstanceRunnerMetrics::default()),
             completion_tx,
@@ -308,16 +328,19 @@ impl InstanceRunner {
             // 2. Process any completions from workers
             self.process_worker_completions().await?;
 
-            // 3. Check for durable sleep wakeups
+            // 3. Check for action timeouts (Rust-side enforcement)
+            self.check_action_timeouts().await?;
+
+            // 4. Check for durable sleep wakeups
             self.process_sleeping_nodes().await?;
 
-            // 4. Collect ready actions from instances → enqueue to dispatch queue
+            // 5. Collect ready actions from instances → enqueue to dispatch queue
             self.collect_ready_actions().await?;
 
-            // 5. Dispatch from queue: dequeue → mark running → sync DB → send to workers
+            // 6. Dispatch from queue: dequeue → mark running → sync DB → send to workers
             self.dispatch_from_queue().await?;
 
-            // 6. Process completed instances
+            // 7. Process completed instances
             self.finalize_completed_instances().await?;
 
             // Small sleep to avoid tight loop when idle
@@ -344,6 +367,7 @@ impl InstanceRunner {
     /// Process completions received from worker tasks
     async fn process_worker_completions(&self) -> InstanceRunnerResult<()> {
         let mut rx = self.completion_rx.lock().await;
+        let mut completed_actions: Vec<(Uuid, String)> = Vec::new();
 
         // Drain all available completions without blocking
         loop {
@@ -351,10 +375,28 @@ impl InstanceRunner {
                 Ok(worker_completion) => {
                     let mut instances = self.active_instances.write().await;
                     if let Some(instance) = instances.get_mut(&worker_completion.instance_id) {
-                        // Remove from in-flight tracking
-                        instance
+                        // Only process if action is still in-flight
+                        // (Rust-side timeout may have already handled it)
+                        if !instance
                             .in_flight
-                            .remove(&worker_completion.completion.node_id);
+                            .remove(&worker_completion.completion.node_id)
+                        {
+                            // Action already completed (e.g., via timeout), ignore this response
+                            debug!(
+                                instance_id = %worker_completion.instance_id,
+                                node_id = %worker_completion.completion.node_id,
+                                "Ignoring late completion for action no longer in-flight"
+                            );
+                            // Still release worker slot
+                            self.worker_pool.release_slot(worker_completion.worker_idx);
+                            continue;
+                        }
+
+                        // Track for timeout removal
+                        completed_actions.push((
+                            worker_completion.instance_id,
+                            worker_completion.completion.node_id.clone(),
+                        ));
 
                         // Add to pending completions
                         instance
@@ -372,6 +414,111 @@ impl InstanceRunner {
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        // Remove completed actions from timeout tracking
+        if !completed_actions.is_empty() {
+            self.remove_from_timeout_tracking(&completed_actions).await;
+        }
+
+        Ok(())
+    }
+
+    /// Remove actions from timeout tracking (called when they complete normally)
+    async fn remove_from_timeout_tracking(&self, actions: &[(Uuid, String)]) {
+        let mut timeout_queue = self.timeout_queue.lock().await;
+        let mut timeout_lookup = self.timeout_lookup.lock().await;
+
+        for (instance_id, node_id) in actions {
+            if let Some(timeout_at_ms) = timeout_lookup.remove(&(*instance_id, node_id.clone()))
+                && let Some(entries) = timeout_queue.get_mut(&timeout_at_ms)
+            {
+                entries.retain(|e| !(e.instance_id == *instance_id && e.node_id == *node_id));
+                if entries.is_empty() {
+                    timeout_queue.remove(&timeout_at_ms);
+                }
+            }
+        }
+    }
+
+    /// Check for timed-out actions and create synthetic failure completions.
+    ///
+    /// This is the Rust-side timeout enforcement - we don't rely on Python
+    /// to report timeouts. Any action that exceeds its timeout_seconds gets
+    /// a synthetic failure completion which will trigger retry logic.
+    async fn check_action_timeouts(&self) -> InstanceRunnerResult<()> {
+        let now_ms = Utc::now().timestamp_millis();
+        let mut timed_out: Vec<InFlightAction> = Vec::new();
+
+        // Find all timed-out actions
+        {
+            let mut timeout_queue = self.timeout_queue.lock().await;
+            let mut timeout_lookup = self.timeout_lookup.lock().await;
+
+            // Collect all entries with timeout_at_ms <= now
+            let expired_keys: Vec<i64> = timeout_queue.range(..=now_ms).map(|(k, _)| *k).collect();
+
+            for key in expired_keys {
+                if let Some(entries) = timeout_queue.remove(&key) {
+                    for entry in entries {
+                        timeout_lookup.remove(&(entry.instance_id, entry.node_id.clone()));
+                        timed_out.push(entry);
+                    }
+                }
+            }
+        }
+
+        if timed_out.is_empty() {
+            return Ok(());
+        }
+
+        // Create synthetic completions for timed-out actions
+        let mut instances = self.active_instances.write().await;
+
+        for entry in timed_out {
+            if let Some(instance) = instances.get_mut(&entry.instance_id) {
+                // Only process if still in-flight (might have completed just before timeout)
+                if !instance.in_flight.remove(&entry.node_id) {
+                    continue;
+                }
+
+                // Get timeout duration for error message
+                let timeout_seconds = instance
+                    .state
+                    .graph
+                    .nodes
+                    .get(&entry.node_id)
+                    .map(|n| n.timeout_seconds)
+                    .unwrap_or(0);
+
+                let completion = Completion {
+                    node_id: entry.node_id.clone(),
+                    success: false,
+                    result: None,
+                    error: Some(format!(
+                        "Action timed out after {} seconds (Rust-side enforcement)",
+                        timeout_seconds
+                    )),
+                    error_type: Some("TimeoutError".to_string()),
+                    worker_id: format!("worker-{}", entry.worker_idx),
+                    duration_ms: (now_ms - entry.timeout_at_ms + (timeout_seconds as i64 * 1000)),
+                    worker_duration_ms: None, // Unknown - worker may still be running
+                };
+
+                instance.pending_completions.push(completion);
+
+                // Release worker slot
+                self.worker_pool.release_slot(entry.worker_idx);
+
+                self.metrics.lock().await.actions_completed += 1;
+
+                warn!(
+                    instance_id = %entry.instance_id,
+                    node_id = %entry.node_id,
+                    timeout_seconds,
+                    "Action timed out (Rust-side enforcement)"
+                );
             }
         }
 
@@ -884,7 +1031,10 @@ impl InstanceRunner {
                 .push(action);
         }
 
-        // Phase 1: Mark as Running in in-memory state
+        // Phase 1: Mark as Running in in-memory state and track timeouts
+        let now_ms = Utc::now().timestamp_millis();
+        let mut timeout_entries: Vec<(i64, InFlightAction)> = Vec::new();
+
         {
             let mut instances = self.active_instances.write().await;
             for (instance_id, actions) in &by_instance {
@@ -909,9 +1059,43 @@ impl InstanceRunner {
                             &worker_id,
                             action.inputs_bytes.clone(),
                         );
+
+                        // Set started_at_ms for timeout tracking
+                        if let Some(node) = instance.state.graph.nodes.get_mut(&action.node_id) {
+                            node.started_at_ms = Some(now_ms);
+                        }
+
                         instance.in_flight.insert(action.node_id.clone());
+
+                        // Track timeout (only if timeout is set)
+                        if action.timeout_seconds > 0 {
+                            let timeout_at_ms = now_ms + (action.timeout_seconds as i64 * 1000);
+                            timeout_entries.push((
+                                timeout_at_ms,
+                                InFlightAction {
+                                    instance_id: *instance_id,
+                                    node_id: action.node_id.clone(),
+                                    timeout_at_ms,
+                                    worker_idx,
+                                },
+                            ));
+                        }
                     }
                 }
+            }
+        }
+
+        // Add timeout entries to tracking structures
+        if !timeout_entries.is_empty() {
+            let mut timeout_queue = self.timeout_queue.lock().await;
+            let mut timeout_lookup = self.timeout_lookup.lock().await;
+
+            for (timeout_at_ms, entry) in timeout_entries {
+                timeout_lookup.insert((entry.instance_id, entry.node_id.clone()), timeout_at_ms);
+                timeout_queue
+                    .entry(timeout_at_ms)
+                    .or_insert_with(Vec::new)
+                    .push(entry);
             }
         }
 
@@ -919,45 +1103,39 @@ impl InstanceRunner {
         // This ensures if we crash, the DB shows the actions were attempted
         {
             let instances = self.active_instances.read().await;
-            for instance_id in by_instance.keys() {
-                if let Some(instance) = instances.get(instance_id) {
-                    let graph_bytes = instance.state.to_bytes();
-                    let next_wakeup = instance
-                        .state
-                        .graph
-                        .next_wakeup_time
-                        .map(|ms| Utc.timestamp_millis_opt(ms).unwrap());
+            let updates: Vec<_> = by_instance
+                .keys()
+                .filter_map(|instance_id| {
+                    instances.get(instance_id).map(|instance| {
+                        let graph_bytes = instance.state.to_bytes();
+                        let next_wakeup = instance
+                            .state
+                            .graph
+                            .next_wakeup_time
+                            .map(|ms| Utc.timestamp_millis_opt(ms).unwrap());
+                        (instance.instance_id, graph_bytes, next_wakeup)
+                    })
+                })
+                .collect();
 
-                    match self
-                        .db
-                        .update_execution_graph(
-                            instance.instance_id,
-                            &self.config.runner_id,
-                            &graph_bytes,
-                            next_wakeup,
-                        )
-                        .await
-                    {
-                        Ok(true) => {
-                            debug!(
-                                instance_id = %instance.instance_id,
-                                "Synced running state to DB before dispatch"
-                            );
+            if !updates.is_empty() {
+                match self
+                    .db
+                    .update_execution_graphs_batch(&self.config.runner_id, &updates)
+                    .await
+                {
+                    Ok(updated_ids) => {
+                        for (id, _, _) in &updates {
+                            if updated_ids.contains(id) {
+                                debug!(instance_id = %id, "Synced running state to DB before dispatch");
+                            } else {
+                                warn!(instance_id = %id, "Lost lease while syncing state before dispatch");
+                                // TODO: Handle lost lease - re-enqueue actions
+                            }
                         }
-                        Ok(false) => {
-                            warn!(
-                                instance_id = %instance.instance_id,
-                                "Lost lease while syncing state before dispatch"
-                            );
-                            // TODO: Handle lost lease - re-enqueue actions
-                        }
-                        Err(e) => {
-                            error!(
-                                instance_id = %instance.instance_id,
-                                error = %e,
-                                "Failed to sync state to DB before dispatch"
-                            );
-                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Failed to sync state to DB before dispatch");
                     }
                 }
             }
@@ -1445,66 +1623,58 @@ impl InstanceRunner {
 
     /// Finalize completed instances
     async fn finalize_completed_instances(&self) -> InstanceRunnerResult<()> {
-        let mut completed_ids = Vec::new();
-        let mut released_ids = Vec::new();
-        let mut lost_lease_ids = Vec::new();
+        // Collect batches for different operation types
+        // (instance_id, result_payload, graph_bytes)
+        let mut to_complete: Vec<(WorkflowInstanceId, Option<Vec<u8>>, Vec<u8>)> = Vec::new();
+        let mut to_fail: Vec<(WorkflowInstanceId, Option<Vec<u8>>, Vec<u8>)> = Vec::new();
+        // (instance_id, graph_bytes, next_wakeup)
+        let mut to_release: Vec<(WorkflowInstanceId, Vec<u8>, Option<DateTime<Utc>>)> = Vec::new();
+        let mut to_update: Vec<(WorkflowInstanceId, Vec<u8>, Option<DateTime<Utc>>)> = Vec::new();
 
+        // Track metadata for logging after batch operations complete
+        let mut complete_meta: HashMap<WorkflowInstanceId, String> = HashMap::new();
+        let mut fail_meta: HashMap<WorkflowInstanceId, (String, Option<String>)> = HashMap::new();
+
+        // Phase 1: Apply completions and categorize instances
         {
             let mut instances = self.active_instances.write().await;
 
-            for (id, instance) in instances.iter_mut() {
+            for (_, instance) in instances.iter_mut() {
                 // Apply any remaining completions
-                if !instance.pending_completions.is_empty() {
+                let completion_result = if !instance.pending_completions.is_empty() {
                     let completions = std::mem::take(&mut instance.pending_completions);
-                    let result = instance
-                        .state
-                        .apply_completions_batch(completions, &instance.dag);
+                    Some(
+                        instance
+                            .state
+                            .apply_completions_batch(completions, &instance.dag),
+                    )
+                } else {
+                    None
+                };
 
+                // Check for workflow completion/failure
+                if let Some(ref result) = completion_result {
                     if result.workflow_completed {
-                        // Persist completed state
                         let graph_bytes = instance.state.to_bytes();
-                        let success = self
-                            .db
-                            .complete_instance_with_graph(
-                                instance.instance_id,
-                                &self.config.runner_id,
-                                result.result_payload.as_deref(),
-                                &graph_bytes,
-                            )
-                            .await?;
-
-                        if success {
-                            completed_ids.push(*id);
-                            self.metrics.lock().await.instances_completed += 1;
-                            info!(
-                                instance_id = %instance.instance_id,
-                                workflow = %instance.workflow_name,
-                                "Instance completed successfully"
-                            );
-                        }
+                        complete_meta.insert(instance.instance_id, instance.workflow_name.clone());
+                        to_complete.push((
+                            instance.instance_id,
+                            result.result_payload.clone(),
+                            graph_bytes,
+                        ));
+                        continue;
                     } else if result.workflow_failed {
-                        // Persist failed state
                         let graph_bytes = instance.state.to_bytes();
-                        let success = self
-                            .db
-                            .fail_instance_with_graph(
-                                instance.instance_id,
-                                &self.config.runner_id,
-                                result.result_payload.as_deref(),
-                                &graph_bytes,
-                            )
-                            .await?;
-
-                        if success {
-                            completed_ids.push(*id);
-                            self.metrics.lock().await.instances_failed += 1;
-                            warn!(
-                                instance_id = %instance.instance_id,
-                                workflow = %instance.workflow_name,
-                                error = ?result.error_message,
-                                "Instance failed"
-                            );
-                        }
+                        fail_meta.insert(
+                            instance.instance_id,
+                            (instance.workflow_name.clone(), result.error_message.clone()),
+                        );
+                        to_fail.push((
+                            instance.instance_id,
+                            result.result_payload.clone(),
+                            graph_bytes,
+                        ));
+                        continue;
                     }
                 }
 
@@ -1515,93 +1685,127 @@ impl InstanceRunner {
 
                 if fully_sleeping {
                     let graph_bytes = instance.state.to_bytes();
-                    let released = self
-                        .db
-                        .release_instance(
-                            instance.instance_id,
-                            &self.config.runner_id,
-                            &graph_bytes,
-                            next_wakeup,
-                        )
-                        .await?;
-                    if released {
-                        released_ids.push(*id);
-                    }
-                    continue;
-                }
-
-                // Check if instance is done (no pending work)
-                if !instance.state.has_pending_work() && instance.in_flight.is_empty() {
-                    // Persist current state
+                    to_release.push((instance.instance_id, graph_bytes, next_wakeup));
+                } else if !instance.state.has_pending_work() && instance.in_flight.is_empty() {
+                    // Instance is done (no pending work)
                     let graph_bytes = instance.state.to_bytes();
-                    match self
-                        .db
-                        .update_execution_graph(
-                            instance.instance_id,
-                            &self.config.runner_id,
-                            &graph_bytes,
-                            next_wakeup,
-                        )
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            warn!(
-                                instance_id = %instance.instance_id,
-                                "Lost lease while persisting execution graph"
-                            );
-                            lost_lease_ids.push(*id);
-                        }
-                        Err(err) => {
-                            error!(
-                                instance_id = %instance.instance_id,
-                                error = %err,
-                                "Failed to persist execution graph"
-                            );
-                        }
-                    }
+                    to_update.push((instance.instance_id, graph_bytes, next_wakeup));
                 } else if instance.state.graph.next_wakeup_time != previous_wakeup {
+                    // Wakeup time changed
                     let graph_bytes = instance.state.to_bytes();
-                    match self
-                        .db
-                        .update_execution_graph(
-                            instance.instance_id,
-                            &self.config.runner_id,
-                            &graph_bytes,
-                            next_wakeup,
-                        )
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            warn!(
-                                instance_id = %instance.instance_id,
-                                "Lost lease while updating wakeup time"
-                            );
-                            lost_lease_ids.push(*id);
-                        }
-                        Err(err) => {
-                            error!(
-                                instance_id = %instance.instance_id,
-                                error = %err,
-                                "Failed to update wakeup time"
-                            );
-                        }
-                    }
+                    to_update.push((instance.instance_id, graph_bytes, next_wakeup));
                 }
             }
         }
 
-        // Remove completed instances
+        // Phase 2: Execute batch operations
+        let mut completed_ids: HashSet<WorkflowInstanceId> = HashSet::new();
+        let mut released_ids: HashSet<WorkflowInstanceId> = HashSet::new();
+        let mut lost_lease_ids: HashSet<WorkflowInstanceId> = HashSet::new();
+
+        // Batch complete
+        if !to_complete.is_empty() {
+            match self
+                .db
+                .complete_instances_batch(&self.config.runner_id, &to_complete)
+                .await
+            {
+                Ok(succeeded) => {
+                    let mut metrics = self.metrics.lock().await;
+                    for id in &succeeded {
+                        completed_ids.insert(*id);
+                        metrics.instances_completed += 1;
+                        if let Some(workflow_name) = complete_meta.get(id) {
+                            info!(
+                                instance_id = %id,
+                                workflow = %workflow_name,
+                                "Instance completed successfully"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to complete instances batch");
+                }
+            }
+        }
+
+        // Batch fail
+        if !to_fail.is_empty() {
+            match self
+                .db
+                .fail_instances_batch(&self.config.runner_id, &to_fail)
+                .await
+            {
+                Ok(succeeded) => {
+                    let mut metrics = self.metrics.lock().await;
+                    for id in &succeeded {
+                        completed_ids.insert(*id);
+                        metrics.instances_failed += 1;
+                        if let Some((workflow_name, error_msg)) = fail_meta.get(id) {
+                            warn!(
+                                instance_id = %id,
+                                workflow = %workflow_name,
+                                error = ?error_msg,
+                                "Instance failed"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to fail instances batch");
+                }
+            }
+        }
+
+        // Batch release
+        if !to_release.is_empty() {
+            match self
+                .db
+                .release_instances_batch(&self.config.runner_id, &to_release)
+                .await
+            {
+                Ok(succeeded) => {
+                    released_ids = succeeded;
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to release instances batch");
+                }
+            }
+        }
+
+        // Batch update
+        if !to_update.is_empty() {
+            match self
+                .db
+                .update_execution_graphs_batch(&self.config.runner_id, &to_update)
+                .await
+            {
+                Ok(succeeded) => {
+                    // Track instances that lost their lease
+                    for (id, _, _) in &to_update {
+                        if !succeeded.contains(id) {
+                            warn!(instance_id = %id, "Lost lease while persisting execution graph");
+                            lost_lease_ids.insert(*id);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to update execution graphs batch");
+                }
+            }
+        }
+
+        // Phase 3: Remove finalized instances from active set
         let mut instances = self.active_instances.write().await;
         for id in completed_ids {
-            instances.remove(&id);
+            instances.remove(&id.0);
         }
         for id in released_ids {
-            instances.remove(&id);
+            instances.remove(&id.0);
         }
         for id in lost_lease_ids {
-            instances.remove(&id);
+            instances.remove(&id.0);
         }
 
         Ok(())
@@ -1611,27 +1815,35 @@ impl InstanceRunner {
     async fn release_all_instances(&self) -> InstanceRunnerResult<()> {
         let instances = std::mem::take(&mut *self.active_instances.write().await);
 
-        for (_, mut instance) in instances {
-            Self::refresh_sleep_state(&mut instance);
-            let next_wakeup = Self::sleep_wakeup_datetime_ms(instance.state.graph.next_wakeup_time);
-            let graph_bytes = instance.state.to_bytes();
-            if let Err(e) = self
+        let releases: Vec<_> = instances
+            .into_values()
+            .map(|mut instance| {
+                Self::refresh_sleep_state(&mut instance);
+                let next_wakeup =
+                    Self::sleep_wakeup_datetime_ms(instance.state.graph.next_wakeup_time);
+                let graph_bytes = instance.state.to_bytes();
+                (instance.instance_id, graph_bytes, next_wakeup)
+            })
+            .collect();
+
+        if !releases.is_empty() {
+            match self
                 .db
-                .release_instance(
-                    instance.instance_id,
-                    &self.config.runner_id,
-                    &graph_bytes,
-                    next_wakeup,
-                )
+                .release_instances_batch(&self.config.runner_id, &releases)
                 .await
             {
-                error!(
-                    instance_id = %instance.instance_id,
-                    error = %e,
-                    "Failed to release instance"
-                );
-            } else {
-                debug!(instance_id = %instance.instance_id, "Released instance");
+                Ok(released) => {
+                    for (id, _, _) in &releases {
+                        if released.contains(id) {
+                            debug!(instance_id = %id, "Released instance");
+                        } else {
+                            warn!(instance_id = %id, "Failed to release instance (lost lease?)");
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to release instances batch");
+                }
             }
         }
 
@@ -1745,5 +1957,193 @@ mod tests {
 
         // Heartbeat should be significantly less than lease to prevent expiration
         assert!(DEFAULT_HEARTBEAT_INTERVAL.as_secs() < DEFAULT_LEASE_SECONDS as u64 / 2);
+    }
+
+    #[test]
+    fn test_in_flight_action_construction() {
+        let instance_id = Uuid::new_v4();
+        let action = InFlightAction {
+            instance_id,
+            node_id: "action_0".to_string(),
+            timeout_at_ms: 1000,
+            worker_idx: 0,
+        };
+        assert_eq!(action.instance_id, instance_id);
+        assert_eq!(action.node_id, "action_0");
+        assert_eq!(action.timeout_at_ms, 1000);
+        assert_eq!(action.worker_idx, 0);
+    }
+
+    #[test]
+    fn test_timeout_queue_ordering() {
+        // BTreeMap should maintain entries sorted by timeout_at_ms
+        use std::collections::BTreeMap;
+
+        let mut timeout_queue: BTreeMap<i64, Vec<InFlightAction>> = BTreeMap::new();
+        let instance_id = Uuid::new_v4();
+
+        // Insert in non-sorted order
+        timeout_queue.insert(
+            3000,
+            vec![InFlightAction {
+                instance_id,
+                node_id: "action_c".to_string(),
+                timeout_at_ms: 3000,
+                worker_idx: 2,
+            }],
+        );
+        timeout_queue.insert(
+            1000,
+            vec![InFlightAction {
+                instance_id,
+                node_id: "action_a".to_string(),
+                timeout_at_ms: 1000,
+                worker_idx: 0,
+            }],
+        );
+        timeout_queue.insert(
+            2000,
+            vec![InFlightAction {
+                instance_id,
+                node_id: "action_b".to_string(),
+                timeout_at_ms: 2000,
+                worker_idx: 1,
+            }],
+        );
+
+        // Iteration should be in sorted order
+        let keys: Vec<i64> = timeout_queue.keys().cloned().collect();
+        assert_eq!(keys, vec![1000, 2000, 3000]);
+
+        // First entry should be the earliest timeout
+        let (first_key, first_actions) = timeout_queue.iter().next().unwrap();
+        assert_eq!(*first_key, 1000);
+        assert_eq!(first_actions[0].node_id, "action_a");
+    }
+
+    #[test]
+    fn test_timeout_queue_multiple_actions_same_deadline() {
+        // Multiple actions can timeout at the same time
+        use std::collections::BTreeMap;
+
+        let mut timeout_queue: BTreeMap<i64, Vec<InFlightAction>> = BTreeMap::new();
+        let instance_id = Uuid::new_v4();
+
+        let deadline = 5000_i64;
+
+        // Add first action at deadline
+        timeout_queue.insert(
+            deadline,
+            vec![InFlightAction {
+                instance_id,
+                node_id: "action_a".to_string(),
+                timeout_at_ms: deadline,
+                worker_idx: 0,
+            }],
+        );
+
+        // Add second action at same deadline
+        timeout_queue
+            .entry(deadline)
+            .or_default()
+            .push(InFlightAction {
+                instance_id,
+                node_id: "action_b".to_string(),
+                timeout_at_ms: deadline,
+                worker_idx: 1,
+            });
+
+        // Should have both actions under same key
+        let actions = timeout_queue.get(&deadline).unwrap();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].node_id, "action_a");
+        assert_eq!(actions[1].node_id, "action_b");
+    }
+
+    #[test]
+    fn test_timeout_lookup_and_removal() {
+        // Test the reverse lookup pattern used in remove_from_timeout_tracking
+        use std::collections::BTreeMap;
+
+        let mut timeout_queue: BTreeMap<i64, Vec<InFlightAction>> = BTreeMap::new();
+        let mut timeout_lookup: HashMap<(Uuid, String), i64> = HashMap::new();
+
+        let instance_id = Uuid::new_v4();
+        let timeout_at_ms = 5000_i64;
+
+        // Add action to both structures (simulating dispatch)
+        let action = InFlightAction {
+            instance_id,
+            node_id: "action_0".to_string(),
+            timeout_at_ms,
+            worker_idx: 0,
+        };
+
+        timeout_lookup.insert((instance_id, "action_0".to_string()), timeout_at_ms);
+        timeout_queue.entry(timeout_at_ms).or_default().push(action);
+
+        // Verify it exists
+        assert!(timeout_lookup.contains_key(&(instance_id, "action_0".to_string())));
+        assert_eq!(timeout_queue.get(&timeout_at_ms).unwrap().len(), 1);
+
+        // Simulate removal (when action completes normally)
+        if let Some(deadline) = timeout_lookup.remove(&(instance_id, "action_0".to_string()))
+            && let Some(entries) = timeout_queue.get_mut(&deadline)
+        {
+            entries.retain(|e| !(e.instance_id == instance_id && e.node_id == "action_0"));
+            if entries.is_empty() {
+                timeout_queue.remove(&deadline);
+            }
+        }
+
+        // Verify it's removed from both structures
+        assert!(!timeout_lookup.contains_key(&(instance_id, "action_0".to_string())));
+        assert!(!timeout_queue.contains_key(&timeout_at_ms));
+    }
+
+    #[test]
+    fn test_timeout_expired_detection() {
+        // Test the pattern used in check_action_timeouts to find expired entries
+        use std::collections::BTreeMap;
+
+        let mut timeout_queue: BTreeMap<i64, Vec<InFlightAction>> = BTreeMap::new();
+        let instance_id = Uuid::new_v4();
+
+        // Add actions with different deadlines
+        for (i, deadline) in [1000_i64, 2000, 3000, 4000, 5000].iter().enumerate() {
+            timeout_queue.insert(
+                *deadline,
+                vec![InFlightAction {
+                    instance_id,
+                    node_id: format!("action_{}", i),
+                    timeout_at_ms: *deadline,
+                    worker_idx: i,
+                }],
+            );
+        }
+
+        // Current time is 2500ms - actions at 1000 and 2000 should be expired
+        let now_ms = 2500_i64;
+        let expired_keys: Vec<i64> = timeout_queue.range(..=now_ms).map(|(k, _)| *k).collect();
+
+        assert_eq!(expired_keys, vec![1000, 2000]);
+
+        // Collect expired actions
+        let mut expired_actions = Vec::new();
+        for key in expired_keys {
+            if let Some(entries) = timeout_queue.remove(&key) {
+                expired_actions.extend(entries);
+            }
+        }
+
+        assert_eq!(expired_actions.len(), 2);
+        assert_eq!(expired_actions[0].node_id, "action_0");
+        assert_eq!(expired_actions[1].node_id, "action_1");
+
+        // Remaining queue should have actions at 3000, 4000, 5000
+        assert_eq!(timeout_queue.len(), 3);
+        assert!(timeout_queue.contains_key(&3000));
+        assert!(timeout_queue.contains_key(&4000));
+        assert!(timeout_queue.contains_key(&5000));
     }
 }
