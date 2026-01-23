@@ -177,6 +177,25 @@ impl Database {
         Ok(instance)
     }
 
+    /// Get raw execution graph bytes for an instance.
+    pub async fn get_instance_execution_graph(
+        &self,
+        id: WorkflowInstanceId,
+    ) -> DbResult<Option<Vec<u8>>> {
+        let row = sqlx::query(
+            r#"
+            SELECT execution_graph
+            FROM workflow_instances
+            WHERE id = $1
+            "#,
+        )
+        .bind(id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.and_then(|row| row.get("execution_graph")))
+    }
+
     // ========================================================================
     // Webapp: Action Queries
     // ========================================================================

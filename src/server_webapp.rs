@@ -17,7 +17,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::get,
 };
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{Duration as ChronoDuration, TimeZone, Utc};
 use serde::Serialize;
 use tera::{Context as TeraContext, Tera};
 use tokio::net::TcpListener;
@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::config::WebappConfig;
 use crate::db::{Database, ScheduleId, WorkerStatus, WorkflowVersionId, WorkflowVersionSummary};
+use crate::messages::execution::{ExecutionGraph, NodeStatus};
 
 /// Webapp server handle
 pub struct WebappServer {
@@ -282,11 +283,22 @@ async fn workflow_run_detail(
         .unwrap_or_default();
 
     // Load action logs for this instance
-    let action_logs = state
+    let mut action_logs = state
         .database
         .get_instance_action_logs(crate::db::WorkflowInstanceId(instance_id))
         .await
         .unwrap_or_default();
+
+    if action_logs.is_empty()
+        && let Ok(Some(graph_bytes)) = state
+            .database
+            .get_instance_execution_graph(crate::db::WorkflowInstanceId(instance_id))
+            .await
+        && let Some(graph) = decode_execution_graph(&graph_bytes)
+    {
+        let dag = decode_dag_from_proto(&version.program_proto);
+        action_logs = synthesize_action_logs_from_execution_graph(instance.id, &dag, &graph);
+    }
 
     Html(render_workflow_run_page(
         &state.templates,
@@ -1604,6 +1616,119 @@ fn build_filtered_execution_graph(
             })
             .collect(),
     }
+}
+
+fn decode_execution_graph(bytes: &[u8]) -> Option<ExecutionGraph> {
+    use prost::Message;
+
+    if bytes.is_empty() {
+        return None;
+    }
+
+    match ExecutionGraph::decode(bytes) {
+        Ok(graph) => Some(graph),
+        Err(err) => {
+            error!(?err, "failed to decode execution graph");
+            None
+        }
+    }
+}
+
+fn datetime_from_ms(ms: i64) -> Option<chrono::DateTime<Utc>> {
+    if ms <= 0 {
+        return None;
+    }
+    Utc.timestamp_millis_opt(ms).single()
+}
+
+fn synthesize_action_logs_from_execution_graph(
+    instance_id: Uuid,
+    dag: &[SimpleDagNode],
+    graph: &ExecutionGraph,
+) -> Vec<crate::db::ActionLog> {
+    let (internal_nodes, _) = build_node_maps(dag);
+    let dag_by_id: std::collections::HashMap<&str, &SimpleDagNode> =
+        dag.iter().map(|node| (node.id.as_str(), node)).collect();
+    let mut action_ids: std::collections::HashMap<String, Uuid> = std::collections::HashMap::new();
+    let mut logs = Vec::new();
+
+    for (node_key, exec_node) in &graph.nodes {
+        let display_node_id = if dag_by_id.contains_key(node_key.as_str()) {
+            node_key.as_str()
+        } else {
+            exec_node.template_id.as_str()
+        };
+
+        let Some(dag_node) = dag_by_id.get(display_node_id) else {
+            continue;
+        };
+
+        if internal_nodes.contains(display_node_id) {
+            continue;
+        }
+
+        let action_id = *action_ids
+            .entry(display_node_id.to_string())
+            .or_insert_with(Uuid::new_v4);
+        let dispatch_payload = exec_node.inputs.clone();
+
+        if exec_node.attempts.is_empty() {
+            if let Some(started_at_ms) = exec_node.started_at_ms {
+                let status =
+                    NodeStatus::try_from(exec_node.status).unwrap_or(NodeStatus::Unspecified);
+                let success = match status {
+                    NodeStatus::Completed => Some(true),
+                    NodeStatus::Failed | NodeStatus::Exhausted | NodeStatus::Caught => Some(false),
+                    _ => None,
+                };
+
+                logs.push(crate::db::ActionLog {
+                    id: Uuid::new_v4(),
+                    action_id,
+                    instance_id,
+                    attempt_number: exec_node.attempt_number,
+                    dispatched_at: datetime_from_ms(started_at_ms).unwrap_or_else(Utc::now),
+                    completed_at: exec_node.completed_at_ms.and_then(datetime_from_ms),
+                    success,
+                    result_payload: exec_node.result.clone(),
+                    error_message: exec_node.error.clone(),
+                    duration_ms: exec_node.duration_ms,
+                    pool_id: None,
+                    worker_id: None,
+                    enqueued_at: None,
+                    module_name: Some(dag_node.module.clone()),
+                    action_name: Some(dag_node.action.clone()),
+                    node_id: Some(display_node_id.to_string()),
+                    dispatch_payload,
+                });
+            }
+            continue;
+        }
+
+        for attempt in &exec_node.attempts {
+            logs.push(crate::db::ActionLog {
+                id: Uuid::new_v4(),
+                action_id,
+                instance_id,
+                attempt_number: attempt.attempt_number,
+                dispatched_at: datetime_from_ms(attempt.started_at_ms).unwrap_or_else(Utc::now),
+                completed_at: datetime_from_ms(attempt.completed_at_ms),
+                success: Some(attempt.success),
+                result_payload: attempt.result.clone(),
+                error_message: attempt.error.clone(),
+                duration_ms: Some(attempt.duration_ms),
+                pool_id: None,
+                worker_id: None,
+                enqueued_at: None,
+                module_name: Some(dag_node.module.clone()),
+                action_name: Some(dag_node.action.clone()),
+                node_id: Some(display_node_id.to_string()),
+                dispatch_payload: dispatch_payload.clone(),
+            });
+        }
+    }
+
+    logs
 }
 
 /// Build lookup maps for node filtering.
