@@ -1176,6 +1176,7 @@ impl InstanceRunner {
     async fn finalize_completed_instances(&self) -> InstanceRunnerResult<()> {
         let mut completed_ids = Vec::new();
         let mut released_ids = Vec::new();
+        let mut lost_lease_ids = Vec::new();
 
         {
             let mut instances = self.active_instances.write().await;
@@ -1262,7 +1263,7 @@ impl InstanceRunner {
                 if !instance.state.has_pending_work() && instance.in_flight.is_empty() {
                     // Persist current state
                     let graph_bytes = instance.state.to_bytes();
-                    let _ = self
+                    match self
                         .db
                         .update_execution_graph(
                             instance.instance_id,
@@ -1270,10 +1271,27 @@ impl InstanceRunner {
                             &graph_bytes,
                             next_wakeup,
                         )
-                        .await;
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn!(
+                                instance_id = %instance.instance_id,
+                                "Lost lease while persisting execution graph"
+                            );
+                            lost_lease_ids.push(*id);
+                        }
+                        Err(err) => {
+                            error!(
+                                instance_id = %instance.instance_id,
+                                error = %err,
+                                "Failed to persist execution graph"
+                            );
+                        }
+                    }
                 } else if instance.state.graph.next_wakeup_time != previous_wakeup {
                     let graph_bytes = instance.state.to_bytes();
-                    let _ = self
+                    match self
                         .db
                         .update_execution_graph(
                             instance.instance_id,
@@ -1281,7 +1299,24 @@ impl InstanceRunner {
                             &graph_bytes,
                             next_wakeup,
                         )
-                        .await;
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn!(
+                                instance_id = %instance.instance_id,
+                                "Lost lease while updating wakeup time"
+                            );
+                            lost_lease_ids.push(*id);
+                        }
+                        Err(err) => {
+                            error!(
+                                instance_id = %instance.instance_id,
+                                error = %err,
+                                "Failed to update wakeup time"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1292,6 +1327,9 @@ impl InstanceRunner {
             instances.remove(&id);
         }
         for id in released_ids {
+            instances.remove(&id);
+        }
+        for id in lost_lease_ids {
             instances.remove(&id);
         }
 
