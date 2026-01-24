@@ -1001,10 +1001,17 @@ impl ExecutionState {
                                 .map(|edge| edge.exception_depth.unwrap_or(0))
                                 .max()
                                 .unwrap_or(0);
-                            matching_exception_edges
+                            let edges_at_max_depth: Vec<_> = matching_exception_edges
                                 .into_iter()
                                 .filter(|edge| edge.exception_depth.unwrap_or(0) == max_depth)
-                                .collect::<Vec<_>>()
+                                .collect();
+                            // Select only the first matching handler - Python semantics require
+                            // that only the first matching except handler executes
+                            if let Some(first) = edges_at_max_depth.into_iter().next() {
+                                vec![first]
+                            } else {
+                                vec![]
+                            }
                         } else {
                             matching_exception_edges
                         };
