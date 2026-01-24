@@ -2905,6 +2905,136 @@ class TestSpreadAction:
         assert retry_found, "Expected retry policy from run_action"
         assert timeout_found, "Expected timeout policy from run_action"
 
+    def test_static_gather_with_run_action(self) -> None:
+        """Test: asyncio.gather(self.run_action(...), self.run_action(...), return_exceptions=True).
+
+        This tests the pattern where run_action wraps static action calls to add
+        retry and timeout policies.
+        """
+        from tests.fixtures_gather.gather_run_action_static import (
+            GatherRunActionStaticWorkflow,
+        )
+
+        program = GatherRunActionStaticWorkflow.workflow_ir()
+
+        # Find the ParallelExpr in the IR
+        parallel_found = False
+        parallel_expr = None
+        for fn in program.functions:
+            for stmt in fn.body.statements:
+                if stmt.HasField("assignment"):
+                    if stmt.assignment.value.HasField("parallel_expr"):
+                        parallel_found = True
+                        parallel_expr = stmt.assignment.value.parallel_expr
+
+        assert parallel_found, (
+            "Expected parallel expression from asyncio.gather(self.run_action(...))"
+        )
+        assert parallel_expr is not None
+
+        # Should have 2 calls
+        assert len(parallel_expr.calls) == 2, (
+            f"Expected 2 calls in parallel, got {len(parallel_expr.calls)}"
+        )
+
+        # Verify first action (upload_ci_logs)
+        call1 = parallel_expr.calls[0]
+        assert call1.HasField("action"), "Expected first call to be an action"
+        assert call1.action.action_name == "upload_ci_logs"
+        assert len(call1.action.policies) == 2, (
+            f"Expected 2 policies for upload_ci_logs, got {len(call1.action.policies)}"
+        )
+
+        # Check policies for first action
+        retry_found = False
+        timeout_found = False
+        for policy_bracket in call1.action.policies:
+            if policy_bracket.HasField("retry"):
+                retry_found = True
+                # RetryPolicy(attempts=3) -> max_retries=2
+                assert policy_bracket.retry.max_retries == 2
+            if policy_bracket.HasField("timeout"):
+                timeout_found = True
+                # timedelta(minutes=2) -> 120 seconds
+                assert policy_bracket.timeout.timeout.seconds == 120
+
+        assert retry_found, "Expected retry policy for upload_ci_logs"
+        assert timeout_found, "Expected timeout policy for upload_ci_logs"
+
+        # Verify second action (cleanup_ci_sandbox)
+        call2 = parallel_expr.calls[1]
+        assert call2.HasField("action"), "Expected second call to be an action"
+        assert call2.action.action_name == "cleanup_ci_sandbox"
+        assert len(call2.action.policies) == 2, (
+            f"Expected 2 policies for cleanup_ci_sandbox, got {len(call2.action.policies)}"
+        )
+
+        # Check policies for second action
+        retry_found = False
+        timeout_found = False
+        for policy_bracket in call2.action.policies:
+            if policy_bracket.HasField("retry"):
+                retry_found = True
+                # RetryPolicy(attempts=2) -> max_retries=1
+                assert policy_bracket.retry.max_retries == 1
+            if policy_bracket.HasField("timeout"):
+                timeout_found = True
+                # timedelta(minutes=1) -> 60 seconds
+                assert policy_bracket.timeout.timeout.seconds == 60
+
+        assert retry_found, "Expected retry policy for cleanup_ci_sandbox"
+        assert timeout_found, "Expected timeout policy for cleanup_ci_sandbox"
+
+    def test_static_gather_mixed_run_action(self) -> None:
+        """Test: asyncio.gather(self.run_action(...), action(...), return_exceptions=True).
+
+        This tests mixed patterns where some calls use run_action wrapper and others don't.
+        """
+        from tests.fixtures_gather.gather_run_action_static import (
+            GatherMixedRunActionWorkflow,
+        )
+
+        program = GatherMixedRunActionWorkflow.workflow_ir()
+
+        # Find the ParallelExpr in the IR
+        parallel_found = False
+        parallel_expr = None
+        for fn in program.functions:
+            for stmt in fn.body.statements:
+                if stmt.HasField("assignment"):
+                    if stmt.assignment.value.HasField("parallel_expr"):
+                        parallel_found = True
+                        parallel_expr = stmt.assignment.value.parallel_expr
+
+        assert parallel_found, "Expected parallel expression from asyncio.gather"
+        assert parallel_expr is not None
+
+        # Should have 2 calls
+        assert len(parallel_expr.calls) == 2, (
+            f"Expected 2 calls in parallel, got {len(parallel_expr.calls)}"
+        )
+
+        # Verify first action (upload_ci_logs with run_action wrapper)
+        call1 = parallel_expr.calls[0]
+        assert call1.HasField("action"), "Expected first call to be an action"
+        assert call1.action.action_name == "upload_ci_logs"
+        # Should have 1 policy (retry only, no timeout)
+        assert len(call1.action.policies) == 1, (
+            f"Expected 1 policy for upload_ci_logs, got {len(call1.action.policies)}"
+        )
+        assert call1.action.policies[0].HasField("retry")
+        # RetryPolicy(attempts=3) -> max_retries=2
+        assert call1.action.policies[0].retry.max_retries == 2
+
+        # Verify second action (send_notification without run_action wrapper)
+        call2 = parallel_expr.calls[1]
+        assert call2.HasField("action"), "Expected second call to be an action"
+        assert call2.action.action_name == "send_notification"
+        # Should have no policies (direct call without wrapper)
+        assert len(call2.action.policies) == 0, (
+            f"Expected 0 policies for send_notification, got {len(call2.action.policies)}"
+        )
+
 
 class TestForLoopWithMultipleCalls:
     """Test for loop bodies with multiple calls."""

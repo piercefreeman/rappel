@@ -2999,9 +2999,34 @@ class IRBuilder(ast.NodeVisitor):
         """Convert a gather argument to an IR Call.
 
         Handles both action calls and regular function calls.
+        Also handles self.run_action() wrapper pattern with retry/timeout policies.
         """
         if not isinstance(node, ast.Call):
             return None
+
+        # Check for self.run_action(...) wrapper pattern
+        if self._is_run_action_call(node):
+            if not node.args:
+                raise UnsupportedPatternError(
+                    "self.run_action() requires an action call as its first argument",
+                    "Use: self.run_action(action_name(...), retry=..., timeout=...)",
+                    line=getattr(node, "lineno", None),
+                    col=getattr(node, "col_offset", None),
+                )
+            inner_call = node.args[0]
+            if not isinstance(inner_call, ast.Call):
+                raise UnsupportedPatternError(
+                    "self.run_action() first argument must be an action call",
+                    "Use: self.run_action(action_name(...), retry=..., timeout=...)",
+                    line=getattr(node, "lineno", None),
+                    col=getattr(node, "col_offset", None),
+                )
+            action_call = self._extract_action_call_from_call(inner_call)
+            if action_call:
+                self._extract_policies_from_run_action(node, action_call)
+                call = ir.Call()
+                call.action.CopyFrom(action_call)
+                return call
 
         # Try to extract as an action call first
         action_call = self._extract_action_call_from_call(node)
