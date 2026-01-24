@@ -56,7 +56,6 @@ use uuid::Uuid;
 
 use crate::ast_evaluator::ExpressionEvaluator;
 use crate::dag::{DAG, DAGConverter, DAGNode};
-use crate::dag_state::DAGHelper;
 use crate::db::{
     ClaimedInstance, Database, WorkerStatusUpdate, WorkflowInstanceId, WorkflowVersionId,
 };
@@ -67,7 +66,7 @@ use crate::messages::proto::WorkflowArguments;
 use crate::messages::{MessageError, decode_message, encode_message};
 use crate::parser::ast;
 use crate::stats::LifecycleStats;
-use crate::value::{WorkflowValue, workflow_value_from_proto_bytes, workflow_value_to_proto_bytes};
+use crate::value::WorkflowValue;
 use crate::worker::{ActionDispatchPayload, PythonWorkerPool};
 
 /// Default lease duration for instance ownership (60 seconds)
@@ -1552,223 +1551,7 @@ impl InstanceRunner {
         node_id: &str,
         dag_node: &DAGNode,
     ) -> Result<Vec<u8>, String> {
-        // Build scope for expression evaluation
-        let scope = instance.state.build_scope_for_node(node_id);
-
-        match dag_node.node_type.as_str() {
-            "assignment" | "fn_call" => {
-                // Execute the assignment expression
-                if let Some(assign_expr) = &dag_node.assign_expr {
-                    match ExpressionEvaluator::evaluate(assign_expr, &scope) {
-                        Ok(value) => {
-                            let result_bytes = workflow_value_to_proto_bytes(&value);
-
-                            // Store result in variables for each target
-                            if let Some(targets) = &dag_node.targets {
-                                if targets.len() > 1 {
-                                    match &value {
-                                        WorkflowValue::Tuple(items)
-                                        | WorkflowValue::List(items) => {
-                                            for (target, item) in targets.iter().zip(items.iter()) {
-                                                instance.state.store_variable_for_node(
-                                                    node_id,
-                                                    &dag_node.node_type,
-                                                    target,
-                                                    item,
-                                                );
-                                                debug!(
-                                                    node_id = %node_id,
-                                                    target = %target,
-                                                    "Stored assignment result"
-                                                );
-                                            }
-                                        }
-                                        _ => {
-                                            warn!(
-                                                node_id = %node_id,
-                                                targets = ?targets,
-                                                value = ?value,
-                                                "Assignment value is not iterable for tuple unpacking"
-                                            );
-                                            for target in targets {
-                                                instance.state.store_variable_for_node(
-                                                    node_id,
-                                                    &dag_node.node_type,
-                                                    target,
-                                                    &value,
-                                                );
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    for target in targets {
-                                        instance.state.store_variable_for_node(
-                                            node_id,
-                                            &dag_node.node_type,
-                                            target,
-                                            &value,
-                                        );
-                                        debug!(
-                                            node_id = %node_id,
-                                            target = %target,
-                                            "Stored assignment result"
-                                        );
-                                    }
-                                }
-                            } else if let Some(target) = &dag_node.target {
-                                instance.state.store_variable_for_node(
-                                    node_id,
-                                    &dag_node.node_type,
-                                    target,
-                                    &value,
-                                );
-                                debug!(
-                                    node_id = %node_id,
-                                    target = %target,
-                                    "Stored assignment result"
-                                );
-                            }
-
-                            Ok(result_bytes)
-                        }
-                        Err(e) => {
-                            warn!(
-                                node_id = %node_id,
-                                error = %e,
-                                "Failed to evaluate assignment expression"
-                            );
-                            Err(format!("Assignment evaluation error: {}", e))
-                        }
-                    }
-                } else {
-                    // No expression - just return empty result
-                    Ok(vec![])
-                }
-            }
-            "branch" | "if" | "elif" => {
-                // Branch nodes don't produce a result - guard evaluation happens in apply_completions_batch
-                debug!(node_id = %node_id, "Branch node completed");
-                Ok(vec![])
-            }
-            "join" | "else" => {
-                // Join nodes don't produce a result themselves - they just synchronize
-                debug!(node_id = %node_id, "Join node completed");
-                Ok(vec![])
-            }
-            "aggregator" => {
-                let helper = DAGHelper::new(&instance.dag);
-                let exec_node = instance.state.graph.nodes.get(node_id);
-                let source_is_spread = dag_node
-                    .aggregates_from
-                    .as_ref()
-                    .and_then(|id| instance.dag.nodes.get(id))
-                    .map(|n| n.is_spread)
-                    .unwrap_or(false);
-
-                let source_ids: Vec<String> = if source_is_spread {
-                    exec_node.map(|n| n.waiting_for.clone()).unwrap_or_default()
-                } else if let Some(exec_node) = exec_node
-                    && !exec_node.waiting_for.is_empty()
-                {
-                    exec_node.waiting_for.clone()
-                } else {
-                    helper
-                        .get_incoming_edges(&dag_node.id)
-                        .iter()
-                        .filter(|edge| {
-                            edge.edge_type == crate::dag::EdgeType::StateMachine
-                                && edge.exception_types.is_none()
-                        })
-                        .map(|edge| edge.source.clone())
-                        .collect()
-                };
-
-                let mut values = Vec::new();
-                for source_id in source_ids {
-                    if let Some(source_node) = instance.state.graph.nodes.get(&source_id) {
-                        if let Some(result_bytes) = &source_node.result {
-                            let value =
-                                extract_result_value(result_bytes).unwrap_or(WorkflowValue::Null);
-                            values.push(value);
-                        } else {
-                            values.push(WorkflowValue::Null);
-                        }
-                    }
-                }
-
-                let should_store_list = dag_node
-                    .targets
-                    .as_ref()
-                    .map(|targets| targets.len() == 1)
-                    .unwrap_or(false);
-
-                if should_store_list {
-                    let list_value = WorkflowValue::List(values);
-                    let args = WorkflowArguments {
-                        arguments: vec![proto::WorkflowArgument {
-                            key: "result".to_string(),
-                            value: Some(list_value.to_proto()),
-                        }],
-                    };
-                    Ok(encode_message(&args))
-                } else {
-                    Ok(encode_message(&WorkflowArguments { arguments: vec![] }))
-                }
-            }
-            "input" | "output" => {
-                // Input/output boundary nodes
-                debug!(node_id = %node_id, node_type = %dag_node.node_type, "Boundary node completed");
-                Ok(vec![])
-            }
-            "return" => {
-                // Return nodes evaluate their expression and store in "result" variable
-                if let Some(assign_expr) = &dag_node.assign_expr {
-                    match ExpressionEvaluator::evaluate(assign_expr, &scope) {
-                        Ok(value) => {
-                            let result_bytes = workflow_value_to_proto_bytes(&value);
-
-                            // Store in target (should be "result")
-                            if let Some(target) = &dag_node.target {
-                                instance.state.store_variable_for_node(
-                                    node_id,
-                                    &dag_node.node_type,
-                                    target,
-                                    &value,
-                                );
-                                debug!(
-                                    node_id = %node_id,
-                                    target = %target,
-                                    "Stored return value"
-                                );
-                            }
-
-                            Ok(result_bytes)
-                        }
-                        Err(e) => {
-                            warn!(
-                                node_id = %node_id,
-                                error = %e,
-                                "Failed to evaluate return expression"
-                            );
-                            Err(format!("Return evaluation error: {}", e))
-                        }
-                    }
-                } else {
-                    // No expression - return None
-                    debug!(node_id = %node_id, "Return node with no expression");
-                    Ok(vec![])
-                }
-            }
-            _ => {
-                // Unknown node type - just mark as completed
-                debug!(
-                    node_id = %node_id,
-                    node_type = %dag_node.node_type,
-                    "Unknown inline node type completed"
-                );
-                Ok(vec![])
-            }
-        }
+        crate::executor::execute_inline_node(&mut instance.state, &instance.dag, node_id, dag_node)
     }
 
     /// Finalize completed instances
@@ -2004,21 +1787,6 @@ impl InstanceRunner {
     pub async fn metrics(&self) -> InstanceRunnerMetrics {
         self.metrics.lock().await.clone()
     }
-}
-
-fn extract_result_value(result_bytes: &[u8]) -> Option<WorkflowValue> {
-    if let Ok(args) = decode_message::<WorkflowArguments>(result_bytes) {
-        for arg in args.arguments {
-            if arg.key == "result" {
-                if let Some(value) = arg.value {
-                    return Some(WorkflowValue::from_proto(&value));
-                }
-                return None;
-            }
-        }
-    }
-
-    workflow_value_from_proto_bytes(result_bytes)
 }
 
 #[cfg(test)]

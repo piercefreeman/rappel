@@ -564,7 +564,7 @@ async fn main() -> Result<()> {
     // Initialize logging - show more detail in verbose mode
     let log_filter = if args.verbose {
         tracing_subscriber::EnvFilter::from_default_env()
-            .add_directive("rappel::instance_runner=debug".parse().unwrap())
+            .add_directive("rappel::runner_database=debug".parse().unwrap())
             .add_directive("hyper=warn".parse().unwrap())
             .add_directive("h2=warn".parse().unwrap())
             .add_directive("tower=warn".parse().unwrap())
@@ -576,7 +576,7 @@ async fn main() -> Result<()> {
             .add_directive("tower=warn".parse().unwrap())
             .add_directive("tonic=warn".parse().unwrap())
             .add_directive("rappel=warn".parse().unwrap())
-            .add_directive("rappel::instance_runner=info".parse().unwrap())
+            .add_directive("rappel::runner_database=info".parse().unwrap())
             .add_directive("rappel::db=info".parse().unwrap())
     };
 

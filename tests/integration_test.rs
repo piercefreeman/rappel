@@ -15,7 +15,7 @@ use serde_json::json;
 use serial_test::serial;
 use tracing::info;
 
-use harness::{HarnessConfig, IntegrationHarness, run_in_memory_with_result};
+use harness::{HarnessConfig, IntegrationHarness, run_workflow_in_memory};
 use rappel::proto;
 
 const SIMPLE_WORKFLOW_MODULE: &str = include_str!("fixtures/simple_workflow.py");
@@ -174,23 +174,6 @@ async def main():
     wf = GatherListCompWorkflow()
     result = await wf.run(items=[1, 2, 3])
     print(f"Registration result: {result}")
-
-asyncio.run(main())
-"#;
-const RUN_GATHER_LISTCOMP_IN_MEMORY_SCRIPT: &str = r#"
-import asyncio
-import json
-import os
-
-from integration_gather_listcomp import GatherListCompWorkflow
-
-async def main():
-    os.environ["PYTEST_CURRENT_TEST"] = "1"
-    os.environ["RAPPEL_BRIDGE_IN_MEMORY"] = "1"
-    wf = GatherListCompWorkflow()
-    result = await wf.run(items=[1, 2, 3])
-    with open("result.json", "w", encoding="utf-8") as f:
-        json.dump(result, f)
 
 asyncio.run(main())
 "#;
@@ -627,6 +610,8 @@ async fn simple_workflow_executes_end_to_end() -> Result<()> {
         workflow_name: "simpleworkflow",
         user_module: "simple_workflow",
         inputs: &[("name", "world")],
+        workflow_class: Some("SimpleWorkflow"),
+        run_args: Some("name=\"world\""),
     })
     .await?
     else {
@@ -642,11 +627,20 @@ async fn simple_workflow_executes_end_to_end() -> Result<()> {
         .stored_result()
         .await?
         .expect("workflow should have a result");
-    let message = parse_result(&stored_payload)?;
+    let db_result = parse_result_json(&stored_payload)?;
+
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "simple_workflow.py",
+        SIMPLE_WORKFLOW_MODULE,
+        "simple_workflow",
+        "SimpleWorkflow",
+        Some("name=\"world\""),
+    )
+    .await?;
     assert_eq!(
-        message,
-        Some("hello world".to_string()),
-        "unexpected workflow result"
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
     );
 
     harness.shutdown().await?;
@@ -691,6 +685,8 @@ async fn sequential_workflow_first_action_executes() -> Result<()> {
         workflow_name: "sequentialworkflow",
         user_module: "sequential_workflow",
         inputs: &[],
+        workflow_class: Some("SequentialWorkflow"),
+        run_args: None,
     })
     .await?
     else {
@@ -706,11 +702,20 @@ async fn sequential_workflow_first_action_executes() -> Result<()> {
         .stored_result()
         .await?
         .expect("workflow should have a result");
-    let message = parse_result(&stored_payload)?;
+    let db_result = parse_result_json(&stored_payload)?;
+
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "sequential_workflow.py",
+        SEQUENTIAL_WORKFLOW_MODULE,
+        "sequential_workflow",
+        "SequentialWorkflow",
+        None,
+    )
+    .await?;
     assert_eq!(
-        message,
-        Some("result:84".to_string()),
-        "unexpected workflow result"
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
     );
 
     harness.shutdown().await?;
@@ -761,6 +766,8 @@ async fn conditional_workflow_registers_and_first_action_executes() -> Result<()
         workflow_name: "conditionalworkflow",
         user_module: "conditional_workflow",
         inputs: &[("tier", "high")],
+        workflow_class: Some("ConditionalWorkflow"),
+        run_args: Some("tier=\"high\""),
     })
     .await?
     else {
@@ -776,11 +783,20 @@ async fn conditional_workflow_registers_and_first_action_executes() -> Result<()
         .stored_result()
         .await?
         .expect("workflow should have a result");
-    let message = parse_result(&stored_payload)?;
+    let db_result = parse_result_json(&stored_payload)?;
+
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "conditional_workflow.py",
+        CONDITIONAL_WORKFLOW_MODULE,
+        "conditional_workflow",
+        "ConditionalWorkflow",
+        Some("tier=\"high\""),
+    )
+    .await?;
     assert_eq!(
-        message,
-        Some("excellent:100".to_string()),
-        "unexpected workflow result"
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
     );
 
     harness.shutdown().await?;
@@ -828,6 +844,8 @@ async fn exception_workflow_registers_and_first_action_executes() -> Result<()> 
         workflow_name: "exceptionworkflow",
         user_module: "exception_workflow",
         inputs: &[],
+        workflow_class: Some("ExceptionWorkflow"),
+        run_args: None,
     })
     .await?
     else {
@@ -843,11 +861,20 @@ async fn exception_workflow_registers_and_first_action_executes() -> Result<()> 
         .stored_result()
         .await?
         .expect("workflow should have a result");
-    let message = parse_result(&stored_payload)?;
+    let db_result = parse_result_json(&stored_payload)?;
+
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "exception_workflow.py",
+        EXCEPTION_WORKFLOW_MODULE,
+        "exception_workflow",
+        "ExceptionWorkflow",
+        None,
+    )
+    .await?;
     assert_eq!(
-        message,
-        Some("success:84".to_string()),
-        "unexpected workflow result"
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
     );
 
     harness.shutdown().await?;
@@ -897,6 +924,8 @@ async fn crash_recovery_workflow_with_timeout_policies() -> Result<()> {
         workflow_name: "crashrecoveryworkflow",
         user_module: "integration_crash_recovery",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -950,6 +979,8 @@ async fn exception_custom_workflow_with_retry_policy() -> Result<()> {
         workflow_name: "exceptioncustomworkflow",
         user_module: "integration_exception_custom",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -1005,6 +1036,8 @@ async fn exception_with_success_workflow_registers() -> Result<()> {
         user_module: "integration_exception_with_success",
         // Use the stored registration inputs (should_fail=False) as-is.
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -1037,6 +1070,8 @@ async fn exception_with_success_workflow_handles_failure_branch() -> Result<()> 
         workflow_name: "exceptionwithsuccessworkflow",
         user_module: "integration_exception_with_success",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -1102,6 +1137,8 @@ async fn exception_values_workflow_returns_exception_metadata() -> Result<()> {
         workflow_name: "exceptionvaluesworkflow",
         user_module: "integration_exception_values",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -1140,6 +1177,8 @@ async fn exception_metadata_workflow_captures_attributes() -> Result<()> {
         workflow_name: "exceptionmetadataworkflow",
         user_module: "integration_exception_metadata",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -1183,6 +1222,8 @@ async fn error_handling_workflow_returns_basemodel_on_failure() -> Result<()> {
         workflow_name: "errorhandlingworkflow",
         user_module: "integration_error_handling",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -1257,6 +1298,8 @@ async fn error_handling_workflow_returns_basemodel_on_success() -> Result<()> {
         workflow_name: "errorhandlingworkflow",
         user_module: "integration_error_handling",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -1351,6 +1394,8 @@ async fn immediate_conditional_workflow_high_branch() -> Result<()> {
         workflow_name: "immediateconditionalworkflow",
         user_module: "immediate_conditional_workflow",
         inputs: &[("value", "100")],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -1400,6 +1445,8 @@ async fn immediate_conditional_workflow_medium_branch() -> Result<()> {
         workflow_name: "immediateconditionalworkflow",
         user_module: "immediate_conditional_workflow",
         inputs: &[("value", "50")],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -1449,6 +1496,8 @@ async fn immediate_conditional_workflow_low_branch() -> Result<()> {
         workflow_name: "immediateconditionalworkflow",
         user_module: "immediate_conditional_workflow",
         inputs: &[("value", "10")],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -1497,6 +1546,8 @@ async fn immediate_required_input_workflow_missing_input_fails_start() -> Result
         workflow_name: "immediaterequiredinputworkflow",
         user_module: "immediate_required_input_workflow",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -1564,6 +1615,8 @@ async fn dead_end_conditional_guard_reaches_followup_action() -> Result<()> {
         workflow_name: "deadendconditionalworkflow",
         user_module: "integration_dead_end_conditional",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -1659,6 +1712,8 @@ async fn loop_workflow_executes_all_iterations() -> Result<()> {
         workflow_name: "loopworkflow",
         user_module: "loop_workflow",
         inputs: &[],
+        workflow_class: Some("LoopWorkflow"),
+        run_args: Some("items=[\"apple\", \"banana\", \"cherry\"]"),
     })
     .await?
     else {
@@ -1674,11 +1729,20 @@ async fn loop_workflow_executes_all_iterations() -> Result<()> {
         .stored_result()
         .await?
         .expect("workflow should have a result");
-    let message = parse_result(&stored_payload)?;
+    let db_result = parse_result_json(&stored_payload)?;
+
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "loop_workflow.py",
+        LOOP_WORKFLOW_MODULE,
+        "loop_workflow",
+        "LoopWorkflow",
+        Some("items=[\"apple\", \"banana\", \"cherry\"]"),
+    )
+    .await?;
     assert_eq!(
-        message,
-        Some("APPLE,BANANA,CHERRY".to_string()),
-        "unexpected workflow result"
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
     );
 
     harness.shutdown().await?;
@@ -1701,6 +1765,8 @@ async fn while_loop_workflow_executes_until_limit() -> Result<()> {
         workflow_name: "whileloopworkflow",
         user_module: "integration_while_loop",
         inputs: &[("limit", "3")],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -1741,6 +1807,8 @@ async fn helper_loop_workflow_executes_all_iterations() -> Result<()> {
         workflow_name: "helperloopworkflow",
         user_module: "integration_helper_loop",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -1802,6 +1870,8 @@ async fn return_inside_for_loop_completes_workflow() -> Result<()> {
         workflow_name: "loopreturnworkflow",
         user_module: "integration_loop_return",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -1868,6 +1938,8 @@ async fn parallel_workflow_executes_concurrent_actions() -> Result<()> {
         workflow_name: "parallelworkflow",
         user_module: "parallel_workflow",
         inputs: &[], // Use default value from Python registration
+        workflow_class: Some("ParallelWorkflow"),
+        run_args: Some("value=5"),
     })
     .await?
     else {
@@ -1883,11 +1955,20 @@ async fn parallel_workflow_executes_concurrent_actions() -> Result<()> {
         .stored_result()
         .await?
         .expect("workflow should have a result");
-    let message = parse_result(&stored_payload)?;
+    let db_result = parse_result_json(&stored_payload)?;
+
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "parallel_workflow.py",
+        PARALLEL_WORKFLOW_MODULE,
+        "parallel_workflow",
+        "ParallelWorkflow",
+        Some("value=5"),
+    )
+    .await?;
     assert_eq!(
-        message,
-        Some("doubled:10,squared:25".to_string()),
-        "unexpected workflow result"
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
     );
 
     harness.shutdown().await?;
@@ -1928,6 +2009,8 @@ async fn parallel_math_workflow_executes_and_returns_model() -> Result<()> {
         workflow_name: "parallelmathworkflow",
         user_module: "integration_parallel_math",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -2002,6 +2085,8 @@ async fn conditional_workflow_medium_branch() -> Result<()> {
         workflow_name: "conditionalworkflow",
         user_module: "conditional_workflow",
         inputs: &[("tier", "medium")],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -2048,6 +2133,8 @@ async fn conditional_workflow_low_branch() -> Result<()> {
         workflow_name: "conditionalworkflow",
         user_module: "conditional_workflow",
         inputs: &[("tier", "low")],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -2113,6 +2200,8 @@ async fn chain_workflow_executes_all_steps() -> Result<()> {
         workflow_name: "chainworkflow",
         user_module: "chain_workflow",
         inputs: &[("text", "hello world")],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -2203,6 +2292,8 @@ async fn for_loop_workflow_executes_all_iterations() -> Result<()> {
         workflow_name: "forloopworkflow",
         user_module: "for_loop_workflow",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -2253,6 +2344,8 @@ async fn fn_call_binding_workflow_executes() -> Result<()> {
         workflow_name: "predictworkflow",
         user_module: "integration_fn_call_binding",
         inputs: &[("user", r#"{"user_id":"user-123"}"#)],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -2326,6 +2419,8 @@ async fn durable_sleep_workflow_executes() -> Result<()> {
         workflow_name: "sleepworkflow",
         user_module: "integration_sleep",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -2461,6 +2556,8 @@ async fn loop_exception_workflow_continues_after_catch() -> Result<()> {
         workflow_name: "loopexceptionworkflow",
         user_module: "integration_loop_exception",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -2541,6 +2638,8 @@ async fn retry_exhausted_break_allows_followup_loop() -> Result<()> {
         workflow_name: "retryexhaustedbreakworkflow",
         user_module: "integration_retry_exhausted_break",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -2580,6 +2679,8 @@ async fn try_break_dataflow_allows_followup_guard() -> Result<()> {
         workflow_name: "trybreakdataflowworkflow",
         user_module: "integration_try_break_dataflow",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -2623,6 +2724,8 @@ async fn nested_try_loop_prefers_inner_handler() -> Result<()> {
         workflow_name: "nestedtryloopworkflow",
         user_module: "integration_nested_try_loop",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -2708,6 +2811,8 @@ async fn parallel_fn_workflow_executes_helper_methods() -> Result<()> {
         workflow_name: "parallelfnworkflow",
         user_module: "integration_parallel_fn",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -2756,6 +2861,8 @@ async fn spread_from_action_non_empty() -> Result<()> {
         workflow_name: "spreadfromactionworkflow",
         user_module: "integration_spread_from_action",
         inputs: &[("include_items", "true")],
+        workflow_class: Some("SpreadFromActionWorkflow"),
+        run_args: Some("include_items=True"),
     })
     .await?
     else {
@@ -2769,11 +2876,20 @@ async fn spread_from_action_non_empty() -> Result<()> {
         .stored_result()
         .await?
         .expect("workflow should have a result");
-    let message = parse_result(&stored_payload)?;
+    let db_result = parse_result_json(&stored_payload)?;
+
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "integration_spread_from_action.py",
+        SPREAD_FROM_ACTION_WORKFLOW_MODULE,
+        "integration_spread_from_action",
+        "SpreadFromActionWorkflow",
+        Some("include_items=True"),
+    )
+    .await?;
     assert_eq!(
-        message,
-        Some("processed:a,processed:b".to_string()),
-        "unexpected workflow result"
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
     );
 
     harness.shutdown().await?;
@@ -2799,6 +2915,8 @@ async fn spread_from_action_empty() -> Result<()> {
         workflow_name: "spreadfromactionworkflow",
         user_module: "integration_spread_from_action",
         inputs: &[("include_items", "false")],
+        workflow_class: Some("SpreadFromActionWorkflow"),
+        run_args: Some("include_items=False"),
     })
     .await?
     else {
@@ -2812,11 +2930,20 @@ async fn spread_from_action_empty() -> Result<()> {
         .stored_result()
         .await?
         .expect("workflow should have a result");
-    let message = parse_result(&stored_payload)?;
+    let db_result = parse_result_json(&stored_payload)?;
+
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "integration_spread_from_action.py",
+        SPREAD_FROM_ACTION_WORKFLOW_MODULE,
+        "integration_spread_from_action",
+        "SpreadFromActionWorkflow",
+        Some("include_items=False"),
+    )
+    .await?;
     assert_eq!(
-        message,
-        Some("empty".to_string()),
-        "unexpected workflow result"
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
     );
 
     harness.shutdown().await?;
@@ -2839,6 +2966,8 @@ async fn spread_in_loop_executes() -> Result<()> {
         workflow_name: "spreadloopworkflow",
         user_module: "integration_spread_loop",
         inputs: &[("items", "[1, 2]")],
+        workflow_class: Some("SpreadLoopWorkflow"),
+        run_args: Some("items=[1, 2]"),
     })
     .await?
     else {
@@ -2852,11 +2981,21 @@ async fn spread_in_loop_executes() -> Result<()> {
         .stored_result()
         .await?
         .expect("workflow should have a result");
-    let message = parse_result(&stored_payload)?.unwrap_or_default();
-    let parsed: serde_json::Value = serde_json::from_str(&message)?;
+    let db_result = parse_result_json(&stored_payload)?;
 
-    assert_eq!(parsed.get("totals"), Some(&json!([3, 5])));
-    assert_eq!(parsed.get("empties"), Some(&json!([0, 0])));
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "integration_spread_loop.py",
+        SPREAD_LOOP_WORKFLOW_MODULE,
+        "integration_spread_loop",
+        "SpreadLoopWorkflow",
+        Some("items=[1, 2]"),
+    )
+    .await?;
+    assert_eq!(
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
+    );
 
     harness.shutdown().await?;
     Ok(())
@@ -2881,6 +3020,8 @@ async fn spread_helper_input_from_action_executes() -> Result<()> {
         workflow_name: "spreadhelperinputworkflow",
         user_module: "integration_spread_helper_input",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -2924,6 +3065,8 @@ async fn gather_listcomp_matches_in_memory() -> Result<()> {
         workflow_name: "gatherlistcompworkflow",
         user_module: "integration_gather_listcomp",
         inputs: &[],
+        workflow_class: Some("GatherListCompWorkflow"),
+        run_args: Some("items=[1, 2, 3]"),
     })
     .await?
     else {
@@ -2939,21 +3082,19 @@ async fn gather_listcomp_matches_in_memory() -> Result<()> {
         .expect("workflow should have a result");
     let db_result = parse_result_json(&stored_payload)?;
 
-    let (_env_dir, in_memory_result) = run_in_memory_with_result(
-        &[
-            (
-                "integration_gather_listcomp.py",
-                GATHER_LISTCOMP_WORKFLOW_MODULE,
-            ),
-            ("run_in_memory.py", RUN_GATHER_LISTCOMP_IN_MEMORY_SCRIPT),
-        ],
-        "run_in_memory.py",
-        "result.json",
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "integration_gather_listcomp.py",
+        GATHER_LISTCOMP_WORKFLOW_MODULE,
+        "integration_gather_listcomp",
+        "GatherListCompWorkflow",
+        Some("items=[1, 2, 3]"),
     )
     .await?;
-    let in_memory_value: serde_json::Value = serde_json::from_str(&in_memory_result)?;
-
-    assert_eq!(db_result, in_memory_value);
+    assert_eq!(
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
+    );
 
     harness.shutdown().await?;
     Ok(())
@@ -3006,6 +3147,8 @@ async fn run_action_spread_workflow_executes() -> Result<()> {
         workflow_name: "runactionspreadworkflow",
         user_module: "integration_run_action_spread",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -3050,6 +3193,8 @@ async fn loop_accum_workflow_executes() -> Result<()> {
         workflow_name: "loopaccumworkflow",
         user_module: "integration_loop_accum",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -3092,6 +3237,8 @@ async fn multi_action_loop_workflow_executes() -> Result<()> {
         workflow_name: "multiactionloopworkflow",
         user_module: "integration_multi_action_loop",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -3134,6 +3281,8 @@ async fn multi_accumulator_workflow_executes() -> Result<()> {
         workflow_name: "multiaccumulatorworkflow",
         user_module: "integration_multi_accumulator",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -3176,6 +3325,8 @@ async fn complex_logic_workflow_executes() -> Result<()> {
         workflow_name: "complexlogicworkflow",
         user_module: "integration_complex_logic",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -3218,6 +3369,8 @@ async fn data_pipeline_workflow_executes() -> Result<()> {
         workflow_name: "datapipelineworkflow",
         user_module: "integration_data_pipeline",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -3260,6 +3413,8 @@ async fn nested_conditionals_workflow_executes() -> Result<()> {
         workflow_name: "nestedconditionalsworkflow",
         user_module: "integration_nested_conditionals",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -3302,6 +3457,8 @@ async fn string_processing_workflow_executes() -> Result<()> {
         workflow_name: "stringprocessingworkflow",
         user_module: "integration_string_processing",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -3341,6 +3498,8 @@ async fn module_workflow_executes() -> Result<()> {
         workflow_name: "integrationworkflow",
         user_module: "integration_module",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -3383,6 +3542,8 @@ async fn complete_feature_workflow_executes() -> Result<()> {
         workflow_name: "completefeatureworkflow",
         user_module: "complete_feature_workflow",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -3440,6 +3601,8 @@ async fn repro_action_request_null_executes() -> Result<()> {
         workflow_name: "reproactionrequestnullworkflow",
         user_module: "repro_action_request_null",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -3478,6 +3641,8 @@ async fn expression_ops_workflow_executes() -> Result<()> {
         workflow_name: "expressionopsworkflow",
         user_module: "integration_expression_ops",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -3523,6 +3688,8 @@ async fn loop_control_flow_workflow_executes() -> Result<()> {
         workflow_name: "loopcontrolflowworkflow",
         user_module: "integration_loop_control_flow",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -3565,6 +3732,8 @@ async fn parallel_block_workflow_executes() -> Result<()> {
         workflow_name: "parallelblockworkflow",
         user_module: "integration_parallel_block",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -3604,6 +3773,8 @@ async fn isexception_workflow_executes() -> Result<()> {
         workflow_name: "isexceptionworkflow",
         user_module: "integration_isexception",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {
@@ -3683,6 +3854,8 @@ async fn helper_early_return_workflow_does_not_stall() -> Result<()> {
         workflow_name: "helperearlyreturnworkflow",
         user_module: "integration_helper_early_return",
         inputs: &[],
+        workflow_class: None,
+        run_args: None,
     })
     .await?
     else {

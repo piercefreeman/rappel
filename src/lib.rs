@@ -26,12 +26,14 @@ pub mod dag;
 pub mod dag_state;
 pub mod db;
 pub mod execution_graph;
-pub mod instance_runner;
+pub mod executor;
 pub mod ir_printer;
 pub mod ir_validation;
 pub mod lexer;
 pub mod messages;
 pub mod parser;
+pub mod runner_database;
+pub mod runner_memory;
 pub mod schedule;
 pub mod server_client;
 pub mod server_webapp;
@@ -40,6 +42,7 @@ pub mod stats;
 pub mod traversal;
 pub mod value;
 pub mod worker;
+mod workflow_ir;
 
 // Configuration
 pub use config::{
@@ -98,7 +101,7 @@ pub use traversal::{
 pub use execution_graph::{BatchCompletionResult, Completion, ExecutionState};
 
 // Instance Runner (lease-based execution)
-pub use instance_runner::{
+pub use runner_database::{
     DEFAULT_CLAIM_BATCH_SIZE, DEFAULT_COMPLETION_BATCH_SIZE, DEFAULT_HEARTBEAT_INTERVAL,
     DEFAULT_LEASE_SECONDS, InstanceRunner, InstanceRunnerConfig, InstanceRunnerError,
     InstanceRunnerMetrics, InstanceRunnerResult,
