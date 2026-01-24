@@ -156,6 +156,10 @@ async fn run_server(
             "/api/workflows/:workflow_version_id/run/:instance_id/run-data",
             get(get_workflow_run_data),
         )
+        .route(
+            "/api/workflows/:workflow_version_id/run/:instance_id/action-logs/:action_id",
+            get(get_workflow_action_logs),
+        )
         .route("/scheduled", get(list_schedules))
         .route("/scheduled/:schedule_id", get(schedule_detail))
         .route("/scheduled/:schedule_id/pause", post(pause_schedule))
@@ -305,9 +309,17 @@ async fn workflow_run_detail(
     ))
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct RunDataQuery {
+    page: Option<i64>,
+    per_page: Option<i64>,
+    include_nodes: Option<bool>,
+}
+
 async fn get_workflow_run_data(
     State(state): State<WebappState>,
     Path((version_id, instance_id)): Path<(Uuid, Uuid)>,
+    axum::extract::Query(query): axum::extract::Query<RunDataQuery>,
 ) -> Result<Json<WorkflowRunDataResponse>, HttpError> {
     let version = state
         .database
@@ -335,7 +347,14 @@ async fn get_workflow_run_data(
 
     let dag = decode_dag_from_proto(&version.program_proto);
     let mut nodes = Vec::new();
-    let mut action_logs_by_action = std::collections::HashMap::new();
+    let mut timeline = TimelinePage {
+        entries: Vec::new(),
+        total: 0,
+    };
+
+    let per_page = query.per_page.unwrap_or(200).clamp(1, 1000);
+    let page = query.page.unwrap_or(1).max(1);
+    let include_nodes = query.include_nodes.unwrap_or(true);
 
     if let Ok(Some(graph_bytes)) = state
         .database
@@ -344,14 +363,72 @@ async fn get_workflow_run_data(
         && let Some(graph) = decode_execution_graph(&graph_bytes)
     {
         let action_logs = synthesize_action_logs_from_execution_graph(instance_id, &dag, &graph);
-        nodes = build_node_contexts_from_action_logs(&action_logs);
-        action_logs_by_action = build_action_logs_by_action(&action_logs);
+        if include_nodes {
+            nodes = build_node_contexts_from_action_logs(&action_logs);
+        }
+        timeline = build_timeline_entries(&action_logs, page, per_page);
     }
+
+    let total = timeline.total;
+    let has_more = (page * per_page) < total;
 
     Ok(Json(WorkflowRunDataResponse {
         nodes,
-        action_logs: action_logs_by_action,
+        timeline: timeline.entries,
+        page,
+        per_page,
+        total,
+        has_more,
     }))
+}
+
+async fn get_workflow_action_logs(
+    State(state): State<WebappState>,
+    Path((version_id, instance_id, action_id)): Path<(Uuid, Uuid, Uuid)>,
+) -> Result<Json<ActionLogsResponse>, HttpError> {
+    let version = state
+        .database
+        .get_workflow_version(WorkflowVersionId(version_id))
+        .await
+        .map_err(|err| {
+            error!(?err, %version_id, "failed to load workflow version");
+            HttpError {
+                status: StatusCode::NOT_FOUND,
+                message: "workflow version not found".to_string(),
+            }
+        })?;
+
+    state
+        .database
+        .get_instance(crate::db::WorkflowInstanceId(instance_id))
+        .await
+        .map_err(|err| {
+            error!(?err, %instance_id, "failed to load instance");
+            HttpError {
+                status: StatusCode::NOT_FOUND,
+                message: "workflow instance not found".to_string(),
+            }
+        })?;
+
+    let dag = decode_dag_from_proto(&version.program_proto);
+    let mut logs = Vec::new();
+
+    if let Ok(Some(graph_bytes)) = state
+        .database
+        .get_instance_execution_graph(crate::db::WorkflowInstanceId(instance_id))
+        .await
+        && let Some(graph) = decode_execution_graph(&graph_bytes)
+    {
+        let action_logs = synthesize_action_logs_from_execution_graph(instance_id, &dag, &graph);
+        logs = action_logs
+            .iter()
+            .filter(|log| log.action_id == action_id)
+            .map(build_action_log_context)
+            .collect();
+        logs.sort_by(|a, b| a.attempt_number.cmp(&b.attempt_number));
+    }
+
+    Ok(Json(ActionLogsResponse { logs }))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -995,10 +1072,24 @@ struct ActionLogContext {
     result_payload: Option<String>,
 }
 
+struct TimelinePage {
+    entries: Vec<ActionLogContext>,
+    total: i64,
+}
+
 #[derive(Serialize)]
 struct WorkflowRunDataResponse {
     nodes: Vec<NodeExecutionContext>,
-    action_logs: std::collections::HashMap<String, Vec<ActionLogContext>>,
+    timeline: Vec<ActionLogContext>,
+    page: i64,
+    per_page: i64,
+    total: i64,
+    has_more: bool,
+}
+
+#[derive(Serialize)]
+struct ActionLogsResponse {
+    logs: Vec<ActionLogContext>,
 }
 
 fn render_workflow_run_page(
@@ -1696,43 +1787,57 @@ fn build_node_contexts_from_action_logs(
         .collect()
 }
 
-fn build_action_logs_by_action(
-    action_logs: &[crate::db::ActionLog],
-) -> std::collections::HashMap<String, Vec<ActionLogContext>> {
-    let mut logs_by_action: std::collections::HashMap<String, Vec<ActionLogContext>> =
-        std::collections::HashMap::new();
-
-    for log in action_logs {
-        let log_ctx = ActionLogContext {
-            id: log.id.to_string(),
-            action_id: log.action_id.to_string(),
-            node_id: log.node_id.clone(),
-            action_name: log.action_name.clone(),
-            module_name: log.module_name.clone(),
-            attempt_number: log.attempt_number,
-            dispatched_at: log
-                .dispatched_at
-                .format("%Y-%m-%d %H:%M:%S%.3f UTC")
-                .to_string(),
-            completed_at: log
-                .completed_at
-                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string()),
-            success: log.success,
-            duration_ms: log.duration_ms,
-            error_message: log.error_message.clone(),
-            result_payload: log
-                .result_payload
-                .as_ref()
-                .map(|p| format_binary_payload(p)),
-        };
-
-        logs_by_action
-            .entry(log.action_id.to_string())
-            .or_default()
-            .push(log_ctx);
+fn build_action_log_context(log: &crate::db::ActionLog) -> ActionLogContext {
+    ActionLogContext {
+        id: log.id.to_string(),
+        action_id: log.action_id.to_string(),
+        node_id: log.node_id.clone(),
+        action_name: log.action_name.clone(),
+        module_name: log.module_name.clone(),
+        attempt_number: log.attempt_number,
+        dispatched_at: log
+            .dispatched_at
+            .format("%Y-%m-%d %H:%M:%S%.3f UTC")
+            .to_string(),
+        completed_at: log
+            .completed_at
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string()),
+        success: log.success,
+        duration_ms: log.duration_ms,
+        error_message: log.error_message.clone(),
+        result_payload: log
+            .result_payload
+            .as_ref()
+            .map(|p| format_binary_payload(p)),
     }
+}
 
-    logs_by_action
+fn build_timeline_entries(
+    action_logs: &[crate::db::ActionLog],
+    page: i64,
+    per_page: i64,
+) -> TimelinePage {
+    let mut sorted_logs: Vec<&crate::db::ActionLog> = action_logs.iter().collect();
+    sorted_logs.sort_by(|a, b| {
+        b.dispatched_at
+            .cmp(&a.dispatched_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let total = sorted_logs.len() as i64;
+    let start = ((page - 1) * per_page).max(0) as usize;
+    let end = (start + per_page as usize).min(sorted_logs.len());
+
+    let entries = if start < sorted_logs.len() {
+        sorted_logs[start..end]
+            .iter()
+            .map(|log| build_action_log_context(log))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    TimelinePage { entries, total }
 }
 
 fn build_action_status_from_execution_graph(
