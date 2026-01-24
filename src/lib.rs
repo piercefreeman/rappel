@@ -90,7 +90,7 @@ pub use stats::{LifecycleStats, LifecycleStatsSnapshot, MetricStats};
 pub use schedule::{next_cron_run, next_interval_run, validate_cron};
 
 // Execution Graph (instance-local execution model)
-pub use execution_graph::{BatchCompletionResult, Completion, ExecutionState};
+pub use execution_graph::{BatchCompletionResult, Completion, ExecutionState, MAX_LOOP_ITERATIONS};
 
 // Instance Runner (lease-based execution)
 pub use runner_database::{
