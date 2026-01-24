@@ -39,7 +39,6 @@ pub mod server_client;
 pub mod server_webapp;
 pub mod server_worker;
 pub mod stats;
-pub mod traversal;
 pub mod value;
 pub mod worker;
 mod workflow_ir;
@@ -89,13 +88,6 @@ pub use stats::{LifecycleStats, LifecycleStatsSnapshot, MetricStats};
 
 // Schedule utilities
 pub use schedule::{next_cron_run, next_interval_run, validate_cron};
-
-// Traversal (shared DAG traversal logic)
-pub use traversal::{
-    InlineScope as TraversalScope, LoopAwareTraversal, MAX_LOOP_ITERATIONS, TraversalEdge,
-    TraversalQueue, WorkQueueEntry, evaluate_guard as traversal_evaluate_guard,
-    get_traversal_successors, select_guarded_edges,
-};
 
 // Execution Graph (instance-local execution model)
 pub use execution_graph::{BatchCompletionResult, Completion, ExecutionState};
