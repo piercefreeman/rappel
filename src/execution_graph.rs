@@ -17,6 +17,10 @@ use tracing::{debug, trace, warn};
 
 use crate::ast_evaluator::{ExpressionEvaluator, Scope};
 use crate::dag::{DAG, DAGEdge, EXCEPTION_SCOPE_VAR, EdgeType};
+
+/// Maximum number of loop iterations before terminating execution.
+/// This prevents infinite loops (e.g., `while True:`) from running forever.
+pub const MAX_LOOP_ITERATIONS: i32 = 50_000;
 use crate::dag_state::DAGHelper;
 use crate::messages::execution::{
     AttemptRecord, BackoffConfig, BackoffKind, ExceptionInfo, ExecutionGraph, ExecutionNode,
@@ -1001,10 +1005,17 @@ impl ExecutionState {
                                 .map(|edge| edge.exception_depth.unwrap_or(0))
                                 .max()
                                 .unwrap_or(0);
-                            matching_exception_edges
+                            let edges_at_max_depth: Vec<_> = matching_exception_edges
                                 .into_iter()
                                 .filter(|edge| edge.exception_depth.unwrap_or(0) == max_depth)
-                                .collect::<Vec<_>>()
+                                .collect();
+                            // Select only the first matching handler - Python semantics require
+                            // that only the first matching except handler executes
+                            if let Some(first) = edges_at_max_depth.into_iter().next() {
+                                vec![first]
+                            } else {
+                                vec![]
+                            }
                         } else {
                             matching_exception_edges
                         };
@@ -1120,12 +1131,32 @@ impl ExecutionState {
                     if let Some(successor) = self.graph.nodes.get_mut(successor_id) {
                         // Increment loop_index for tracking
                         let current_idx = successor.loop_index.unwrap_or(0);
-                        successor.loop_index = Some(current_idx + 1);
+                        let new_idx = current_idx + 1;
+                        successor.loop_index = Some(new_idx);
                         trace!(
                             node_id = %successor_id,
-                            loop_index = current_idx + 1,
+                            loop_index = new_idx,
                             "Reset node for loop iteration"
                         );
+
+                        // Check for infinite loop
+                        if new_idx > MAX_LOOP_ITERATIONS {
+                            let message = format!(
+                                "Loop exceeded maximum iterations ({}) at node '{}'. \
+                                 This may indicate an infinite loop (e.g., `while True:`).",
+                                MAX_LOOP_ITERATIONS, successor_id
+                            );
+                            warn!(
+                                node_id = %successor_id,
+                                iterations = new_idx,
+                                max = MAX_LOOP_ITERATIONS,
+                                "Loop exceeded max iterations, terminating workflow"
+                            );
+                            result.workflow_failed = true;
+                            result.error_message = Some(message.clone());
+                            result.result_payload = Some(Self::build_error_payload(&message));
+                            return result;
+                        }
                     }
                 }
 

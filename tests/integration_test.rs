@@ -64,6 +64,21 @@ const NESTED_TRY_LOOP_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_nested_try_loop.py");
 const HELPER_EARLY_RETURN_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_helper_early_return.py");
+
+// Production issue test fixtures
+const GATHER_CLOSURE_BINDING_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_gather_closure_binding.py");
+const BREAK_IN_EXCEPT_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_break_in_except.py");
+const MULTIPLE_EXCEPT_HANDLERS_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_multiple_except_handlers.py");
+const INSTANCE_ATTRIBUTE_ACCESS_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_instance_attribute_access.py");
+const IS_NOT_NONE_COMPARISON_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_is_not_none_comparison.py");
+const LOGGER_IN_EXCEPT_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_logger_in_except.py");
+
 const EXCEPTION_WITH_SUCCESS_FAILURE_SCRIPT: &str = r#"
 import asyncio
 import os
@@ -3876,6 +3891,707 @@ async fn helper_early_return_workflow_does_not_stall() -> Result<()> {
         message,
         Some("final:processed:3".to_string()),
         "unexpected workflow result - workflow may have stalled waiting for early-return branches"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Production Issue Tests
+// =============================================================================
+// These tests reproduce and verify fixes for issues reported in production.
+
+// Issue 1: Late-binding closure in asyncio.gather with list comprehensions
+// When using asyncio.gather with a list comprehension that captures a loop variable,
+// each coroutine should receive its own distinct value, not the last value.
+const REGISTER_GATHER_CLOSURE_BINDING_SCRIPT: &str = r#"
+import asyncio
+import os
+from uuid import UUID
+
+from integration_gather_closure_binding import GatherClosureBindingWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = GatherClosureBindingWorkflow()
+    # Use 3 distinct UUIDs - each action should receive a different one
+    comment_ids = [
+        UUID("11111111-1111-1111-1111-111111111111"),
+        UUID("22222222-2222-2222-2222-222222222222"),
+        UUID("33333333-3333-3333-3333-333333333333"),
+    ]
+    result = await wf.run(post_id="post_123", comment_ids=comment_ids)
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that asyncio.gather with list comprehension correctly binds each loop variable.
+///
+/// Issue: All coroutines receive the last value of the loop variable instead of
+/// the value at the time each coroutine was created.
+///
+/// Expected: Each action receives a distinct comment_id.
+/// Bug: All actions receive the same (last) comment_id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn gather_closure_binding_workflow_each_action_gets_distinct_value() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_gather_closure_binding.py",
+                GATHER_CLOSURE_BINDING_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_GATHER_CLOSURE_BINDING_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "gatherclosurebindingworkflow",
+        user_module: "integration_gather_closure_binding",
+        inputs: &[],
+        workflow_class: Some("GatherClosureBindingWorkflow"),
+        run_args: Some(
+            "post_id=\"post_123\", comment_ids=[__import__(\"uuid\").UUID(\"11111111-1111-1111-1111-111111111111\"), __import__(\"uuid\").UUID(\"22222222-2222-2222-2222-222222222222\"), __import__(\"uuid\").UUID(\"33333333-3333-3333-3333-333333333333\")]",
+        ),
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let db_result = parse_result_json(&stored_payload)?;
+
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "integration_gather_closure_binding.py",
+        GATHER_CLOSURE_BINDING_WORKFLOW_MODULE,
+        "integration_gather_closure_binding",
+        "GatherClosureBindingWorkflow",
+        Some("post_id=\"post_123\", comment_ids=[__import__(\"uuid\").UUID(\"11111111-1111-1111-1111-111111111111\"), __import__(\"uuid\").UUID(\"22222222-2222-2222-2222-222222222222\"), __import__(\"uuid\").UUID(\"33333333-3333-3333-3333-333333333333\")]"),
+    )
+    .await?;
+
+    assert_eq!(
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
+    );
+
+    // Verify each action received a distinct comment_id
+    let results = db_result.as_array().expect("result should be an array");
+    assert_eq!(results.len(), 3, "should have 3 results");
+
+    let comment_ids: Vec<&str> = results
+        .iter()
+        .map(|r| r.get("comment_id").unwrap().as_str().unwrap())
+        .collect();
+
+    // Each comment_id should be unique
+    assert_eq!(
+        comment_ids[0], "11111111-1111-1111-1111-111111111111",
+        "first action should receive first comment_id"
+    );
+    assert_eq!(
+        comment_ids[1], "22222222-2222-2222-2222-222222222222",
+        "second action should receive second comment_id"
+    );
+    assert_eq!(
+        comment_ids[2], "33333333-3333-3333-3333-333333333333",
+        "third action should receive third comment_id"
+    );
+
+    // Verify no duplicates (bug would cause all to be the same)
+    let unique_ids: std::collections::HashSet<&str> = comment_ids.iter().copied().collect();
+    assert_eq!(
+        unique_ids.len(),
+        3,
+        "all comment_ids should be unique - bug would cause all to be the last value"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// Issue 2: break inside except block causes workflow to raise exception
+const REGISTER_BREAK_IN_EXCEPT_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_break_in_except import BreakInExceptWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = BreakInExceptWorkflow()
+    # fail_on=1 means the second page (page=1) will raise CrawlFetchError
+    result = await wf.run(max_pages=3, fail_on=1)
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that break inside except block correctly exits loop and continues execution.
+///
+/// Issue: When using break inside an except block, the workflow raises an exception
+/// to the outer handler instead of continuing with code after the loop.
+///
+/// Expected: After break in except, code after the loop executes normally.
+/// Bug: Exception propagates to outer handler instead of continuing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn break_in_except_continues_after_loop() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_break_in_except.py",
+                BREAK_IN_EXCEPT_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_BREAK_IN_EXCEPT_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "breakinexceptworkflow",
+        user_module: "integration_break_in_except",
+        inputs: &[],
+        workflow_class: Some("BreakInExceptWorkflow"),
+        run_args: Some("max_pages=3, fail_on=1"),
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let db_result = parse_result_json(&stored_payload)?;
+
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "integration_break_in_except.py",
+        BREAK_IN_EXCEPT_WORKFLOW_MODULE,
+        "integration_break_in_except",
+        "BreakInExceptWorkflow",
+        Some("max_pages=3, fail_on=1"),
+    )
+    .await?;
+
+    assert_eq!(
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
+    );
+
+    // Verify workflow completed successfully and code after loop executed
+    // page 0 succeeds, page 1 fails with CrawlFetchError, break happens
+    // After break, the parsed_items loop should process "page_0_data"
+    let items = db_result.get("items").expect("should have items key");
+    assert!(
+        items.is_array(),
+        "items should be an array (code after loop executed)"
+    );
+
+    let logs = db_result.get("logs").expect("should have logs key");
+    assert!(logs.is_array(), "logs should be an array");
+
+    // Should have logged the CrawlFetchError
+    let log_messages: Vec<&str> = logs
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        log_messages.iter().any(|m| m.contains("CrawlFetchError")),
+        "should have logged CrawlFetchError"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// Issue 3: Multiple except blocks all execute
+const REGISTER_MULTIPLE_EXCEPT_HANDLERS_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_multiple_except_handlers import MultipleExceptHandlersWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = MultipleExceptHandlersWorkflow()
+    result = await wf.run(raise_specific_error=True)
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that only one except handler executes when exception is raised.
+///
+/// Issue: When a try block has multiple except handlers for different exception types,
+/// multiple handlers may execute instead of just the matching one.
+///
+/// Expected: Only one handler executes (the most specific matching one).
+/// Bug: Both handlers may execute when SpecificError is raised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn multiple_except_handlers_only_one_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_multiple_except_handlers.py",
+                MULTIPLE_EXCEPT_HANDLERS_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_MULTIPLE_EXCEPT_HANDLERS_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "multipleexcepthandlersworkflow",
+        user_module: "integration_multiple_except_handlers",
+        inputs: &[],
+        workflow_class: Some("MultipleExceptHandlersWorkflow"),
+        run_args: Some("raise_specific_error=True"),
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let db_result = parse_result_json(&stored_payload)?;
+
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "integration_multiple_except_handlers.py",
+        MULTIPLE_EXCEPT_HANDLERS_WORKFLOW_MODULE,
+        "integration_multiple_except_handlers",
+        "MultipleExceptHandlersWorkflow",
+        Some("raise_specific_error=True"),
+    )
+    .await?;
+
+    assert_eq!(
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
+    );
+
+    // Verify only one handler was called
+    let handlers_called = db_result
+        .get("handlers_called")
+        .expect("should have handlers_called key")
+        .as_array()
+        .expect("handlers_called should be an array");
+
+    assert_eq!(
+        handlers_called.len(),
+        1,
+        "exactly one handler should execute - bug causes multiple handlers to execute"
+    );
+
+    // The SpecificError handler should have executed
+    assert_eq!(
+        handlers_called[0].as_str().unwrap(),
+        "SpecificError",
+        "SpecificError handler should have executed"
+    );
+
+    let count = db_result
+        .get("count")
+        .expect("should have count key")
+        .as_i64()
+        .expect("count should be an integer");
+    assert_eq!(count, 1, "handler count should be 1");
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// Issue 4: Instance attribute access not supported in workflow methods
+const REGISTER_INSTANCE_ATTRIBUTE_ACCESS_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_instance_attribute_access import InstanceAttributeAccessWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = InstanceAttributeAccessWorkflow()
+    result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that instance attribute access works in workflow methods.
+///
+/// Issue: Accessing attributes of instance variables (e.g., self.some_object.attribute)
+/// in workflow method code causes an immediate exception with NoneType: None.
+///
+/// Expected: Accessing self.crawl_retry.attempts works correctly.
+/// Bug: Workflow fails immediately with no HTTP requests made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn instance_attribute_access_works() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_instance_attribute_access.py",
+                INSTANCE_ATTRIBUTE_ACCESS_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_INSTANCE_ATTRIBUTE_ACCESS_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "instanceattributeaccessworkflow",
+        user_module: "integration_instance_attribute_access",
+        inputs: &[],
+        workflow_class: Some("InstanceAttributeAccessWorkflow"),
+        run_args: None,
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let db_result = parse_result_json(&stored_payload)?;
+
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "integration_instance_attribute_access.py",
+        INSTANCE_ATTRIBUTE_ACCESS_WORKFLOW_MODULE,
+        "integration_instance_attribute_access",
+        "InstanceAttributeAccessWorkflow",
+        None,
+    )
+    .await?;
+
+    assert_eq!(
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
+    );
+
+    // Verify the workflow succeeded
+    assert_eq!(
+        db_result.get("success").and_then(|v| v.as_bool()),
+        Some(true),
+        "workflow should succeed - bug causes NoneType exception"
+    );
+
+    // Verify the config values were correctly accessed
+    let config_used = db_result
+        .get("config_used")
+        .expect("should have config_used key");
+    assert_eq!(
+        config_used.get("max_attempts").and_then(|v| v.as_i64()),
+        Some(3),
+        "max_attempts should be 3"
+    );
+    assert_eq!(
+        config_used.get("backoff").and_then(|v| v.as_i64()),
+        Some(10),
+        "backoff should be 10"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// Issue 5: is not None comparisons not supported
+const REGISTER_IS_NOT_NONE_COMPARISON_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_is_not_none_comparison import IsNotNoneComparisonWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = IsNotNoneComparisonWorkflow()
+    result = await wf.run(should_return=True)
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that 'is not None' comparisons work in workflow code.
+///
+/// Issue: Using 'is not None' comparisons in workflow code raises
+/// UnsupportedPatternError: Unsupported expression type 'Compare'.
+///
+/// Expected: 'is not None' comparison works correctly.
+/// Bug: UnsupportedPatternError for Compare expression type.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn is_not_none_comparison_works() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_is_not_none_comparison.py",
+                IS_NOT_NONE_COMPARISON_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_IS_NOT_NONE_COMPARISON_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "isnotnonecomparisonworkflow",
+        user_module: "integration_is_not_none_comparison",
+        inputs: &[],
+        workflow_class: Some("IsNotNoneComparisonWorkflow"),
+        run_args: Some("should_return=True"),
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let db_result = parse_result_json(&stored_payload)?;
+
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "integration_is_not_none_comparison.py",
+        IS_NOT_NONE_COMPARISON_WORKFLOW_MODULE,
+        "integration_is_not_none_comparison",
+        "IsNotNoneComparisonWorkflow",
+        Some("should_return=True"),
+    )
+    .await?;
+
+    assert_eq!(
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
+    );
+
+    // Verify the comparison worked correctly
+    assert_eq!(
+        db_result.get("had_value").and_then(|v| v.as_bool()),
+        Some(true),
+        "'is not None' comparison should have detected the value"
+    );
+    assert_eq!(
+        db_result.get("result").and_then(|v| v.as_str()),
+        Some("processed_found_value"),
+        "value should have been processed"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// Also test the None case
+const REGISTER_IS_NOT_NONE_COMPARISON_NONE_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_is_not_none_comparison import IsNotNoneComparisonWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = IsNotNoneComparisonWorkflow()
+    result = await wf.run(should_return=False)
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn is_not_none_comparison_handles_none() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_is_not_none_comparison.py",
+                IS_NOT_NONE_COMPARISON_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_IS_NOT_NONE_COMPARISON_NONE_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "isnotnonecomparisonworkflow",
+        user_module: "integration_is_not_none_comparison",
+        inputs: &[],
+        workflow_class: Some("IsNotNoneComparisonWorkflow"),
+        run_args: Some("should_return=False"),
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let db_result = parse_result_json(&stored_payload)?;
+
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "integration_is_not_none_comparison.py",
+        IS_NOT_NONE_COMPARISON_WORKFLOW_MODULE,
+        "integration_is_not_none_comparison",
+        "IsNotNoneComparisonWorkflow",
+        Some("should_return=False"),
+    )
+    .await?;
+
+    assert_eq!(
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
+    );
+
+    // Verify the comparison correctly identified None
+    assert_eq!(
+        db_result.get("had_value").and_then(|v| v.as_bool()),
+        Some(false),
+        "'is not None' comparison should have detected None"
+    );
+    assert_eq!(
+        db_result.get("result").and_then(|v| v.as_str()),
+        Some("no_value"),
+        "None case should have been handled"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// Issue 6: LOGGER calls not supported in workflow exception handlers
+const REGISTER_LOGGER_IN_EXCEPT_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_logger_in_except import LoggerInExceptWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = LoggerInExceptWorkflow()
+    result = await wf.run(should_fail=True)
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that action calls work in exception handlers.
+///
+/// Issue: Direct LOGGER.info() calls inside workflow exception handlers cause
+/// IR compilation to fail. The workaround is to use actions for logging.
+///
+/// Expected: Action calls in except handlers work correctly.
+/// Bug: IR compilation fails when processing exception handler.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn logger_in_except_action_calls_work() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_logger_in_except.py",
+                LOGGER_IN_EXCEPT_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_LOGGER_IN_EXCEPT_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "loggerinexceptworkflow",
+        user_module: "integration_logger_in_except",
+        inputs: &[],
+        workflow_class: Some("LoggerInExceptWorkflow"),
+        run_args: Some("should_fail=True"),
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let db_result = parse_result_json(&stored_payload)?;
+
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "integration_logger_in_except.py",
+        LOGGER_IN_EXCEPT_WORKFLOW_MODULE,
+        "integration_logger_in_except",
+        "LoggerInExceptWorkflow",
+        Some("should_fail=True"),
+    )
+    .await?;
+
+    assert_eq!(
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
+    );
+
+    // Verify the exception handler executed and logged
+    assert_eq!(
+        db_result.get("success").and_then(|v| v.as_bool()),
+        Some(false),
+        "workflow should have caught the exception"
+    );
+
+    let logs = db_result
+        .get("logs")
+        .expect("should have logs key")
+        .as_array()
+        .expect("logs should be an array");
+
+    assert_eq!(
+        logs.len(),
+        1,
+        "should have one log entry from except handler"
+    );
+    assert_eq!(
+        logs[0].as_str(),
+        Some("FetchError caught"),
+        "log message should be from FetchError handler"
     );
 
     harness.shutdown().await?;
