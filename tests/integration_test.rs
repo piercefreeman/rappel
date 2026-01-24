@@ -78,6 +78,8 @@ const IS_NOT_NONE_COMPARISON_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_is_not_none_comparison.py");
 const LOGGER_IN_EXCEPT_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_logger_in_except.py");
+const TUPLE_UNPACK_FN_CALL_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_tuple_unpack_fn_call.py");
 
 const EXCEPTION_WITH_SUCCESS_FAILURE_SCRIPT: &str = r#"
 import asyncio
@@ -4592,6 +4594,106 @@ async fn logger_in_except_action_calls_work() -> Result<()> {
         logs[0].as_str(),
         Some("FetchError caught"),
         "log message should be from FetchError handler"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Tuple Unpacking from Helper Method Return Test
+// =============================================================================
+
+const REGISTER_TUPLE_UNPACK_FN_CALL_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_tuple_unpack_fn_call import TupleUnpackFnCallWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = TupleUnpackFnCallWorkflow()
+    result = await wf.run(user_id="test_user")
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that tuple unpacking from helper method returns correctly flows into action kwargs.
+///
+/// This tests the scenario where:
+/// 1. A helper method returns a tuple
+/// 2. The tuple is unpacked: `a, b = await self.helper_method()`
+/// 3. The unpacked variables are used in subsequent action kwargs
+///
+/// The bug was that the Rust scheduler stored the entire tuple for each target
+/// instead of unpacking individual items, causing empty kwargs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn tuple_unpack_fn_call_kwargs_populated() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_tuple_unpack_fn_call.py",
+                TUPLE_UNPACK_FN_CALL_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_TUPLE_UNPACK_FN_CALL_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "tupleunpackfncallworkflow",
+        user_module: "integration_tuple_unpack_fn_call",
+        inputs: &[("user_id", r#""test_user""#)],
+        workflow_class: Some("TupleUnpackFnCallWorkflow"),
+        run_args: Some("user_id=\"test_user\""),
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let db_result = parse_result_json(&stored_payload)?;
+
+    // Verify the result contains the expected values from tuple-unpacked variables
+    // The profile_id comes from profile_metadata, crawl_id comes from crawl_result (tuple index 1)
+    assert_eq!(
+        db_result.get("profile_id").and_then(|v| v.as_str()),
+        Some("profile_test_user"),
+        "profile_id should be correctly populated"
+    );
+    assert_eq!(
+        db_result.get("crawl_id").and_then(|v| v.as_str()),
+        Some("crawl_profile_test_user"),
+        "crawl_id should be correctly populated from tuple-unpacked variable"
+    );
+    assert_eq!(
+        db_result.get("status").and_then(|v| v.as_str()),
+        Some("success"),
+        "status should indicate success"
+    );
+
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "integration_tuple_unpack_fn_call.py",
+        TUPLE_UNPACK_FN_CALL_WORKFLOW_MODULE,
+        "integration_tuple_unpack_fn_call",
+        "TupleUnpackFnCallWorkflow",
+        Some("user_id=\"test_user\""),
+    )
+    .await?;
+
+    assert_eq!(
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
     );
 
     harness.shutdown().await?;
