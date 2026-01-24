@@ -68,10 +68,24 @@ def _resolve_boot_binary(binary: str) -> str:
     if resolved:
         return resolved
     repo_root = _repo_root()
-    for profile in ("debug", "release"):
-        candidate = repo_root / "target" / profile / binary
-        if candidate.exists():
-            return str(candidate)
+    # Check multiple target directories:
+    # - CARGO_TARGET_DIR (set by cargo llvm-cov and other tools)
+    # - target/llvm-cov-target (used by cargo llvm-cov by default)
+    # - target (standard cargo target)
+    target_dirs = []
+    if cargo_target_dir := os.environ.get("CARGO_TARGET_DIR"):
+        target_dirs.append(Path(cargo_target_dir))
+    target_dirs.extend(
+        [
+            repo_root / "target" / "llvm-cov-target",
+            repo_root / "target",
+        ]
+    )
+    for target_dir in target_dirs:
+        for profile in ("debug", "release"):
+            candidate = target_dir / profile / binary
+            if candidate.exists():
+                return str(candidate)
     return binary
 
 

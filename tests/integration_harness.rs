@@ -658,9 +658,14 @@ pub async fn run_in_env(
         .join("python")
         .canonicalize()?;
 
-    PY_ENV_READY
-        .get_or_try_init(|| async { run_shell(repo_python.as_path(), "uv sync", &[], None).await })
-        .await?;
+    let skip_uv_sync = env::var_os("RAPPEL_SKIP_UV_SYNC").is_some();
+    if !skip_uv_sync {
+        PY_ENV_READY
+            .get_or_try_init(|| async {
+                run_shell(repo_python.as_path(), "uv sync", &[], None).await
+            })
+            .await?;
+    }
 
     if !requirements.is_empty() {
         let extra_deps_toml = requirements
@@ -710,11 +715,11 @@ rappel = {{ path = "{}", editable = true }}
     // Run the entrypoint
     let run_command = if requirements.is_empty() {
         format!(
-            "uv run --project {} python {entrypoint}",
+            "uv run --no-sync --project {} python {entrypoint}",
             repo_python.display()
         )
     } else {
-        format!("uv run python {entrypoint}")
+        format!("uv run --no-sync python {entrypoint}")
     };
     run_shell(
         env_dir.path(),
