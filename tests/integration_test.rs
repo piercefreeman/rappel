@@ -2483,6 +2483,14 @@ const RETRY_EXHAUSTED_BREAK_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_retry_exhausted_break.py");
 const TRY_BREAK_DATAFLOW_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_try_break_dataflow.py");
+const RETRY_EXCEPTION_CATCH_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_retry_exception_catch.py");
+const RETRY_EXCEPTION_SIMPLE_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_retry_exception_simple.py");
+const RETRY_EXCEPTION_MULTI_ACTION_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_retry_exception_multi_action.py");
+const RETRY_EXCEPTION_MULTI_NO_RETURN_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_retry_exception_multi_no_return.py");
 
 const REGISTER_LOOP_EXCEPTION_SCRIPT: &str = r#"
 import asyncio
@@ -2522,6 +2530,62 @@ async def main():
     os.environ.pop("PYTEST_CURRENT_TEST", None)
     wf = TryBreakDataflowWorkflow()
     result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_RETRY_EXCEPTION_CATCH_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_retry_exception_catch import RetryExceptionCatchWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = RetryExceptionCatchWorkflow()
+    result = await wf.run(user_id="test_user_123")
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_RETRY_EXCEPTION_SIMPLE_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_retry_exception_simple import RetryExceptionSimpleWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = RetryExceptionSimpleWorkflow()
+    result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_RETRY_EXCEPTION_MULTI_ACTION_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_retry_exception_multi_action import RetryExceptionMultiActionWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = RetryExceptionMultiActionWorkflow()
+    result = await wf.run(user_id="test_user")
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_RETRY_EXCEPTION_MULTI_NO_RETURN_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_retry_exception_multi_no_return import RetryExceptionMultiNoReturnWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = RetryExceptionMultiNoReturnWorkflow()
+    result = await wf.run(user_id="test_user")
     print(f"Registration result: {result}")
 
 asyncio.run(main())
@@ -2713,6 +2777,213 @@ async fn try_break_dataflow_allows_followup_guard() -> Result<()> {
         .expect("workflow should have a result");
     let message = parse_result(&stored_payload)?;
     assert_eq!(message, Some("".to_string()));
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test that ValueError exception is caught after retry exhaustion.
+///
+/// This reproduces a bug where:
+/// 1. An action raises ValueError with retry=RetryPolicy(attempts=N)
+/// 2. All N attempts fail
+/// 3. The exception should be caught by `except ValueError:` handler
+/// 4. BUG: Workflow stalls instead of exception being caught
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn retry_exception_catch_after_exhaustion() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_retry_exception_catch.py",
+                RETRY_EXCEPTION_CATCH_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_RETRY_EXCEPTION_CATCH_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "retryexceptioncatchworkflow",
+        user_module: "integration_retry_exception_catch",
+        inputs: &[],
+        workflow_class: None,
+        run_args: None,
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+
+    // The exception should have been caught and "caught_error" returned
+    assert_eq!(
+        message,
+        Some("caught_error".to_string()),
+        "Exception should be caught after retry exhaustion"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test simple exception catch after retry exhaustion (no return inside try).
+///
+/// This is a simpler variant that doesn't have a return statement inside
+/// the try block, to isolate the exception handling issue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn retry_exception_simple_catch_after_exhaustion() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_retry_exception_simple.py",
+                RETRY_EXCEPTION_SIMPLE_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_RETRY_EXCEPTION_SIMPLE_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "retryexceptionsimpleworkflow",
+        user_module: "integration_retry_exception_simple",
+        inputs: &[],
+        workflow_class: None,
+        run_args: None,
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+
+    // The exception should have been caught and recovery_action should have run
+    assert_eq!(
+        message,
+        Some("recovered".to_string()),
+        "Exception should be caught after retry exhaustion"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test exception catch with multiple actions in try but NO return inside try.
+///
+/// This tests if the issue is the return inside try or having multiple actions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn retry_exception_multi_no_return_catch() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_retry_exception_multi_no_return.py",
+                RETRY_EXCEPTION_MULTI_NO_RETURN_WORKFLOW_MODULE,
+            ),
+            (
+                "register.py",
+                REGISTER_RETRY_EXCEPTION_MULTI_NO_RETURN_SCRIPT,
+            ),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "retryexceptionmultinoreturnworkflow",
+        user_module: "integration_retry_exception_multi_no_return",
+        inputs: &[],
+        workflow_class: None,
+        run_args: None,
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+
+    // The exception should have been caught and "caught_error" returned
+    assert_eq!(
+        message,
+        Some("caught_error".to_string()),
+        "Exception should be caught after retry exhaustion"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test exception catch after retry exhaustion with multiple actions in try block.
+///
+/// This reproduces the stall bug when:
+/// 1. Multiple actions in try block
+/// 2. Return statement inside try block
+/// 3. First action fails after retry exhaustion
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn retry_exception_multi_action_catch_after_exhaustion() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_retry_exception_multi_action.py",
+                RETRY_EXCEPTION_MULTI_ACTION_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_RETRY_EXCEPTION_MULTI_ACTION_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "retryexceptionmultiactionworkflow",
+        user_module: "integration_retry_exception_multi_action",
+        inputs: &[],
+        workflow_class: None,
+        run_args: None,
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+
+    // The exception should have been caught and "caught_error" returned
+    assert_eq!(
+        message,
+        Some("caught_error".to_string()),
+        "Exception should be caught after retry exhaustion"
+    );
 
     harness.shutdown().await?;
     Ok(())

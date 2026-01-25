@@ -1223,6 +1223,22 @@ impl ExecutionState {
                     continue;
                 }
 
+                // Exception handler: if the edge has exception_types, the handler is ready
+                // immediately because the exception has already occurred and been matched.
+                // We don't need to wait for other potential exception sources.
+                if edge.exception_types.is_some() {
+                    trace!(
+                        successor_id = %successor_id,
+                        exception_types = ?edge.exception_types,
+                        "Exception handler ready via exception edge"
+                    );
+                    if !ready_successors.iter().any(|(id, _)| id == successor_id) {
+                        ready_successors.push((successor_id.clone(), None));
+                        trace!(successor_id = %successor_id, "Added exception handler to ready_successors");
+                    }
+                    continue;
+                }
+
                 // Check if this is a barrier (has waiting_for)
                 if !successor.waiting_for.is_empty() {
                     // Count completed predecessors
