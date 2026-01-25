@@ -765,8 +765,20 @@ pub fn generate_in_memory_script(
         r#"import asyncio
 import json
 import os
+from dataclasses import asdict, is_dataclass
 
 from {user_module} import {workflow_class}
+
+def serialize_result(result):
+    """Serialize workflow result to JSON-compatible format."""
+    # Handle Pydantic BaseModel
+    if hasattr(result, "model_dump"):
+        return result.model_dump(mode="json")
+    # Handle dataclasses
+    if is_dataclass(result) and not isinstance(result, type):
+        return asdict(result)
+    # Already JSON-serializable
+    return result
 
 async def main():
     os.environ["PYTEST_CURRENT_TEST"] = "1"
@@ -774,7 +786,7 @@ async def main():
     wf = {workflow_class}()
     result = await wf.run({args_str})
     with open("result.json", "w", encoding="utf-8") as f:
-        json.dump(result, f)
+        json.dump(serialize_result(result), f)
 
 asyncio.run(main())
 "#

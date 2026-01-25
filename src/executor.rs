@@ -202,7 +202,58 @@ pub fn execute_inline_node(
                     Ok(value) => {
                         let result_bytes = workflow_value_to_proto_bytes(&value);
 
-                        if let Some(target) = &dag_node.target {
+                        // Handle tuple unpacking for return nodes (from expanded fn_call)
+                        if let Some(targets) = &dag_node.targets {
+                            if targets.len() > 1 {
+                                match &value {
+                                    WorkflowValue::Tuple(items) | WorkflowValue::List(items) => {
+                                        for (target, item) in targets.iter().zip(items.iter()) {
+                                            state.store_variable_for_node(
+                                                node_id,
+                                                &dag_node.node_type,
+                                                target,
+                                                item,
+                                            );
+                                            debug!(
+                                                node_id = %node_id,
+                                                target = %target,
+                                                "Stored return value (unpacked)"
+                                            );
+                                        }
+                                    }
+                                    _ => {
+                                        warn!(
+                                            node_id = %node_id,
+                                            targets = ?targets,
+                                            value = ?value,
+                                            "Return value is not iterable for tuple unpacking"
+                                        );
+                                        for target in targets {
+                                            state.store_variable_for_node(
+                                                node_id,
+                                                &dag_node.node_type,
+                                                target,
+                                                &value,
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                for target in targets {
+                                    state.store_variable_for_node(
+                                        node_id,
+                                        &dag_node.node_type,
+                                        target,
+                                        &value,
+                                    );
+                                    debug!(
+                                        node_id = %node_id,
+                                        target = %target,
+                                        "Stored return value"
+                                    );
+                                }
+                            }
+                        } else if let Some(target) = &dag_node.target {
                             state.store_variable_for_node(
                                 node_id,
                                 &dag_node.node_type,

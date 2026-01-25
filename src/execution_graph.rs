@@ -908,13 +908,51 @@ impl ExecutionState {
                                 if arg.key == "result" {
                                     if let Some(value) = &arg.value {
                                         let workflow_value = WorkflowValue::from_proto(value);
-                                        for target in &node.targets.clone() {
-                                            self.store_variable_for_node(
-                                                &completion.node_id,
-                                                &node_type,
-                                                target,
-                                                &workflow_value,
-                                            );
+                                        let targets = node.targets.clone();
+
+                                        // Unpack tuples/lists when there are multiple targets
+                                        if targets.len() > 1 {
+                                            match &workflow_value {
+                                                WorkflowValue::Tuple(items)
+                                                | WorkflowValue::List(items) => {
+                                                    for (target, item) in
+                                                        targets.iter().zip(items.iter())
+                                                    {
+                                                        self.store_variable_for_node(
+                                                            &completion.node_id,
+                                                            &node_type,
+                                                            target,
+                                                            item,
+                                                        );
+                                                    }
+                                                }
+                                                _ => {
+                                                    // Non-iterable value with multiple targets - store as-is
+                                                    warn!(
+                                                        node_id = %completion.node_id,
+                                                        targets = ?targets,
+                                                        "Value is not iterable for tuple unpacking"
+                                                    );
+                                                    for target in &targets {
+                                                        self.store_variable_for_node(
+                                                            &completion.node_id,
+                                                            &node_type,
+                                                            target,
+                                                            &workflow_value,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            // Single target - store entire value
+                                            for target in &targets {
+                                                self.store_variable_for_node(
+                                                    &completion.node_id,
+                                                    &node_type,
+                                                    target,
+                                                    &workflow_value,
+                                                );
+                                            }
                                         }
                                     }
                                     break;
