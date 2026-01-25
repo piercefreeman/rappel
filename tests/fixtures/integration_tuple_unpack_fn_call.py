@@ -54,13 +54,13 @@ async def perform_crawl(profile_id: str) -> CrawlResult:
 
 
 @action
-async def parse_results(request: ParseRequest) -> dict:
+async def parse_results(request: ParseRequest) -> ParseResult:
     """Parse results using profile_id and crawl_id from tuple-unpacked variables."""
-    return {
-        "profile_id": request.profile_id,
-        "crawl_id": request.crawl_id,
-        "status": "success",
-    }
+    return ParseResult(
+        profile_id=request.profile_id,
+        crawl_id=request.crawl_id,
+        status="success",
+    )
 
 
 @workflow
@@ -74,7 +74,7 @@ class TupleUnpackFnCallWorkflow(Workflow):
     3. crawl_result (from tuple index 1) is used in parse_results() kwargs
     """
 
-    async def run(self, user_id: str) -> dict:
+    async def run(self, user_id: str) -> ParseResult:
         # Get profile metadata
         profile_metadata = await self.run_action(get_profile(user_id))
 
