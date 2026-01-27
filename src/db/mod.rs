@@ -133,9 +133,9 @@ pub struct WorkflowVersionSummary {
     pub created_at: DateTime<Utc>,
 }
 
+/// Pool-level worker status update (one row per pool_id).
 #[derive(Debug, Clone)]
 pub struct WorkerStatusUpdate {
-    pub worker_id: i64,
     pub throughput_per_min: f64,
     pub total_completed: i64,
     pub last_action_at: Option<DateTime<Utc>>,
@@ -143,17 +143,24 @@ pub struct WorkerStatusUpdate {
     pub median_dequeue_ms: Option<i64>,
     /// Median execution time from dispatch to completion in milliseconds
     pub median_handling_ms: Option<i64>,
-    /// Current size of the dispatch queue (pool-level metric, same for all workers)
+    /// Current size of the dispatch queue
     pub dispatch_queue_size: i64,
-    /// Total in-flight actions across all workers (pool-level metric)
+    /// Total in-flight actions across all workers
     pub total_in_flight: i64,
+    /// Number of active Python worker processes
+    pub active_workers: i32,
+    /// Actions per second (throughput_per_min / 60)
+    pub actions_per_sec: f64,
+    /// Average instance duration in seconds (computed in-memory)
+    pub avg_instance_duration_secs: Option<f64>,
+    /// Encoded time-series ring buffer (BYTEA)
+    pub time_series: Option<Vec<u8>>,
 }
 
-/// Worker throughput status for webapp reporting.
+/// Pool-level worker status for webapp reporting.
 #[derive(Debug, Clone, FromRow)]
 pub struct WorkerStatus {
     pub pool_id: Uuid,
-    pub worker_id: i64,
     pub throughput_per_min: f64,
     pub total_completed: i64,
     pub last_action_at: Option<DateTime<Utc>>,
@@ -162,10 +169,18 @@ pub struct WorkerStatus {
     pub median_dequeue_ms: Option<i64>,
     /// Median execution time from dispatch to completion in milliseconds
     pub median_handling_ms: Option<i64>,
-    /// Current size of the dispatch queue (pool-level metric)
+    /// Current size of the dispatch queue
     pub dispatch_queue_size: Option<i64>,
-    /// Total in-flight actions across all workers (pool-level metric)
+    /// Total in-flight actions across all workers
     pub total_in_flight: Option<i64>,
+    /// Number of active Python worker processes
+    pub active_workers: i32,
+    /// Actions per second
+    pub actions_per_sec: f64,
+    /// Average instance duration in seconds
+    pub avg_instance_duration_secs: Option<f64>,
+    /// Encoded time-series ring buffer
+    pub time_series: Option<Vec<u8>>,
 }
 
 /// A workflow instance (execution)

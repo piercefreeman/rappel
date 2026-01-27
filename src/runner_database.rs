@@ -55,6 +55,7 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use crate::ast_evaluator::ExpressionEvaluator;
+use crate::pool_status::{PoolTimeSeries, TimeSeriesEntry};
 use crate::dag::{DAG, DAGConverter, DAGNode};
 use crate::db::{
     ClaimedInstance, Database, ScheduleId, WorkerStatusUpdate, WorkflowInstanceId,
@@ -196,6 +197,8 @@ struct ActiveInstance {
     queued_ready_count: usize,
     /// Pending completions to be batched
     pending_completions: Vec<Completion>,
+    /// When this instance was claimed by this runner
+    claimed_at: Instant,
 }
 
 /// Metrics snapshot for the instance runner
@@ -287,6 +290,9 @@ pub struct InstanceRunner {
     /// Sequence number for action IDs
     action_seq: AtomicU32,
 
+    /// Pool-level time-series ring buffer (24h at 1-minute resolution)
+    pool_time_series: std::sync::Mutex<PoolTimeSeries>,
+
     /// Lifecycle stats
     #[allow(dead_code)]
     stats: Option<Arc<LifecycleStats>>,
@@ -335,6 +341,7 @@ impl InstanceRunner {
             completion_tx,
             completion_rx: Mutex::new(completion_rx),
             action_seq: AtomicU32::new(0),
+            pool_time_series: std::sync::Mutex::new(PoolTimeSeries::new()),
             stats: None,
         }
     }
@@ -755,12 +762,11 @@ impl InstanceRunner {
         })
     }
 
-    /// Spawn the worker status report background task.
+    /// Spawn the pool-level status report background task.
     ///
-    /// Periodically reports worker pool metrics to the database including:
-    /// - Per-worker throughput and completion counts
-    /// - Dispatch queue size (pool-level)
-    /// - Total in-flight actions (pool-level)
+    /// Every 60 seconds, aggregates pool-level metrics and writes a single row
+    /// to worker_status keyed by pool_id. Also pushes a TimeSeriesEntry into
+    /// the in-memory ring buffer and encodes it as BYTEA.
     fn spawn_status_report_task(&self) -> tokio::task::JoinHandle<()> {
         let db = self.db.clone();
         let pool_id = self.config.pool_id;
@@ -768,10 +774,14 @@ impl InstanceRunner {
         let worker_pool = Arc::clone(&self.worker_pool);
         let dispatch_queue = &self.dispatch_queue as *const Mutex<VecDeque<QueuedAction>>;
         let shutdown = &self.shutdown as *const AtomicBool;
+        let active_instances = &self.active_instances as *const RwLock<HashMap<Uuid, ActiveInstance>>;
+        let pool_time_series = &self.pool_time_series as *const std::sync::Mutex<PoolTimeSeries>;
 
         // Safety: We know self lives as long as the returned handle
         let shutdown_ptr = unsafe { &*shutdown };
         let dispatch_queue_ptr = unsafe { &*dispatch_queue };
+        let active_instances_ptr = unsafe { &*active_instances };
+        let pool_time_series_ptr = unsafe { &*pool_time_series };
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(status_interval);
@@ -784,41 +794,86 @@ impl InstanceRunner {
                     break;
                 }
 
-                // Get dispatch queue size
+                // 1. Per-worker throughput snapshots → aggregate
+                let snapshots = worker_pool.throughput_snapshots();
+                let throughput_per_min: f64 = snapshots.iter().map(|s| s.throughput_per_min).sum();
+                let actions_per_sec = throughput_per_min / 60.0;
+                let total_completed: i64 = snapshots
+                    .iter()
+                    .map(|s| s.total_completed as i64)
+                    .sum();
+                let last_action_at = snapshots
+                    .iter()
+                    .filter_map(|s| s.last_action_at)
+                    .max();
+
+                // 2. Active workers count
+                let active_workers = worker_pool.len() as i32;
+
+                // 3. Average instance duration from in-memory active instances
+                let avg_instance_duration_secs = {
+                    let instances = active_instances_ptr.read().await;
+                    if instances.is_empty() {
+                        None
+                    } else {
+                        let now = Instant::now();
+                        let total_secs: f64 = instances
+                            .values()
+                            .map(|inst| now.duration_since(inst.claimed_at).as_secs_f64())
+                            .sum();
+                        Some(total_secs / instances.len() as f64)
+                    }
+                };
+
+                // 4. Dispatch queue size
                 let dispatch_queue_size = dispatch_queue_ptr.lock().await.len() as i64;
 
-                // Get total in-flight from worker pool
+                // 5. Total in-flight from worker pool
                 let total_in_flight = worker_pool.total_in_flight() as i64;
 
-                // Get per-worker throughput snapshots
-                let snapshots = worker_pool.throughput_snapshots();
+                // 6. Push time-series entry and encode
+                let now_secs = Utc::now().timestamp();
+                let time_series_bytes = {
+                    let mut ts = pool_time_series_ptr
+                        .lock()
+                        .expect("pool_time_series lock poisoned");
+                    ts.push(TimeSeriesEntry {
+                        timestamp_secs: now_secs,
+                        actions_per_sec: actions_per_sec as f32,
+                        active_workers: active_workers as u16,
+                        avg_instance_duration_secs: avg_instance_duration_secs
+                            .unwrap_or(0.0) as f32,
+                    });
+                    ts.encode()
+                };
 
-                // Convert to WorkerStatusUpdate
-                let statuses: Vec<WorkerStatusUpdate> = snapshots
-                    .into_iter()
-                    .map(|snapshot| WorkerStatusUpdate {
-                        worker_id: snapshot.worker_id as i64,
-                        throughput_per_min: snapshot.throughput_per_min,
-                        total_completed: snapshot.total_completed as i64,
-                        last_action_at: snapshot.last_action_at,
-                        median_dequeue_ms: None, // TODO: track dequeue latency
-                        median_handling_ms: None, // TODO: track handling latency
-                        dispatch_queue_size,
-                        total_in_flight,
-                    })
-                    .collect();
+                // 7. Upsert single pool-level row
+                let update = WorkerStatusUpdate {
+                    throughput_per_min,
+                    total_completed,
+                    last_action_at,
+                    median_dequeue_ms: None,
+                    median_handling_ms: None,
+                    dispatch_queue_size,
+                    total_in_flight,
+                    active_workers,
+                    actions_per_sec,
+                    avg_instance_duration_secs,
+                    time_series: Some(time_series_bytes),
+                };
 
-                if !statuses.is_empty() {
-                    match db.upsert_worker_statuses(pool_id, &statuses).await {
-                        Ok(()) => {
-                            debug!(
-                                worker_count = statuses.len(),
-                                dispatch_queue_size, total_in_flight, "Reported worker status"
-                            );
-                        }
-                        Err(e) => {
-                            error!(error = %e, "Failed to report worker status");
-                        }
+                match db.upsert_worker_status(pool_id, &update).await {
+                    Ok(()) => {
+                        debug!(
+                            active_workers,
+                            actions_per_sec,
+                            dispatch_queue_size,
+                            total_in_flight,
+                            "Reported pool status"
+                        );
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Failed to report pool status");
                     }
                 }
             }
@@ -1128,6 +1183,7 @@ impl InstanceRunner {
             in_flight: HashSet::new(),
             queued_ready_count: 0,
             pending_completions: Vec::new(),
+            claimed_at: Instant::now(),
         };
 
         self.active_instances

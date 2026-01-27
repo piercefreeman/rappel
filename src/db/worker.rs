@@ -506,58 +506,61 @@ impl Database {
     // Worker Status
     // ========================================================================
 
-    pub async fn upsert_worker_statuses(
+    /// Upsert a single pool-level worker status row.
+    pub async fn upsert_worker_status(
         &self,
         pool_id: Uuid,
-        statuses: &[WorkerStatusUpdate],
+        status: &WorkerStatusUpdate,
     ) -> DbResult<()> {
-        if statuses.is_empty() {
-            return Ok(());
-        }
-
-        let mut tx = self.pool.begin().await?;
-        for status in statuses {
-            sqlx::query(
-                r#"
-                INSERT INTO worker_status (
-                    pool_id,
-                    worker_id,
-                    throughput_per_min,
-                    total_completed,
-                    last_action_at,
-                    updated_at,
-                    median_dequeue_ms,
-                    median_handling_ms,
-                    dispatch_queue_size,
-                    total_in_flight
-                )
-                VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, $9)
-                ON CONFLICT (pool_id, worker_id)
-                DO UPDATE SET
-                    throughput_per_min = EXCLUDED.throughput_per_min,
-                    total_completed = EXCLUDED.total_completed,
-                    last_action_at = EXCLUDED.last_action_at,
-                    updated_at = EXCLUDED.updated_at,
-                    median_dequeue_ms = EXCLUDED.median_dequeue_ms,
-                    median_handling_ms = EXCLUDED.median_handling_ms,
-                    dispatch_queue_size = EXCLUDED.dispatch_queue_size,
-                    total_in_flight = EXCLUDED.total_in_flight
-                "#,
+        sqlx::query(
+            r#"
+            INSERT INTO worker_status (
+                pool_id,
+                throughput_per_min,
+                total_completed,
+                last_action_at,
+                updated_at,
+                median_dequeue_ms,
+                median_handling_ms,
+                dispatch_queue_size,
+                total_in_flight,
+                active_workers,
+                actions_per_sec,
+                avg_instance_duration_secs,
+                time_series
             )
-            .bind(pool_id)
-            .bind(status.worker_id)
-            .bind(status.throughput_per_min)
-            .bind(status.total_completed)
-            .bind(status.last_action_at)
-            .bind(status.median_dequeue_ms)
-            .bind(status.median_handling_ms)
-            .bind(status.dispatch_queue_size)
-            .bind(status.total_in_flight)
-            .execute(&mut *tx)
-            .await?;
-        }
+            VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7, $8, $9, $10, $11, $12)
+            ON CONFLICT (pool_id)
+            DO UPDATE SET
+                throughput_per_min = EXCLUDED.throughput_per_min,
+                total_completed = EXCLUDED.total_completed,
+                last_action_at = EXCLUDED.last_action_at,
+                updated_at = EXCLUDED.updated_at,
+                median_dequeue_ms = EXCLUDED.median_dequeue_ms,
+                median_handling_ms = EXCLUDED.median_handling_ms,
+                dispatch_queue_size = EXCLUDED.dispatch_queue_size,
+                total_in_flight = EXCLUDED.total_in_flight,
+                active_workers = EXCLUDED.active_workers,
+                actions_per_sec = EXCLUDED.actions_per_sec,
+                avg_instance_duration_secs = EXCLUDED.avg_instance_duration_secs,
+                time_series = EXCLUDED.time_series
+            "#,
+        )
+        .bind(pool_id)
+        .bind(status.throughput_per_min)
+        .bind(status.total_completed)
+        .bind(status.last_action_at)
+        .bind(status.median_dequeue_ms)
+        .bind(status.median_handling_ms)
+        .bind(status.dispatch_queue_size)
+        .bind(status.total_in_flight)
+        .bind(status.active_workers)
+        .bind(status.actions_per_sec)
+        .bind(status.avg_instance_duration_secs)
+        .bind(&status.time_series)
+        .execute(&self.pool)
+        .await?;
 
-        tx.commit().await?;
         Ok(())
     }
 

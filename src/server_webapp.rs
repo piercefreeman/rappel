@@ -27,6 +27,7 @@ use uuid::Uuid;
 use crate::config::WebappConfig;
 use crate::db::{Database, ScheduleId, WorkerStatus, WorkflowVersionId, WorkflowVersionSummary};
 use crate::messages::execution::{ExecutionGraph, NodeStatus};
+use crate::pool_status::PoolTimeSeries;
 
 /// Webapp server handle
 pub struct WebappServer {
@@ -495,17 +496,19 @@ async fn list_workers(
     let minutes = query.minutes.unwrap_or(5).max(1);
     let since = Utc::now() - ChronoDuration::minutes(minutes);
 
-    match state.database.list_worker_statuses_recent(since).await {
-        Ok(workers) => Html(render_workers_page(&state.templates, &workers, minutes)),
+    let workers = match state.database.list_worker_statuses_recent(since).await {
+        Ok(w) => w,
         Err(err) => {
             error!(?err, "failed to load worker status");
-            Html(render_error_page(
+            return Html(render_error_page(
                 &state.templates,
                 "Unable to load worker status",
                 "We couldn't fetch worker throughput stats. Please check the database connection.",
-            ))
+            ));
         }
-    }
+    };
+
+    Html(render_workers_page(&state.templates, &workers, minutes))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1249,41 +1252,115 @@ struct WorkersPageContext {
     window_minutes: i64,
     workers: Vec<WorkerStatusRow>,
     has_workers: bool,
+    active_worker_count: i32,
+    actions_per_sec: String,
+    avg_instance_duration: String,
+    time_series_json: String,
+    has_time_series: bool,
 }
 
 #[derive(Serialize)]
 struct WorkerStatusRow {
     pool_id: String,
-    worker_id: i64,
+    active_workers: i32,
+    actions_per_sec: String,
     throughput_per_min: String,
     total_completed: i64,
     last_action_at: Option<String>,
     updated_at: String,
     median_dequeue_ms: Option<i64>,
     median_handling_ms: Option<i64>,
+    avg_instance_duration: String,
 }
 
-fn render_workers_page(templates: &Tera, statuses: &[WorkerStatus], window_minutes: i64) -> String {
-    let workers = statuses
+fn render_workers_page(
+    templates: &Tera,
+    statuses: &[WorkerStatus],
+    window_minutes: i64,
+) -> String {
+    let workers: Vec<WorkerStatusRow> = statuses
         .iter()
-        .map(|status| WorkerStatusRow {
-            pool_id: status.pool_id.to_string(),
-            worker_id: status.worker_id,
-            throughput_per_min: format!("{:.2}", status.throughput_per_min),
-            total_completed: status.total_completed,
-            last_action_at: status.last_action_at.map(|dt| dt.to_rfc3339()),
-            updated_at: status.updated_at.to_rfc3339(),
-            median_dequeue_ms: status.median_dequeue_ms,
-            median_handling_ms: status.median_handling_ms,
+        .map(|status| {
+            let avg_instance_duration = match status.avg_instance_duration_secs {
+                Some(secs) if secs >= 3600.0 => format!("{:.1}h", secs / 3600.0),
+                Some(secs) if secs >= 60.0 => format!("{:.1}m", secs / 60.0),
+                Some(secs) => format!("{:.1}s", secs),
+                None => "\u{2014}".to_string(),
+            };
+            WorkerStatusRow {
+                pool_id: status.pool_id.to_string(),
+                active_workers: status.active_workers,
+                actions_per_sec: format!("{:.2}", status.actions_per_sec),
+                throughput_per_min: format!("{:.2}", status.throughput_per_min),
+                total_completed: status.total_completed,
+                last_action_at: status.last_action_at.map(|dt| dt.to_rfc3339()),
+                updated_at: status.updated_at.to_rfc3339(),
+                median_dequeue_ms: status.median_dequeue_ms,
+                median_handling_ms: status.median_handling_ms,
+                avg_instance_duration,
+            }
         })
         .collect();
+
+    // Aggregate across pools
+    let active_worker_count: i32 = statuses.iter().map(|s| s.active_workers).sum();
+    let total_actions_per_sec: f64 = statuses.iter().map(|s| s.actions_per_sec).sum();
+    let actions_per_sec = format!("{:.2}", total_actions_per_sec);
+
+    // Weighted average of instance duration across pools
+    let avg_instance_duration = {
+        let durations: Vec<f64> = statuses
+            .iter()
+            .filter_map(|s| s.avg_instance_duration_secs)
+            .collect();
+        if durations.is_empty() {
+            "\u{2014}".to_string()
+        } else {
+            let avg = durations.iter().sum::<f64>() / durations.len() as f64;
+            if avg >= 3600.0 {
+                format!("{:.1}h", avg / 3600.0)
+            } else if avg >= 60.0 {
+                format!("{:.1}m", avg / 60.0)
+            } else {
+                format!("{:.1}s", avg)
+            }
+        }
+    };
+
+    // Decode time-series from all pools and merge into a single JSON array.
+    // For a single-pool setup this is just the one blob; for multi-pool we
+    // pick the pool with the most data points (typically there's only one).
+    let mut best_ts: Option<PoolTimeSeries> = None;
+    for status in statuses {
+        if let Some(ref bytes) = status.time_series {
+            if let Some(ts) = PoolTimeSeries::decode(bytes) {
+                let is_better = best_ts.as_ref().is_none_or(|b| ts.len() > b.len());
+                if is_better {
+                    best_ts = Some(ts);
+                }
+            }
+        }
+    }
+
+    let (time_series_json, has_time_series) = match best_ts {
+        Some(ts) if ts.len() > 0 => {
+            let json = serde_json::to_string(&ts.to_json_entries()).unwrap_or_default();
+            (json, true)
+        }
+        _ => ("[]".to_string(), false),
+    };
 
     let context = WorkersPageContext {
         title: "Worker Throughput".to_string(),
         active_tab: "workers".to_string(),
         window_minutes,
-        workers,
         has_workers: !statuses.is_empty(),
+        active_worker_count,
+        actions_per_sec,
+        avg_instance_duration,
+        workers,
+        time_series_json,
+        has_time_series,
     };
 
     render_template(templates, "workers.html", &context)
@@ -2324,7 +2401,6 @@ mod tests {
         let templates = test_templates();
         let statuses = vec![crate::db::WorkerStatus {
             pool_id: Uuid::new_v4(),
-            worker_id: 0,
             throughput_per_min: 2.5,
             total_completed: 42,
             last_action_at: Some(chrono::Utc::now()),
@@ -2333,12 +2409,18 @@ mod tests {
             median_handling_ms: Some(120),
             dispatch_queue_size: Some(10),
             total_in_flight: Some(5),
+            active_workers: 4,
+            actions_per_sec: 0.04,
+            avg_instance_duration_secs: Some(45.3),
+            time_series: None,
         }];
 
         let html = render_workers_page(&templates, &statuses, 5);
 
         assert!(html.contains("Workers"));
         assert!(html.contains("42"));
+        assert!(html.contains("0.04")); // actions/sec
+        assert!(html.contains("45.3s")); // avg instance duration
     }
 
     // ========================================================================

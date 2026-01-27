@@ -32,6 +32,7 @@ pub mod ir_validation;
 pub mod lexer;
 pub mod messages;
 pub mod parser;
+pub mod pool_status;
 pub mod runner_database;
 pub mod runner_memory;
 pub mod schedule;
