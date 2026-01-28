@@ -527,9 +527,10 @@ impl Database {
                 active_workers,
                 actions_per_sec,
                 avg_instance_duration_secs,
+                active_instance_count,
                 time_series
             )
-            VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT (pool_id)
             DO UPDATE SET
                 throughput_per_min = EXCLUDED.throughput_per_min,
@@ -543,6 +544,7 @@ impl Database {
                 active_workers = EXCLUDED.active_workers,
                 actions_per_sec = EXCLUDED.actions_per_sec,
                 avg_instance_duration_secs = EXCLUDED.avg_instance_duration_secs,
+                active_instance_count = EXCLUDED.active_instance_count,
                 time_series = EXCLUDED.time_series
             "#,
         )
@@ -557,6 +559,7 @@ impl Database {
         .bind(status.active_workers)
         .bind(status.actions_per_sec)
         .bind(status.avg_instance_duration_secs)
+        .bind(status.active_instance_count)
         .bind(&status.time_series)
         .execute(&self.pool)
         .await?;

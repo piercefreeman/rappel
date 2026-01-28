@@ -153,6 +153,8 @@ pub struct WorkerStatusUpdate {
     pub actions_per_sec: f64,
     /// Average instance duration in seconds (computed in-memory)
     pub avg_instance_duration_secs: Option<f64>,
+    /// Number of workflow instances currently owned by this runner
+    pub active_instance_count: i32,
     /// Encoded time-series ring buffer (BYTEA)
     pub time_series: Option<Vec<u8>>,
 }
@@ -179,6 +181,8 @@ pub struct WorkerStatus {
     pub actions_per_sec: f64,
     /// Average instance duration in seconds
     pub avg_instance_duration_secs: Option<f64>,
+    /// Number of workflow instances currently owned by this runner
+    pub active_instance_count: i32,
     /// Encoded time-series ring buffer
     pub time_series: Option<Vec<u8>>,
 }

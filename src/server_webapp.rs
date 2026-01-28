@@ -1255,6 +1255,9 @@ struct WorkersPageContext {
     active_worker_count: i32,
     actions_per_sec: String,
     avg_instance_duration: String,
+    active_instance_count: i32,
+    total_queue_depth: i64,
+    total_in_flight: i64,
     time_series_json: String,
     has_time_series: bool,
 }
@@ -1273,11 +1276,7 @@ struct WorkerStatusRow {
     avg_instance_duration: String,
 }
 
-fn render_workers_page(
-    templates: &Tera,
-    statuses: &[WorkerStatus],
-    window_minutes: i64,
-) -> String {
+fn render_workers_page(templates: &Tera, statuses: &[WorkerStatus], window_minutes: i64) -> String {
     let workers: Vec<WorkerStatusRow> = statuses
         .iter()
         .map(|status| {
@@ -1306,6 +1305,9 @@ fn render_workers_page(
     let active_worker_count: i32 = statuses.iter().map(|s| s.active_workers).sum();
     let total_actions_per_sec: f64 = statuses.iter().map(|s| s.actions_per_sec).sum();
     let actions_per_sec = format!("{:.2}", total_actions_per_sec);
+    let active_instance_count: i32 = statuses.iter().map(|s| s.active_instance_count).sum();
+    let total_queue_depth: i64 = statuses.iter().filter_map(|s| s.dispatch_queue_size).sum();
+    let total_in_flight: i64 = statuses.iter().filter_map(|s| s.total_in_flight).sum();
 
     // Weighted average of instance duration across pools
     let avg_instance_duration = {
@@ -1358,6 +1360,9 @@ fn render_workers_page(
         active_worker_count,
         actions_per_sec,
         avg_instance_duration,
+        active_instance_count,
+        total_queue_depth,
+        total_in_flight,
         workers,
         time_series_json,
         has_time_series,
@@ -2412,6 +2417,7 @@ mod tests {
             active_workers: 4,
             actions_per_sec: 0.04,
             avg_instance_duration_secs: Some(45.3),
+            active_instance_count: 12,
             time_series: None,
         }];
 

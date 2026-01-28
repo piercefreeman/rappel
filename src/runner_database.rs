@@ -55,7 +55,6 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use crate::ast_evaluator::ExpressionEvaluator;
-use crate::pool_status::{PoolTimeSeries, TimeSeriesEntry};
 use crate::dag::{DAG, DAGConverter, DAGNode};
 use crate::db::{
     ClaimedInstance, Database, ScheduleId, WorkerStatusUpdate, WorkflowInstanceId,
@@ -67,6 +66,7 @@ use crate::messages::proto;
 use crate::messages::proto::WorkflowArguments;
 use crate::messages::{MessageError, decode_message, encode_message};
 use crate::parser::ast;
+use crate::pool_status::{PoolTimeSeries, TimeSeriesEntry};
 use crate::schedule::{apply_jitter, next_cron_run, next_interval_run};
 use crate::stats::LifecycleStats;
 use crate::value::WorkflowValue;
@@ -774,7 +774,8 @@ impl InstanceRunner {
         let worker_pool = Arc::clone(&self.worker_pool);
         let dispatch_queue = &self.dispatch_queue as *const Mutex<VecDeque<QueuedAction>>;
         let shutdown = &self.shutdown as *const AtomicBool;
-        let active_instances = &self.active_instances as *const RwLock<HashMap<Uuid, ActiveInstance>>;
+        let active_instances =
+            &self.active_instances as *const RwLock<HashMap<Uuid, ActiveInstance>>;
         let pool_time_series = &self.pool_time_series as *const std::sync::Mutex<PoolTimeSeries>;
 
         // Safety: We know self lives as long as the returned handle
@@ -786,6 +787,8 @@ impl InstanceRunner {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(status_interval);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let mut prev_total_completed: i64 = 0;
+            let mut prev_tick: Option<Instant> = None;
 
             loop {
                 interval.tick().await;
@@ -794,34 +797,46 @@ impl InstanceRunner {
                     break;
                 }
 
+                let tick_now = Instant::now();
+
                 // 1. Per-worker throughput snapshots → aggregate
                 let snapshots = worker_pool.throughput_snapshots();
                 let throughput_per_min: f64 = snapshots.iter().map(|s| s.throughput_per_min).sum();
-                let actions_per_sec = throughput_per_min / 60.0;
-                let total_completed: i64 = snapshots
-                    .iter()
-                    .map(|s| s.total_completed as i64)
-                    .sum();
-                let last_action_at = snapshots
-                    .iter()
-                    .filter_map(|s| s.last_action_at)
-                    .max();
+                let total_completed: i64 = snapshots.iter().map(|s| s.total_completed as i64).sum();
+
+                // Instantaneous actions/sec from delta since last tick
+                let actions_per_sec = match prev_tick {
+                    Some(prev) => {
+                        let elapsed = tick_now.duration_since(prev).as_secs_f64();
+                        let delta = total_completed - prev_total_completed;
+                        if elapsed > 0.0 {
+                            delta as f64 / elapsed
+                        } else {
+                            0.0
+                        }
+                    }
+                    None => 0.0,
+                };
+                prev_total_completed = total_completed;
+                prev_tick = Some(tick_now);
+                let last_action_at = snapshots.iter().filter_map(|s| s.last_action_at).max();
 
                 // 2. Active workers count
                 let active_workers = worker_pool.len() as i32;
 
-                // 3. Average instance duration from in-memory active instances
-                let avg_instance_duration_secs = {
+                // 3. Average instance duration and count from in-memory active instances
+                let (avg_instance_duration_secs, active_instance_count) = {
                     let instances = active_instances_ptr.read().await;
+                    let count = instances.len() as i32;
                     if instances.is_empty() {
-                        None
+                        (None, count)
                     } else {
                         let now = Instant::now();
                         let total_secs: f64 = instances
                             .values()
                             .map(|inst| now.duration_since(inst.claimed_at).as_secs_f64())
                             .sum();
-                        Some(total_secs / instances.len() as f64)
+                        (Some(total_secs / instances.len() as f64), count)
                     }
                 };
 
@@ -841,8 +856,11 @@ impl InstanceRunner {
                         timestamp_secs: now_secs,
                         actions_per_sec: actions_per_sec as f32,
                         active_workers: active_workers as u16,
-                        avg_instance_duration_secs: avg_instance_duration_secs
-                            .unwrap_or(0.0) as f32,
+                        avg_instance_duration_secs: avg_instance_duration_secs.unwrap_or(0.0)
+                            as f32,
+                        active_instances: active_instance_count as u32,
+                        queue_depth: dispatch_queue_size as u32,
+                        in_flight_actions: total_in_flight as u32,
                     });
                     ts.encode()
                 };
@@ -859,6 +877,7 @@ impl InstanceRunner {
                     active_workers,
                     actions_per_sec,
                     avg_instance_duration_secs,
+                    active_instance_count,
                     time_series: Some(time_series_bytes),
                 };
 
