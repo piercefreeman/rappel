@@ -26,20 +26,23 @@ pub mod dag;
 pub mod dag_state;
 pub mod db;
 pub mod execution_graph;
-pub mod instance_runner;
+pub mod executor;
 pub mod ir_printer;
 pub mod ir_validation;
 pub mod lexer;
 pub mod messages;
 pub mod parser;
+pub mod pool_status;
+pub mod runner_database;
+pub mod runner_memory;
 pub mod schedule;
 pub mod server_client;
 pub mod server_webapp;
 pub mod server_worker;
 pub mod stats;
-pub mod traversal;
 pub mod value;
 pub mod worker;
+mod workflow_ir;
 
 // Configuration
 pub use config::{
@@ -87,19 +90,13 @@ pub use stats::{LifecycleStats, LifecycleStatsSnapshot, MetricStats};
 // Schedule utilities
 pub use schedule::{next_cron_run, next_interval_run, validate_cron};
 
-// Traversal (shared DAG traversal logic)
-pub use traversal::{
-    InlineScope as TraversalScope, LoopAwareTraversal, MAX_LOOP_ITERATIONS, TraversalEdge,
-    TraversalQueue, WorkQueueEntry, evaluate_guard as traversal_evaluate_guard,
-    get_traversal_successors, select_guarded_edges,
-};
-
 // Execution Graph (instance-local execution model)
-pub use execution_graph::{BatchCompletionResult, Completion, ExecutionState};
+pub use execution_graph::{BatchCompletionResult, Completion, ExecutionState, MAX_LOOP_ITERATIONS};
 
 // Instance Runner (lease-based execution)
-pub use instance_runner::{
+pub use runner_database::{
     DEFAULT_CLAIM_BATCH_SIZE, DEFAULT_COMPLETION_BATCH_SIZE, DEFAULT_HEARTBEAT_INTERVAL,
-    DEFAULT_LEASE_SECONDS, InstanceRunner, InstanceRunnerConfig, InstanceRunnerError,
-    InstanceRunnerMetrics, InstanceRunnerResult,
+    DEFAULT_LEASE_SECONDS, DEFAULT_SCHEDULE_CHECK_BATCH_SIZE, DEFAULT_SCHEDULE_CHECK_INTERVAL,
+    InstanceRunner, InstanceRunnerConfig, InstanceRunnerError, InstanceRunnerMetrics,
+    InstanceRunnerResult,
 };

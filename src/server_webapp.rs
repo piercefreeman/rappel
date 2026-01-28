@@ -27,6 +27,7 @@ use uuid::Uuid;
 use crate::config::WebappConfig;
 use crate::db::{Database, ScheduleId, WorkerStatus, WorkflowVersionId, WorkflowVersionSummary};
 use crate::messages::execution::{ExecutionGraph, NodeStatus};
+use crate::pool_status::PoolTimeSeries;
 
 /// Webapp server handle
 pub struct WebappServer {
@@ -152,6 +153,14 @@ async fn run_server(
             "/workflows/:workflow_version_id/run/:instance_id",
             get(workflow_run_detail),
         )
+        .route(
+            "/api/workflows/:workflow_version_id/run/:instance_id/run-data",
+            get(get_workflow_run_data),
+        )
+        .route(
+            "/api/workflows/:workflow_version_id/run/:instance_id/action-logs/:action_id",
+            get(get_workflow_action_logs),
+        )
         .route("/scheduled", get(list_schedules))
         .route("/scheduled/:schedule_id", get(schedule_detail))
         .route("/scheduled/:schedule_id/pause", post(pause_schedule))
@@ -275,28 +284,152 @@ async fn workflow_run_detail(
         }
     };
 
-    // Synthesize action logs from execution graph
-    let action_logs = if let Ok(Some(graph_bytes)) = state
+    let dag = decode_dag_from_proto(&version.program_proto);
+
+    // Build execution graph status data (used for DAG rendering)
+    let graph_data = if let Ok(Some(graph_bytes)) = state
         .database
         .get_instance_execution_graph(crate::db::WorkflowInstanceId(instance_id))
         .await
     {
         if let Some(graph) = decode_execution_graph(&graph_bytes) {
-            let dag = decode_dag_from_proto(&version.program_proto);
-            synthesize_action_logs_from_execution_graph(instance.id, &dag, &graph)
+            let action_status = build_action_status_from_execution_graph(&dag, &graph);
+            build_filtered_execution_graph(&dag, &action_status)
         } else {
-            Vec::new()
+            build_filtered_execution_graph(&dag, &std::collections::HashMap::new())
         }
     } else {
-        Vec::new()
+        build_filtered_execution_graph(&dag, &std::collections::HashMap::new())
     };
 
     Html(render_workflow_run_page(
         &state.templates,
         &version,
         &instance,
-        &action_logs,
+        graph_data,
     ))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RunDataQuery {
+    page: Option<i64>,
+    per_page: Option<i64>,
+    include_nodes: Option<bool>,
+}
+
+async fn get_workflow_run_data(
+    State(state): State<WebappState>,
+    Path((version_id, instance_id)): Path<(Uuid, Uuid)>,
+    axum::extract::Query(query): axum::extract::Query<RunDataQuery>,
+) -> Result<Json<WorkflowRunDataResponse>, HttpError> {
+    let version = state
+        .database
+        .get_workflow_version(WorkflowVersionId(version_id))
+        .await
+        .map_err(|err| {
+            error!(?err, %version_id, "failed to load workflow version");
+            HttpError {
+                status: StatusCode::NOT_FOUND,
+                message: "workflow version not found".to_string(),
+            }
+        })?;
+
+    state
+        .database
+        .get_instance(crate::db::WorkflowInstanceId(instance_id))
+        .await
+        .map_err(|err| {
+            error!(?err, %instance_id, "failed to load instance");
+            HttpError {
+                status: StatusCode::NOT_FOUND,
+                message: "workflow instance not found".to_string(),
+            }
+        })?;
+
+    let dag = decode_dag_from_proto(&version.program_proto);
+    let mut nodes = Vec::new();
+    let mut timeline = TimelinePage {
+        entries: Vec::new(),
+        total: 0,
+    };
+
+    let per_page = query.per_page.unwrap_or(200).clamp(1, 1000);
+    let page = query.page.unwrap_or(1).max(1);
+    let include_nodes = query.include_nodes.unwrap_or(true);
+
+    if let Ok(Some(graph_bytes)) = state
+        .database
+        .get_instance_execution_graph(crate::db::WorkflowInstanceId(instance_id))
+        .await
+        && let Some(graph) = decode_execution_graph(&graph_bytes)
+    {
+        let action_logs = synthesize_action_logs_from_execution_graph(instance_id, &dag, &graph);
+        if include_nodes {
+            nodes = build_node_contexts_from_action_logs(&action_logs);
+        }
+        timeline = build_timeline_entries(&action_logs, page, per_page);
+    }
+
+    let total = timeline.total;
+    let has_more = (page * per_page) < total;
+
+    Ok(Json(WorkflowRunDataResponse {
+        nodes,
+        timeline: timeline.entries,
+        page,
+        per_page,
+        total,
+        has_more,
+    }))
+}
+
+async fn get_workflow_action_logs(
+    State(state): State<WebappState>,
+    Path((version_id, instance_id, action_id)): Path<(Uuid, Uuid, Uuid)>,
+) -> Result<Json<ActionLogsResponse>, HttpError> {
+    let version = state
+        .database
+        .get_workflow_version(WorkflowVersionId(version_id))
+        .await
+        .map_err(|err| {
+            error!(?err, %version_id, "failed to load workflow version");
+            HttpError {
+                status: StatusCode::NOT_FOUND,
+                message: "workflow version not found".to_string(),
+            }
+        })?;
+
+    state
+        .database
+        .get_instance(crate::db::WorkflowInstanceId(instance_id))
+        .await
+        .map_err(|err| {
+            error!(?err, %instance_id, "failed to load instance");
+            HttpError {
+                status: StatusCode::NOT_FOUND,
+                message: "workflow instance not found".to_string(),
+            }
+        })?;
+
+    let dag = decode_dag_from_proto(&version.program_proto);
+    let mut logs = Vec::new();
+
+    if let Ok(Some(graph_bytes)) = state
+        .database
+        .get_instance_execution_graph(crate::db::WorkflowInstanceId(instance_id))
+        .await
+        && let Some(graph) = decode_execution_graph(&graph_bytes)
+    {
+        let action_logs = synthesize_action_logs_from_execution_graph(instance_id, &dag, &graph);
+        logs = action_logs
+            .iter()
+            .filter(|log| log.action_id == action_id)
+            .map(build_action_log_context)
+            .collect();
+        logs.sort_by(|a, b| a.attempt_number.cmp(&b.attempt_number));
+    }
+
+    Ok(Json(ActionLogsResponse { logs }))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -363,17 +496,19 @@ async fn list_workers(
     let minutes = query.minutes.unwrap_or(5).max(1);
     let since = Utc::now() - ChronoDuration::minutes(minutes);
 
-    match state.database.list_worker_statuses_recent(since).await {
-        Ok(workers) => Html(render_workers_page(&state.templates, &workers, minutes)),
+    let workers = match state.database.list_worker_statuses_recent(since).await {
+        Ok(w) => w,
         Err(err) => {
             error!(?err, "failed to load worker status");
-            Html(render_error_page(
+            return Html(render_error_page(
                 &state.templates,
                 "Unable to load worker status",
                 "We couldn't fetch worker throughput stats. Please check the database connection.",
-            ))
+            ));
         }
-    }
+    };
+
+    Html(render_workers_page(&state.templates, &workers, minutes))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -855,13 +990,8 @@ struct WorkflowRunPageContext {
     active_tab: String,
     workflow: WorkflowDetailMetadata,
     instance: InstanceContext,
-    nodes: Vec<NodeExecutionContext>,
     /// Graph data for DAG visualization
     graph_data: ExecutionGraphData,
-    /// JSON-encoded node data for client-side use (avoids HTML entity escaping)
-    nodes_json: String,
-    /// JSON-encoded action logs for client-side use (keyed by action_id)
-    action_logs_json: String,
 }
 
 /// Graph data for execution visualization (includes status)
@@ -877,7 +1007,7 @@ struct ExecutionGraphNode {
     action: String,
     module: String,
     depends_on: Vec<String>,
-    /// Status: pending, dispatched, completed, failed
+    /// Status: pending, blocked, dispatched, completed, failed
     status: String,
 }
 
@@ -945,11 +1075,31 @@ struct ActionLogContext {
     result_payload: Option<String>,
 }
 
+struct TimelinePage {
+    entries: Vec<ActionLogContext>,
+    total: i64,
+}
+
+#[derive(Serialize)]
+struct WorkflowRunDataResponse {
+    nodes: Vec<NodeExecutionContext>,
+    timeline: Vec<ActionLogContext>,
+    page: i64,
+    per_page: i64,
+    total: i64,
+    has_more: bool,
+}
+
+#[derive(Serialize)]
+struct ActionLogsResponse {
+    logs: Vec<ActionLogContext>,
+}
+
 fn render_workflow_run_page(
     templates: &Tera,
     version: &crate::db::WorkflowVersion,
     instance: &crate::db::WorkflowInstance,
-    action_logs: &[crate::db::ActionLog],
+    graph_data: ExecutionGraphData,
 ) -> String {
     let workflow = WorkflowDetailMetadata {
         id: version.id.to_string(),
@@ -963,10 +1113,9 @@ fn render_workflow_run_page(
         },
     };
 
-    // Decode the DAG from the workflow version
+    // Decode the DAG from the workflow version for progress display
     let dag = decode_dag_from_proto(&version.program_proto);
 
-    // Build action names list for progress display
     let action_names: Vec<String> = dag
         .iter()
         .map(|node| {
@@ -1003,112 +1152,12 @@ fn render_workflow_run_page(
         result_payload: format_payload(&instance.result_payload),
     };
 
-    // Build nodes from action_logs (synthesized from execution_graph)
-    // Group by action_id to get the latest attempt for each action
-    let mut latest_by_action: std::collections::HashMap<String, &crate::db::ActionLog> =
-        std::collections::HashMap::new();
-    for log in action_logs.iter() {
-        let key = log.action_id.to_string();
-        if let Some(existing) = latest_by_action.get(&key) {
-            if log.attempt_number > existing.attempt_number {
-                latest_by_action.insert(key, log);
-            }
-        } else {
-            latest_by_action.insert(key, log);
-        }
-    }
-
-    let nodes: Vec<NodeExecutionContext> = latest_by_action
-        .values()
-        .map(|log| NodeExecutionContext {
-            id: log
-                .node_id
-                .clone()
-                .unwrap_or_else(|| log.action_id.to_string()),
-            action_id: log.action_id.to_string(),
-            module: log.module_name.clone().unwrap_or_default(),
-            action: log.action_name.clone().unwrap_or_default(),
-            status: if log.success == Some(true) {
-                "completed".to_string()
-            } else if log.success == Some(false) {
-                "failed".to_string()
-            } else {
-                "running".to_string()
-            },
-            request_payload: log
-                .dispatch_payload
-                .as_ref()
-                .map(|p| format_binary_payload(p))
-                .unwrap_or_else(|| "(not recorded)".to_string()),
-            response_payload: log
-                .result_payload
-                .as_ref()
-                .map(|p| format_binary_payload(p))
-                .unwrap_or_else(|| "(not recorded)".to_string()),
-            attempt_number: log.attempt_number,
-            max_retries: 0,
-            timeout_retry_limit: 0,
-            retry_kind: String::new(),
-            scheduled_at: None,
-            last_error: log.error_message.clone(),
-        })
-        .collect();
-
-    // Build a map of node_id -> status from the nodes
-    let action_status: std::collections::HashMap<String, String> = nodes
-        .iter()
-        .map(|n| (n.id.clone(), n.status.clone()))
-        .collect();
-
-    // Build execution graph data with status info, filtering out internal nodes
-    let graph_data = build_filtered_execution_graph(&dag, &action_status);
-
-    // Serialize nodes to JSON for client-side use (avoids HTML entity escaping issues)
-    let nodes_json = serde_json::to_string(&nodes).unwrap_or_else(|_| "[]".to_string());
-
-    // Build action logs map: action_id -> Vec<ActionLogContext>
-    let mut logs_by_action: std::collections::HashMap<String, Vec<ActionLogContext>> =
-        std::collections::HashMap::new();
-    for log in action_logs {
-        let log_ctx = ActionLogContext {
-            id: log.id.to_string(),
-            action_id: log.action_id.to_string(),
-            node_id: log.node_id.clone(),
-            action_name: log.action_name.clone(),
-            module_name: log.module_name.clone(),
-            attempt_number: log.attempt_number,
-            dispatched_at: log
-                .dispatched_at
-                .format("%Y-%m-%d %H:%M:%S%.3f UTC")
-                .to_string(),
-            completed_at: log
-                .completed_at
-                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string()),
-            success: log.success,
-            duration_ms: log.duration_ms,
-            error_message: log.error_message.clone(),
-            result_payload: log
-                .result_payload
-                .as_ref()
-                .map(|p| format_binary_payload(p)),
-        };
-        logs_by_action
-            .entry(log.action_id.to_string())
-            .or_default()
-            .push(log_ctx);
-    }
-    let action_logs_json =
-        serde_json::to_string(&logs_by_action).unwrap_or_else(|_| "{}".to_string());
-
     let context = WorkflowRunPageContext {
         title: format!("Run {} - {}", instance.id, version.workflow_name),
         active_tab: "workflows".to_string(),
         workflow,
         instance: instance_ctx,
-        nodes,
         graph_data,
-        nodes_json,
-        action_logs_json,
     };
 
     render_template(templates, "workflow_run.html", &context)
@@ -1203,41 +1252,120 @@ struct WorkersPageContext {
     window_minutes: i64,
     workers: Vec<WorkerStatusRow>,
     has_workers: bool,
+    active_worker_count: i32,
+    actions_per_sec: String,
+    avg_instance_duration: String,
+    active_instance_count: i32,
+    total_queue_depth: i64,
+    total_in_flight: i64,
+    time_series_json: String,
+    has_time_series: bool,
 }
 
 #[derive(Serialize)]
 struct WorkerStatusRow {
     pool_id: String,
-    worker_id: i64,
+    active_workers: i32,
+    actions_per_sec: String,
     throughput_per_min: String,
     total_completed: i64,
     last_action_at: Option<String>,
     updated_at: String,
     median_dequeue_ms: Option<i64>,
     median_handling_ms: Option<i64>,
+    avg_instance_duration: String,
 }
 
 fn render_workers_page(templates: &Tera, statuses: &[WorkerStatus], window_minutes: i64) -> String {
-    let workers = statuses
+    let workers: Vec<WorkerStatusRow> = statuses
         .iter()
-        .map(|status| WorkerStatusRow {
-            pool_id: status.pool_id.to_string(),
-            worker_id: status.worker_id,
-            throughput_per_min: format!("{:.2}", status.throughput_per_min),
-            total_completed: status.total_completed,
-            last_action_at: status.last_action_at.map(|dt| dt.to_rfc3339()),
-            updated_at: status.updated_at.to_rfc3339(),
-            median_dequeue_ms: status.median_dequeue_ms,
-            median_handling_ms: status.median_handling_ms,
+        .map(|status| {
+            let avg_instance_duration = match status.avg_instance_duration_secs {
+                Some(secs) if secs >= 3600.0 => format!("{:.1}h", secs / 3600.0),
+                Some(secs) if secs >= 60.0 => format!("{:.1}m", secs / 60.0),
+                Some(secs) => format!("{:.1}s", secs),
+                None => "\u{2014}".to_string(),
+            };
+            WorkerStatusRow {
+                pool_id: status.pool_id.to_string(),
+                active_workers: status.active_workers,
+                actions_per_sec: format!("{:.2}", status.actions_per_sec),
+                throughput_per_min: format!("{:.2}", status.throughput_per_min),
+                total_completed: status.total_completed,
+                last_action_at: status.last_action_at.map(|dt| dt.to_rfc3339()),
+                updated_at: status.updated_at.to_rfc3339(),
+                median_dequeue_ms: status.median_dequeue_ms,
+                median_handling_ms: status.median_handling_ms,
+                avg_instance_duration,
+            }
         })
         .collect();
+
+    // Aggregate across pools
+    let active_worker_count: i32 = statuses.iter().map(|s| s.active_workers).sum();
+    let total_actions_per_sec: f64 = statuses.iter().map(|s| s.actions_per_sec).sum();
+    let actions_per_sec = format!("{:.2}", total_actions_per_sec);
+    let active_instance_count: i32 = statuses.iter().map(|s| s.active_instance_count).sum();
+    let total_queue_depth: i64 = statuses.iter().filter_map(|s| s.dispatch_queue_size).sum();
+    let total_in_flight: i64 = statuses.iter().filter_map(|s| s.total_in_flight).sum();
+
+    // Weighted average of instance duration across pools
+    let avg_instance_duration = {
+        let durations: Vec<f64> = statuses
+            .iter()
+            .filter_map(|s| s.avg_instance_duration_secs)
+            .collect();
+        if durations.is_empty() {
+            "\u{2014}".to_string()
+        } else {
+            let avg = durations.iter().sum::<f64>() / durations.len() as f64;
+            if avg >= 3600.0 {
+                format!("{:.1}h", avg / 3600.0)
+            } else if avg >= 60.0 {
+                format!("{:.1}m", avg / 60.0)
+            } else {
+                format!("{:.1}s", avg)
+            }
+        }
+    };
+
+    // Decode time-series from all pools and merge into a single JSON array.
+    // For a single-pool setup this is just the one blob; for multi-pool we
+    // pick the pool with the most data points (typically there's only one).
+    let mut best_ts: Option<PoolTimeSeries> = None;
+    for status in statuses {
+        if let Some(ref bytes) = status.time_series
+            && let Some(ts) = PoolTimeSeries::decode(bytes)
+        {
+            let is_better = best_ts.as_ref().is_none_or(|b| ts.len() > b.len());
+            if is_better {
+                best_ts = Some(ts);
+            }
+        }
+    }
+
+    let (time_series_json, has_time_series) = match best_ts {
+        Some(ts) if !ts.is_empty() => {
+            let json = serde_json::to_string(&ts.to_json_entries()).unwrap_or_default();
+            (json, true)
+        }
+        _ => ("[]".to_string(), false),
+    };
 
     let context = WorkersPageContext {
         title: "Worker Throughput".to_string(),
         active_tab: "workers".to_string(),
         window_minutes,
-        workers,
         has_workers: !statuses.is_empty(),
+        active_worker_count,
+        actions_per_sec,
+        avg_instance_duration,
+        active_instance_count,
+        total_queue_depth,
+        total_in_flight,
+        workers,
+        time_series_json,
+        has_time_series,
     };
 
     render_template(templates, "workers.html", &context)
@@ -1688,6 +1816,147 @@ fn synthesize_action_logs_from_execution_graph(
     logs
 }
 
+fn build_node_contexts_from_action_logs(
+    action_logs: &[crate::db::ActionLog],
+) -> Vec<NodeExecutionContext> {
+    let mut latest_by_action: std::collections::HashMap<String, &crate::db::ActionLog> =
+        std::collections::HashMap::new();
+    for log in action_logs {
+        let key = log.action_id.to_string();
+        if let Some(existing) = latest_by_action.get(&key) {
+            if log.attempt_number > existing.attempt_number {
+                latest_by_action.insert(key, log);
+            }
+        } else {
+            latest_by_action.insert(key, log);
+        }
+    }
+
+    latest_by_action
+        .values()
+        .map(|log| NodeExecutionContext {
+            id: log
+                .node_id
+                .clone()
+                .unwrap_or_else(|| log.action_id.to_string()),
+            action_id: log.action_id.to_string(),
+            module: log.module_name.clone().unwrap_or_default(),
+            action: log.action_name.clone().unwrap_or_default(),
+            status: if log.success == Some(true) {
+                "completed".to_string()
+            } else if log.success == Some(false) {
+                "failed".to_string()
+            } else {
+                "running".to_string()
+            },
+            request_payload: log
+                .dispatch_payload
+                .as_ref()
+                .map(|p| format_binary_payload(p))
+                .unwrap_or_else(|| "(not recorded)".to_string()),
+            response_payload: log
+                .result_payload
+                .as_ref()
+                .map(|p| format_binary_payload(p))
+                .unwrap_or_else(|| "(not recorded)".to_string()),
+            attempt_number: log.attempt_number,
+            max_retries: 0,
+            timeout_retry_limit: 0,
+            retry_kind: String::new(),
+            scheduled_at: None,
+            last_error: log.error_message.clone(),
+        })
+        .collect()
+}
+
+fn build_action_log_context(log: &crate::db::ActionLog) -> ActionLogContext {
+    ActionLogContext {
+        id: log.id.to_string(),
+        action_id: log.action_id.to_string(),
+        node_id: log.node_id.clone(),
+        action_name: log.action_name.clone(),
+        module_name: log.module_name.clone(),
+        attempt_number: log.attempt_number,
+        dispatched_at: log
+            .dispatched_at
+            .format("%Y-%m-%d %H:%M:%S%.3f UTC")
+            .to_string(),
+        completed_at: log
+            .completed_at
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string()),
+        success: log.success,
+        duration_ms: log.duration_ms,
+        error_message: log.error_message.clone(),
+        result_payload: log
+            .result_payload
+            .as_ref()
+            .map(|p| format_binary_payload(p)),
+    }
+}
+
+fn build_timeline_entries(
+    action_logs: &[crate::db::ActionLog],
+    page: i64,
+    per_page: i64,
+) -> TimelinePage {
+    let mut sorted_logs: Vec<&crate::db::ActionLog> = action_logs.iter().collect();
+    sorted_logs.sort_by(|a, b| {
+        b.dispatched_at
+            .cmp(&a.dispatched_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let total = sorted_logs.len() as i64;
+    let start = ((page - 1) * per_page).max(0) as usize;
+    let end = (start + per_page as usize).min(sorted_logs.len());
+
+    let entries = if start < sorted_logs.len() {
+        sorted_logs[start..end]
+            .iter()
+            .map(|log| build_action_log_context(log))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    TimelinePage { entries, total }
+}
+
+fn build_action_status_from_execution_graph(
+    dag: &[SimpleDagNode],
+    graph: &ExecutionGraph,
+) -> std::collections::HashMap<String, String> {
+    let (internal_nodes, _) = build_node_maps(dag);
+    let dag_by_id: std::collections::HashMap<&str, &SimpleDagNode> =
+        dag.iter().map(|node| (node.id.as_str(), node)).collect();
+    let mut status_map = std::collections::HashMap::new();
+
+    for (node_key, exec_node) in &graph.nodes {
+        let display_node_id = if dag_by_id.contains_key(node_key.as_str()) {
+            node_key.as_str()
+        } else {
+            exec_node.template_id.as_str()
+        };
+
+        if internal_nodes.contains(display_node_id) {
+            continue;
+        }
+
+        let status = NodeStatus::try_from(exec_node.status).unwrap_or(NodeStatus::Unspecified);
+        let status_label = match status {
+            NodeStatus::Blocked => "blocked",
+            NodeStatus::Pending => "pending",
+            NodeStatus::Running => "dispatched",
+            NodeStatus::Completed => "completed",
+            NodeStatus::Failed | NodeStatus::Exhausted | NodeStatus::Caught => "failed",
+            NodeStatus::Unspecified => "pending",
+        };
+        status_map.insert(display_node_id.to_string(), status_label.to_string());
+    }
+
+    status_map
+}
+
 /// Build lookup maps for node filtering.
 fn build_node_maps(
     dag: &[SimpleDagNode],
@@ -2024,9 +2293,9 @@ mod tests {
             priority: 0,
         };
 
-        let action_logs: Vec<crate::db::ActionLog> = vec![];
+        let graph_data = ExecutionGraphData { nodes: vec![] };
 
-        let html = render_workflow_run_page(&templates, &version, &instance, &action_logs);
+        let html = render_workflow_run_page(&templates, &version, &instance, graph_data);
 
         assert!(html.contains("test_workflow"));
         assert!(html.contains("completed"));
@@ -2037,7 +2306,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_workflow_run_page_with_action_logs() {
+    fn test_render_workflow_run_page_includes_run_data_url() {
         let templates = test_templates();
         let version_id = Uuid::new_v4();
         let instance_id = Uuid::new_v4();
@@ -2066,33 +2335,14 @@ mod tests {
             priority: 0,
         };
 
-        let action_logs = vec![crate::db::ActionLog {
-            id: Uuid::new_v4(),
-            action_id: Uuid::new_v4(),
-            instance_id,
-            attempt_number: 1,
-            dispatched_at: chrono::Utc::now(),
-            completed_at: Some(chrono::Utc::now()),
-            success: Some(true),
-            result_payload: Some(b"{\"result\": 42}".to_vec()),
-            error_message: None,
-            duration_ms: Some(100),
-            pool_id: None,
-            worker_id: None,
-            enqueued_at: None,
-            module_name: Some("my_module".to_string()),
-            action_name: Some("do_something".to_string()),
-            node_id: Some("action_0".to_string()),
-            dispatch_payload: Some(b"{\"x\": 1}".to_vec()),
-        }];
+        let graph_data = ExecutionGraphData { nodes: vec![] };
 
-        let html = render_workflow_run_page(&templates, &version, &instance, &action_logs);
+        let html = render_workflow_run_page(&templates, &version, &instance, graph_data);
 
         assert!(html.contains("action_workflow"));
         assert!(html.contains("running"));
-        assert!(html.contains("my_module"));
-        assert!(html.contains("do_something"));
-        assert!(html.contains("action_0"));
+        let run_data_url = format!("/api/workflows/{}/run/{}/run-data", version_id, instance_id);
+        assert!(html.contains(&run_data_url));
     }
 
     #[test]
@@ -2156,19 +2406,27 @@ mod tests {
         let templates = test_templates();
         let statuses = vec![crate::db::WorkerStatus {
             pool_id: Uuid::new_v4(),
-            worker_id: 0,
             throughput_per_min: 2.5,
             total_completed: 42,
             last_action_at: Some(chrono::Utc::now()),
             updated_at: chrono::Utc::now(),
             median_dequeue_ms: Some(15),
             median_handling_ms: Some(120),
+            dispatch_queue_size: Some(10),
+            total_in_flight: Some(5),
+            active_workers: 4,
+            actions_per_sec: 0.04,
+            avg_instance_duration_secs: Some(45.3),
+            active_instance_count: 12,
+            time_series: None,
         }];
 
         let html = render_workers_page(&templates, &statuses, 5);
 
         assert!(html.contains("Workers"));
         assert!(html.contains("42"));
+        assert!(html.contains("0.04")); // actions/sec
+        assert!(html.contains("45.3s")); // avg instance duration
     }
 
     // ========================================================================

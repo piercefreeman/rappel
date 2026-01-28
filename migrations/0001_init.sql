@@ -123,5 +123,8 @@ CREATE TABLE worker_status (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     median_dequeue_ms BIGINT,
     median_handling_ms BIGINT,
+    -- Pool-level metrics (same for all workers in pool)
+    dispatch_queue_size BIGINT,
+    total_in_flight BIGINT,
     PRIMARY KEY (pool_id, worker_id)
 );

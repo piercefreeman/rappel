@@ -24,9 +24,141 @@
         <button type="submit" class="ml-auto rounded-lg bg-zinc-900 px-3 py-1 text-xs font-semibold text-white transition hover:bg-zinc-700 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200">Apply</button>
     </form>
     <div class="text-xs text-zinc-500 dark:text-zinc-400">
-        Showing workers updated in the last {{ window_minutes }} minute{% if window_minutes != 1 %}s{% endif %}
+        Showing pools updated in the last {{ window_minutes }} minute{% if window_minutes != 1 %}s{% endif %}
     </div>
 </section>
+
+<section class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
+    <div class="rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 p-5">
+        <p class="text-xs uppercase tracking-[0.3em] text-zinc-500 dark:text-zinc-400">Active Workers</p>
+        <p class="mt-2 text-3xl font-semibold text-zinc-900 dark:text-white">{{ active_worker_count }}</p>
+    </div>
+    <div class="rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 p-5">
+        <p class="text-xs uppercase tracking-[0.3em] text-zinc-500 dark:text-zinc-400">Actions / sec</p>
+        <p class="mt-2 text-3xl font-semibold text-zinc-900 dark:text-white">{{ actions_per_sec }}</p>
+    </div>
+    <div class="rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 p-5">
+        <p class="text-xs uppercase tracking-[0.3em] text-zinc-500 dark:text-zinc-400">Avg Instance Duration</p>
+        <p class="mt-2 text-3xl font-semibold text-zinc-900 dark:text-white">{{ avg_instance_duration }}</p>
+    </div>
+    <div class="rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 p-5">
+        <p class="text-xs uppercase tracking-[0.3em] text-zinc-500 dark:text-zinc-400">Active Instances</p>
+        <p class="mt-2 text-3xl font-semibold text-zinc-900 dark:text-white">{{ active_instance_count }}</p>
+    </div>
+    <div class="rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 p-5">
+        <p class="text-xs uppercase tracking-[0.3em] text-zinc-500 dark:text-zinc-400">In-Flight Actions</p>
+        <p class="mt-2 text-3xl font-semibold text-zinc-900 dark:text-white">{{ total_in_flight }}</p>
+    </div>
+    <div class="rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 p-5">
+        <p class="text-xs uppercase tracking-[0.3em] text-zinc-500 dark:text-zinc-400">Queue Depth</p>
+        <p class="mt-2 text-3xl font-semibold text-zinc-900 dark:text-white">{{ total_queue_depth }}</p>
+    </div>
+</section>
+
+{% if has_time_series %}
+<section class="rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 p-5">
+    <p class="text-xs uppercase tracking-[0.3em] text-zinc-500 dark:text-zinc-400 mb-4">Actions / sec (2h)</p>
+    <div id="ts-chart" style="width:100%;height:200px;"></div>
+</section>
+
+<section class="rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 p-5">
+    <p class="text-xs uppercase tracking-[0.3em] text-zinc-500 dark:text-zinc-400 mb-4">Active Instances (2h)</p>
+    <div id="inst-chart" style="width:100%;height:200px;"></div>
+</section>
+
+<script>
+(function() {
+    var data = {{ time_series_json | safe }};
+    if (!data || data.length === 0) return;
+
+    var ns = 'http://www.w3.org/2000/svg';
+
+    // Shared time range
+    var tMin = data[0].t;
+    var tMax = data[data.length - 1].t;
+    var tRange = Math.max(tMax - tMin, 1);
+
+    // ---- Helper: render a single-series chart ----
+    function renderSingleChart(containerId, values, color) {
+        var container = document.getElementById(containerId);
+        if (!container) return;
+        var W = container.clientWidth;
+        var H = 200;
+        var PAD_L = 50, PAD_R = 16, PAD_T = 12, PAD_B = 28;
+        var plotW = W - PAD_L - PAD_R;
+        var plotH = H - PAD_T - PAD_B;
+
+        var maxV = 0;
+        for (var i = 0; i < values.length; i++) {
+            if (values[i] > maxV) maxV = values[i];
+        }
+        if (maxV === 0) maxV = 1;
+        maxV *= 1.1;
+
+        function x(t) { return PAD_L + ((t - tMin) / tRange) * plotW; }
+        function y(v) { return PAD_T + plotH - (v / maxV) * plotH; }
+
+        var svg = document.createElementNS(ns, 'svg');
+        svg.setAttribute('width', W);
+        svg.setAttribute('height', H);
+        svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+        svg.style.display = 'block';
+
+        // Grid + Y labels
+        for (var g = 0; g <= 4; g++) {
+            var gy = PAD_T + (plotH / 4) * g;
+            var line = document.createElementNS(ns, 'line');
+            line.setAttribute('x1', PAD_L); line.setAttribute('x2', W - PAD_R);
+            line.setAttribute('y1', gy); line.setAttribute('y2', gy);
+            line.setAttribute('stroke', 'currentColor'); line.setAttribute('stroke-opacity', '0.1');
+            svg.appendChild(line);
+            var val = maxV - (maxV / 4) * g;
+            var label = document.createElementNS(ns, 'text');
+            label.setAttribute('x', PAD_L - 6); label.setAttribute('y', gy + 4);
+            label.setAttribute('text-anchor', 'end');
+            label.setAttribute('fill', 'currentColor'); label.setAttribute('fill-opacity', '0.5');
+            label.setAttribute('font-size', '10');
+            label.textContent = val < 10 ? val.toFixed(1) : Math.round(val).toString();
+            svg.appendChild(label);
+        }
+        // X labels
+        var labelCount = Math.min(6, data.length);
+        for (var li = 0; li < labelCount; li++) {
+            var idx = Math.floor((li / (labelCount - 1 || 1)) * (data.length - 1));
+            var d = new Date(data[idx].t * 1000);
+            var xl = x(data[idx].t);
+            var xlabel = document.createElementNS(ns, 'text');
+            xlabel.setAttribute('x', xl); xlabel.setAttribute('y', H - 4);
+            xlabel.setAttribute('text-anchor', 'middle');
+            xlabel.setAttribute('fill', 'currentColor'); xlabel.setAttribute('fill-opacity', '0.5');
+            xlabel.setAttribute('font-size', '10');
+            xlabel.textContent = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+            svg.appendChild(xlabel);
+        }
+        // Area + line
+        var pts = [];
+        for (var j = 0; j < data.length; j++) {
+            pts.push(x(data[j].t).toFixed(1) + ',' + y(values[j]).toFixed(1));
+        }
+        var polygon = document.createElementNS(ns, 'polygon');
+        polygon.setAttribute('points', pts.join(' ') + ' ' + x(tMax).toFixed(1) + ',' + (PAD_T + plotH) + ' ' + x(tMin).toFixed(1) + ',' + (PAD_T + plotH));
+        polygon.setAttribute('fill', color); polygon.setAttribute('fill-opacity', '0.12');
+        svg.appendChild(polygon);
+        var polyline = document.createElementNS(ns, 'polyline');
+        polyline.setAttribute('points', pts.join(' '));
+        polyline.setAttribute('fill', 'none'); polyline.setAttribute('stroke', color); polyline.setAttribute('stroke-width', '1.5');
+        svg.appendChild(polyline);
+        container.appendChild(svg);
+    }
+
+    // Actions/sec chart
+    renderSingleChart('ts-chart', data.map(function(d) { return d.aps; }), '#6366f1');
+
+    // Active instances chart
+    renderSingleChart('inst-chart', data.map(function(d) { return d.ai; }), '#10b981');
+})();
+</script>
+{% endif %}
 
 {% if workers | length == 0 %}
     <div class="rounded-2xl border border-dashed border-zinc-300 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900/40 p-6 text-center text-zinc-600 dark:text-zinc-400">
@@ -39,9 +171,11 @@
                 <thead class="bg-zinc-100 dark:bg-zinc-800/60">
                     <tr>
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Pool</th>
-                        <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Worker</th>
+                        <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Workers</th>
+                        <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Actions/sec</th>
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Throughput/min</th>
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Total Completed</th>
+                        <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Avg Duration</th>
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Median Dequeue</th>
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Median Execution</th>
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Last Action</th>
@@ -52,21 +186,23 @@
                     {% for worker in workers %}
                         <tr>
                             <td class="px-4 py-3 font-mono text-xs text-zinc-700 dark:text-zinc-300">{{ worker.pool_id }}</td>
-                            <td class="px-4 py-3 font-mono text-xs text-zinc-700 dark:text-zinc-300">{{ worker.worker_id }}</td>
+                            <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">{{ worker.active_workers }}</td>
+                            <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">{{ worker.actions_per_sec }}</td>
                             <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">{{ worker.throughput_per_min }}</td>
                             <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">{{ worker.total_completed }}</td>
+                            <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">{{ worker.avg_instance_duration }}</td>
                             <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">
                                 {% if worker.median_dequeue_ms %}
                                     {{ worker.median_dequeue_ms }}ms
                                 {% else %}
-                                    <span class="text-zinc-400">—</span>
+                                    <span class="text-zinc-400">&mdash;</span>
                                 {% endif %}
                             </td>
                             <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">
                                 {% if worker.median_handling_ms %}
                                     {{ worker.median_handling_ms }}ms
                                 {% else %}
-                                    <span class="text-zinc-400">—</span>
+                                    <span class="text-zinc-400">&mdash;</span>
                                 {% endif %}
                             </td>
                             <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">

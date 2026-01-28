@@ -404,11 +404,13 @@ impl Database {
     ) -> DbResult<Vec<WorkerStatus>> {
         let workers = sqlx::query_as::<_, WorkerStatus>(
             r#"
-            SELECT pool_id, worker_id, throughput_per_min, total_completed, last_action_at, updated_at,
-                   median_dequeue_ms, median_handling_ms
+            SELECT pool_id, throughput_per_min, total_completed, last_action_at, updated_at,
+                   median_dequeue_ms, median_handling_ms, dispatch_queue_size, total_in_flight,
+                   active_workers, actions_per_sec, avg_instance_duration_secs,
+                   active_instance_count, time_series
             FROM worker_status
             WHERE updated_at >= $1
-            ORDER BY updated_at DESC, pool_id, worker_id
+            ORDER BY updated_at DESC, pool_id
             "#,
         )
         .bind(since)

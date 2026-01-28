@@ -131,7 +131,8 @@ By default we will only try explicit actions one time if there is an explicit ex
 
 ## Project Status
 
-_NOTE: Right now you shouldn't use rappel in any production applications. The spec is changing too quickly and we don't guarantee backwards compatibility before 1.0.0. But we would love if you try it out in your side project and see how you find it._
+> [!IMPORTANT]
+> Right now you shouldn't use rappel in any production applications. The spec is changing too quickly and we don't guarantee backwards compatibility before 1.0.0. But we would love if you try it out in your side project and see how you find it.
 
 Rappel is in an early alpha. Particular areas of focus include:
 
@@ -141,6 +142,47 @@ Rappel is in an early alpha. Particular areas of focus include:
 1. Unit and integration tests
 
 If you have a particular workflow that you think should be working but isn't yet producing the correct DAG (you can visualize it via CLI by `.visualize()`) please file an issue.
+
+## Testing
+
+### Rust tests (unit + integration)
+
+Integration tests are regular Rust tests in `tests/` and run against a real Postgres database. The test harness:
+- Loads `.env` (via `dotenvy`) for `RAPPEL_DATABASE_URL`
+- Runs DB migrations automatically on connect
+- Truncates integration tables before each test
+- Creates a temporary Python environment using `uv` and spawns `python/.venv/bin/rappel-worker`
+
+Commands:
+
+```bash
+# Everything (unit + integration)
+cargo test
+
+# Only integration tests
+cargo test --test integration_test
+cargo test --test schedule_test
+
+# Single integration test
+cargo test gather_listcomp_matches_in_memory --test integration_test
+```
+
+Prereqs:
+- Ensure Postgres is running and `RAPPEL_DATABASE_URL` is explicitly set to mirror `docker-compose.yml`
+- Ensure `uv` is installed (the tests call `uv sync` under the hood)
+
+Example (matches `docker-compose.yml` in this repo):
+
+```bash
+export RAPPEL_DATABASE_URL=postgresql://mountaineer:mountaineer@localhost:5433/mountaineer_daemons
+```
+
+### Python tests
+
+```bash
+cd python
+uv run pytest
+```
 
 ## Configuration
 
@@ -156,6 +198,8 @@ These are the primary environment parameters that you'll likely want to customiz
 | `RAPPEL_USER_MODULE` | Python module preloaded into each worker | none | `my_app.actions` |
 | `RAPPEL_POLL_INTERVAL_MS` | Poll interval for the dispatch loop (ms) | `100` | `50` |
 | `RAPPEL_MAX_ACTION_LIFECYCLE` | Max actions per worker before recycling (see below) | none (no limit) | `1000` |
+| `RAPPEL_INSTANCE_CLAIM_BATCH_SIZE` | Max workflow instances to claim per DB query | `50` | `25` |
+| `RAPPEL_MAX_CONCURRENT_INSTANCES` | Max workflow instances a runner can hold concurrently | `100` | `200` |
 | `RAPPEL_WEBAPP_ENABLED` | Enable the web dashboard | `false` | `true` |
 | `RAPPEL_WEBAPP_ADDR` | Web dashboard bind address | `0.0.0.0:24119` | `0.0.0.0:8080` |
 | `RAPPEL_WEBAPP_DB_MAX_CONNECTIONS` | Max DB connections for the webapp pool | `2` | `4` |

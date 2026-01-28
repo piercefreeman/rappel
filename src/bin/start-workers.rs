@@ -83,13 +83,14 @@ async fn main() -> Result<()> {
         worker_config = worker_config.with_user_module(module);
     }
 
-    // Create worker pool
+    // Create worker pool with concurrency limit
     let worker_pool = Arc::new(
-        PythonWorkerPool::new(
+        PythonWorkerPool::new_with_concurrency(
             worker_config,
             config.worker_count,
             Arc::clone(&worker_bridge),
             config.max_action_lifecycle,
+            config.concurrent_per_worker,
         )
         .await?,
     );
@@ -103,6 +104,11 @@ async fn main() -> Result<()> {
         claim_batch_size: config.batch_size as i32,
         completion_batch_size: config.completion_batch_size,
         idle_poll_interval: Duration::from_millis(config.poll_interval_ms),
+        schedule_check_interval: Duration::from_millis(config.schedule_check_interval_ms),
+        schedule_check_batch_size: config.schedule_check_batch_size,
+        gc_interval: config.gc.interval_ms.map(Duration::from_millis),
+        gc_retention_seconds: config.gc.retention_seconds,
+        gc_batch_size: config.gc.batch_size,
         ..Default::default()
     };
 

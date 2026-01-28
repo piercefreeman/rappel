@@ -307,6 +307,10 @@ pub struct HarnessConfig<'a> {
     pub user_module: &'static str,
     /// Input arguments for the workflow
     pub inputs: &'a [(&'static str, &'static str)],
+    /// Workflow class name for in-memory testing (e.g., "GatherListCompWorkflow")
+    pub workflow_class: Option<&'static str>,
+    /// Python kwargs string for workflow run (e.g., "items=[1, 2, 3]")
+    pub run_args: Option<&'static str>,
 }
 
 /// Integration test harness that manages the full runtime stack.
@@ -654,9 +658,14 @@ pub async fn run_in_env(
         .join("python")
         .canonicalize()?;
 
-    PY_ENV_READY
-        .get_or_try_init(|| async { run_shell(repo_python.as_path(), "uv sync", &[], None).await })
-        .await?;
+    let skip_uv_sync = env::var_os("RAPPEL_SKIP_UV_SYNC").is_some();
+    if !skip_uv_sync {
+        PY_ENV_READY
+            .get_or_try_init(|| async {
+                run_shell(repo_python.as_path(), "uv sync", &[], None).await
+            })
+            .await?;
+    }
 
     if !requirements.is_empty() {
         let extra_deps_toml = requirements
@@ -706,11 +715,11 @@ rappel = {{ path = "{}", editable = true }}
     // Run the entrypoint
     let run_command = if requirements.is_empty() {
         format!(
-            "uv run --project {} python {entrypoint}",
+            "uv run --no-sync --project {} python {entrypoint}",
             repo_python.display()
         )
     } else {
-        format!("uv run python {entrypoint}")
+        format!("uv run --no-sync python {entrypoint}")
     };
     run_shell(
         env_dir.path(),
@@ -721,6 +730,97 @@ rappel = {{ path = "{}", editable = true }}
     .await?;
 
     Ok(env_dir)
+}
+
+/// Run a Python script in a temporary environment with in-memory execution enabled.
+pub async fn run_in_memory_with_result(
+    files: &[(&str, &str)],
+    entrypoint: &str,
+    result_filename: &str,
+) -> Result<(TempDir, String)> {
+    let env_vars = vec![
+        ("PYTEST_CURRENT_TEST", "1".to_string()),
+        ("RAPPEL_BRIDGE_IN_MEMORY", "1".to_string()),
+    ];
+    let env_dir = run_in_env(files, &[], &env_vars, entrypoint).await?;
+    let result_path = env_dir.path().join(result_filename);
+    let result = fs::read_to_string(&result_path)
+        .with_context(|| format!("read in-memory result file {}", result_path.display()))?;
+    Ok((env_dir, result))
+}
+
+/// Generate an in-memory runner script for the given workflow.
+///
+/// # Arguments
+/// * `user_module` - The Python module containing the workflow (e.g., "integration_gather_listcomp")
+/// * `workflow_class` - The workflow class name (e.g., "GatherListCompWorkflow")
+/// * `run_args` - The Python kwargs string for wf.run() (e.g., "items=[1, 2, 3]")
+pub fn generate_in_memory_script(
+    user_module: &str,
+    workflow_class: &str,
+    run_args: Option<&str>,
+) -> String {
+    let args_str = run_args.unwrap_or("");
+    format!(
+        r#"import asyncio
+import json
+import os
+from dataclasses import asdict, is_dataclass
+
+from {user_module} import {workflow_class}
+
+def serialize_result(result):
+    """Serialize workflow result to JSON-compatible format."""
+    # Handle Pydantic BaseModel
+    if hasattr(result, "model_dump"):
+        return result.model_dump(mode="json")
+    # Handle dataclasses
+    if is_dataclass(result) and not isinstance(result, type):
+        return asdict(result)
+    # Already JSON-serializable
+    return result
+
+async def main():
+    os.environ["PYTEST_CURRENT_TEST"] = "1"
+    os.environ["RAPPEL_BRIDGE_IN_MEMORY"] = "1"
+    wf = {workflow_class}()
+    result = await wf.run({args_str})
+    with open("result.json", "w", encoding="utf-8") as f:
+        json.dump(serialize_result(result), f)
+
+asyncio.run(main())
+"#
+    )
+}
+
+/// Run workflow in-memory and return the JSON result.
+///
+/// # Arguments
+/// * `workflow_module_file` - The filename for the workflow module (e.g., "integration_gather_listcomp.py")
+/// * `workflow_module_content` - The content of the workflow module
+/// * `user_module` - The Python module name (e.g., "integration_gather_listcomp")
+/// * `workflow_class` - The workflow class name (e.g., "GatherListCompWorkflow")
+/// * `run_args` - The Python kwargs string for wf.run()
+pub async fn run_workflow_in_memory(
+    workflow_module_file: &str,
+    workflow_module_content: &str,
+    user_module: &str,
+    workflow_class: &str,
+    run_args: Option<&str>,
+) -> Result<serde_json::Value> {
+    let in_memory_script = generate_in_memory_script(user_module, workflow_class, run_args);
+    let (_env_dir, in_memory_result) = run_in_memory_with_result(
+        &[
+            (workflow_module_file, workflow_module_content),
+            ("run_in_memory.py", &in_memory_script),
+        ],
+        "run_in_memory.py",
+        "result.json",
+    )
+    .await?;
+    let in_memory_value: serde_json::Value = serde_json::from_str(&in_memory_result)
+        .with_context(|| format!("parse in-memory result JSON: {}", in_memory_result))?;
+    Ok(in_memory_value)
 }
 
 async fn run_shell(

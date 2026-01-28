@@ -2999,9 +2999,34 @@ class IRBuilder(ast.NodeVisitor):
         """Convert a gather argument to an IR Call.
 
         Handles both action calls and regular function calls.
+        Also handles self.run_action() wrapper pattern with retry/timeout policies.
         """
         if not isinstance(node, ast.Call):
             return None
+
+        # Check for self.run_action(...) wrapper pattern
+        if self._is_run_action_call(node):
+            if not node.args:
+                raise UnsupportedPatternError(
+                    "self.run_action() requires an action call as its first argument",
+                    "Use: self.run_action(action_name(...), retry=..., timeout=...)",
+                    line=getattr(node, "lineno", None),
+                    col=getattr(node, "col_offset", None),
+                )
+            inner_call = node.args[0]
+            if not isinstance(inner_call, ast.Call):
+                raise UnsupportedPatternError(
+                    "self.run_action() first argument must be an action call",
+                    "Use: self.run_action(action_name(...), retry=..., timeout=...)",
+                    line=getattr(node, "lineno", None),
+                    col=getattr(node, "col_offset", None),
+                )
+            action_call = self._extract_action_call_from_call(inner_call)
+            if action_call:
+                self._extract_policies_from_run_action(node, action_call)
+                call = ir.Call()
+                call.action.CopyFrom(action_call)
+                return call
 
         # Try to extract as an action call first
         action_call = self._extract_action_call_from_call(node)
@@ -3123,6 +3148,11 @@ class IRBuilder(ast.NodeVisitor):
 
     def _expr_to_ir_with_model_coercion(self, node: ast.expr) -> Optional[ir.Expr]:
         """Convert an AST expression to IR, converting model constructors to dicts."""
+        # First, try to resolve self.attr.subattr chains at build time
+        resolved = self._resolve_instance_attribute_chain(node)
+        if resolved is not None:
+            return resolved
+
         result = _expr_to_ir(
             node,
             model_converter=self._convert_model_constructor_if_needed,
@@ -3133,6 +3163,89 @@ class IRBuilder(ast.NodeVisitor):
         if result is not None:
             self._fill_default_kwargs_recursive(result)
         return result
+
+    def _resolve_instance_attribute_chain(self, node: ast.expr) -> Optional[ir.Expr]:
+        """Resolve self.attr.subattr chains at build time.
+
+        For expressions like self.config.max_retries where self.config is
+        defined in __init__, evaluate the chain at build time and return
+        the value as an IR literal.
+        """
+        chain = self._extract_self_attribute_chain(node)
+        if chain is None or len(chain) < 2:
+            return None
+
+        # chain[0] is the top-level attribute (e.g., "config")
+        # chain[1:] are nested attributes (e.g., ["max_retries"])
+        top_attr = chain[0]
+        if top_attr not in self._instance_attrs:
+            return None
+
+        # Get the AST expression for the top-level attribute
+        attr_ast = self._instance_attrs[top_attr]
+
+        # Try to resolve nested attributes
+        resolved_ast = self._resolve_nested_attributes(attr_ast, chain[1:])
+        if resolved_ast is None:
+            return None
+
+        # Convert the resolved AST to IR
+        return _expr_to_ir(
+            resolved_ast,
+            model_converter=self._convert_model_constructor_if_needed,
+            enum_resolver=self._resolve_enum_attribute,
+            exception_class_resolver=self._is_exception_class,
+        )
+
+    def _extract_self_attribute_chain(self, node: ast.expr) -> Optional[List[str]]:
+        """Extract attribute chain from self.a.b.c pattern.
+
+        Returns ["a", "b", "c"] for self.a.b.c, or None if not a self chain.
+        """
+        chain: List[str] = []
+        current = node
+
+        while isinstance(current, ast.Attribute):
+            chain.append(current.attr)
+            current = current.value
+
+        # Check if the base is "self"
+        if isinstance(current, ast.Name) and current.id == "self":
+            chain.reverse()
+            return chain
+
+        return None
+
+    def _resolve_nested_attributes(
+        self, ast_node: ast.expr, attrs: List[str]
+    ) -> Optional[ast.expr]:
+        """Resolve nested attributes on an AST expression.
+
+        For a Call like ClassName(a=1, b=2), resolving ["a"] returns the
+        AST node for 1.
+        """
+        if not attrs:
+            return ast_node
+
+        attr_name = attrs[0]
+        remaining = attrs[1:]
+
+        # Handle Call expressions (constructor calls)
+        if isinstance(ast_node, ast.Call):
+            # Look for keyword argument with matching name
+            for kw in ast_node.keywords:
+                if kw.arg == attr_name:
+                    return self._resolve_nested_attributes(kw.value, remaining)
+            return None
+
+        # Handle Dict expressions
+        if isinstance(ast_node, ast.Dict):
+            for key, value in zip(ast_node.keys, ast_node.values, strict=True):
+                if isinstance(key, ast.Constant) and key.value == attr_name:
+                    return self._resolve_nested_attributes(value, remaining)
+            return None
+
+        return None
 
     def _fill_default_kwargs_recursive(self, expr: ir.Expr) -> None:
         """Recursively fill in default kwargs for all function calls in an expression."""
@@ -3893,6 +4006,10 @@ def _cmp_op_to_ir(op: ast.cmpop) -> Optional[ir.BinaryOperator]:
         ast.GtE: ir.BinaryOperator.BINARY_OP_GE,
         ast.In: ir.BinaryOperator.BINARY_OP_IN,
         ast.NotIn: ir.BinaryOperator.BINARY_OP_NOT_IN,
+        # Identity comparisons are treated as equality in rappel since we deal
+        # with serialized values where object identity doesn't apply
+        ast.Is: ir.BinaryOperator.BINARY_OP_EQ,
+        ast.IsNot: ir.BinaryOperator.BINARY_OP_NE,
     }
     return mapping.get(type(op))
 

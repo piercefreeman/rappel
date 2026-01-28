@@ -17,6 +17,10 @@ use tracing::{debug, trace, warn};
 
 use crate::ast_evaluator::{ExpressionEvaluator, Scope};
 use crate::dag::{DAG, DAGEdge, EXCEPTION_SCOPE_VAR, EdgeType};
+
+/// Maximum number of loop iterations before terminating execution.
+/// This prevents infinite loops (e.g., `while True:`) from running forever.
+pub const MAX_LOOP_ITERATIONS: i32 = 50_000;
 use crate::dag_state::DAGHelper;
 use crate::messages::execution::{
     AttemptRecord, BackoffConfig, BackoffKind, ExceptionInfo, ExecutionGraph, ExecutionNode,
@@ -51,7 +55,10 @@ pub struct Completion {
     pub error: Option<String>,
     pub error_type: Option<String>,
     pub worker_id: String,
+    /// Total round-trip time from dispatch to result (for metrics)
     pub duration_ms: i64,
+    /// Actual time spent executing on the worker (for accurate started_at calculation)
+    pub worker_duration_ms: Option<i64>,
 }
 
 /// Wrapper around ExecutionGraph with high-level operations
@@ -184,22 +191,71 @@ impl ExecutionState {
         (max_retries, timeout_seconds, backoff)
     }
 
-    /// Mark a node as running (being executed by a worker)
+    /// Mark a node as running (dispatched to a worker).
+    ///
+    /// Note: `started_at_ms` is NOT set here - it will be set when the completion
+    /// arrives, computed from `completed_at_ms - worker_duration_ms`. This ensures
+    /// the recorded start time reflects when the worker actually started executing,
+    /// not when we dispatched the action.
     pub fn mark_running(&mut self, node_id: &str, worker_id: &str, inputs: Option<Vec<u8>>) {
+        self.mark_running_inner(node_id, worker_id, inputs, true);
+    }
+
+    /// Mark a node as running without removing it from the ready queue.
+    /// This allows callers to batch ready_queue removals for performance.
+    pub fn mark_running_no_queue_removal(
+        &mut self,
+        node_id: &str,
+        worker_id: &str,
+        inputs: Option<Vec<u8>>,
+    ) {
+        self.mark_running_inner(node_id, worker_id, inputs, false);
+    }
+
+    fn mark_running_inner(
+        &mut self,
+        node_id: &str,
+        worker_id: &str,
+        inputs: Option<Vec<u8>>,
+        remove_ready: bool,
+    ) {
         if let Some(node) = self.graph.nodes.get_mut(node_id) {
             node.status = NodeStatus::Running as i32;
             node.worker_id = Some(worker_id.to_string());
-            node.started_at_ms = Some(Utc::now().timestamp_millis());
+            // started_at_ms is set on completion with accurate worker timing
             node.inputs = inputs;
         }
 
-        // Remove from ready queue
-        self.graph.ready_queue.retain(|id| id != node_id);
+        if remove_ready {
+            self.graph.ready_queue.retain(|id| id != node_id);
+        }
     }
 
     /// Drain the ready queue, returning all node IDs that are ready to execute
     pub fn drain_ready_queue(&mut self) -> Vec<String> {
         std::mem::take(&mut self.graph.ready_queue)
+    }
+
+    /// Get a copy of the ready queue without draining it.
+    /// Used when we need to iterate but only remove specific items.
+    pub fn peek_ready_queue(&self) -> Vec<String> {
+        self.graph.ready_queue.clone()
+    }
+
+    /// Remove a specific node from the ready queue.
+    pub fn remove_from_ready_queue(&mut self, node_id: &str) {
+        self.graph.ready_queue.retain(|id| id != node_id);
+    }
+
+    /// Remove a batch of nodes from the ready queue in one pass.
+    pub fn remove_from_ready_queue_batch(&mut self, node_ids: &[String]) {
+        if node_ids.is_empty() {
+            return;
+        }
+        let remove_set: HashSet<&str> = node_ids.iter().map(String::as_str).collect();
+        self.graph
+            .ready_queue
+            .retain(|id| !remove_set.contains(id.as_str()));
     }
 
     /// Check if a node exists and get its status
@@ -267,6 +323,127 @@ impl ExecutionState {
         }
 
         scope
+    }
+
+    fn build_minimal_scope_for_node(
+        &self,
+        node_id: &str,
+        exec_node: Option<&ExecutionNode>,
+        loop_var: Option<&str>,
+        required_vars: &HashSet<String>,
+    ) -> Scope {
+        let mut scope = Scope::new();
+        if required_vars.is_empty() {
+            return scope;
+        }
+
+        let mut prefix = Self::scope_prefix(node_id);
+        if Self::is_bind_node(node_id) {
+            prefix = prefix.and_then(Self::parent_prefix);
+        }
+
+        let template_id = exec_node
+            .map(|node| node.template_id.as_str())
+            .unwrap_or(node_id);
+        let spread_index = exec_node.and_then(|node| node.spread_index);
+
+        for var_name in required_vars {
+            let mut value_bytes = None;
+
+            // IMPORTANT: For spread actions, the loop variable must be looked up from the
+            // spread-specific storage FIRST, before checking scoped variables. This handles
+            // the case where the same variable name was used in an earlier for loop - we
+            // don't want the stale value from that loop, we want the spread iteration value.
+            if loop_var == Some(var_name.as_str())
+                && let Some(index) = spread_index
+            {
+                let scoped_var = format!("{}[{}].{}", template_id, index, var_name);
+                value_bytes = self.graph.variables.get(&scoped_var);
+            }
+
+            // Then try scoped variables (from function scope, loops, etc.)
+            if value_bytes.is_none()
+                && let Some(prefix) = prefix
+            {
+                let scoped_key = Self::scoped_var_key(prefix, var_name);
+                value_bytes = self.graph.variables.get(&scoped_key);
+            }
+
+            // Finally try global variables
+            if value_bytes.is_none() {
+                value_bytes = self.graph.variables.get(var_name);
+            }
+
+            if let Some(bytes) = value_bytes
+                && let Some(value) = workflow_value_from_proto_bytes(bytes)
+            {
+                scope.insert(var_name.clone(), value);
+            }
+        }
+
+        scope
+    }
+
+    fn collect_expr_vars(expr: &ast::Expr, vars: &mut HashSet<String>) {
+        use ast::expr;
+
+        match &expr.kind {
+            Some(expr::Kind::Variable(v)) => {
+                vars.insert(v.name.clone());
+            }
+            Some(expr::Kind::BinaryOp(bin)) => {
+                if let Some(left) = bin.left.as_ref() {
+                    Self::collect_expr_vars(left, vars);
+                }
+                if let Some(right) = bin.right.as_ref() {
+                    Self::collect_expr_vars(right, vars);
+                }
+            }
+            Some(expr::Kind::UnaryOp(unary)) => {
+                if let Some(op) = unary.operand.as_ref() {
+                    Self::collect_expr_vars(op, vars);
+                }
+            }
+            Some(expr::Kind::List(list)) => {
+                for elem in &list.elements {
+                    Self::collect_expr_vars(elem, vars);
+                }
+            }
+            Some(expr::Kind::Dict(dict)) => {
+                for entry in &dict.entries {
+                    if let Some(key) = entry.key.as_ref() {
+                        Self::collect_expr_vars(key, vars);
+                    }
+                    if let Some(value) = entry.value.as_ref() {
+                        Self::collect_expr_vars(value, vars);
+                    }
+                }
+            }
+            Some(expr::Kind::Index(index)) => {
+                if let Some(obj) = index.object.as_ref() {
+                    Self::collect_expr_vars(obj, vars);
+                }
+                if let Some(idx) = index.index.as_ref() {
+                    Self::collect_expr_vars(idx, vars);
+                }
+            }
+            Some(expr::Kind::Dot(dot)) => {
+                if let Some(obj) = dot.object.as_ref() {
+                    Self::collect_expr_vars(obj, vars);
+                }
+            }
+            Some(expr::Kind::FunctionCall(call)) => {
+                for arg in &call.args {
+                    Self::collect_expr_vars(arg, vars);
+                }
+                for kw in &call.kwargs {
+                    if let Some(value) = kw.value.as_ref() {
+                        Self::collect_expr_vars(value, vars);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     pub fn store_variable_for_node(
@@ -363,10 +540,27 @@ impl ExecutionState {
     }
 
     fn build_error_payload(message: &str) -> Vec<u8> {
+        let mut values = HashMap::new();
+        values.insert(
+            "args".to_string(),
+            WorkflowValue::Tuple(vec![WorkflowValue::String(message.to_string())]),
+        );
+        let error = WorkflowValue::Exception {
+            exc_type: "RuntimeError".to_string(),
+            module: "builtins".to_string(),
+            message: message.to_string(),
+            traceback: String::new(),
+            values,
+            type_hierarchy: vec![
+                "RuntimeError".to_string(),
+                "Exception".to_string(),
+                "BaseException".to_string(),
+            ],
+        };
         let args = WorkflowArguments {
             arguments: vec![crate::messages::proto::WorkflowArgument {
                 key: "error".to_string(),
-                value: Some(WorkflowValue::String(message.to_string()).to_proto()),
+                value: Some(error.to_proto()),
             }],
         };
         encode_message(&args)
@@ -452,22 +646,30 @@ impl ExecutionState {
         dag: &DAG,
     ) -> (Vec<&'a DAGEdge>, Vec<String>) {
         // Log all incoming edges for debugging
-        debug!(
+        trace!(
             edge_count = edges.len(),
-            scope_vars = ?scope.keys().collect::<Vec<_>>(),
+            scope_vars_len = scope.len(),
             "filter_edges_by_guards called"
         );
-        for edge in edges {
-            debug!(
-                source = %edge.source,
-                target = %edge.target,
-                has_guard_expr = edge.guard_expr.is_some(),
-                is_else = edge.is_else,
-                is_loop_back = edge.is_loop_back,
-                guard_string = ?edge.guard_string,
-                edge_type = ?edge.edge_type,
-                "Processing edge in filter_edges_by_guards"
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let scope_vars = scope.keys().collect::<Vec<_>>();
+            tracing::trace!(
+                edge_count = edges.len(),
+                scope_vars = ?scope_vars,
+                "filter_edges_by_guards called"
             );
+            for edge in edges {
+                tracing::trace!(
+                    source = %edge.source,
+                    target = %edge.target,
+                    has_guard_expr = edge.guard_expr.is_some(),
+                    is_else = edge.is_else,
+                    is_loop_back = edge.is_loop_back,
+                    guard_string = ?edge.guard_string,
+                    edge_type = ?edge.edge_type,
+                    "Processing edge in filter_edges_by_guards"
+                );
+            }
         }
 
         // Separate edges by type
@@ -561,19 +763,23 @@ impl ExecutionState {
 
         // Build kwargs from the DAG node's kwarg expressions when available.
         let mut kwargs = WorkflowArguments { arguments: vec![] };
-        let mut scope = self.build_scope_for_node(node_id);
-
-        // For spread iterations, inject the loop variable into scope.
-        if let (Some(exec_node), Some(loop_var)) = (exec_node, dag_node.spread_loop_var.as_deref())
-            && let Some(index) = exec_node.spread_index
-        {
-            let var_name = format!("{}[{}].{}", template_id, index, loop_var);
-            if let Some(value_bytes) = self.graph.variables.get(&var_name)
-                && let Some(value) = workflow_value_from_proto_bytes(value_bytes)
-            {
-                scope.insert(loop_var.to_string(), value);
+        let mut required_vars = HashSet::new();
+        if let Some(kwarg_exprs) = &dag_node.kwarg_exprs {
+            for expr in kwarg_exprs.values() {
+                Self::collect_expr_vars(expr, &mut required_vars);
+            }
+        } else if let Some(kwarg_map) = &dag_node.kwargs {
+            for var_ref in kwarg_map.values() {
+                required_vars.insert(var_ref.trim_start_matches('$').to_string());
             }
         }
+
+        let scope = self.build_minimal_scope_for_node(
+            node_id,
+            exec_node,
+            dag_node.spread_loop_var.as_deref(),
+            &required_vars,
+        );
 
         if let Some(kwarg_exprs) = &dag_node.kwarg_exprs {
             for (key, expr) in kwarg_exprs {
@@ -621,12 +827,18 @@ impl ExecutionState {
         dag: &DAG,
     ) -> BatchCompletionResult {
         // Log entry for debugging
-        let completion_ids: Vec<_> = completions.iter().map(|c| c.node_id.as_str()).collect();
-        warn!(
+        debug!(
             completion_count = completions.len(),
-            node_ids = ?completion_ids,
             "apply_completions_batch called"
         );
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let completion_ids: Vec<_> = completions.iter().map(|c| c.node_id.as_str()).collect();
+            tracing::trace!(
+                completion_count = completions.len(),
+                node_ids = ?completion_ids,
+                "apply_completions_batch called"
+            );
+        }
 
         let mut result = BatchCompletionResult::default();
         let helper = DAGHelper::new(dag);
@@ -661,7 +873,19 @@ impl ExecutionState {
                 .unwrap_or_default();
 
             if let Some(node) = self.graph.nodes.get_mut(&completion.node_id) {
-                let started_at = node.started_at_ms.unwrap_or(now_ms);
+                // Compute started_at from worker_duration if available (most accurate),
+                // otherwise fall back to previously set value or current time
+                let started_at = completion
+                    .worker_duration_ms
+                    .map(|wd| now_ms - wd)
+                    .or(node.started_at_ms)
+                    .unwrap_or(now_ms);
+
+                // Set started_at_ms now that we have accurate timing
+                if node.started_at_ms.is_none() {
+                    node.started_at_ms = Some(started_at);
+                }
+
                 let attempt = AttemptRecord {
                     attempt_number: node.attempt_number,
                     worker_id: completion.worker_id.clone(),
@@ -694,13 +918,51 @@ impl ExecutionState {
                                 if arg.key == "result" {
                                     if let Some(value) = &arg.value {
                                         let workflow_value = WorkflowValue::from_proto(value);
-                                        for target in &node.targets.clone() {
-                                            self.store_variable_for_node(
-                                                &completion.node_id,
-                                                &node_type,
-                                                target,
-                                                &workflow_value,
-                                            );
+                                        let targets = node.targets.clone();
+
+                                        // Unpack tuples/lists when there are multiple targets
+                                        if targets.len() > 1 {
+                                            match &workflow_value {
+                                                WorkflowValue::Tuple(items)
+                                                | WorkflowValue::List(items) => {
+                                                    for (target, item) in
+                                                        targets.iter().zip(items.iter())
+                                                    {
+                                                        self.store_variable_for_node(
+                                                            &completion.node_id,
+                                                            &node_type,
+                                                            target,
+                                                            item,
+                                                        );
+                                                    }
+                                                }
+                                                _ => {
+                                                    // Non-iterable value with multiple targets - store as-is
+                                                    warn!(
+                                                        node_id = %completion.node_id,
+                                                        targets = ?targets,
+                                                        "Value is not iterable for tuple unpacking"
+                                                    );
+                                                    for target in &targets {
+                                                        self.store_variable_for_node(
+                                                            &completion.node_id,
+                                                            &node_type,
+                                                            target,
+                                                            &workflow_value,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            // Single target - store entire value
+                                            for target in &targets {
+                                                self.store_variable_for_node(
+                                                    &completion.node_id,
+                                                    &node_type,
+                                                    target,
+                                                    &workflow_value,
+                                                );
+                                            }
                                         }
                                     }
                                     break;
@@ -791,10 +1053,17 @@ impl ExecutionState {
                                 .map(|edge| edge.exception_depth.unwrap_or(0))
                                 .max()
                                 .unwrap_or(0);
-                            matching_exception_edges
+                            let edges_at_max_depth: Vec<_> = matching_exception_edges
                                 .into_iter()
                                 .filter(|edge| edge.exception_depth.unwrap_or(0) == max_depth)
-                                .collect::<Vec<_>>()
+                                .collect();
+                            // Select only the first matching handler - Python semantics require
+                            // that only the first matching except handler executes
+                            if let Some(first) = edges_at_max_depth.into_iter().next() {
+                                vec![first]
+                            } else {
+                                vec![]
+                            }
                         } else {
                             matching_exception_edges
                         };
@@ -851,14 +1120,29 @@ impl ExecutionState {
                 continue;
             };
 
-            debug!(
+            trace!(
                 source_node = %completion.node_id,
                 outgoing_edge_count = outgoing_edges.len(),
                 "Found outgoing edges for completed node"
             );
 
             // Evaluate guards to determine which edges are enabled
-            let scope = self.build_scope_for_node(&completion.node_id);
+            let mut guard_vars = HashSet::new();
+            for edge in &outgoing_edges {
+                if let Some(expr) = edge.guard_expr.as_ref() {
+                    Self::collect_expr_vars(expr, &mut guard_vars);
+                }
+            }
+            let exec_node = self.graph.nodes.get(&completion.node_id);
+            let loop_var = exec_node
+                .and_then(|node| dag.nodes.get(&node.template_id))
+                .and_then(|node| node.spread_loop_var.as_deref());
+            let scope = self.build_minimal_scope_for_node(
+                &completion.node_id,
+                exec_node,
+                loop_var,
+                &guard_vars,
+            );
             let (enabled_edges, guard_errors) =
                 self.filter_edges_by_guards(&outgoing_edges, &scope, dag);
             if !guard_errors.is_empty() {
@@ -872,12 +1156,18 @@ impl ExecutionState {
                 return result;
             }
 
-            debug!(
-                source_node = %completion.node_id,
-                enabled_edge_count = enabled_edges.len(),
-                enabled_targets = ?enabled_edges.iter().map(|e| e.target.as_str()).collect::<Vec<_>>(),
-                "Filtered enabled edges"
-            );
+            if tracing::enabled!(tracing::Level::TRACE) {
+                let enabled_targets = enabled_edges
+                    .iter()
+                    .map(|e| e.target.as_str())
+                    .collect::<Vec<_>>();
+                tracing::trace!(
+                    source_node = %completion.node_id,
+                    enabled_edge_count = enabled_edges.len(),
+                    enabled_targets = ?enabled_targets,
+                    "Filtered enabled edges"
+                );
+            }
 
             for edge in enabled_edges {
                 let successor_id = &edge.target;
@@ -889,12 +1179,32 @@ impl ExecutionState {
                     if let Some(successor) = self.graph.nodes.get_mut(successor_id) {
                         // Increment loop_index for tracking
                         let current_idx = successor.loop_index.unwrap_or(0);
-                        successor.loop_index = Some(current_idx + 1);
+                        let new_idx = current_idx + 1;
+                        successor.loop_index = Some(new_idx);
                         trace!(
                             node_id = %successor_id,
-                            loop_index = current_idx + 1,
+                            loop_index = new_idx,
                             "Reset node for loop iteration"
                         );
+
+                        // Check for infinite loop
+                        if new_idx > MAX_LOOP_ITERATIONS {
+                            let message = format!(
+                                "Loop exceeded maximum iterations ({}) at node '{}'. \
+                                 This may indicate an infinite loop (e.g., `while True:`).",
+                                MAX_LOOP_ITERATIONS, successor_id
+                            );
+                            warn!(
+                                node_id = %successor_id,
+                                iterations = new_idx,
+                                max = MAX_LOOP_ITERATIONS,
+                                "Loop exceeded max iterations, terminating workflow"
+                            );
+                            result.workflow_failed = true;
+                            result.error_message = Some(message.clone());
+                            result.result_payload = Some(Self::build_error_payload(&message));
+                            return result;
+                        }
                     }
                 }
 
@@ -909,17 +1219,33 @@ impl ExecutionState {
                 // Check current status
                 let status =
                     NodeStatus::try_from(successor.status).unwrap_or(NodeStatus::Unspecified);
-                debug!(
+                trace!(
                     successor_id = %successor_id,
                     status = ?status,
                     "Checking successor status"
                 );
                 if status != NodeStatus::Blocked {
-                    debug!(
+                    trace!(
                         successor_id = %successor_id,
                         status = ?status,
                         "Skipping successor - not blocked"
                     );
+                    continue;
+                }
+
+                // Exception handler: if the edge has exception_types, the handler is ready
+                // immediately because the exception has already occurred and been matched.
+                // We don't need to wait for other potential exception sources.
+                if edge.exception_types.is_some() {
+                    trace!(
+                        successor_id = %successor_id,
+                        exception_types = ?edge.exception_types,
+                        "Exception handler ready via exception edge"
+                    );
+                    if !ready_successors.iter().any(|(id, _)| id == successor_id) {
+                        ready_successors.push((successor_id.clone(), None));
+                        trace!(successor_id = %successor_id, "Added exception handler to ready_successors");
+                    }
                     continue;
                 }
 
@@ -966,7 +1292,7 @@ impl ExecutionState {
                         .copied()
                         .collect();
 
-                    debug!(
+                    trace!(
                         successor_id = %successor_id,
                         template_id = %template_id,
                         incoming_edge_count = incoming.len(),
@@ -987,7 +1313,7 @@ impl ExecutionState {
                     for inc_edge in incoming {
                         // Skip loop-back edges when checking readiness (they don't block forward progress)
                         if inc_edge.is_loop_back {
-                            debug!(
+                            trace!(
                                 successor_id = %successor_id,
                                 edge_source = %inc_edge.source,
                                 "Skipping loop-back edge"
@@ -1003,7 +1329,7 @@ impl ExecutionState {
                             .get(&inc_edge.source)
                             .map(|n| is_completed(n.status))
                             .unwrap_or(false);
-                        debug!(
+                        trace!(
                             successor_id = %successor_id,
                             edge_source = %inc_edge.source,
                             source_completed = source_status,
@@ -1024,7 +1350,7 @@ impl ExecutionState {
                         completed_count == total_non_loopback
                     };
 
-                    debug!(
+                    trace!(
                         successor_id = %successor_id,
                         completed = completed_count,
                         total = total_non_loopback,
@@ -1035,10 +1361,7 @@ impl ExecutionState {
 
                     if is_ready && !ready_successors.iter().any(|(id, _)| id == successor_id) {
                         ready_successors.push((successor_id.clone(), None));
-                        debug!(
-                            successor_id = %successor_id,
-                            "Added successor to ready_successors"
-                        );
+                        trace!(successor_id = %successor_id, "Added successor to ready_successors");
                     }
                 }
             }
@@ -1586,6 +1909,49 @@ mod tests {
     }
 
     #[test]
+    fn test_build_error_payload_serializes_exception() {
+        let payload = ExecutionState::build_error_payload("boom");
+        let args: WorkflowArguments = decode_message(&payload).expect("decode payload");
+        let entry = args
+            .arguments
+            .iter()
+            .find(|arg| arg.key == "error")
+            .expect("error entry");
+        let value = entry.value.as_ref().expect("error value");
+        let value = WorkflowValue::from_proto(value);
+
+        match value {
+            WorkflowValue::Exception {
+                exc_type,
+                module,
+                message,
+                values,
+                type_hierarchy,
+                ..
+            } => {
+                assert_eq!(exc_type, "RuntimeError");
+                assert_eq!(module, "builtins");
+                assert_eq!(message, "boom");
+                assert_eq!(
+                    type_hierarchy,
+                    vec![
+                        "RuntimeError".to_string(),
+                        "Exception".to_string(),
+                        "BaseException".to_string(),
+                    ]
+                );
+                match values.get("args") {
+                    Some(WorkflowValue::Tuple(items)) => {
+                        assert_eq!(items, &vec![WorkflowValue::String("boom".to_string())]);
+                    }
+                    other => panic!("expected args tuple, got {other:?}"),
+                }
+            }
+            other => panic!("expected exception payload, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_attempt_record_storage() {
         let mut state = ExecutionState::new();
         state.graph.nodes.insert(
@@ -1718,5 +2084,85 @@ mod tests {
         assert_eq!(backoff.kind, BackoffKind::Exponential as i32);
         assert_eq!(backoff.base_delay_ms, 1000);
         assert_eq!(backoff.multiplier, 2.0);
+    }
+
+    /// Test crash recovery with partial dispatch.
+    ///
+    /// Simulates: 10 nodes ready, dispatch 2, crash, recover.
+    /// All 10 nodes should be recoverable because:
+    /// - We peek (not drain) the ready_queue
+    /// - mark_running removes dispatched nodes from ready_queue
+    /// - Undispatched nodes remain in ready_queue
+    /// - Running nodes are recovered to Pending on crash recovery
+    #[test]
+    fn test_crash_recovery_partial_dispatch() {
+        let mut state = ExecutionState::new();
+
+        // Create 10 pending nodes and add them to ready_queue
+        for i in 0..10 {
+            let node_id = format!("action_{}", i);
+            state.graph.nodes.insert(
+                node_id.clone(),
+                ExecutionNode {
+                    template_id: node_id.clone(),
+                    status: NodeStatus::Pending as i32,
+                    max_retries: 3,
+                    ..Default::default()
+                },
+            );
+            state.graph.ready_queue.push(node_id);
+        }
+
+        assert_eq!(state.graph.ready_queue.len(), 10);
+
+        // CORRECT PATTERN: Peek, don't drain
+        let ready_nodes = state.peek_ready_queue();
+        assert_eq!(ready_nodes.len(), 10);
+        // ready_queue is STILL intact
+        assert_eq!(state.graph.ready_queue.len(), 10);
+
+        // Dispatch only 2 nodes - mark_running removes them from ready_queue
+        state.mark_running("action_0", "worker-0", None);
+        state.mark_running("action_1", "worker-1", None);
+
+        // Now ready_queue has 8 (the 2 dispatched were removed by mark_running)
+        assert_eq!(state.graph.ready_queue.len(), 8);
+
+        // Sync to DB
+        let bytes = state.to_bytes();
+
+        // CRASH and recover
+        let mut recovered = ExecutionState::from_bytes(&bytes).unwrap();
+
+        // Before recovery: 8 in ready_queue, 2 Running
+        assert_eq!(recovered.graph.ready_queue.len(), 8);
+
+        // Run recovery - resets Running nodes to Pending
+        recovered.recover_running_nodes();
+
+        // After recovery: ALL 10 should be in ready_queue
+        // - 8 that were never dispatched (still in ready_queue)
+        // - 2 that were Running -> recovered to Pending -> added to ready_queue
+        assert_eq!(
+            recovered.graph.ready_queue.len(),
+            10,
+            "All nodes should be recoverable"
+        );
+
+        // No orphaned Pending nodes
+        let pending_not_in_queue: Vec<_> = recovered
+            .graph
+            .nodes
+            .iter()
+            .filter(|(node_id, node)| {
+                node.status == NodeStatus::Pending as i32
+                    && !recovered.graph.ready_queue.contains(*node_id)
+            })
+            .collect();
+
+        assert!(
+            pending_not_in_queue.is_empty(),
+            "No Pending nodes should be orphaned"
+        );
     }
 }

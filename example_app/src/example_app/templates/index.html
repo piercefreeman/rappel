@@ -408,6 +408,7 @@
         <label for="batch-workflow">Workflow:</label>
         <select id="batch-workflow" name="workflow_name">
           <option value="ParallelMathWorkflow">ParallelMathWorkflow</option>
+          <option value="ManyActionsWorkflow">ManyActionsWorkflow</option>
           <option value="NoOpWorkflow">NoOpWorkflow</option>
         </select>
         <label for="batch-count">Count:</label>
@@ -464,6 +465,27 @@
         <button type="button" id="delete-btn" class="danger">Delete</button>
       </form>
       <div class="status" id="schedule-action-status"></div>
+    </section>
+
+    <!-- Many Actions -->
+    <section class="workflow-section">
+      <h3>18. Many Actions (Stress Test)</h3>
+      <p>
+        Execute a configurable number of actions to stress test the system.
+        Can run in parallel (asyncio.gather) or sequentially.
+      </p>
+      <form id="many-actions-form">
+        <label for="many-actions-count">Action Count:</label>
+        <input type="number" id="many-actions-count" name="action_count" min="1" value="50" style="width: 6rem;" />
+        <label for="many-actions-parallel">
+          <input type="checkbox" id="many-actions-parallel" name="parallel" checked />
+          Parallel
+        </label>
+        <button type="submit">Run Many Actions</button>
+      </form>
+      <div class="hint">Try 50-100 for quick tests, 500+ for stress testing</div>
+      <div class="status" id="many-actions-status"></div>
+      <div class="result" id="many-actions-result" hidden></div>
     </section>
 
     <!-- Admin Section -->
@@ -699,6 +721,31 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
+      // 18. Many Actions
+      runWorkflow(
+        "many-actions-form",
+        "/api/many-actions",
+        (form) => {
+          const action_count = Number(form.querySelector("#many-actions-count").value);
+          const parallel = form.querySelector("#many-actions-parallel").checked;
+          return Number.isFinite(action_count) && action_count >= 1
+            ? { action_count, parallel }
+            : null;
+        },
+        (data) => {
+          // Truncate results array if too large for display
+          const display = { ...data };
+          if (display.results && display.results.length > 20) {
+            display.results = [
+              ...display.results.slice(0, 10),
+              `... ${display.results.length - 20} more ...`,
+              ...display.results.slice(-10),
+            ];
+          }
+          return JSON.stringify(display, null, 2);
+        }
+      );
+
       // 16. Batch workflow runs
       const batchForm = document.getElementById("batch-form");
       const batchStatus = document.getElementById("batch-status");
@@ -709,6 +756,10 @@
       const batchButton = batchForm.querySelector("button");
       const batchDefaults = {
         ParallelMathWorkflow: { hint: 'Inputs JSON: {"number": 7}', inputs: '{"number": 7}' },
+        ManyActionsWorkflow: {
+          hint: 'Inputs JSON: {"action_count": 50, "parallel": true}',
+          inputs: '{"action_count": 50, "parallel": true}'
+        },
         NoOpWorkflow: {
           hint: 'Inputs JSON: {"indices": [0, 1, 2, 3, 4], "complexity": 0}',
           inputs: '{"indices": [0, 1, 2, 3, 4], "complexity": 0}'

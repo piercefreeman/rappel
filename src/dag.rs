@@ -1214,7 +1214,10 @@ impl DAGConverter {
             .cloned()
             .collect();
 
-        tracing::debug!(?order, "add_global_data_flow_edges order");
+        tracing::debug!(order_len = order.len(), "add_global_data_flow_edges order");
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(?order, "add_global_data_flow_edges order");
+        }
 
         // Collect variable modifications (definitions) across all nodes.
         // Skip join nodes - they mark variable availability at a join point but don't
@@ -1447,13 +1450,15 @@ impl DAGConverter {
                             // Still allow edge to the next modification if it uses the var.
                             if let Some(node) = dag.nodes.get(node_id) {
                                 let uses = uses_var(node, &var_name);
-                                tracing::debug!(
-                                    node_id = %node_id,
-                                    var_name = %var_name,
-                                    has_assign_expr = node.assign_expr.is_some(),
-                                    uses = uses,
-                                    "checking next modifier uses var"
-                                );
+                                if tracing::enabled!(tracing::Level::TRACE) {
+                                    tracing::trace!(
+                                        node_id = %node_id,
+                                        var_name = %var_name,
+                                        has_assign_expr = node.assign_expr.is_some(),
+                                        uses = uses,
+                                        "checking next modifier uses var"
+                                    );
+                                }
                                 if uses {
                                     let key =
                                         (mod_node.clone(), node_id.clone(), Some(var_name.clone()));
@@ -2057,9 +2062,11 @@ impl DAGConverter {
         // Set targets for unpacking (store all targets)
         if !targets.is_empty() {
             node = node.with_targets(targets);
-            tracing::debug!(node_id = %node_id, targets = ?targets, "setting action targets");
-        } else {
-            tracing::debug!(node_id = %node_id, "no targets for action");
+            if tracing::enabled!(tracing::Level::TRACE) {
+                tracing::trace!(node_id = %node_id, targets = ?targets, "setting action targets");
+            }
+        } else if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(node_id = %node_id, "no targets for action");
         }
 
         if let Some(ref fn_name) = self.current_function {
@@ -3187,11 +3194,20 @@ impl DAGConverter {
                 };
                 tracing::debug!(
                     handler_entry = ?graph.entry,
-                    handler_exits = ?graph.exits,
-                    handler_nodes = ?graph.nodes,
+                    handler_exits_len = graph.exits.len(),
+                    handler_nodes_len = graph.nodes.len(),
                     handler_is_noop = graph.is_noop,
                     "handler graph before prepend_exception_binding"
                 );
+                if tracing::enabled!(tracing::Level::TRACE) {
+                    tracing::trace!(
+                        handler_entry = ?graph.entry,
+                        handler_exits = ?graph.exits,
+                        handler_nodes = ?graph.nodes,
+                        handler_is_noop = graph.is_noop,
+                        "handler graph before prepend_exception_binding"
+                    );
+                }
                 if let Some(exception_var) =
                     handler.exception_var.as_ref().filter(|var| !var.is_empty())
                 {
@@ -3199,10 +3215,18 @@ impl DAGConverter {
                 }
                 tracing::debug!(
                     handler_entry = ?graph.entry,
-                    handler_exits = ?graph.exits,
-                    handler_nodes = ?graph.nodes,
+                    handler_exits_len = graph.exits.len(),
+                    handler_nodes_len = graph.nodes.len(),
                     "handler graph after prepend_exception_binding"
                 );
+                if tracing::enabled!(tracing::Level::TRACE) {
+                    tracing::trace!(
+                        handler_entry = ?graph.entry,
+                        handler_exits = ?graph.exits,
+                        handler_nodes = ?graph.nodes,
+                        "handler graph after prepend_exception_binding"
+                    );
+                }
                 nodes.extend(graph.nodes.clone());
                 handler_graphs.push((handler.exception_types.clone(), graph));
             }
@@ -3590,11 +3614,20 @@ impl DAGConverter {
 
         tracing::debug!(
             function_name = %function_name,
-            fn_node_ids = ?fn_node_ids,
-            order = ?order,
-            var_modifications = ?self.var_modifications.keys().collect::<Vec<_>>(),
+            fn_node_count = fn_node_ids.len(),
+            order_len = order.len(),
+            var_modifications_len = self.var_modifications.len(),
             "add_data_flow_from_definitions"
         );
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let var_modifications = self.var_modifications.keys().collect::<Vec<_>>();
+            tracing::trace!(
+                fn_node_ids = ?fn_node_ids,
+                order = ?order,
+                var_modifications = ?var_modifications,
+                "add_data_flow_from_definitions"
+            );
+        }
 
         let mut edges_to_add = Vec::new();
 
@@ -3602,9 +3635,16 @@ impl DAGConverter {
         for (var_name, modifications) in &self.var_modifications {
             tracing::debug!(
                 var_name = %var_name,
-                modifications = ?modifications,
+                modifications_len = modifications.len(),
                 "processing variable modifications"
             );
+            if tracing::enabled!(tracing::Level::TRACE) {
+                tracing::trace!(
+                    var_name = %var_name,
+                    modifications = ?modifications,
+                    "processing variable modifications"
+                );
+            }
             for (i, mod_node) in modifications.iter().enumerate() {
                 if !fn_node_ids.contains(mod_node) {
                     continue;
@@ -3652,9 +3692,12 @@ impl DAGConverter {
         }
 
         tracing::debug!(
-            edges_to_add = ?edges_to_add,
+            edges_to_add_len = edges_to_add.len(),
             "data flow edges being created"
         );
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(edges_to_add = ?edges_to_add, "data flow edges being created");
+        }
         for (var_name, source, target) in edges_to_add {
             // Check if this is a loop-back edge:
             // - Any data flow edge from loop_incr to nodes inside the loop body should be loop-back
@@ -3673,12 +3716,14 @@ impl DAGConverter {
     fn node_uses_variable(&self, node: &DAGNode, var_name: &str) -> bool {
         // Check kwargs for variable references
         if let Some(ref kwargs) = node.kwargs {
-            tracing::debug!(
-                node_id = %node.id,
-                var_name = %var_name,
-                kwargs = ?kwargs,
-                "checking if node uses variable in kwargs"
-            );
+            if tracing::enabled!(tracing::Level::TRACE) {
+                tracing::trace!(
+                    node_id = %node.id,
+                    var_name = %var_name,
+                    kwargs = ?kwargs,
+                    "checking if node uses variable in kwargs"
+                );
+            }
             for value in kwargs.values() {
                 // Check for $var_name pattern
                 if value == &format!("${}", var_name) {
@@ -9316,5 +9361,114 @@ fn main(input: [value], output: [final]):
              mutually exclusive paths, which will cause a stall.",
             readiness_predecessors.len()
         );
+    }
+
+    #[test]
+    fn test_try_except_multi_action_with_return_has_exception_edges() {
+        // Test that exception edges are created for all try body nodes when
+        // the try block has multiple actions and a return statement inside.
+        //
+        // This tests a bug where:
+        // 1. Try block has: action1, action2, return
+        // 2. action1 fails after retry exhaustion
+        // 3. Exception should route to except handler
+        // 4. Bug: exception edge from action1 to handler is missing
+        let source = r#"fn main(input: [user_id], output: [result]):
+    try:
+        metadata = @failing_action(user_id=user_id)
+        result = @process_result(data=metadata)
+        return result
+    except ValueError:
+        return "caught_error""#;
+
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program).unwrap();
+
+        // Print all nodes for debugging
+        println!("Nodes:");
+        for (id, node) in dag.nodes.iter() {
+            println!(
+                "  {} (type={}, fn={})",
+                id,
+                node.node_type,
+                node.function_name.as_deref().unwrap_or("None")
+            );
+        }
+
+        // Print all edges for debugging
+        println!("\nAll edges:");
+        for edge in &dag.edges {
+            println!(
+                "  {} -> {} (type={:?}, exception_types={:?}, condition={:?})",
+                edge.source, edge.target, edge.edge_type, edge.exception_types, edge.condition
+            );
+        }
+
+        // Find the first action node (failing_action in the original workflow)
+        let failing_action_node = dag
+            .nodes
+            .values()
+            .find(|n| n.node_type == "action_call" && n.id == "action_2")
+            .expect("should have action_2 node");
+
+        println!("\nFirst action node: {}", failing_action_node.id);
+
+        // Find all exception edges from the failing_action node
+        let exception_edges_from_failing: Vec<_> = dag
+            .edges
+            .iter()
+            .filter(|e| e.source == failing_action_node.id && e.exception_types.is_some())
+            .collect();
+
+        println!("Exception edges from failing_action:");
+        for edge in &exception_edges_from_failing {
+            println!(
+                "  -> {} (exception_types={:?})",
+                edge.target, edge.exception_types
+            );
+        }
+
+        // There SHOULD be an exception edge from failing_action to the handler
+        assert!(
+            !exception_edges_from_failing.is_empty(),
+            "failing_action should have at least one exception edge to the handler. \
+             Found {} exception edges from failing_action.",
+            exception_edges_from_failing.len()
+        );
+
+        // Verify the exception edge points to the ValueError handler
+        let has_valueerror_handler_edge = exception_edges_from_failing.iter().any(|e| {
+            e.exception_types
+                .as_ref()
+                .map(|t| t.contains(&"ValueError".to_string()))
+                .unwrap_or(false)
+        });
+        assert!(
+            has_valueerror_handler_edge,
+            "failing_action should have exception edge to ValueError handler"
+        );
+
+        // Also verify all try body nodes have exception edges
+        let try_body_nodes: Vec<_> = dag
+            .nodes
+            .values()
+            .filter(|n| {
+                n.function_name.as_deref() == Some("__try_body_1__")
+                    || n.function_name.as_deref() == Some("main")
+            })
+            .filter(|n| n.node_type == "action_call")
+            .collect();
+
+        for node in try_body_nodes {
+            let has_exception_edge = dag
+                .edges
+                .iter()
+                .any(|e| e.source == node.id && e.exception_types.is_some());
+            assert!(
+                has_exception_edge,
+                "try body action node {} should have an exception edge",
+                node.id
+            );
+        }
     }
 }

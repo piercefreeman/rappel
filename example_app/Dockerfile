@@ -19,8 +19,18 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
 
 WORKDIR /repo
-COPY . /repo
-RUN uv run scripts/build_wheel.py --out-dir target/wheels
+COPY Cargo.toml Cargo.lock build.rs README.md /repo/
+COPY src /repo/src
+COPY proto /repo/proto
+COPY python /repo/python
+COPY scripts /repo/scripts
+COPY templates /repo/templates
+COPY migrations /repo/migrations
+COPY tests/fixtures/benchmark_workflow.py /repo/tests/fixtures/benchmark_workflow.py
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/root/.cache/uv \
+    uv run scripts/build_wheel.py --out-dir target/wheels
 
 # final image
 #FROM python:3.12-slim-bookworm AS runtime
@@ -45,8 +55,10 @@ ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 
 COPY --from=wheel-builder /repo/target/wheels /tmp/wheels
-RUN set -eux; wheel=$(ls /tmp/wheels/rappel-*.whl | head -n 1); uv pip install --no-cache-dir "$wheel"
-RUN uv pip install --no-cache-dir ".[tests]"
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -eux; wheel=$(ls /tmp/wheels/rappel-*.whl | head -n 1); uv pip install --no-cache-dir "$wheel"
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --no-cache-dir ".[tests]"
 
 ENV RAPPEL_HTTP_PORT=24117 \
     RAPPEL_GRPC_PORT=24118
