@@ -233,6 +233,7 @@
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Active Instances</th>
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Total Completed</th>
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Median Duration</th>
+                        <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Median Dequeue</th>
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-semibold text-zinc-500 dark:text-zinc-400">Updated</th>
                     </tr>
                 </thead>
@@ -243,6 +244,13 @@
                             <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">{{ row.active_instances }}</td>
                             <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">{{ row.total_completed }}</td>
                             <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">{{ row.median_duration }}</td>
+                            <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">
+                                {% if row.median_dequeue_ms %}
+                                    {{ row.median_dequeue_ms }}ms
+                                {% else %}
+                                    <span class="text-zinc-400">&mdash;</span>
+                                {% endif %}
+                            </td>
                             <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">{{ macros::datetime(timestamp=row.updated_at) }}</td>
                         </tr>
                     {% endfor %}

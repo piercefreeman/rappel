@@ -1216,6 +1216,7 @@ struct InstanceStatusRow {
     active_instances: i32,
     total_completed: i64,
     median_duration: String,
+    median_dequeue_ms: Option<i64>,
     updated_at: String,
 }
 
@@ -1257,6 +1258,7 @@ fn render_workers_page(templates: &Tera, statuses: &[WorkerStatus], window_minut
                 active_instances: status.active_instance_count,
                 total_completed: status.total_instances_completed,
                 median_duration,
+                median_dequeue_ms: status.median_dequeue_ms,
                 updated_at: status.updated_at.to_rfc3339(),
             }
         })
