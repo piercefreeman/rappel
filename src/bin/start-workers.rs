@@ -101,9 +101,11 @@ async fn main() -> Result<()> {
 
     // Configure and create instance runner
     let runner_config = InstanceRunnerConfig {
-        claim_batch_size: config.batch_size as i32,
+        claim_batch_size: config.instance_claim_batch_size,
+        max_concurrent_instances: config.max_concurrent_instances,
         completion_batch_size: config.completion_batch_size,
         idle_poll_interval: Duration::from_millis(config.poll_interval_ms),
+        status_report_interval: Duration::from_millis(config.worker_status_interval_ms),
         schedule_check_interval: Duration::from_millis(config.schedule_check_interval_ms),
         schedule_check_batch_size: config.schedule_check_batch_size,
         gc_interval: config.gc.interval_ms.map(Duration::from_millis),
@@ -119,7 +121,8 @@ async fn main() -> Result<()> {
     ));
 
     info!(
-        claim_batch_size = config.batch_size,
+        claim_batch_size = config.instance_claim_batch_size,
+        max_concurrent_instances = config.max_concurrent_instances,
         poll_interval_ms = config.poll_interval_ms,
         "instance runner created - waiting for shutdown signal"
     );
