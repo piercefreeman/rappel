@@ -1352,11 +1352,18 @@ impl ExecutionState {
 
                 // Handle loop-back edges: reset node status to allow re-visitation
                 if edge.is_loop_back {
-                    self.reset_nodes_for_loop(successor_id, &edge.source, dag);
+                    // Get current iteration index before reset
+                    let current_idx = self
+                        .graph
+                        .nodes
+                        .get(successor_id)
+                        .and_then(|n| n.loop_index)
+                        .unwrap_or(0);
+
+                    self.reset_nodes_for_loop(successor_id, &edge.source, dag, current_idx);
 
                     if let Some(successor) = self.graph.nodes.get_mut(successor_id) {
                         // Increment loop_index for tracking
-                        let current_idx = successor.loop_index.unwrap_or(0);
                         let new_idx = current_idx + 1;
                         successor.loop_index = Some(new_idx);
                         trace!(
@@ -1629,15 +1636,53 @@ impl ExecutionState {
         result
     }
 
-    fn reset_nodes_for_loop(&mut self, loop_head_id: &str, loop_back_source: &str, dag: &DAG) {
+    fn reset_nodes_for_loop(
+        &mut self,
+        loop_head_id: &str,
+        loop_back_source: &str,
+        dag: &DAG,
+        iteration_idx: i32,
+    ) {
         let nodes_in_loop = Self::collect_loop_nodes(loop_head_id, loop_back_source, dag);
         if nodes_in_loop.is_empty() {
             return;
         }
 
         for node_id in &nodes_in_loop {
-            if let Some(node) = self.graph.nodes.get_mut(node_id) {
-                Self::reset_node_for_loop(node);
+            // Preserve completed iteration by moving to indexed node ID
+            if let Some(node) = self.graph.nodes.remove(node_id) {
+                // Only preserve if the node actually executed (has timing data)
+                if node.started_at_ms.is_some() {
+                    let iter_node_id = format!("{}[iter_{}]", node_id, iteration_idx);
+                    self.graph.nodes.insert(iter_node_id, node.clone());
+                }
+
+                // Create fresh node for next iteration
+                let fresh_node = ExecutionNode {
+                    template_id: node.template_id.clone(),
+                    spread_index: node.spread_index,
+                    status: NodeStatus::Blocked as i32,
+                    worker_id: None,
+                    started_at_ms: None,
+                    completed_at_ms: None,
+                    duration_ms: None,
+                    inputs: None,
+                    result: None,
+                    error: None,
+                    error_type: None,
+                    waiting_for: Vec::new(),
+                    completed_count: 0,
+                    attempt_number: 0,
+                    max_retries: node.max_retries,
+                    attempts: Vec::new(),
+                    timeout_seconds: node.timeout_seconds,
+                    timeout_retry_limit: node.timeout_retry_limit,
+                    backoff: node.backoff.clone(),
+                    loop_index: node.loop_index,
+                    loop_accumulators: node.loop_accumulators.clone(),
+                    targets: node.targets.clone(),
+                };
+                self.graph.nodes.insert(node_id.clone(), fresh_node);
             }
         }
 
@@ -1697,22 +1742,6 @@ impl ExecutionState {
         }
 
         visited
-    }
-
-    fn reset_node_for_loop(node: &mut ExecutionNode) {
-        node.status = NodeStatus::Blocked as i32;
-        node.worker_id = None;
-        node.started_at_ms = None;
-        node.completed_at_ms = None;
-        node.duration_ms = None;
-        node.inputs = None;
-        node.result = None;
-        node.error = None;
-        node.error_type = None;
-        node.waiting_for.clear();
-        node.completed_count = 0;
-        node.attempt_number = 0;
-        node.attempts.clear();
     }
 
     /// Expand a spread node into N concrete execution nodes

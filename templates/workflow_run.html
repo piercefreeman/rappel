@@ -5,59 +5,64 @@
 
 {% block content %}
 <section class="space-y-4">
-    <a href="/workflows/{{ workflow.id }}" class="text-xs uppercase tracking-[0.4em] text-zinc-500 transition hover:text-zinc-700 dark:hover:text-zinc-300">&larr; Back to workflow detail</a>
+    <a href="/workflows/{{ workflow.id }}" class="inline-flex items-center gap-1.5 text-xs uppercase tracking-[0.3em] text-zinc-500 transition hover:text-zinc-700 dark:hover:text-zinc-300">
+        <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+        </svg>
+        Back to workflow detail
+    </a>
     <div class="space-y-2">
         <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-white">Run {{ instance.id }}</h1>
         <p class="text-sm text-zinc-600 dark:text-zinc-400">{{ workflow.name }}</p>
     </div>
-    <dl class="grid gap-4 rounded-2xl border border-zinc-200 dark:border-zinc-900 bg-zinc-100 dark:bg-zinc-900/40 p-6 md:grid-cols-2 lg:grid-cols-4">
-        <div>
-            <dt class="text-xs uppercase tracking-[0.4em] text-zinc-500">Version ID</dt>
-            <dd class="text-lg font-semibold text-zinc-900 dark:text-white font-mono text-sm">{{ workflow.id }}</dd>
+    <dl class="grid gap-6 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-6 md:grid-cols-2 lg:grid-cols-3">
+        <div class="space-y-1">
+            <dt class="text-xs uppercase tracking-[0.3em] text-zinc-500">Version ID</dt>
+            <dd class="font-mono text-sm text-zinc-800 dark:text-zinc-200">{{ workflow.id }}</dd>
         </div>
-        <div>
-            <dt class="text-xs uppercase tracking-[0.4em] text-zinc-500">Run Created</dt>
-            <dd class="text-lg font-semibold text-zinc-900 dark:text-white">{{ macros::datetime(timestamp=instance.created_at) }}</dd>
+        <div class="space-y-1">
+            <dt class="text-xs uppercase tracking-[0.3em] text-zinc-500">Run Created</dt>
+            <dd class="text-sm font-medium text-zinc-800 dark:text-zinc-200">{{ macros::datetime(timestamp=instance.created_at) }}</dd>
         </div>
-        <div>
-            <dt class="text-xs uppercase tracking-[0.4em] text-zinc-500">Status</dt>
-            <dd class="text-lg font-semibold text-zinc-900 dark:text-white">{{ instance.status }}</dd>
+        <div class="space-y-1">
+            <dt class="text-xs uppercase tracking-[0.3em] text-zinc-500">Status</dt>
+            <dd class="text-sm font-medium text-zinc-800 dark:text-zinc-200">{{ instance.status }}</dd>
         </div>
     </dl>
 </section>
 
 <section class="grid gap-6 lg:grid-cols-2">
-    <div class="rounded-2xl border border-zinc-200 dark:border-zinc-900 bg-zinc-100 dark:bg-zinc-900/40 p-5">
-        <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Input Payload</p>
-        <pre class="mt-3 overflow-x-auto whitespace-pre-wrap rounded-xl bg-zinc-200/70 dark:bg-zinc-950/70 p-4 text-xs text-zinc-800 dark:text-zinc-200">{{ instance.input_payload }}</pre>
+    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-5">
+        <p class="text-xs uppercase tracking-[0.3em] text-zinc-500 mb-3">Input Payload</p>
+        <pre class="overflow-x-auto whitespace-pre-wrap rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 p-4 font-mono text-xs text-zinc-700 dark:text-zinc-300">{{ instance.input_payload }}</pre>
     </div>
-    <div class="rounded-2xl border border-zinc-200 dark:border-zinc-900 bg-zinc-100 dark:bg-zinc-900/40 p-5">
-        <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Result Payload</p>
-        <pre class="mt-3 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl bg-zinc-200/70 dark:bg-zinc-950/70 p-4 text-xs text-zinc-800 dark:text-zinc-200">{{ instance.result_payload }}</pre>
+    <div class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-5">
+        <p class="text-xs uppercase tracking-[0.3em] text-zinc-500 mb-3">Result Payload</p>
+        <pre class="max-h-64 overflow-auto whitespace-pre-wrap rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 p-4 font-mono text-xs text-zinc-700 dark:text-zinc-300">{{ instance.result_payload }}</pre>
     </div>
 </section>
 
 <section class="space-y-3">
     <div>
-        <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">DAG</p>
+        <p class="text-xs uppercase tracking-[0.3em] text-zinc-500">DAG</p>
         <h2 class="text-2xl font-semibold text-zinc-900 dark:text-white">Execution Graph</h2>
-        <p class="text-sm text-zinc-600 dark:text-zinc-400">Workflow dependency structure</p>
+        <p class="text-sm text-zinc-500 dark:text-zinc-500">Workflow dependency structure</p>
     </div>
     <!-- Horizontal DAG -->
-    <div id="execution-graph" class="relative min-h-[300px] max-h-[500px] overflow-auto rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-950 p-4">
-        <p id="graph-empty" class="p-6 text-sm text-zinc-600 dark:text-zinc-400">No DAG nodes to display.</p>
+    <div id="execution-graph" class="relative min-h-[300px] max-h-[500px] overflow-auto rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 bg-grid p-4">
+        <p id="graph-empty" class="p-6 text-sm text-zinc-500 dark:text-zinc-500">No DAG nodes to display.</p>
     </div>
 </section>
 
 <!-- Gantt-style Timeline -->
 <section class="space-y-3">
     <div>
-        <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Timeline</p>
+        <p class="text-xs uppercase tracking-[0.3em] text-zinc-500">Timeline</p>
         <h2 class="text-2xl font-semibold text-zinc-900 dark:text-white">Execution Timeline</h2>
-        <p class="text-sm text-zinc-600 dark:text-zinc-400">Action execution timing and duration</p>
+        <p class="text-sm text-zinc-500 dark:text-zinc-500">Action execution timing and duration</p>
     </div>
-    <div id="timeline-container" class="rounded-2xl border border-zinc-800 bg-zinc-950 overflow-hidden">
-        <div id="timeline-empty" class="text-center py-8 text-zinc-400">
+    <div id="timeline-container" class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 overflow-hidden">
+        <div id="timeline-empty" class="text-center py-8 text-zinc-500 dark:text-zinc-500">
             <p class="text-sm">No execution logs recorded yet</p>
         </div>
         <div id="timeline-gantt" class="hidden">
@@ -69,19 +74,19 @@
 <!-- Execution Log (list-based view) -->
 <section class="space-y-3">
     <div>
-        <p class="text-xs uppercase tracking-[0.4em] text-zinc-500">Log</p>
+        <p class="text-xs uppercase tracking-[0.3em] text-zinc-500">Log</p>
         <h2 class="text-2xl font-semibold text-zinc-900 dark:text-white">Execution Log</h2>
-        <p class="text-sm text-zinc-600 dark:text-zinc-400">Chronological history of all action executions</p>
+        <p class="text-sm text-zinc-500 dark:text-zinc-500">Chronological history of all action executions</p>
     </div>
-    <div id="log-container" class="rounded-2xl border border-zinc-200 dark:border-zinc-900 bg-zinc-100 dark:bg-zinc-900/40 overflow-hidden">
-        <div id="log-empty" class="text-center py-8 text-zinc-600 dark:text-zinc-400">
+    <div id="log-container" class="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 overflow-hidden">
+        <div id="log-empty" class="text-center py-8 text-zinc-500 dark:text-zinc-500">
             <p class="text-sm">No execution logs recorded yet</p>
         </div>
-        <div id="log-content" class="hidden divide-y divide-zinc-200 dark:divide-zinc-800">
+        <div id="log-content" class="hidden divide-y divide-zinc-100 dark:divide-zinc-800/50">
             <!-- Log entries will be injected here -->
         </div>
-        <div id="log-load-more-container" class="hidden py-3 text-center border-t border-zinc-200 dark:border-zinc-800">
-            <button id="log-load-more" class="rounded-full border border-zinc-300 dark:border-zinc-700 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-800 transition-colors">
+        <div id="log-load-more-container" class="hidden py-4 text-center border-t border-zinc-200 dark:border-zinc-800">
+            <button id="log-load-more" class="rounded-lg border border-zinc-300 dark:border-zinc-700 px-4 py-2 text-xs font-medium text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors">
                 Load more
             </button>
         </div>
@@ -89,15 +94,15 @@
 </section>
 
 <!-- Sliding Detail Panel -->
-<div id="detail-drawer" class="fixed inset-y-0 right-0 z-50 w-full max-w-md transform translate-x-full transition-transform duration-300 ease-in-out">
-    <div class="h-full flex flex-col bg-zinc-900 border-l border-zinc-800 shadow-2xl">
+<div id="detail-drawer" class="fixed inset-y-0 right-0 z-50 w-full max-w-md transform translate-x-full transition-transform duration-300 ease-in-out" style="margin: 16px; margin-right: 0; height: calc(100% - 32px);">
+    <div class="h-full flex flex-col bg-white/80 dark:bg-zinc-900/80 backdrop-blur-3xl border border-white/30 dark:border-zinc-700/50 rounded-l-2xl shadow-[0_0_60px_-15px_rgba(0,0,0,0.3)] dark:shadow-[0_0_60px_-15px_rgba(0,0,0,0.5)]">
         <!-- Header -->
-        <div class="flex items-center justify-between p-5 border-b border-zinc-800">
+        <div class="flex items-center justify-between p-5 border-b border-zinc-200/30 dark:border-zinc-700/30 rounded-tl-2xl">
             <div class="min-w-0 flex-1">
-                <p id="drawer-title" class="text-xl font-semibold text-white truncate"></p>
-                <p id="drawer-subtitle" class="text-sm text-zinc-400 truncate mt-0.5"></p>
+                <p id="drawer-title" class="text-xl font-semibold text-zinc-900 dark:text-white truncate"></p>
+                <p id="drawer-subtitle" class="text-sm text-zinc-500 truncate mt-0.5 font-mono"></p>
             </div>
-            <button id="drawer-close" class="ml-4 p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors">
+            <button id="drawer-close" class="ml-4 p-2 rounded-xl text-zinc-400 hover:text-zinc-600 dark:hover:text-white hover:bg-white/50 dark:hover:bg-zinc-700/50 transition-colors">
                 <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
                 </svg>
@@ -107,36 +112,36 @@
         <div id="drawer-content" class="flex-1 overflow-auto p-5 space-y-5">
             <!-- Status and duration -->
             <div class="flex items-center gap-3">
-                <span id="drawer-status" class="rounded px-2.5 py-1 text-xs font-bold uppercase tracking-wide"></span>
-                <span id="drawer-duration" class="text-sm text-zinc-400"></span>
+                <span id="drawer-status" class="rounded-lg px-2.5 py-1 text-xs font-semibold uppercase tracking-wide"></span>
+                <span id="drawer-duration" class="text-sm text-zinc-500"></span>
             </div>
             <!-- Timing info -->
-            <div class="rounded-xl bg-zinc-800/50 p-4">
+            <div class="rounded-xl border border-white/20 dark:border-zinc-700/50 bg-white/40 dark:bg-zinc-800/40 p-4">
                 <div class="grid grid-cols-2 gap-4 text-sm">
                     <div>
                         <span class="text-xs uppercase tracking-wider text-zinc-500">Started</span>
-                        <p id="drawer-started" class="font-mono text-zinc-200 mt-1"></p>
+                        <p id="drawer-started" class="font-mono text-zinc-700 dark:text-zinc-300 mt-1 text-xs"></p>
                     </div>
                     <div>
                         <span class="text-xs uppercase tracking-wider text-zinc-500">Completed</span>
-                        <p id="drawer-completed" class="font-mono text-zinc-200 mt-1"></p>
+                        <p id="drawer-completed" class="font-mono text-zinc-700 dark:text-zinc-300 mt-1 text-xs"></p>
                     </div>
                 </div>
             </div>
             <!-- Error section -->
             <div id="drawer-error-section" class="hidden">
-                <p class="text-xs uppercase tracking-wider text-red-400 mb-2">Error</p>
-                <pre id="drawer-error" class="text-sm text-red-300 bg-red-950/50 border border-red-900 p-4 rounded-xl whitespace-pre-wrap break-words font-mono max-h-48 overflow-auto"></pre>
+                <p class="text-xs uppercase tracking-wider text-red-500 dark:text-red-400 mb-2">Error</p>
+                <pre id="drawer-error" class="text-xs text-red-600 dark:text-red-300 bg-red-500/10 border border-red-500/30 p-4 rounded-xl whitespace-pre-wrap break-words font-mono max-h-48 overflow-auto"></pre>
             </div>
             <!-- Request section -->
             <div>
                 <p class="text-xs uppercase tracking-wider text-zinc-500 mb-2">Request</p>
-                <pre id="drawer-request" class="text-sm text-zinc-200 bg-zinc-800/50 p-4 rounded-xl whitespace-pre-wrap break-words font-mono max-h-64 overflow-auto"></pre>
+                <pre id="drawer-request" class="text-xs text-zinc-700 dark:text-zinc-300 bg-white/40 dark:bg-zinc-800/40 border border-white/20 dark:border-zinc-700/50 p-4 rounded-xl whitespace-pre-wrap break-words font-mono max-h-64 overflow-auto"></pre>
             </div>
             <!-- Response section -->
             <div>
                 <p class="text-xs uppercase tracking-wider text-zinc-500 mb-2">Response</p>
-                <pre id="drawer-response" class="text-sm text-zinc-200 bg-zinc-800/50 p-4 rounded-xl whitespace-pre-wrap break-words font-mono max-h-64 overflow-auto"></pre>
+                <pre id="drawer-response" class="text-xs text-zinc-700 dark:text-zinc-300 bg-white/40 dark:bg-zinc-800/40 border border-white/20 dark:border-zinc-700/50 p-4 rounded-xl whitespace-pre-wrap break-words font-mono max-h-64 overflow-auto"></pre>
             </div>
             <!-- Attempt history -->
             <div id="drawer-history-section" class="hidden">
@@ -146,8 +151,8 @@
         </div>
     </div>
 </div>
-<!-- Backdrop -->
-<div id="detail-backdrop" class="fixed inset-0 z-40 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-300"></div>
+<!-- Backdrop (invisible - just for click-to-close) -->
+<div id="detail-backdrop" class="fixed inset-0 z-40 opacity-0 pointer-events-none transition-opacity duration-300"></div>
 {% endblock content %}
 
 {% block scripts %}
@@ -273,12 +278,38 @@ class DAGLayout {
 
   getStatusColors(status) {
     const isDark = document.documentElement.classList.contains('dark');
+    // Modern style: transparent fill with colored border (matching badge style)
     const colors = {
-      'completed': { bg: isDark ? '#064e3b' : '#d1fae5', border: '#10b981', text: isDark ? '#6ee7b7' : '#059669', label: isDark ? '#a7f3d0' : '#047857' },
-      'failed': { bg: isDark ? '#7f1d1d' : '#fee2e2', border: '#ef4444', text: isDark ? '#fca5a5' : '#dc2626', label: isDark ? '#fecaca' : '#b91c1c' },
-      'dispatched': { bg: isDark ? '#78350f' : '#fef3c7', border: '#f59e0b', text: isDark ? '#fcd34d' : '#d97706', label: isDark ? '#fde68a' : '#b45309' },
-      'pending': { bg: isDark ? '#27272a' : '#f4f4f5', border: isDark ? '#52525b' : '#a1a1aa', text: isDark ? '#a1a1aa' : '#71717a', label: isDark ? '#d4d4d8' : '#52525b' },
-      'queued': { bg: isDark ? '#27272a' : '#f4f4f5', border: isDark ? '#52525b' : '#a1a1aa', text: isDark ? '#a1a1aa' : '#71717a', label: isDark ? '#d4d4d8' : '#52525b' }
+      'completed': {
+        bg: isDark ? 'rgba(16, 185, 129, 0.1)' : 'rgba(16, 185, 129, 0.08)',
+        border: isDark ? 'rgba(16, 185, 129, 0.5)' : 'rgba(16, 185, 129, 0.4)',
+        text: isDark ? '#34d399' : '#059669',
+        label: isDark ? '#6ee7b7' : '#047857'
+      },
+      'failed': {
+        bg: isDark ? 'rgba(239, 68, 68, 0.1)' : 'rgba(239, 68, 68, 0.08)',
+        border: isDark ? 'rgba(239, 68, 68, 0.5)' : 'rgba(239, 68, 68, 0.4)',
+        text: isDark ? '#f87171' : '#dc2626',
+        label: isDark ? '#fca5a5' : '#b91c1c'
+      },
+      'dispatched': {
+        bg: isDark ? 'rgba(245, 158, 11, 0.1)' : 'rgba(245, 158, 11, 0.08)',
+        border: isDark ? 'rgba(245, 158, 11, 0.5)' : 'rgba(245, 158, 11, 0.4)',
+        text: isDark ? '#fbbf24' : '#d97706',
+        label: isDark ? '#fcd34d' : '#b45309'
+      },
+      'pending': {
+        bg: isDark ? 'rgba(113, 113, 122, 0.1)' : 'rgba(113, 113, 122, 0.08)',
+        border: isDark ? 'rgba(113, 113, 122, 0.4)' : 'rgba(113, 113, 122, 0.3)',
+        text: isDark ? '#a1a1aa' : '#71717a',
+        label: isDark ? '#d4d4d8' : '#52525b'
+      },
+      'queued': {
+        bg: isDark ? 'rgba(59, 130, 246, 0.1)' : 'rgba(59, 130, 246, 0.08)',
+        border: isDark ? 'rgba(59, 130, 246, 0.5)' : 'rgba(59, 130, 246, 0.4)',
+        text: isDark ? '#60a5fa' : '#2563eb',
+        label: isDark ? '#93c5fd' : '#1d4ed8'
+      }
     };
     return colors[status] || colors['pending'];
   }
@@ -363,7 +394,7 @@ class DAGLayout {
     });
 
     const isDark = document.documentElement.classList.contains('dark');
-    const strokeColor = isDark ? '#52525b' : '#d4d4d8';
+    const strokeColor = isDark ? 'rgba(113, 113, 122, 0.4)' : 'rgba(161, 161, 170, 0.5)';
     nodes.forEach(node => {
       if (!node.depends_on) return;
       node.depends_on.forEach(depId => {
@@ -384,7 +415,7 @@ class DAGLayout {
         path.setAttribute('d', d);
         path.setAttribute('fill', 'none');
         path.setAttribute('stroke', strokeColor);
-        path.setAttribute('stroke-width', '2');
+        path.setAttribute('stroke-width', '1.5');
         path.setAttribute('stroke-linecap', 'round');
         svg.appendChild(path);
       });
@@ -395,13 +426,13 @@ class DAGLayout {
     const { nodeHeight } = this.options;
     const colors = this.getStatusColors(node.status);
     const el = document.createElement('div');
-    el.className = 'absolute rounded-lg px-3 py-2 cursor-pointer transition-colors duration-150 hover:brightness-110';
-    el.style.cssText = `left: ${left}px; top: ${top}px; width: ${nodeWidth}px; min-height: ${nodeHeight}px; background: ${colors.bg}; border: 2px solid ${colors.border}; overflow: hidden;`;
+    el.className = 'absolute rounded-xl px-3 py-2.5 cursor-pointer transition-all duration-150 hover:scale-[1.02]';
+    el.style.cssText = `left: ${left}px; top: ${top}px; width: ${nodeWidth}px; min-height: ${nodeHeight}px; background: ${colors.bg}; border: 1px solid ${colors.border}; overflow: hidden; backdrop-filter: blur(8px);`;
     el.dataset.nodeId = node.id;
     el.innerHTML = `
-      <p class="text-[10px] font-mono font-medium uppercase tracking-wider truncate" style="color: ${colors.label}">${node.id}</p>
-      <p class="text-sm font-semibold truncate mt-0.5" style="color: ${colors.text}">${node.action}</p>
-      <p class="text-[10px] truncate opacity-70" style="color: ${colors.text}">${node.module}</p>
+      <p class="text-[10px] font-mono font-medium uppercase tracking-wide truncate opacity-70" style="color: ${colors.label}">${node.id}</p>
+      <p class="text-sm font-medium truncate mt-1" style="color: ${colors.text}">${node.action}</p>
+      <p class="text-[10px] truncate opacity-50 mt-0.5" style="color: ${colors.text}">${node.module}</p>
     `;
     if (this.options.onNodeClick) { el.addEventListener('click', () => this.options.onNodeClick(node.id)); }
     return el;
@@ -462,30 +493,25 @@ class GanttTimeline {
     let html = `
       <div class="flex flex-col" style="min-width: 100%;">
         <!-- Header bar -->
-        <div class="flex items-center justify-between px-5 border-b border-zinc-800 bg-zinc-900" style="height: ${headerHeight}px;">
+        <div class="flex items-center justify-between px-5 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900" style="height: ${headerHeight}px;">
           <div class="flex items-center gap-3">
-            <div class="w-2 h-2 rounded-full bg-emerald-500"></div>
-            <span class="text-sm font-semibold text-emerald-400">workflow()</span>
+            <div class="w-2 h-2 rounded-full bg-blue-500"></div>
+            <span class="text-sm font-medium text-blue-600 dark:text-blue-400">workflow()</span>
           </div>
-          <span class="text-sm font-mono text-zinc-400">${this.formatDuration(workflowDuration)}</span>
+          <span class="text-sm font-mono text-zinc-500">${this.formatDuration(workflowDuration)}</span>
         </div>
 
         <!-- Chart area -->
         <div class="relative overflow-x-auto">
           <!-- Time axis -->
-          <div class="sticky top-0 z-10 flex items-end border-b border-zinc-800 bg-zinc-950" style="height: ${timeAxisHeight}px;">
+          <div class="sticky top-0 z-10 flex items-end border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950" style="height: ${timeAxisHeight}px;">
             <div class="flex-1 relative px-4">
               ${this.renderTimeAxis(minTime, maxTime)}
             </div>
           </div>
 
-          <!-- Rows with stripes -->
-          <div class="relative">
-            <!-- Stripe background -->
-            <div class="absolute inset-0 flex pointer-events-none">
-              ${this.renderStripes(20)}
-            </div>
-
+          <!-- Rows with grid lines -->
+          <div class="relative bg-grid">
             <!-- Row content -->
             ${sorted.map((entry, idx) => this.renderRow(entry, idx, minTime, totalDuration)).join('')}
           </div>
@@ -548,20 +574,20 @@ class GanttTimeline {
     const startPct = ((start - minTime) / totalDuration) * 100;
     const widthPct = ((end - start) / totalDuration) * 100;
 
-    // Status colors - flat, vibrant
+    // Status colors - transparent fill with colored border (matching badge style)
     let borderColor, textColor, bgColor;
     if (entry.success === true) {
-      borderColor = 'border-emerald-500';
-      textColor = 'text-emerald-400';
-      bgColor = 'bg-emerald-950';
+      borderColor = 'border-emerald-500/60';
+      textColor = 'text-emerald-600 dark:text-emerald-400';
+      bgColor = 'bg-emerald-500/10';
     } else if (entry.success === false) {
-      borderColor = 'border-red-500';
-      textColor = 'text-red-400';
-      bgColor = 'bg-red-950';
+      borderColor = 'border-red-500/60';
+      textColor = 'text-red-600 dark:text-red-400';
+      bgColor = 'bg-red-500/10';
     } else {
-      borderColor = 'border-amber-500';
-      textColor = 'text-amber-400';
-      bgColor = 'bg-amber-950';
+      borderColor = 'border-amber-500/60';
+      textColor = 'text-amber-600 dark:text-amber-400';
+      bgColor = 'bg-amber-500/10';
     }
 
     const actionName = entry.actionName || entry.action_name || 'Unknown';
@@ -570,10 +596,10 @@ class GanttTimeline {
     return `
       <div class="relative flex items-center px-4" style="height: ${rowHeight}px;" data-entry-idx="${idx}">
         <div
-          class="absolute flex items-center justify-between gap-2 px-3 rounded border ${borderColor} ${bgColor} cursor-pointer hover:brightness-110 transition-colors"
+          class="absolute flex items-center justify-between gap-2 px-3 rounded-lg border ${borderColor} ${bgColor} cursor-pointer hover:bg-opacity-20 transition-colors"
           style="left: calc(${startPct}% + 16px); width: max(${widthPct}%, ${minBarWidth}px); height: ${rowHeight - 12}px;"
         >
-          <span class="text-xs font-semibold ${textColor} truncate">${actionName}()</span>
+          <span class="text-xs font-medium ${textColor} truncate">${actionName}()</span>
           <span class="text-[10px] font-mono text-zinc-500 whitespace-nowrap">${durationText}</span>
         </div>
       </div>
@@ -604,16 +630,16 @@ function openDrawer(entry, nodeInfo) {
 
   // Status
   const statusEl = document.getElementById('drawer-status');
-  statusEl.className = 'rounded px-2.5 py-1 text-xs font-bold uppercase tracking-wide';
+  statusEl.className = 'rounded-lg px-2.5 py-1 text-xs font-semibold uppercase tracking-wide border';
   if (entry.success === true) {
     statusEl.textContent = 'Success';
-    statusEl.classList.add('bg-emerald-500/20', 'text-emerald-400');
+    statusEl.classList.add('border-emerald-500/50', 'bg-emerald-500/10', 'text-emerald-600', 'dark:text-emerald-400');
   } else if (entry.success === false) {
     statusEl.textContent = 'Failed';
-    statusEl.classList.add('bg-red-500/20', 'text-red-400');
+    statusEl.classList.add('border-red-500/50', 'bg-red-500/10', 'text-red-600', 'dark:text-red-400');
   } else {
     statusEl.textContent = 'Running';
-    statusEl.classList.add('bg-amber-500/20', 'text-amber-400');
+    statusEl.classList.add('border-amber-500/50', 'bg-amber-500/10', 'text-amber-600', 'dark:text-amber-400');
   }
 
   // Duration
@@ -817,19 +843,25 @@ function renderExecutionLog(actionLookup) {
     const row = document.createElement('div');
     row.className = 'transition-colors';
 
-    let statusColor, statusBg, statusText;
+    let statusColor, statusBg, statusBorder, statusText, ringColor;
     if (log.success === true) {
       statusColor = 'text-emerald-600 dark:text-emerald-400';
-      statusBg = 'bg-emerald-100 dark:bg-emerald-500/20';
+      statusBg = 'bg-emerald-500/10';
+      statusBorder = 'border-emerald-500/50';
       statusText = 'Success';
+      ringColor = 'ring-emerald-500';
     } else if (log.success === false) {
       statusColor = 'text-red-600 dark:text-red-400';
-      statusBg = 'bg-red-100 dark:bg-red-500/20';
+      statusBg = 'bg-red-500/10';
+      statusBorder = 'border-red-500/50';
       statusText = 'Failed';
+      ringColor = 'ring-red-500';
     } else {
       statusColor = 'text-amber-600 dark:text-amber-400';
-      statusBg = 'bg-amber-100 dark:bg-amber-500/20';
+      statusBg = 'bg-amber-500/10';
+      statusBorder = 'border-amber-500/50';
       statusText = 'Running';
+      ringColor = 'ring-amber-500';
     }
 
     let durationText = '-';
@@ -841,38 +873,38 @@ function renderExecutionLog(actionLookup) {
     const expandId = `log-expand-${idx}`;
 
     row.innerHTML = `
-      <div class="flex items-center gap-4 p-4 ${hasDetails ? 'cursor-pointer hover:bg-zinc-200/50 dark:hover:bg-zinc-800/50' : ''}" ${hasDetails ? `onclick="toggleLogExpand('${expandId}')"` : ''}>
+      <div class="flex items-center gap-4 p-4 ${hasDetails ? 'cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-900/50' : ''}" ${hasDetails ? `onclick="toggleLogExpand('${expandId}')"` : ''}>
         <div class="flex flex-col items-center">
-          <div class="w-2.5 h-2.5 rounded-full ${statusBg} ring-2 ${log.success === true ? 'ring-emerald-500' : log.success === false ? 'ring-red-500' : 'ring-amber-500'}"></div>
+          <div class="w-2 h-2 rounded-full ${log.success === true ? 'bg-emerald-500' : log.success === false ? 'bg-red-500' : 'bg-amber-500'}"></div>
         </div>
         <div class="flex-1 min-w-0">
           <div class="flex items-center gap-2 flex-wrap">
-            <span class="font-semibold text-zinc-800 dark:text-zinc-200">${log.actionName}</span>
-            <span class="text-xs text-zinc-500 font-mono">${log.moduleName}</span>
-            <span class="text-xs px-2 py-0.5 rounded font-semibold ${statusBg} ${statusColor}">${statusText}</span>
+            <span class="font-medium text-zinc-800 dark:text-zinc-200">${log.actionName}</span>
+            <span class="text-xs text-zinc-400 font-mono">${log.moduleName}</span>
+            <span class="inline-flex items-center text-xs px-2 py-0.5 rounded-full border font-medium ${statusBg} ${statusBorder} ${statusColor}">${statusText}</span>
           </div>
-          <div class="flex items-center gap-4 mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-            <span>Started: <span class="text-zinc-700 dark:text-zinc-300">${log.dispatched_at}</span></span>
-            <span>Duration: <span class="text-zinc-700 dark:text-zinc-300">${durationText}</span></span>
+          <div class="flex items-center gap-4 mt-1.5 text-xs text-zinc-500">
+            <span>Started: <span class="text-zinc-600 dark:text-zinc-400 font-mono">${log.dispatched_at}</span></span>
+            <span>Duration: <span class="text-zinc-600 dark:text-zinc-400 font-mono">${durationText}</span></span>
           </div>
         </div>
-        <div class="flex items-center gap-2">
-          <span class="text-xs text-zinc-500">Attempt ${log.attempt_number + 1}</span>
+        <div class="flex items-center gap-3">
+          <span class="text-xs text-zinc-400 tabular-nums">Attempt ${log.attempt_number + 1}</span>
           ${hasDetails ? `<svg class="w-4 h-4 text-zinc-400 transition-transform" id="${expandId}-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" /></svg>` : ''}
         </div>
       </div>
       ${hasDetails ? `
-      <div id="${expandId}" class="hidden border-t border-zinc-200 dark:border-zinc-800 px-4 py-4 ml-6 space-y-3 bg-zinc-50 dark:bg-zinc-900/50">
+      <div id="${expandId}" class="hidden border-t border-zinc-100 dark:border-zinc-800/50 px-4 py-4 ml-6 space-y-3 bg-zinc-50 dark:bg-zinc-900/30">
         ${log.error_message ? `
         <div>
-          <p class="text-xs uppercase tracking-wider text-red-500 dark:text-red-400 mb-1 font-semibold">Error</p>
-          <pre class="text-xs text-red-700 dark:text-red-300 bg-red-100 dark:bg-red-900/30 p-3 rounded-lg whitespace-pre-wrap break-words font-mono overflow-x-auto max-h-32">${escapeHtml(log.error_message)}</pre>
+          <p class="text-xs uppercase tracking-wider text-red-500 dark:text-red-400 mb-1.5 font-medium">Error</p>
+          <pre class="text-xs text-red-600 dark:text-red-300 bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 p-3 rounded-lg whitespace-pre-wrap break-words font-mono overflow-x-auto max-h-32">${escapeHtml(log.error_message)}</pre>
         </div>
         ` : ''}
         ${log.result_payload ? `
         <div>
-          <p class="text-xs uppercase tracking-wider text-zinc-500 mb-1 font-semibold">${log.success === false ? 'Exception' : 'Result'}</p>
-          <pre class="text-xs text-zinc-700 dark:text-zinc-300 bg-zinc-200 dark:bg-zinc-800 p-3 rounded-lg whitespace-pre-wrap break-words font-mono overflow-x-auto max-h-64">${escapeHtml(log.result_payload)}</pre>
+          <p class="text-xs uppercase tracking-wider text-zinc-500 mb-1.5 font-medium">${log.success === false ? 'Exception' : 'Result'}</p>
+          <pre class="text-xs text-zinc-600 dark:text-zinc-300 bg-zinc-100 dark:bg-zinc-900/50 border border-zinc-200 dark:border-zinc-800 p-3 rounded-lg whitespace-pre-wrap break-words font-mono overflow-x-auto max-h-64">${escapeHtml(log.result_payload)}</pre>
         </div>
         ` : ''}
       </div>
