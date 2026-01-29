@@ -16,7 +16,7 @@ use prost::Message;
 use tracing::{debug, trace, warn};
 
 use crate::ast_evaluator::{ExpressionEvaluator, Scope};
-use crate::dag::{DAG, DAGEdge, EXCEPTION_SCOPE_VAR, EdgeType};
+use crate::dag::{DAG, DAGEdge, DAGNode, EXCEPTION_SCOPE_VAR, EdgeType};
 
 /// Maximum number of loop iterations before terminating execution.
 /// This prevents infinite loops (e.g., `while True:`) from running forever.
@@ -24,7 +24,7 @@ pub const MAX_LOOP_ITERATIONS: i32 = 50_000;
 use crate::dag_state::DAGHelper;
 use crate::messages::execution::{
     AttemptRecord, BackoffConfig, BackoffKind, ExceptionInfo, ExecutionGraph, ExecutionNode,
-    NodeStatus,
+    NodeKind, NodeStatus,
 };
 use crate::messages::proto::WorkflowArguments;
 use crate::messages::{decode_message, encode_message};
@@ -78,6 +78,37 @@ const EXECUTION_GRAPH_VERSION: u8 = 1;
 const EXECUTION_GRAPH_CODEC_ZSTD: u8 = 1;
 const EXECUTION_GRAPH_HEADER_LEN: usize = 4 + 1 + 1 + 8;
 const EXECUTION_GRAPH_ZSTD_LEVEL: i32 = 3;
+
+/// Determine the NodeKind for a DAG node based on its properties.
+/// This is the source of truth for node type classification.
+fn determine_node_kind(dag_node: &DAGNode) -> NodeKind {
+    // Sleep actions are special - check first
+    if dag_node.action_name.as_deref() == Some("sleep") {
+        return NodeKind::Sleep;
+    }
+    // Aggregator nodes collect spread results
+    if dag_node.is_aggregator {
+        return NodeKind::Aggregator;
+    }
+    // Spread nodes are templates for parallel expansion
+    if dag_node.is_spread {
+        return NodeKind::Spread;
+    }
+    // Map node_type string to NodeKind enum
+    match dag_node.node_type.as_str() {
+        "action_call" => NodeKind::Action,
+        "assignment" => NodeKind::Assignment,
+        "branch" => NodeKind::Branch,
+        "join" => NodeKind::Join,
+        "fn_call" => NodeKind::FnCall,
+        "return" => NodeKind::Return,
+        "break" => NodeKind::Break,
+        "for_loop" => NodeKind::ForLoop,
+        "input" => NodeKind::Input,
+        "output" => NodeKind::Output,
+        _ => NodeKind::Unspecified,
+    }
+}
 
 fn encode_execution_graph_bytes(raw: &[u8]) -> Vec<u8> {
     let compressed = match zstd::bulk::compress(raw, EXECUTION_GRAPH_ZSTD_LEVEL) {
@@ -245,6 +276,9 @@ impl ExecutionState {
                 loop_index: None,
                 loop_accumulators: None,
                 targets: node.target.clone().map(|t| vec![t]).unwrap_or_default(),
+                node_kind: determine_node_kind(node) as i32,
+                parent_execution_id: None,
+                iteration_index: None,
             };
 
             self.graph.nodes.insert(node_id.clone(), exec_node);
@@ -1650,10 +1684,13 @@ impl ExecutionState {
 
         for node_id in &nodes_in_loop {
             // Preserve completed iteration by moving to indexed node ID
-            if let Some(node) = self.graph.nodes.remove(node_id) {
+            if let Some(mut node) = self.graph.nodes.remove(node_id) {
                 // Only preserve if the node actually executed (has timing data)
                 if node.started_at_ms.is_some() {
                     let iter_node_id = format!("{}[iter_{}]", node_id, iteration_idx);
+                    // Set parent and iteration info on the archived node
+                    node.parent_execution_id = Some(node_id.clone());
+                    node.iteration_index = Some(iteration_idx);
                     self.graph.nodes.insert(iter_node_id, node.clone());
                 }
 
@@ -1681,6 +1718,9 @@ impl ExecutionState {
                     loop_index: node.loop_index,
                     loop_accumulators: node.loop_accumulators.clone(),
                     targets: node.targets.clone(),
+                    node_kind: node.node_kind,
+                    parent_execution_id: None,
+                    iteration_index: None,
                 };
                 self.graph.nodes.insert(node_id.clone(), fresh_node);
             }
@@ -1797,6 +1837,10 @@ impl ExecutionState {
                     loop_index: None,
                     loop_accumulators: None,
                     targets: vec![],
+                    // Spread children are action calls with the spread template as parent
+                    node_kind: NodeKind::Action as i32,
+                    parent_execution_id: Some(spread_node_id.to_string()),
+                    iteration_index: None,
                 };
 
                 self.graph.nodes.insert(node_id.clone(), exec_node);
@@ -1886,6 +1930,16 @@ impl ExecutionState {
 
         for (node_id, node) in &self.graph.nodes {
             if node.status != NodeStatus::Completed as i32 {
+                continue;
+            }
+
+            // Skip archived loop iteration nodes - they completed in a previous iteration
+            // and their successors in the DAG now refer to fresh nodes for the next iteration.
+            // Processing stalled completions for archived nodes would incorrectly add
+            // duplicate attempts with 0ms duration.
+            // Note: We check iteration_index specifically because parent_execution_id is also
+            // set for spread children, which SHOULD be processed for stalled completions.
+            if node.iteration_index.is_some() {
                 continue;
             }
 
@@ -2778,6 +2832,92 @@ mod tests {
     }
 
     #[test]
+    fn test_find_stalled_completions_skips_archived_loop_iterations() {
+        // Test that archived loop iteration nodes (with iteration_index set) are skipped
+        // by find_stalled_completions. This prevents phantom 0ms entries.
+        use crate::dag::{DAGEdge, DAGNode};
+        use std::collections::HashMap;
+
+        let mut nodes = HashMap::new();
+        let mut edges = Vec::new();
+
+        // Create a simple DAG with action_1 -> action_2
+        let action_1 = DAGNode::new(
+            "action_1".to_string(),
+            "action_call".to_string(),
+            "action_1".to_string(),
+        );
+        nodes.insert("action_1".to_string(), action_1);
+
+        let action_2 = DAGNode::new(
+            "action_2".to_string(),
+            "action_call".to_string(),
+            "action_2".to_string(),
+        );
+        nodes.insert("action_2".to_string(), action_2);
+
+        edges.push(DAGEdge::state_machine(
+            "action_1".to_string(),
+            "action_2".to_string(),
+        ));
+
+        let dag = DAG {
+            nodes,
+            edges,
+            entry_node: Some("action_1".to_string()),
+        };
+
+        // Create execution state with:
+        // - action_1[iter_0]: archived, Completed (with iteration_index set)
+        // - action_1: fresh node, Blocked
+        // - action_2: Blocked
+        let mut state = ExecutionState::new();
+
+        // Archived iteration node - Completed with iteration_index
+        state.graph.nodes.insert(
+            "action_1[iter_0]".to_string(),
+            ExecutionNode {
+                template_id: "action_1".to_string(),
+                status: NodeStatus::Completed as i32,
+                started_at_ms: Some(1000),
+                completed_at_ms: Some(2000),
+                duration_ms: Some(1000),
+                iteration_index: Some(0),
+                parent_execution_id: Some("action_1".to_string()),
+                ..Default::default()
+            },
+        );
+
+        // Fresh node for next iteration - Blocked
+        state.graph.nodes.insert(
+            "action_1".to_string(),
+            ExecutionNode {
+                template_id: "action_1".to_string(),
+                status: NodeStatus::Blocked as i32,
+                ..Default::default()
+            },
+        );
+
+        // Successor node - Blocked
+        state.graph.nodes.insert(
+            "action_2".to_string(),
+            ExecutionNode {
+                template_id: "action_2".to_string(),
+                status: NodeStatus::Blocked as i32,
+                ..Default::default()
+            },
+        );
+
+        // find_stalled_completions should NOT find action_1[iter_0] as stalled
+        // because it has iteration_index set (it's an archived loop iteration)
+        let stalled = state.find_stalled_completions(&dag);
+        assert!(
+            stalled.is_empty(),
+            "Should not find stalled completions for archived loop iteration nodes"
+        );
+    }
+
+    #[test]
     fn test_parallel_join_completion() {
         // Test that an output node becomes ready when multiple parallel branches complete
         // This tests a scenario that could cause stalls if the join logic doesn't work correctly
@@ -3103,5 +3243,358 @@ mod tests {
             state.has_pending_work(),
             "Should now have pending work (output in ready_queue)"
         );
+    }
+
+    // =========================================================================
+    // NodeKind Tests
+    // =========================================================================
+
+    #[test]
+    fn test_node_kind_action_call() {
+        let dag_node = DAGNode::new(
+            "action_1".to_string(),
+            "action_call".to_string(),
+            "call action".to_string(),
+        );
+        assert_eq!(determine_node_kind(&dag_node), NodeKind::Action);
+    }
+
+    #[test]
+    fn test_node_kind_sleep() {
+        let mut dag_node = DAGNode::new(
+            "action_1".to_string(),
+            "action_call".to_string(),
+            "sleep".to_string(),
+        );
+        dag_node.action_name = Some("sleep".to_string());
+        assert_eq!(determine_node_kind(&dag_node), NodeKind::Sleep);
+    }
+
+    #[test]
+    fn test_node_kind_aggregator() {
+        let mut dag_node = DAGNode::new(
+            "agg_1".to_string(),
+            "action_call".to_string(),
+            "aggregator".to_string(),
+        );
+        dag_node.is_aggregator = true;
+        assert_eq!(determine_node_kind(&dag_node), NodeKind::Aggregator);
+    }
+
+    #[test]
+    fn test_node_kind_spread() {
+        let mut dag_node = DAGNode::new(
+            "spread_1".to_string(),
+            "action_call".to_string(),
+            "spread".to_string(),
+        );
+        dag_node.is_spread = true;
+        assert_eq!(determine_node_kind(&dag_node), NodeKind::Spread);
+    }
+
+    #[test]
+    fn test_node_kind_assignment() {
+        let dag_node = DAGNode::new(
+            "assign_1".to_string(),
+            "assignment".to_string(),
+            "x = 1".to_string(),
+        );
+        assert_eq!(determine_node_kind(&dag_node), NodeKind::Assignment);
+    }
+
+    #[test]
+    fn test_node_kind_branch() {
+        let dag_node = DAGNode::new(
+            "branch_1".to_string(),
+            "branch".to_string(),
+            "if x".to_string(),
+        );
+        assert_eq!(determine_node_kind(&dag_node), NodeKind::Branch);
+    }
+
+    #[test]
+    fn test_node_kind_join() {
+        let dag_node = DAGNode::new(
+            "join_1".to_string(),
+            "join".to_string(),
+            "join".to_string(),
+        );
+        assert_eq!(determine_node_kind(&dag_node), NodeKind::Join);
+    }
+
+    #[test]
+    fn test_node_kind_fn_call() {
+        let dag_node = DAGNode::new(
+            "fn_call_1".to_string(),
+            "fn_call".to_string(),
+            "call fn".to_string(),
+        );
+        assert_eq!(determine_node_kind(&dag_node), NodeKind::FnCall);
+    }
+
+    #[test]
+    fn test_node_kind_return() {
+        let dag_node = DAGNode::new(
+            "return_1".to_string(),
+            "return".to_string(),
+            "return".to_string(),
+        );
+        assert_eq!(determine_node_kind(&dag_node), NodeKind::Return);
+    }
+
+    #[test]
+    fn test_node_kind_break() {
+        let dag_node = DAGNode::new(
+            "break_1".to_string(),
+            "break".to_string(),
+            "break".to_string(),
+        );
+        assert_eq!(determine_node_kind(&dag_node), NodeKind::Break);
+    }
+
+    #[test]
+    fn test_node_kind_input() {
+        let dag_node = DAGNode::new(
+            "input".to_string(),
+            "input".to_string(),
+            "input".to_string(),
+        );
+        assert_eq!(determine_node_kind(&dag_node), NodeKind::Input);
+    }
+
+    #[test]
+    fn test_node_kind_output() {
+        let dag_node = DAGNode::new(
+            "output".to_string(),
+            "output".to_string(),
+            "output".to_string(),
+        );
+        assert_eq!(determine_node_kind(&dag_node), NodeKind::Output);
+    }
+
+    #[test]
+    fn test_node_kind_unknown() {
+        let dag_node = DAGNode::new(
+            "unknown_1".to_string(),
+            "unknown_type".to_string(),
+            "unknown".to_string(),
+        );
+        assert_eq!(determine_node_kind(&dag_node), NodeKind::Unspecified);
+    }
+
+    #[test]
+    fn test_node_kind_storage_roundtrip() {
+        // Test that node_kind is properly stored and recovered
+        let mut state = ExecutionState::new();
+        state.graph.nodes.insert(
+            "action_1".to_string(),
+            ExecutionNode {
+                template_id: "action_1".to_string(),
+                status: NodeStatus::Pending as i32,
+                node_kind: NodeKind::Action as i32,
+                ..Default::default()
+            },
+        );
+        state.graph.nodes.insert(
+            "sleep_1".to_string(),
+            ExecutionNode {
+                template_id: "sleep_1".to_string(),
+                status: NodeStatus::Pending as i32,
+                node_kind: NodeKind::Sleep as i32,
+                ..Default::default()
+            },
+        );
+
+        let bytes = state.to_bytes();
+        let recovered = ExecutionState::from_bytes(&bytes).unwrap();
+
+        let action = recovered.graph.nodes.get("action_1").unwrap();
+        let sleep = recovered.graph.nodes.get("sleep_1").unwrap();
+        assert_eq!(action.node_kind, NodeKind::Action as i32);
+        assert_eq!(sleep.node_kind, NodeKind::Sleep as i32);
+    }
+
+    #[test]
+    fn test_parent_execution_id_storage_roundtrip() {
+        // Test that parent_execution_id is properly stored and recovered
+        let mut state = ExecutionState::new();
+        state.graph.nodes.insert(
+            "spread_1[0]".to_string(),
+            ExecutionNode {
+                template_id: "spread_1".to_string(),
+                spread_index: Some(0),
+                status: NodeStatus::Pending as i32,
+                node_kind: NodeKind::Action as i32,
+                parent_execution_id: Some("spread_1".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let bytes = state.to_bytes();
+        let recovered = ExecutionState::from_bytes(&bytes).unwrap();
+
+        let node = recovered.graph.nodes.get("spread_1[0]").unwrap();
+        assert_eq!(node.parent_execution_id, Some("spread_1".to_string()));
+    }
+
+    #[test]
+    fn test_iteration_index_storage_roundtrip() {
+        // Test that iteration_index is properly stored and recovered
+        let mut state = ExecutionState::new();
+        state.graph.nodes.insert(
+            "action_1[iter_0]".to_string(),
+            ExecutionNode {
+                template_id: "action_1".to_string(),
+                status: NodeStatus::Completed as i32,
+                node_kind: NodeKind::Action as i32,
+                parent_execution_id: Some("action_1".to_string()),
+                iteration_index: Some(0),
+                ..Default::default()
+            },
+        );
+        state.graph.nodes.insert(
+            "action_1[iter_1]".to_string(),
+            ExecutionNode {
+                template_id: "action_1".to_string(),
+                status: NodeStatus::Completed as i32,
+                node_kind: NodeKind::Action as i32,
+                parent_execution_id: Some("action_1".to_string()),
+                iteration_index: Some(1),
+                ..Default::default()
+            },
+        );
+
+        let bytes = state.to_bytes();
+        let recovered = ExecutionState::from_bytes(&bytes).unwrap();
+
+        let iter0 = recovered.graph.nodes.get("action_1[iter_0]").unwrap();
+        let iter1 = recovered.graph.nodes.get("action_1[iter_1]").unwrap();
+        assert_eq!(iter0.iteration_index, Some(0));
+        assert_eq!(iter0.parent_execution_id, Some("action_1".to_string()));
+        assert_eq!(iter1.iteration_index, Some(1));
+        assert_eq!(iter1.parent_execution_id, Some("action_1".to_string()));
+    }
+
+    #[test]
+    fn test_spread_expansion_sets_parent_and_kind() {
+        // Build a minimal DAG with a spread node
+        let mut dag = DAG {
+            nodes: std::collections::HashMap::new(),
+            edges: vec![],
+            entry_node: Some("spread_1".to_string()),
+        };
+
+        let mut spread_node = DAGNode::new(
+            "spread_1".to_string(),
+            "action_call".to_string(),
+            "spread".to_string(),
+        );
+        spread_node.is_spread = true;
+        spread_node.spread_loop_var = Some("item".to_string());
+        spread_node.aggregates_to = Some("agg_1".to_string());
+        dag.nodes.insert("spread_1".to_string(), spread_node);
+
+        let mut agg_node = DAGNode::new(
+            "agg_1".to_string(),
+            "action_call".to_string(),
+            "aggregator".to_string(),
+        );
+        agg_node.is_aggregator = true;
+        dag.nodes.insert("agg_1".to_string(), agg_node);
+
+        // Initialize execution state
+        let mut state = ExecutionState::new();
+        state.initialize_from_dag(&dag, &WorkflowArguments::default());
+
+        // Verify spread template has Spread kind
+        let spread_exec = state.graph.nodes.get("spread_1").unwrap();
+        assert_eq!(spread_exec.node_kind, NodeKind::Spread as i32);
+
+        // Expand the spread
+        let items = vec![
+            WorkflowValue::Int(1),
+            WorkflowValue::Int(2),
+            WorkflowValue::Int(3),
+        ];
+        state.expand_spread("spread_1", items, &dag);
+
+        // Verify expanded nodes have Action kind and parent set
+        for i in 0..3 {
+            let child_id = format!("spread_1[{}]", i);
+            let child = state.graph.nodes.get(&child_id).unwrap();
+            assert_eq!(
+                child.node_kind,
+                NodeKind::Action as i32,
+                "Spread child should have Action kind"
+            );
+            assert_eq!(
+                child.parent_execution_id,
+                Some("spread_1".to_string()),
+                "Spread child should have parent_execution_id set"
+            );
+            assert_eq!(
+                child.spread_index,
+                Some(i as i32),
+                "Spread child should have spread_index set"
+            );
+        }
+    }
+
+    #[test]
+    fn test_initialize_from_dag_sets_node_kind() {
+        // Build a DAG with various node types
+        let mut dag = DAG {
+            nodes: std::collections::HashMap::new(),
+            edges: vec![],
+            entry_node: Some("input".to_string()),
+        };
+
+        let input_node = DAGNode::new(
+            "input".to_string(),
+            "input".to_string(),
+            "input".to_string(),
+        );
+        dag.nodes.insert("input".to_string(), input_node);
+
+        let mut action_node = DAGNode::new(
+            "action_1".to_string(),
+            "action_call".to_string(),
+            "call action".to_string(),
+        );
+        action_node.module_name = Some("my_module".to_string());
+        action_node.action_name = Some("my_action".to_string());
+        dag.nodes.insert("action_1".to_string(), action_node);
+
+        let mut sleep_node = DAGNode::new(
+            "sleep_1".to_string(),
+            "action_call".to_string(),
+            "sleep".to_string(),
+        );
+        sleep_node.action_name = Some("sleep".to_string());
+        dag.nodes.insert("sleep_1".to_string(), sleep_node);
+
+        let output_node = DAGNode::new(
+            "output".to_string(),
+            "output".to_string(),
+            "output".to_string(),
+        );
+        dag.nodes.insert("output".to_string(), output_node);
+
+        // Initialize execution state
+        let mut state = ExecutionState::new();
+        state.initialize_from_dag(&dag, &WorkflowArguments::default());
+
+        // Verify node kinds are set correctly
+        let input_exec = state.graph.nodes.get("input").unwrap();
+        assert_eq!(input_exec.node_kind, NodeKind::Input as i32);
+
+        let action_exec = state.graph.nodes.get("action_1").unwrap();
+        assert_eq!(action_exec.node_kind, NodeKind::Action as i32);
+
+        let sleep_exec = state.graph.nodes.get("sleep_1").unwrap();
+        assert_eq!(sleep_exec.node_kind, NodeKind::Sleep as i32);
+
+        let output_exec = state.graph.nodes.get("output").unwrap();
+        assert_eq!(output_exec.node_kind, NodeKind::Output as i32);
     }
 }

@@ -27,7 +27,7 @@ use uuid::Uuid;
 use crate::config::WebappConfig;
 use crate::db::{Database, ScheduleId, WorkerStatus, WorkflowVersionId, WorkflowVersionSummary};
 use crate::execution_graph::ExecutionState;
-use crate::messages::execution::{ExecutionGraph, NodeStatus};
+use crate::messages::execution::{ExecutionGraph, NodeKind, NodeStatus};
 use crate::pool_status::PoolTimeSeries;
 
 /// Webapp server handle
@@ -1051,8 +1051,8 @@ struct ExecutionGraphNode {
     depends_on: Vec<String>,
     /// Status: pending, blocked, dispatched, completed, failed
     status: String,
-    /// Whether this is a sleep action
-    is_sleep: bool,
+    /// Node kind as integer (matches NodeKind proto enum)
+    node_kind: i32,
 }
 
 #[derive(Serialize)]
@@ -1669,7 +1669,37 @@ struct SimpleDagNode {
     guard: Option<String>,
     depends_on: Vec<String>,
     waits_for: Vec<String>,
-    is_sleep: bool,
+    node_kind: NodeKind,
+}
+
+/// Determine the NodeKind for a DAG node based on its properties.
+fn determine_node_kind_from_dag(node: &crate::dag::DAGNode) -> NodeKind {
+    // Sleep actions are special - check first
+    if node.action_name.as_deref() == Some("sleep") {
+        return NodeKind::Sleep;
+    }
+    // Aggregator nodes collect spread results
+    if node.is_aggregator {
+        return NodeKind::Aggregator;
+    }
+    // Spread nodes are templates for parallel expansion
+    if node.is_spread {
+        return NodeKind::Spread;
+    }
+    // Map node_type string to NodeKind enum
+    match node.node_type.as_str() {
+        "action_call" => NodeKind::Action,
+        "assignment" => NodeKind::Assignment,
+        "branch" => NodeKind::Branch,
+        "join" => NodeKind::Join,
+        "fn_call" => NodeKind::FnCall,
+        "return" => NodeKind::Return,
+        "break" => NodeKind::Break,
+        "for_loop" => NodeKind::ForLoop,
+        "input" => NodeKind::Input,
+        "output" => NodeKind::Output,
+        _ => NodeKind::Unspecified,
+    }
 }
 
 fn decode_dag_from_proto(proto_bytes: &[u8]) -> Vec<SimpleDagNode> {
@@ -1709,7 +1739,7 @@ fn decode_dag_from_proto(proto_bytes: &[u8]) -> Vec<SimpleDagNode> {
                 .collect();
 
             let action_name = node.action_name.clone().unwrap_or_default();
-            let is_sleep = action_name == "sleep";
+            let node_kind = determine_node_kind_from_dag(node);
 
             SimpleDagNode {
                 id: node.id.clone(),
@@ -1718,7 +1748,7 @@ fn decode_dag_from_proto(proto_bytes: &[u8]) -> Vec<SimpleDagNode> {
                 guard: node.guard_expr.as_ref().map(crate::print_expr),
                 depends_on,
                 waits_for,
-                is_sleep,
+                node_kind,
             }
         })
         .collect()
@@ -1780,7 +1810,7 @@ fn build_filtered_execution_graph(
                     .get(&node.id)
                     .cloned()
                     .unwrap_or_else(|| "pending".to_string()),
-                is_sleep: node.is_sleep,
+                node_kind: node.node_kind as i32,
             })
             .collect(),
     }
@@ -1815,10 +1845,18 @@ fn synthesize_action_logs_from_execution_graph(
     let (internal_nodes, _) = build_node_maps(dag);
     let dag_by_id: std::collections::HashMap<&str, &SimpleDagNode> =
         dag.iter().map(|node| (node.id.as_str(), node)).collect();
+    // Use node_key (unique per execution) for action_id, not display_node_id (template)
     let mut action_ids: std::collections::HashMap<String, Uuid> = std::collections::HashMap::new();
     let mut logs = Vec::new();
 
-    for (node_key, exec_node) in &graph.nodes {
+    // Sort node keys for deterministic iteration order
+    let mut sorted_keys: Vec<_> = graph.nodes.keys().collect();
+    sorted_keys.sort();
+
+    for node_key in sorted_keys {
+        let exec_node = &graph.nodes[node_key];
+
+        // display_node_id is the template ID for UI grouping
         let display_node_id = if dag_by_id.contains_key(node_key.as_str()) {
             node_key.as_str()
         } else {
@@ -1833,15 +1871,31 @@ fn synthesize_action_logs_from_execution_graph(
             continue;
         }
 
+        // Generate unique action_id per execution instance (node_key), not per template
         let action_id = *action_ids
-            .entry(display_node_id.to_string())
+            .entry(node_key.to_string())
             .or_insert_with(Uuid::new_v4);
         let dispatch_payload = exec_node.inputs.clone();
 
         if exec_node.attempts.is_empty() {
+            // Only include if the node has completed (has duration_ms) or has meaningful state
+            // Skip nodes that were just started but never completed (0ms incomplete entries)
+            let status =
+                NodeStatus::try_from(exec_node.status).unwrap_or(NodeStatus::Unspecified);
+            let is_terminal = matches!(
+                status,
+                NodeStatus::Completed
+                    | NodeStatus::Failed
+                    | NodeStatus::Exhausted
+                    | NodeStatus::Caught
+            );
+
             if let Some(started_at_ms) = exec_node.started_at_ms {
-                let status =
-                    NodeStatus::try_from(exec_node.status).unwrap_or(NodeStatus::Unspecified);
+                // Skip incomplete entries that have no duration and aren't in a terminal state
+                if exec_node.duration_ms.is_none() && !is_terminal {
+                    continue;
+                }
+
                 let success = match status {
                     NodeStatus::Completed => Some(true),
                     NodeStatus::Failed | NodeStatus::Exhausted | NodeStatus::Caught => Some(false),
@@ -1913,8 +1967,13 @@ fn build_node_contexts_from_action_logs(
         }
     }
 
-    latest_by_action
-        .values()
+    // Sort by action_id for deterministic ordering
+    let mut sorted_keys: Vec<_> = latest_by_action.keys().cloned().collect();
+    sorted_keys.sort();
+
+    sorted_keys
+        .iter()
+        .filter_map(|key| latest_by_action.get(key))
         .map(|log| NodeExecutionContext {
             id: log
                 .node_id
@@ -1988,10 +2047,13 @@ fn build_timeline_entries(
     per_page: i64,
 ) -> TimelinePage {
     let mut sorted_logs: Vec<&crate::db::ActionLog> = action_logs.iter().collect();
+    // Sort by dispatched_at descending, then by node_id and action_id for deterministic ordering
+    // (action_id alone is non-deterministic since it's generated fresh each call)
     sorted_logs.sort_by(|a, b| {
         b.dispatched_at
             .cmp(&a.dispatched_at)
-            .then_with(|| a.id.cmp(&b.id))
+            .then_with(|| a.node_id.cmp(&b.node_id))
+            .then_with(|| a.action_id.cmp(&b.action_id))
     });
 
     let total = sorted_logs.len() as i64;
@@ -2052,11 +2114,11 @@ fn build_node_maps(
     std::collections::HashSet<String>,
     std::collections::HashMap<String, Vec<String>>,
 ) {
-    // Internal nodes are those with empty module, EXCEPT for sleep actions
-    // which should be shown in the UI even though they don't have a module
+    // Internal nodes are those that are NOT Action or Sleep nodes
+    // Action and Sleep are the visible execution nodes shown in UI
     let internal_nodes: std::collections::HashSet<String> = dag
         .iter()
-        .filter(|node| node.module.is_empty() && !node.is_sleep)
+        .filter(|node| !matches!(node.node_kind, NodeKind::Action | NodeKind::Sleep))
         .map(|node| node.id.clone())
         .collect();
 
@@ -3227,5 +3289,160 @@ mod tests {
         // Page should render successfully with instance data
         assert!(html.contains("Run Created"));
         assert!(html.contains("Status"));
+    }
+
+    #[test]
+    fn test_build_node_maps_filters_by_kind() {
+        // Create SimpleDagNodes with various kinds
+        let dag = vec![
+            SimpleDagNode {
+                id: "action_1".to_string(),
+                module: "my_module".to_string(),
+                action: "my_action".to_string(),
+                guard: None,
+                depends_on: vec![],
+                waits_for: vec![],
+                node_kind: NodeKind::Action,
+            },
+            SimpleDagNode {
+                id: "sleep_1".to_string(),
+                module: "".to_string(), // Sleep has empty module
+                action: "sleep".to_string(),
+                guard: None,
+                depends_on: vec![],
+                waits_for: vec![],
+                node_kind: NodeKind::Sleep,
+            },
+            SimpleDagNode {
+                id: "assignment_1".to_string(),
+                module: "".to_string(),
+                action: "".to_string(),
+                guard: None,
+                depends_on: vec![],
+                waits_for: vec![],
+                node_kind: NodeKind::Assignment,
+            },
+            SimpleDagNode {
+                id: "branch_1".to_string(),
+                module: "".to_string(),
+                action: "".to_string(),
+                guard: None,
+                depends_on: vec![],
+                waits_for: vec![],
+                node_kind: NodeKind::Branch,
+            },
+            SimpleDagNode {
+                id: "input".to_string(),
+                module: "".to_string(),
+                action: "".to_string(),
+                guard: None,
+                depends_on: vec![],
+                waits_for: vec![],
+                node_kind: NodeKind::Input,
+            },
+        ];
+
+        let (internal_nodes, _) = build_node_maps(&dag);
+
+        // Action and Sleep should NOT be internal (they are visible)
+        assert!(
+            !internal_nodes.contains("action_1"),
+            "Action should not be internal"
+        );
+        assert!(
+            !internal_nodes.contains("sleep_1"),
+            "Sleep should not be internal"
+        );
+
+        // Other node types should be internal (hidden from UI)
+        assert!(
+            internal_nodes.contains("assignment_1"),
+            "Assignment should be internal"
+        );
+        assert!(
+            internal_nodes.contains("branch_1"),
+            "Branch should be internal"
+        );
+        assert!(
+            internal_nodes.contains("input"),
+            "Input should be internal"
+        );
+    }
+
+    #[test]
+    fn test_determine_node_kind_from_dag() {
+        // Test action node
+        let action_node = crate::dag::DAGNode::new(
+            "action_1".to_string(),
+            "action_call".to_string(),
+            "call action".to_string(),
+        );
+        assert_eq!(
+            determine_node_kind_from_dag(&action_node),
+            NodeKind::Action
+        );
+
+        // Test sleep node (action_name == "sleep" takes precedence)
+        let mut sleep_node = crate::dag::DAGNode::new(
+            "sleep_1".to_string(),
+            "action_call".to_string(),
+            "sleep".to_string(),
+        );
+        sleep_node.action_name = Some("sleep".to_string());
+        assert_eq!(determine_node_kind_from_dag(&sleep_node), NodeKind::Sleep);
+
+        // Test aggregator node (is_aggregator takes precedence)
+        let mut agg_node = crate::dag::DAGNode::new(
+            "agg_1".to_string(),
+            "action_call".to_string(),
+            "aggregator".to_string(),
+        );
+        agg_node.is_aggregator = true;
+        assert_eq!(
+            determine_node_kind_from_dag(&agg_node),
+            NodeKind::Aggregator
+        );
+
+        // Test spread node (is_spread takes precedence)
+        let mut spread_node = crate::dag::DAGNode::new(
+            "spread_1".to_string(),
+            "action_call".to_string(),
+            "spread".to_string(),
+        );
+        spread_node.is_spread = true;
+        assert_eq!(
+            determine_node_kind_from_dag(&spread_node),
+            NodeKind::Spread
+        );
+
+        // Test assignment node
+        let assign_node = crate::dag::DAGNode::new(
+            "assign_1".to_string(),
+            "assignment".to_string(),
+            "x = 1".to_string(),
+        );
+        assert_eq!(
+            determine_node_kind_from_dag(&assign_node),
+            NodeKind::Assignment
+        );
+
+        // Test input node
+        let input_node = crate::dag::DAGNode::new(
+            "input".to_string(),
+            "input".to_string(),
+            "input".to_string(),
+        );
+        assert_eq!(determine_node_kind_from_dag(&input_node), NodeKind::Input);
+
+        // Test output node
+        let output_node = crate::dag::DAGNode::new(
+            "output".to_string(),
+            "output".to_string(),
+            "output".to_string(),
+        );
+        assert_eq!(
+            determine_node_kind_from_dag(&output_node),
+            NodeKind::Output
+        );
     }
 }
