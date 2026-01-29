@@ -240,6 +240,8 @@ pub struct ActionLog {
     pub action_name: Option<String>,
     pub node_id: Option<String>,
     pub dispatch_payload: Option<Vec<u8>>,
+    /// Node kind (matches NodeKind proto enum) - used to identify sleep nodes etc.
+    pub node_kind: i32,
 }
 
 // ============================================================================

@@ -1920,6 +1920,7 @@ fn synthesize_action_logs_from_execution_graph(
                     action_name: Some(dag_node.action.clone()),
                     node_id: Some(display_node_id.to_string()),
                     dispatch_payload,
+                    node_kind: exec_node.node_kind,
                 });
             }
             continue;
@@ -1944,6 +1945,7 @@ fn synthesize_action_logs_from_execution_graph(
                 action_name: Some(dag_node.action.clone()),
                 node_id: Some(display_node_id.to_string()),
                 dispatch_payload: dispatch_payload.clone(),
+                node_kind: exec_node.node_kind,
             });
         }
     }
@@ -2010,11 +2012,7 @@ fn build_node_contexts_from_action_logs(
 }
 
 fn build_action_log_context(log: &crate::db::ActionLog) -> ActionLogContext {
-    let is_sleep = log
-        .action_name
-        .as_ref()
-        .map(|name| name == "sleep")
-        .unwrap_or(false);
+    let is_sleep = NodeKind::try_from(log.node_kind) == Ok(NodeKind::Sleep);
 
     ActionLogContext {
         id: log.id.to_string(),

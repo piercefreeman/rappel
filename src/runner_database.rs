@@ -61,7 +61,7 @@ use crate::db::{
     WorkflowInstanceId, WorkflowSchedule, WorkflowVersionId,
 };
 use crate::execution_graph::{Completion, ExecutionState, PayloadTuple, SLEEP_WORKER_ID};
-use crate::messages::execution::{ExecutionNode, NodeStatus};
+use crate::messages::execution::{ExecutionNode, NodeKind, NodeStatus};
 use crate::messages::proto;
 use crate::messages::proto::WorkflowArguments;
 use crate::messages::{MessageError, decode_message, encode_message};
@@ -93,9 +93,6 @@ pub const DEFAULT_SCHEDULE_CHECK_BATCH_SIZE: i32 = 100;
 /// Default staleness timeout - instances that haven't made progress in this duration are released.
 /// This catches instances stuck with work in ready_queue that never gets dispatched.
 pub const DEFAULT_STALENESS_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Built-in durable sleep action name.
-const SLEEP_ACTION_NAME: &str = "sleep";
 
 #[derive(Debug, Error)]
 pub enum InstanceRunnerError {
@@ -734,15 +731,8 @@ impl InstanceRunner {
                     continue;
                 }
 
-                let template_id = &exec_node.template_id;
-                let is_sleep = instance
-                    .dag
-                    .nodes
-                    .get(template_id)
-                    .and_then(|node| node.action_name.as_deref())
-                    .map(|name| name == SLEEP_ACTION_NAME)
-                    .unwrap_or(false);
-
+                // Use the structured node_kind field instead of string matching
+                let is_sleep = NodeKind::try_from(exec_node.node_kind) == Ok(NodeKind::Sleep);
                 if !is_sleep {
                     continue;
                 }
@@ -1536,7 +1526,7 @@ impl InstanceRunner {
 
                 // Handle durable sleep actions inline - schedule_sleep_action calls mark_running
                 // which removes from ready_queue
-                if dag_node.action_name.as_deref() == Some(SLEEP_ACTION_NAME) {
+                if NodeKind::try_from(exec_node.node_kind) == Ok(NodeKind::Sleep) {
                     if let Err(e) = self
                         .schedule_sleep_action(instance, &node_id, &dag_node)
                         .await
@@ -1993,14 +1983,8 @@ impl InstanceRunner {
                 continue;
             }
 
-            let template_id = &exec_node.template_id;
-            let is_sleep = instance
-                .dag
-                .nodes
-                .get(template_id)
-                .and_then(|node| node.action_name.as_deref())
-                .map(|name| name == SLEEP_ACTION_NAME)
-                .unwrap_or(false);
+            // Use the structured node_kind field instead of looking up the DAG
+            let is_sleep = NodeKind::try_from(exec_node.node_kind) == Ok(NodeKind::Sleep);
 
             if is_sleep {
                 if let Some(wakeup) = Self::sleep_wakeup_time_ms(exec_node) {
