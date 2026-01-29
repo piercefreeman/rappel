@@ -2138,8 +2138,16 @@ impl InstanceRunner {
                     let graph_bytes = instance.state.to_bytes_fully_stripped();
                     to_release.push((instance.instance_id, graph_bytes, next_wakeup));
                 } else if !instance.state.has_pending_work() && instance.in_flight.is_empty() {
+                    // Instance has no work and isn't complete - this is an anomalous state.
+                    // Release it so another runner (or this one on next claim) can try to
+                    // make progress. This prevents indefinite stalls.
+                    warn!(
+                        instance_id = %instance.instance_id,
+                        workflow = %instance.workflow_name,
+                        "Instance has no pending work but is not complete; releasing"
+                    );
                     let graph_bytes = instance.state.to_bytes_fully_stripped();
-                    to_update.push((instance.instance_id, graph_bytes, next_wakeup));
+                    to_release.push((instance.instance_id, graph_bytes, next_wakeup));
                 } else if instance.state.graph.next_wakeup_time != previous_wakeup {
                     // Wakeup time changed
                     let graph_bytes = instance.state.to_bytes_fully_stripped();

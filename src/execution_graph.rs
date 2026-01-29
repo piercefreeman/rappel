@@ -2776,4 +2776,332 @@ mod tests {
             "output node should be ready after recovery"
         );
     }
+
+    #[test]
+    fn test_parallel_join_completion() {
+        // Test that an output node becomes ready when multiple parallel branches complete
+        // This tests a scenario that could cause stalls if the join logic doesn't work correctly
+        use crate::dag::{DAGEdge, DAGNode};
+        use std::collections::HashMap;
+
+        let mut nodes = HashMap::new();
+        let mut edges = Vec::new();
+
+        // Input node
+        let mut input = DAGNode::new(
+            "input".to_string(),
+            "input".to_string(),
+            "input".to_string(),
+        );
+        input.is_input = true;
+        input.function_name = Some("main".to_string());
+        nodes.insert("input".to_string(), input);
+
+        // Two parallel actions
+        let mut action_a = DAGNode::new(
+            "action_a".to_string(),
+            "fn_call".to_string(),
+            "action_a".to_string(),
+        );
+        action_a.module_name = Some("test".to_string());
+        action_a.action_name = Some("do_a".to_string());
+        action_a.function_name = Some("main".to_string());
+        nodes.insert("action_a".to_string(), action_a);
+
+        let mut action_b = DAGNode::new(
+            "action_b".to_string(),
+            "fn_call".to_string(),
+            "action_b".to_string(),
+        );
+        action_b.module_name = Some("test".to_string());
+        action_b.action_name = Some("do_b".to_string());
+        action_b.function_name = Some("main".to_string());
+        nodes.insert("action_b".to_string(), action_b);
+
+        // Join node that requires both branches
+        let mut join = DAGNode::new("join".to_string(), "join".to_string(), "join".to_string());
+        join.function_name = Some("main".to_string());
+        nodes.insert("join".to_string(), join);
+
+        // Output node
+        let mut output = DAGNode::new(
+            "output".to_string(),
+            "output".to_string(),
+            "output".to_string(),
+        );
+        output.is_output = true;
+        output.function_name = Some("main".to_string());
+        nodes.insert("output".to_string(), output);
+
+        // Edges: input -> action_a, input -> action_b, action_a -> join, action_b -> join, join -> output
+        edges.push(DAGEdge::state_machine(
+            "input".to_string(),
+            "action_a".to_string(),
+        ));
+        edges.push(DAGEdge::state_machine(
+            "input".to_string(),
+            "action_b".to_string(),
+        ));
+        edges.push(DAGEdge::state_machine(
+            "action_a".to_string(),
+            "join".to_string(),
+        ));
+        edges.push(DAGEdge::state_machine(
+            "action_b".to_string(),
+            "join".to_string(),
+        ));
+        edges.push(DAGEdge::state_machine(
+            "join".to_string(),
+            "output".to_string(),
+        ));
+
+        let dag = DAG {
+            nodes,
+            edges,
+            entry_node: Some("input".to_string()),
+        };
+
+        // Initialize execution state
+        let mut state = ExecutionState::new();
+        state.initialize_from_dag(&dag, &WorkflowArguments::default());
+
+        // Simulate input completing
+        let input_completion = Completion {
+            node_id: "input".to_string(),
+            success: true,
+            result: None,
+            error: None,
+            error_type: None,
+            worker_id: "test".to_string(),
+            duration_ms: 0,
+            worker_duration_ms: Some(0),
+        };
+        let result = state.apply_completions_batch(vec![input_completion], &dag);
+        assert!(
+            result.newly_ready.contains(&"action_a".to_string()),
+            "action_a should be ready"
+        );
+        assert!(
+            result.newly_ready.contains(&"action_b".to_string()),
+            "action_b should be ready"
+        );
+
+        // Mark actions as running (simulating dispatch)
+        state.mark_running("action_a", "worker1", None);
+        state.mark_running("action_b", "worker2", None);
+
+        // Complete action_a
+        let action_a_completion = Completion {
+            node_id: "action_a".to_string(),
+            success: true,
+            result: Some(vec![1, 2, 3]),
+            error: None,
+            error_type: None,
+            worker_id: "worker1".to_string(),
+            duration_ms: 100,
+            worker_duration_ms: Some(100),
+        };
+        let result = state.apply_completions_batch(vec![action_a_completion], &dag);
+        // Join shouldn't be ready yet - needs action_b
+        assert!(
+            !result.newly_ready.contains(&"join".to_string()),
+            "join should NOT be ready yet (needs action_b)"
+        );
+
+        // Complete action_b
+        let action_b_completion = Completion {
+            node_id: "action_b".to_string(),
+            success: true,
+            result: Some(vec![4, 5, 6]),
+            error: None,
+            error_type: None,
+            worker_id: "worker2".to_string(),
+            duration_ms: 150,
+            worker_duration_ms: Some(150),
+        };
+        let result = state.apply_completions_batch(vec![action_b_completion], &dag);
+        // Now join should be ready
+        assert!(
+            result.newly_ready.contains(&"join".to_string()),
+            "join should be ready after both branches complete"
+        );
+
+        // Process join as inline node (simulate what collect_ready_actions does)
+        let join_node = state.graph.nodes.get_mut("join").unwrap();
+        join_node.status = NodeStatus::Completed as i32;
+        state.remove_from_ready_queue("join");
+
+        // Complete join
+        let join_completion = Completion {
+            node_id: "join".to_string(),
+            success: true,
+            result: None,
+            error: None,
+            error_type: None,
+            worker_id: "inline".to_string(),
+            duration_ms: 0,
+            worker_duration_ms: Some(0),
+        };
+        let result = state.apply_completions_batch(vec![join_completion], &dag);
+        assert!(
+            result.newly_ready.contains(&"output".to_string()),
+            "output should be ready after join completes"
+        );
+
+        // Process output as inline node
+        let output_node = state.graph.nodes.get_mut("output").unwrap();
+        output_node.status = NodeStatus::Completed as i32;
+        state.remove_from_ready_queue("output");
+
+        // Complete output and check workflow completion
+        let output_completion = Completion {
+            node_id: "output".to_string(),
+            success: true,
+            result: None,
+            error: None,
+            error_type: None,
+            worker_id: "inline".to_string(),
+            duration_ms: 0,
+            worker_duration_ms: Some(0),
+        };
+        let result = state.apply_completions_batch(vec![output_completion], &dag);
+        assert!(
+            result.workflow_completed,
+            "workflow should be completed after output node completes"
+        );
+    }
+
+    #[test]
+    fn test_stalled_instance_detection_no_pending_work() {
+        // Test the scenario where an instance has:
+        // 1. No pending work (has_pending_work() returns false)
+        // 2. No in-flight actions
+        // 3. Workflow is not complete
+        // This is the "stall" scenario that keeps the instance owned but making no progress
+        use crate::dag::{DAGEdge, DAGNode};
+        use std::collections::HashMap;
+
+        let mut nodes = HashMap::new();
+        let mut edges = Vec::new();
+
+        // Simple workflow: input -> action -> output
+        let mut input = DAGNode::new(
+            "input".to_string(),
+            "input".to_string(),
+            "input".to_string(),
+        );
+        input.is_input = true;
+        input.function_name = Some("main".to_string());
+        nodes.insert("input".to_string(), input);
+
+        let mut action = DAGNode::new(
+            "action".to_string(),
+            "fn_call".to_string(),
+            "action".to_string(),
+        );
+        action.module_name = Some("test".to_string());
+        action.action_name = Some("do_work".to_string());
+        action.function_name = Some("main".to_string());
+        nodes.insert("action".to_string(), action);
+
+        let mut output = DAGNode::new(
+            "output".to_string(),
+            "output".to_string(),
+            "output".to_string(),
+        );
+        output.is_output = true;
+        output.function_name = Some("main".to_string());
+        nodes.insert("output".to_string(), output);
+
+        edges.push(DAGEdge::state_machine(
+            "input".to_string(),
+            "action".to_string(),
+        ));
+        edges.push(DAGEdge::state_machine(
+            "action".to_string(),
+            "output".to_string(),
+        ));
+
+        let dag = DAG {
+            nodes,
+            edges,
+            entry_node: Some("input".to_string()),
+        };
+
+        // Create a state where action is Completed but output is still Blocked
+        // This simulates a crash between action completing and output being advanced
+        let mut state = ExecutionState::new();
+        state.graph.nodes.insert(
+            "input".to_string(),
+            ExecutionNode {
+                template_id: "input".to_string(),
+                status: NodeStatus::Completed as i32,
+                ..Default::default()
+            },
+        );
+        state.graph.nodes.insert(
+            "action".to_string(),
+            ExecutionNode {
+                template_id: "action".to_string(),
+                status: NodeStatus::Completed as i32,
+                result: Some(vec![1, 2, 3]),
+                ..Default::default()
+            },
+        );
+        state.graph.nodes.insert(
+            "output".to_string(),
+            ExecutionNode {
+                template_id: "output".to_string(),
+                status: NodeStatus::Blocked as i32,
+                ..Default::default()
+            },
+        );
+
+        // Verify the state conditions for stall detection
+        assert!(
+            !state.has_pending_work(),
+            "Should have no pending work (no Pending/Running nodes, empty ready_queue)"
+        );
+        assert!(
+            state.graph.ready_queue.is_empty(),
+            "Ready queue should be empty"
+        );
+
+        // Check workflow completion - should NOT be complete yet
+        let status = state.check_workflow_completion(&dag);
+        assert!(
+            !status.workflow_completed,
+            "Workflow should NOT be complete (output is Blocked)"
+        );
+        assert!(!status.workflow_failed, "Workflow should NOT be failed");
+
+        // Find stalled completions - should find the action node
+        let stalled = state.find_stalled_completions(&dag);
+        assert_eq!(
+            stalled.len(),
+            1,
+            "Should find 1 stalled completion (action has blocked successor)"
+        );
+        assert_eq!(
+            stalled[0].node_id, "action",
+            "Stalled completion should be for action node"
+        );
+
+        // Apply the stalled completion to advance the workflow
+        let result = state.apply_completions_batch(stalled, &dag);
+        assert!(
+            result.newly_ready.contains(&"output".to_string()),
+            "Output should become ready after reprocessing stalled completion"
+        );
+
+        // Now the output should be in ready_queue
+        assert!(
+            state.graph.ready_queue.contains(&"output".to_string()),
+            "Output should be in ready_queue"
+        );
+        assert!(
+            state.has_pending_work(),
+            "Should now have pending work (output in ready_queue)"
+        );
+    }
 }
