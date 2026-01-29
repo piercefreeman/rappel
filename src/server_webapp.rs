@@ -1252,6 +1252,7 @@ struct InstanceStatusRow {
     pool_id: String,
     active_instances: i32,
     total_completed: i64,
+    instances_per_sec: String,
     median_duration: String,
     median_dequeue_ms: Option<i64>,
     updated_at: String,
@@ -1294,6 +1295,7 @@ fn render_workers_page(templates: &Tera, statuses: &[WorkerStatus], window_minut
                 pool_id: status.pool_id.to_string(),
                 active_instances: status.active_instance_count,
                 total_completed: status.total_instances_completed,
+                instances_per_sec: format!("{:.2}", status.instances_per_sec),
                 median_duration,
                 median_dequeue_ms: status.median_dequeue_ms,
                 updated_at: status.updated_at.to_rfc3339(),
@@ -2486,6 +2488,7 @@ mod tests {
             median_instance_duration_secs: Some(45.3),
             active_instance_count: 12,
             total_instances_completed: 7,
+            instances_per_sec: 0.02,
             time_series: None,
         }];
 

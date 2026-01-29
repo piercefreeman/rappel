@@ -904,6 +904,7 @@ impl InstanceRunner {
             let mut interval = tokio::time::interval(status_interval);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let mut prev_total_completed: i64 = 0;
+            let mut prev_instances_completed: i64 = 0;
             let mut prev_tick: Option<Instant> = None;
 
             loop {
@@ -919,21 +920,28 @@ impl InstanceRunner {
                 let snapshots = worker_pool.throughput_snapshots();
                 let throughput_per_min: f64 = snapshots.iter().map(|s| s.throughput_per_min).sum();
                 let total_completed: i64 = snapshots.iter().map(|s| s.total_completed as i64).sum();
+                let total_instances_completed =
+                    instances_completed_total_ptr.load(Ordering::Relaxed) as i64;
 
-                // Instantaneous actions/sec from delta since last tick
-                let actions_per_sec = match prev_tick {
+                // Instantaneous actions/sec and instances/sec from delta since last tick
+                let (actions_per_sec, instances_per_sec) = match prev_tick {
                     Some(prev) => {
                         let elapsed = tick_now.duration_since(prev).as_secs_f64();
-                        let delta = total_completed - prev_total_completed;
+                        let action_delta = total_completed - prev_total_completed;
+                        let instance_delta = total_instances_completed - prev_instances_completed;
                         if elapsed > 0.0 {
-                            delta as f64 / elapsed
+                            (
+                                action_delta as f64 / elapsed,
+                                instance_delta as f64 / elapsed,
+                            )
                         } else {
-                            0.0
+                            (0.0, 0.0)
                         }
                     }
-                    None => 0.0,
+                    None => (0.0, 0.0),
                 };
                 prev_total_completed = total_completed;
+                prev_instances_completed = total_instances_completed;
                 prev_tick = Some(tick_now);
                 let last_action_at = snapshots.iter().filter_map(|s| s.last_action_at).max();
 
@@ -976,13 +984,12 @@ impl InstanceRunner {
                         active_instances: active_instance_count as u32,
                         queue_depth: dispatch_queue_size as u32,
                         in_flight_actions: total_in_flight as u32,
+                        instances_per_sec: instances_per_sec as f32,
                     });
                     ts.encode()
                 };
 
                 // 7. Upsert single pool-level row
-                let total_instances_completed =
-                    instances_completed_total_ptr.load(Ordering::Relaxed) as i64;
                 let update = WorkerStatusUpdate {
                     throughput_per_min,
                     total_completed,
@@ -996,6 +1003,7 @@ impl InstanceRunner {
                     median_instance_duration_secs,
                     active_instance_count,
                     total_instances_completed,
+                    instances_per_sec,
                     time_series: Some(time_series_bytes),
                 };
 

@@ -12,9 +12,9 @@ use serde::Serialize;
 const MAX_ENTRIES: usize = 1440;
 
 /// Size of one serialized entry in bytes.
-const ENTRY_SIZE: usize = 30;
+const ENTRY_SIZE: usize = 34;
 
-/// A single time-series data point (30 bytes serialized).
+/// A single time-series data point (34 bytes serialized).
 #[derive(Debug, Clone, Copy)]
 pub struct TimeSeriesEntry {
     /// Unix timestamp in seconds
@@ -31,6 +31,8 @@ pub struct TimeSeriesEntry {
     pub queue_depth: u32,
     /// Actions currently being executed by workers
     pub in_flight_actions: u32,
+    /// Instances completed per second at this point
+    pub instances_per_sec: f32,
 }
 
 /// Ring buffer of time-series entries, max 1440 (24 hours at 1-minute resolution).
@@ -62,7 +64,7 @@ impl PoolTimeSeries {
         self.entries.is_empty()
     }
 
-    /// Encode to binary: `[u32 count][N x 30-byte entries]`
+    /// Encode to binary: `[u32 count][N x 34-byte entries]`
     ///
     /// Each entry is:
     /// - i64 timestamp_secs (8 bytes, little-endian)
@@ -72,6 +74,7 @@ impl PoolTimeSeries {
     /// - u32 active_instances (4 bytes)
     /// - u32 queue_depth (4 bytes)
     /// - u32 in_flight_actions (4 bytes)
+    /// - f32 instances_per_sec (4 bytes)
     pub fn encode(&self) -> Vec<u8> {
         let count = self.entries.len() as u32;
         let mut buf = Vec::with_capacity(4 + self.entries.len() * ENTRY_SIZE);
@@ -84,6 +87,7 @@ impl PoolTimeSeries {
             buf.extend_from_slice(&entry.active_instances.to_le_bytes());
             buf.extend_from_slice(&entry.queue_depth.to_le_bytes());
             buf.extend_from_slice(&entry.in_flight_actions.to_le_bytes());
+            buf.extend_from_slice(&entry.instances_per_sec.to_le_bytes());
         }
         buf
     }
@@ -116,6 +120,8 @@ impl PoolTimeSeries {
             let queue_depth = u32::from_le_bytes(bytes[offset + 22..offset + 26].try_into().ok()?);
             let in_flight_actions =
                 u32::from_le_bytes(bytes[offset + 26..offset + 30].try_into().ok()?);
+            let instances_per_sec =
+                f32::from_le_bytes(bytes[offset + 30..offset + 34].try_into().ok()?);
             entries.push_back(TimeSeriesEntry {
                 timestamp_secs,
                 actions_per_sec,
@@ -124,6 +130,7 @@ impl PoolTimeSeries {
                 active_instances,
                 queue_depth,
                 in_flight_actions,
+                instances_per_sec,
             });
         }
         Some(Self { entries })
@@ -141,6 +148,7 @@ impl PoolTimeSeries {
                 ai: e.active_instances,
                 qd: e.queue_depth,
                 inf: e.in_flight_actions,
+                ips: e.instances_per_sec,
             })
             .collect()
     }
@@ -170,6 +178,8 @@ pub struct TimeSeriesJsonEntry {
     /// In-flight actions
     #[serde(rename = "inf")]
     pub inf: u32,
+    /// Instances per second
+    pub ips: f32,
 }
 
 #[cfg(test)]
@@ -185,6 +195,7 @@ mod tests {
             active_instances: 20,
             queue_depth: 5,
             in_flight_actions: 8,
+            instances_per_sec: 0.5,
         }
     }
 
@@ -220,6 +231,7 @@ mod tests {
             active_instances: 100,
             queue_depth: 15,
             in_flight_actions: 32,
+            instances_per_sec: 1.5,
         });
         ts.push(TimeSeriesEntry {
             timestamp_secs: 1700000060,
@@ -229,6 +241,7 @@ mod tests {
             active_instances: 90,
             queue_depth: 10,
             in_flight_actions: 24,
+            instances_per_sec: 1.2,
         });
 
         let bytes = ts.encode();
@@ -243,12 +256,14 @@ mod tests {
         assert_eq!(json[0].ai, 100);
         assert_eq!(json[0].qd, 15);
         assert_eq!(json[0].inf, 32);
+        assert!((json[0].ips - 1.5).abs() < 0.001);
 
         assert_eq!(json[1].t, 1700000060);
         assert_eq!(json[1].w, 6);
         assert_eq!(json[1].ai, 90);
         assert_eq!(json[1].qd, 10);
         assert_eq!(json[1].inf, 24);
+        assert!((json[1].ips - 1.2).abs() < 0.001);
     }
 
     #[test]
@@ -282,6 +297,7 @@ mod tests {
             active_instances: 50,
             queue_depth: 3,
             in_flight_actions: 10,
+            instances_per_sec: 2.0,
         });
         let json = ts.to_json_entries();
         assert_eq!(json.len(), 1);
@@ -291,5 +307,6 @@ mod tests {
         assert_eq!(json[0].ai, 50);
         assert_eq!(json[0].qd, 3);
         assert_eq!(json[0].inf, 10);
+        assert!((json[0].ips - 2.0).abs() < f32::EPSILON);
     }
 }

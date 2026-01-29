@@ -162,6 +162,8 @@ pub struct WorkerStatusUpdate {
     pub active_instance_count: i32,
     /// Total instances completed (completed + failed) since runner start
     pub total_instances_completed: i64,
+    /// Instances completed per second
+    pub instances_per_sec: f64,
     /// Encoded time-series ring buffer (BYTEA)
     pub time_series: Option<Vec<u8>>,
 }
@@ -192,6 +194,8 @@ pub struct WorkerStatus {
     pub active_instance_count: i32,
     /// Total instances completed (completed + failed) since runner start
     pub total_instances_completed: i64,
+    /// Instances completed per second
+    pub instances_per_sec: f64,
     /// Encoded time-series ring buffer
     pub time_series: Option<Vec<u8>>,
 }
