@@ -90,6 +90,10 @@ pub const DEFAULT_SCHEDULE_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 /// Default schedule check batch size
 pub const DEFAULT_SCHEDULE_CHECK_BATCH_SIZE: i32 = 100;
 
+/// Default staleness timeout - instances that haven't made progress in this duration are released.
+/// This catches instances stuck with work in ready_queue that never gets dispatched.
+pub const DEFAULT_STALENESS_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Built-in durable sleep action name.
 const SLEEP_ACTION_NAME: &str = "sleep";
 
@@ -199,6 +203,8 @@ struct ActiveInstance {
     pending_completions: Vec<Completion>,
     /// When this instance was claimed by this runner
     claimed_at: Instant,
+    /// When this instance last made progress (completion received)
+    last_progress_at: Instant,
 }
 
 /// Metrics snapshot for the instance runner
@@ -1348,6 +1354,7 @@ impl InstanceRunner {
             }
         };
 
+        let now = Instant::now();
         let active = ActiveInstance {
             instance_id: claimed.id,
             workflow_name: claimed.workflow_name,
@@ -1356,7 +1363,8 @@ impl InstanceRunner {
             in_flight: HashSet::new(),
             queued_ready_count: 0,
             pending_completions: stalled_completions,
-            claimed_at: Instant::now(),
+            claimed_at: now,
+            last_progress_at: now,
         };
 
         self.active_instances
@@ -2087,6 +2095,9 @@ impl InstanceRunner {
                         .state
                         .apply_completions_batch(completions, &instance.dag);
 
+                    // Mark progress when completions are applied
+                    instance.last_progress_at = Instant::now();
+
                     // Extract payloads for completed nodes (inputs + results)
                     for node_id in completed_node_ids {
                         if let Some(node) = instance.state.graph.nodes.get(&node_id) {
@@ -2166,6 +2177,22 @@ impl InstanceRunner {
                         instance_id = %instance.instance_id,
                         workflow = %instance.workflow_name,
                         "Instance has no pending work but is not complete; releasing"
+                    );
+                    let graph_bytes = instance.state.to_bytes_fully_stripped();
+                    to_release.push((instance.instance_id, graph_bytes, next_wakeup));
+                } else if instance.in_flight.is_empty()
+                    && instance.last_progress_at.elapsed() > DEFAULT_STALENESS_TIMEOUT
+                {
+                    // Instance has pending work but hasn't made progress in too long.
+                    // This catches stuck instances where nodes are in ready_queue but
+                    // never get dispatched (e.g., due to queued_ready_count mismatch).
+                    // Release it so it can be reclaimed with a fresh state.
+                    warn!(
+                        instance_id = %instance.instance_id,
+                        workflow = %instance.workflow_name,
+                        stale_secs = instance.last_progress_at.elapsed().as_secs(),
+                        pending_nodes = instance.state.graph.ready_queue.len(),
+                        "Instance stalled with pending work; releasing"
                     );
                     let graph_bytes = instance.state.to_bytes_fully_stripped();
                     to_release.push((instance.instance_id, graph_bytes, next_wakeup));
