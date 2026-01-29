@@ -2405,6 +2405,8 @@ mod tests {
             median_instance_duration_secs: Some(45.3),
             active_instance_count: 12,
             total_instances_completed: 7,
+            instances_per_sec: 0.12,
+            instances_per_min: 7.2,
             time_series: None,
         }];
 

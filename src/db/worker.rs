@@ -563,9 +563,11 @@ impl Database {
                 median_instance_duration_secs,
                 active_instance_count,
                 total_instances_completed,
+                instances_per_sec,
+                instances_per_min,
                 time_series
             )
-            VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             ON CONFLICT (pool_id)
             DO UPDATE SET
                 throughput_per_min = EXCLUDED.throughput_per_min,
@@ -581,6 +583,8 @@ impl Database {
                 median_instance_duration_secs = EXCLUDED.median_instance_duration_secs,
                 active_instance_count = EXCLUDED.active_instance_count,
                 total_instances_completed = EXCLUDED.total_instances_completed,
+                instances_per_sec = EXCLUDED.instances_per_sec,
+                instances_per_min = EXCLUDED.instances_per_min,
                 time_series = EXCLUDED.time_series
             "#,
         )
@@ -597,6 +601,8 @@ impl Database {
         .bind(status.median_instance_duration_secs)
         .bind(status.active_instance_count)
         .bind(status.total_instances_completed)
+        .bind(status.instances_per_sec)
+        .bind(status.instances_per_min)
         .bind(&status.time_series)
         .execute(&self.pool)
         .await?;

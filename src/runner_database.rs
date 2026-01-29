@@ -299,6 +299,9 @@ pub struct InstanceRunner {
     /// Total instances completed (completed + failed) since runner start
     instances_completed_total: AtomicU64,
 
+    /// Instance throughput tracker (instances/sec and instances/min)
+    instance_throughput: std::sync::Mutex<crate::stats::InstanceThroughputTracker>,
+
     /// Lifecycle stats
     #[allow(dead_code)]
     stats: Option<Arc<LifecycleStats>>,
@@ -375,6 +378,9 @@ impl InstanceRunner {
                 Duration::from_secs(300),
             )),
             instances_completed_total: AtomicU64::new(0),
+            instance_throughput: std::sync::Mutex::new(
+                crate::stats::InstanceThroughputTracker::default_window(),
+            ),
             stats: None,
         }
     }
@@ -825,6 +831,8 @@ impl InstanceRunner {
         let instance_duration_metric =
             &self.instance_duration_metric as *const std::sync::Mutex<crate::stats::RollingMetric>;
         let instances_completed_total = &self.instances_completed_total as *const AtomicU64;
+        let instance_throughput = &self.instance_throughput
+            as *const std::sync::Mutex<crate::stats::InstanceThroughputTracker>;
 
         // Safety: We know self lives as long as the returned handle
         let shutdown_ptr = unsafe { &*shutdown };
@@ -833,6 +841,7 @@ impl InstanceRunner {
         let pool_time_series_ptr = unsafe { &*pool_time_series };
         let instance_duration_metric_ptr = unsafe { &*instance_duration_metric };
         let instances_completed_total_ptr = unsafe { &*instances_completed_total };
+        let instance_throughput_ptr = unsafe { &*instance_throughput };
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(status_interval);
@@ -914,7 +923,17 @@ impl InstanceRunner {
                     ts.encode()
                 };
 
-                // 7. Upsert single pool-level row
+                // 7. Get instance throughput snapshot
+                let (instances_per_sec, instances_per_min) = instance_throughput_ptr
+                    .lock()
+                    .ok()
+                    .map(|mut tracker| {
+                        let snapshot = tracker.snapshot();
+                        (snapshot.instances_per_sec, snapshot.instances_per_min)
+                    })
+                    .unwrap_or((0.0, 0.0));
+
+                // 8. Upsert single pool-level row
                 let total_instances_completed =
                     instances_completed_total_ptr.load(Ordering::Relaxed) as i64;
                 let update = WorkerStatusUpdate {
@@ -930,6 +949,8 @@ impl InstanceRunner {
                     median_instance_duration_secs,
                     active_instance_count,
                     total_instances_completed,
+                    instances_per_sec,
+                    instances_per_min,
                     time_series: Some(time_series_bytes),
                 };
 
@@ -2235,6 +2256,10 @@ impl InstanceRunner {
                                 );
                             }
                         }
+                        // Record throughput for successful completions
+                        if let Ok(mut tracker) = self.instance_throughput.lock() {
+                            tracker.record_completed_batch(succeeded.len());
+                        }
                         all_archive_records.extend(archive_records);
                     }
                     Err(e) => {
@@ -2276,6 +2301,10 @@ impl InstanceRunner {
                                     "Instance failed"
                                 );
                             }
+                        }
+                        // Record throughput for failed instances
+                        if let Ok(mut tracker) = self.instance_throughput.lock() {
+                            tracker.record_failed_batch(succeeded.len());
                         }
                         all_archive_records.extend(archive_records);
                     }
