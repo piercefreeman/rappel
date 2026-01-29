@@ -957,6 +957,74 @@ impl ExecutionState {
         Some(encode_message(&kwargs))
     }
 
+    /// Check if the workflow is already complete or failed.
+    ///
+    /// This is used to detect completion when there are no new pending completions,
+    /// e.g., after a failed completion DB write (lease expired) caused the instance
+    /// to stay in-memory but not be archived.
+    pub fn check_workflow_completion(&self, dag: &DAG) -> BatchCompletionResult {
+        let mut result = BatchCompletionResult::default();
+
+        // Check for uncaught exceptions (workflow failed)
+        for (node_id, _exception_info) in &self.graph.exceptions {
+            if let Some(node) = self.graph.nodes.get(node_id) {
+                if node.status == NodeStatus::Exhausted as i32 {
+                    result.workflow_failed = true;
+                    result.error_message = node.error.clone();
+                    return result;
+                }
+            }
+        }
+
+        // Check for workflow completion (entry function output node completed)
+        let entry_function = dag
+            .nodes
+            .values()
+            .find(|n| n.is_input)
+            .and_then(|n| n.function_name.clone());
+
+        for node in dag.nodes.values() {
+            let is_entry_output = node.is_output
+                && entry_function
+                    .as_deref()
+                    .map(|name| node.function_name.as_deref() == Some(name))
+                    .unwrap_or(true);
+
+            if is_entry_output
+                && let Some(exec_node) = self.graph.nodes.get(&node.id)
+                && exec_node.status == NodeStatus::Completed as i32
+            {
+                result.workflow_completed = true;
+
+                // Build result payload from the "result" variable
+                if let Some(result_value_bytes) = self.graph.variables.get("result") {
+                    if let Ok(value) = decode_message::<crate::messages::proto::WorkflowArgumentValue>(
+                        result_value_bytes,
+                    ) {
+                        let args = WorkflowArguments {
+                            arguments: vec![crate::messages::proto::WorkflowArgument {
+                                key: "result".to_string(),
+                                value: Some(value),
+                            }],
+                        };
+                        result.result_payload = Some(encode_message(&args));
+                    }
+                } else {
+                    let args = WorkflowArguments {
+                        arguments: vec![crate::messages::proto::WorkflowArgument {
+                            key: "result".to_string(),
+                            value: Some(WorkflowValue::Null.to_proto()),
+                        }],
+                    };
+                    result.result_payload = Some(encode_message(&args));
+                }
+                return result;
+            }
+        }
+
+        result
+    }
+
     /// Apply a batch of completions and compute newly ready nodes
     pub fn apply_completions_batch(
         &mut self,

@@ -29,6 +29,22 @@ pub type ExecutionGraphUpdate = (WorkflowInstanceId, Vec<u8>, Option<DateTime<Ut
 /// Batch completion/failure: (instance_id, result_payload, graph_bytes)
 pub type InstanceFinalization = (WorkflowInstanceId, Option<Vec<u8>>, Vec<u8>);
 
+/// Record to be archived to completed_instances (used for background archiving)
+#[derive(Debug, Clone)]
+pub struct ArchiveRecord {
+    pub id: Uuid,
+    pub partition_id: i32,
+    pub workflow_name: String,
+    pub workflow_version_id: Option<Uuid>,
+    pub schedule_id: Option<Uuid>,
+    pub input_payload: Option<Vec<u8>>,
+    pub result_payload: Option<Vec<u8>>,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub priority: i32,
+    pub execution_graph: Vec<u8>,
+}
+
 impl Database {
     // ========================================================================
     // Workflow Versions
@@ -854,106 +870,228 @@ impl Database {
         Ok(result.rows_affected() as i64)
     }
 
-    /// Complete multiple instances and update their execution graphs atomically.
+    /// Complete multiple instances: delete from workflow_instances (fast path).
     ///
     /// Only succeeds for instances where the caller still owns them.
-    /// Returns the set of instance IDs that were successfully completed.
+    /// Returns (succeeded_ids, archive_data) - caller should spawn background archive task.
     pub async fn complete_instances_batch(
         &self,
         owner_id: &str,
         completions: &[InstanceFinalization],
-    ) -> DbResult<HashSet<WorkflowInstanceId>> {
+    ) -> DbResult<(HashSet<WorkflowInstanceId>, Vec<ArchiveRecord>)> {
         if completions.is_empty() {
-            return Ok(HashSet::new());
+            return Ok((HashSet::new(), Vec::new()));
         }
 
         let ids: Vec<Uuid> = completions.iter().map(|(id, _, _)| id.0).collect();
         let results: Vec<Option<Vec<u8>>> = completions.iter().map(|(_, r, _)| r.clone()).collect();
         let graphs: Vec<Vec<u8>> = completions.iter().map(|(_, _, g)| g.clone()).collect();
 
+        // Fast path: verify ownership, collect data for archive, delete from queue
         let rows = sqlx::query(
             r#"
-            UPDATE workflow_instances i
-            SET status = 'completed',
-                result_payload = u.result_payload,
-                execution_graph = u.execution_graph,
-                next_wakeup_time = NULL,
-                completed_at = NOW(),
-                owner_id = NULL,
-                lease_expires_at = NULL
-            FROM (
-                SELECT unnest($1::uuid[]) as id,
-                       unnest($3::bytea[]) as result_payload,
-                       unnest($4::bytea[]) as execution_graph
-            ) u
-            WHERE i.id = u.id
-              AND i.owner_id = $2
-              AND i.lease_expires_at > NOW()
-            RETURNING i.id
+            WITH owned AS (
+                SELECT id FROM workflow_instances
+                WHERE id = ANY($1)
+                  AND owner_id = $2
+                  AND lease_expires_at > NOW()
+            ),
+            to_delete AS (
+                SELECT i.id, i.partition_id, i.workflow_name, i.workflow_version_id, i.schedule_id,
+                       i.input_payload, i.created_at, i.priority
+                FROM workflow_instances i
+                JOIN owned o ON i.id = o.id
+            ),
+            deleted_payloads AS (
+                DELETE FROM node_payloads
+                WHERE instance_id IN (SELECT id FROM to_delete)
+            ),
+            deleted AS (
+                DELETE FROM workflow_instances
+                WHERE id IN (SELECT id FROM to_delete)
+            )
+            SELECT id, partition_id, workflow_name, workflow_version_id, schedule_id,
+                   input_payload, created_at, priority
+            FROM to_delete
             "#,
         )
         .bind(&ids)
         .bind(owner_id)
-        .bind(&results)
-        .bind(&graphs)
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows
-            .iter()
-            .map(|row| WorkflowInstanceId(row.get("id")))
-            .collect())
+        // Build archive records for background task
+        let mut succeeded = HashSet::new();
+        let mut archive_records = Vec::new();
+
+        for row in rows {
+            let id: Uuid = row.get("id");
+            succeeded.insert(WorkflowInstanceId(id));
+
+            // Find the matching result/graph from input
+            if let Some(idx) = ids.iter().position(|&i| i == id) {
+                archive_records.push(ArchiveRecord {
+                    id,
+                    partition_id: row.get("partition_id"),
+                    workflow_name: row.get("workflow_name"),
+                    workflow_version_id: row.get("workflow_version_id"),
+                    schedule_id: row.get("schedule_id"),
+                    input_payload: row.get("input_payload"),
+                    result_payload: results[idx].clone(),
+                    status: "completed".to_string(),
+                    created_at: row.get("created_at"),
+                    priority: row.get("priority"),
+                    execution_graph: graphs[idx].clone(),
+                });
+            }
+        }
+
+        Ok((succeeded, archive_records))
     }
 
-    /// Fail multiple instances and update their execution graphs atomically.
+    /// Archive records to completed_instances (background task).
+    /// This is fire-and-forget - failures are logged but don't block the main loop.
+    pub async fn archive_instances_batch(&self, records: &[ArchiveRecord]) -> DbResult<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let ids: Vec<Uuid> = records.iter().map(|r| r.id).collect();
+        let partition_ids: Vec<i32> = records.iter().map(|r| r.partition_id).collect();
+        let workflow_names: Vec<&str> = records.iter().map(|r| r.workflow_name.as_str()).collect();
+        let version_ids: Vec<Option<Uuid>> =
+            records.iter().map(|r| r.workflow_version_id).collect();
+        let schedule_ids: Vec<Option<Uuid>> = records.iter().map(|r| r.schedule_id).collect();
+        let input_payloads: Vec<Option<&[u8]>> =
+            records.iter().map(|r| r.input_payload.as_deref()).collect();
+        let result_payloads: Vec<Option<&[u8]>> = records
+            .iter()
+            .map(|r| r.result_payload.as_deref())
+            .collect();
+        let statuses: Vec<&str> = records.iter().map(|r| r.status.as_str()).collect();
+        let created_ats: Vec<DateTime<Utc>> = records.iter().map(|r| r.created_at).collect();
+        let priorities: Vec<i32> = records.iter().map(|r| r.priority).collect();
+        let graphs: Vec<&[u8]> = records
+            .iter()
+            .map(|r| r.execution_graph.as_slice())
+            .collect();
+
+        sqlx::query(
+            r#"
+            INSERT INTO completed_instances (
+                id, partition_id, workflow_name, workflow_version_id, schedule_id,
+                input_payload, result_payload, status, created_at, completed_at,
+                priority, execution_graph
+            )
+            SELECT id, partition_id, workflow_name, workflow_version_id, schedule_id,
+                   input_payload, result_payload, status, created_at, NOW(),
+                   priority, execution_graph
+            FROM unnest(
+                $1::uuid[], $2::int[], $3::text[], $4::uuid[], $5::uuid[],
+                $6::bytea[], $7::bytea[], $8::text[], $9::timestamptz[], $10::int[], $11::bytea[]
+            ) AS t(id, partition_id, workflow_name, workflow_version_id, schedule_id,
+                   input_payload, result_payload, status, created_at, priority, execution_graph)
+            ON CONFLICT (id) DO NOTHING
+            "#,
+        )
+        .bind(&ids)
+        .bind(&partition_ids)
+        .bind(&workflow_names)
+        .bind(&version_ids)
+        .bind(&schedule_ids)
+        .bind(&input_payloads)
+        .bind(&result_payloads)
+        .bind(&statuses)
+        .bind(&created_ats)
+        .bind(&priorities)
+        .bind(&graphs)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Fail multiple instances: archive to completed_instances, delete from workflow_instances.
     ///
     /// Only succeeds for instances where the caller still owns them.
     /// Returns the set of instance IDs that were successfully failed.
+    /// Fail multiple instances: delete from workflow_instances (fast path).
+    ///
+    /// Only succeeds for instances where the caller still owns them.
+    /// Returns (succeeded_ids, archive_data) - caller should spawn background archive task.
     pub async fn fail_instances_batch(
         &self,
         owner_id: &str,
         failures: &[InstanceFinalization],
-    ) -> DbResult<HashSet<WorkflowInstanceId>> {
+    ) -> DbResult<(HashSet<WorkflowInstanceId>, Vec<ArchiveRecord>)> {
         if failures.is_empty() {
-            return Ok(HashSet::new());
+            return Ok((HashSet::new(), Vec::new()));
         }
 
         let ids: Vec<Uuid> = failures.iter().map(|(id, _, _)| id.0).collect();
         let results: Vec<Option<Vec<u8>>> = failures.iter().map(|(_, r, _)| r.clone()).collect();
         let graphs: Vec<Vec<u8>> = failures.iter().map(|(_, _, g)| g.clone()).collect();
 
+        // Fast path: verify ownership, collect data for archive, delete from queue
         let rows = sqlx::query(
             r#"
-            UPDATE workflow_instances i
-            SET status = 'failed',
-                result_payload = u.result_payload,
-                execution_graph = u.execution_graph,
-                next_wakeup_time = NULL,
-                completed_at = NOW(),
-                owner_id = NULL,
-                lease_expires_at = NULL
-            FROM (
-                SELECT unnest($1::uuid[]) as id,
-                       unnest($3::bytea[]) as result_payload,
-                       unnest($4::bytea[]) as execution_graph
-            ) u
-            WHERE i.id = u.id
-              AND i.owner_id = $2
-              AND i.lease_expires_at > NOW()
-            RETURNING i.id
+            WITH owned AS (
+                SELECT id FROM workflow_instances
+                WHERE id = ANY($1)
+                  AND owner_id = $2
+                  AND lease_expires_at > NOW()
+            ),
+            to_delete AS (
+                SELECT i.id, i.partition_id, i.workflow_name, i.workflow_version_id, i.schedule_id,
+                       i.input_payload, i.created_at, i.priority
+                FROM workflow_instances i
+                JOIN owned o ON i.id = o.id
+            ),
+            deleted_payloads AS (
+                DELETE FROM node_payloads
+                WHERE instance_id IN (SELECT id FROM to_delete)
+            ),
+            deleted AS (
+                DELETE FROM workflow_instances
+                WHERE id IN (SELECT id FROM to_delete)
+            )
+            SELECT id, partition_id, workflow_name, workflow_version_id, schedule_id,
+                   input_payload, created_at, priority
+            FROM to_delete
             "#,
         )
         .bind(&ids)
         .bind(owner_id)
-        .bind(&results)
-        .bind(&graphs)
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows
-            .iter()
-            .map(|row| WorkflowInstanceId(row.get("id")))
-            .collect())
+        // Build archive records for background task
+        let mut succeeded = HashSet::new();
+        let mut archive_records = Vec::new();
+
+        for row in rows {
+            let id: Uuid = row.get("id");
+            succeeded.insert(WorkflowInstanceId(id));
+
+            // Find the matching result/graph from input
+            if let Some(idx) = ids.iter().position(|&i| i == id) {
+                archive_records.push(ArchiveRecord {
+                    id,
+                    partition_id: row.get("partition_id"),
+                    workflow_name: row.get("workflow_name"),
+                    workflow_version_id: row.get("workflow_version_id"),
+                    schedule_id: row.get("schedule_id"),
+                    input_payload: row.get("input_payload"),
+                    result_payload: results[idx].clone(),
+                    status: "failed".to_string(),
+                    created_at: row.get("created_at"),
+                    priority: row.get("priority"),
+                    execution_graph: graphs[idx].clone(),
+                });
+            }
+        }
+
+        Ok((succeeded, archive_records))
     }
 
     /// Release ownership of multiple instances without completing them.
@@ -1028,34 +1166,23 @@ impl Database {
 
     /// Save node payloads (inputs and/or results) for a batch of nodes.
     ///
-    /// Uses upsert semantics: if a row exists, it updates the non-null fields.
-    /// This allows inputs to be written on dispatch and results on completion.
-    pub async fn save_node_payloads_batch(
-        &self,
-        payloads: &[NodePayload],
-    ) -> DbResult<()> {
+    /// Pure INSERT (no upsert) - each payload gets a new row with generated ID.
+    /// This is much faster than upsert since there's no conflict checking.
+    pub async fn save_node_payloads_batch(&self, payloads: &[NodePayload]) -> DbResult<()> {
         if payloads.is_empty() {
             return Ok(());
         }
 
         let instance_ids: Vec<Uuid> = payloads.iter().map(|p| p.instance_id.0).collect();
         let node_ids: Vec<&str> = payloads.iter().map(|p| p.node_id.as_str()).collect();
-        let inputs: Vec<Option<&[u8]>> = payloads
-            .iter()
-            .map(|p| p.inputs.as_deref())
-            .collect();
-        let results: Vec<Option<&[u8]>> = payloads
-            .iter()
-            .map(|p| p.result.as_deref())
-            .collect();
+        let inputs: Vec<Option<&[u8]>> = payloads.iter().map(|p| p.inputs.as_deref()).collect();
+        let results: Vec<Option<&[u8]>> = payloads.iter().map(|p| p.result.as_deref()).collect();
 
+        // Pure INSERT - no ON CONFLICT since we have a generated primary key
         sqlx::query(
             r#"
             INSERT INTO node_payloads (instance_id, node_id, inputs, result)
             SELECT * FROM unnest($1::uuid[], $2::text[], $3::bytea[], $4::bytea[])
-            ON CONFLICT (instance_id, node_id) DO UPDATE SET
-                inputs = COALESCE(EXCLUDED.inputs, node_payloads.inputs),
-                result = COALESCE(EXCLUDED.result, node_payloads.result)
             "#,
         )
         .bind(&instance_ids)
@@ -1071,15 +1198,18 @@ impl Database {
     /// Load all node payloads for an instance.
     ///
     /// Used during cold start recovery to reconstruct the full ExecutionState.
+    /// Uses DISTINCT ON to get the latest payload per node (by created_at).
     pub async fn load_node_payloads(
         &self,
         instance_id: WorkflowInstanceId,
     ) -> DbResult<Vec<NodePayload>> {
         let rows = sqlx::query(
             r#"
-            SELECT instance_id, node_id, inputs, result
+            SELECT DISTINCT ON (instance_id, node_id)
+                   instance_id, node_id, inputs, result
             FROM node_payloads
             WHERE instance_id = $1
+            ORDER BY instance_id, node_id, created_at DESC
             "#,
         )
         .bind(instance_id.0)
@@ -1100,6 +1230,7 @@ impl Database {
     /// Load node payloads for multiple instances in a single query.
     ///
     /// More efficient than calling load_node_payloads for each instance.
+    /// Uses DISTINCT ON to get the latest payload per node (by created_at).
     pub async fn load_node_payloads_batch(
         &self,
         instance_ids: &[WorkflowInstanceId],
@@ -1112,9 +1243,11 @@ impl Database {
 
         let rows = sqlx::query(
             r#"
-            SELECT instance_id, node_id, inputs, result
+            SELECT DISTINCT ON (instance_id, node_id)
+                   instance_id, node_id, inputs, result
             FROM node_payloads
             WHERE instance_id = ANY($1)
+            ORDER BY instance_id, node_id, created_at DESC
             "#,
         )
         .bind(&ids)

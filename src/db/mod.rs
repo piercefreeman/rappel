@@ -25,7 +25,9 @@ use thiserror::Error;
 // No re-exports needed - methods are automatically available on Database.
 
 // Re-export types from worker module
-pub use worker::{ClaimedInstance, ExecutionGraphUpdate, InstanceFinalization, NodePayload};
+pub use worker::{
+    ArchiveRecord, ClaimedInstance, ExecutionGraphUpdate, InstanceFinalization, NodePayload,
+};
 
 // ============================================================================
 // Type Aliases & Newtypes

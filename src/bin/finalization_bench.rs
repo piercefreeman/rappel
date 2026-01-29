@@ -28,7 +28,10 @@ use rappel::messages::execution::{
 use rappel::{Database, ExecutionState, WorkflowInstanceId};
 
 #[derive(Parser, Debug)]
-#[command(name = "finalization-bench", about = "Benchmark the finalization pipeline")]
+#[command(
+    name = "finalization-bench",
+    about = "Benchmark the finalization pipeline"
+)]
 struct Args {
     /// Database URL (defaults to RAPPEL_DATABASE_URL or docker-compose config)
     #[arg(long)]
@@ -298,7 +301,13 @@ async fn main() -> Result<()> {
             // Create new instances
             let new_payloads: Vec<Option<Vec<u8>>> = vec![None; replenish_count];
             let new_ids = db
-                .create_instances_batch_with_priority(&bench_name, version_id, &new_payloads, None, 0)
+                .create_instances_batch_with_priority(
+                    &bench_name,
+                    version_id,
+                    &new_payloads,
+                    None,
+                    0,
+                )
                 .await?;
 
             // Claim them
@@ -318,7 +327,8 @@ async fn main() -> Result<()> {
 
             // Add to active set
             for id in new_ids {
-                let state = build_execution_state(args.nodes, &node_inputs, &node_results, &mut rng);
+                let state =
+                    build_execution_state(args.nodes, &node_inputs, &node_results, &mut rng);
                 active_instances.insert(
                     id.0,
                     SimulatedInstance {
@@ -329,8 +339,11 @@ async fn main() -> Result<()> {
             }
         }
 
-        let total_ms =
-            timing.serialize_ms + timing.complete_ms + timing.release_ms + timing.update_ms + timing.payloads_ms;
+        let total_ms = timing.serialize_ms
+            + timing.complete_ms
+            + timing.release_ms
+            + timing.update_ms
+            + timing.payloads_ms;
 
         if args.offload_payloads {
             println!(
@@ -369,14 +382,20 @@ async fn main() -> Result<()> {
     println!("\n=== Summary ===");
     println!("Total time: {:?}", total_time);
 
-    let avg_serialize: u128 = timings.iter().map(|t| t.serialize_ms).sum::<u128>() / timings.len() as u128;
-    let avg_complete: u128 = timings.iter().map(|t| t.complete_ms).sum::<u128>() / timings.len() as u128;
-    let avg_release: u128 = timings.iter().map(|t| t.release_ms).sum::<u128>() / timings.len() as u128;
-    let avg_update: u128 = timings.iter().map(|t| t.update_ms).sum::<u128>() / timings.len() as u128;
-    let avg_payloads: u128 = timings.iter().map(|t| t.payloads_ms).sum::<u128>() / timings.len() as u128;
+    let avg_serialize: u128 =
+        timings.iter().map(|t| t.serialize_ms).sum::<u128>() / timings.len() as u128;
+    let avg_complete: u128 =
+        timings.iter().map(|t| t.complete_ms).sum::<u128>() / timings.len() as u128;
+    let avg_release: u128 =
+        timings.iter().map(|t| t.release_ms).sum::<u128>() / timings.len() as u128;
+    let avg_update: u128 =
+        timings.iter().map(|t| t.update_ms).sum::<u128>() / timings.len() as u128;
+    let avg_payloads: u128 =
+        timings.iter().map(|t| t.payloads_ms).sum::<u128>() / timings.len() as u128;
     let avg_total = avg_serialize + avg_complete + avg_release + avg_update + avg_payloads;
     let avg_bytes: usize = timings.iter().map(|t| t.total_bytes).sum::<usize>() / timings.len();
-    let avg_payload_bytes: usize = timings.iter().map(|t| t.payload_bytes).sum::<usize>() / timings.len();
+    let avg_payload_bytes: usize =
+        timings.iter().map(|t| t.payload_bytes).sum::<usize>() / timings.len();
 
     println!("Average per iteration:");
     println!("  serialize: {}ms", avg_serialize);
@@ -447,22 +466,23 @@ async fn run_finalize_iteration(
     };
 
     // Helper to collect payloads from an instance's execution state
-    let collect_payloads = |inst: &SimulatedInstance, payloads: &mut Vec<NodePayload>, timing: &mut FinalizeTiming| {
-        for (node_id, node) in &inst.state.graph.nodes {
-            if node.inputs.is_some() || node.result.is_some() {
-                let inputs_size = node.inputs.as_ref().map(|b| b.len()).unwrap_or(0);
-                let result_size = node.result.as_ref().map(|b| b.len()).unwrap_or(0);
-                timing.payload_bytes += inputs_size + result_size;
+    let collect_payloads =
+        |inst: &SimulatedInstance, payloads: &mut Vec<NodePayload>, timing: &mut FinalizeTiming| {
+            for (node_id, node) in &inst.state.graph.nodes {
+                if node.inputs.is_some() || node.result.is_some() {
+                    let inputs_size = node.inputs.as_ref().map(|b| b.len()).unwrap_or(0);
+                    let result_size = node.result.as_ref().map(|b| b.len()).unwrap_or(0);
+                    timing.payload_bytes += inputs_size + result_size;
 
-                payloads.push(NodePayload {
-                    instance_id: inst.instance_id,
-                    node_id: node_id.clone(),
-                    inputs: node.inputs.clone(),
-                    result: node.result.clone(),
-                });
+                    payloads.push(NodePayload {
+                        instance_id: inst.instance_id,
+                        node_id: node_id.clone(),
+                        inputs: node.inputs.clone(),
+                        result: node.result.clone(),
+                    });
+                }
             }
-        }
-    };
+        };
 
     // Select instances to complete
     for &id in shuffled.iter().skip(offset).take(complete_count) {

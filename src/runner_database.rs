@@ -57,8 +57,8 @@ use uuid::Uuid;
 use crate::ast_evaluator::ExpressionEvaluator;
 use crate::dag::{DAG, DAGConverter, DAGNode};
 use crate::db::{
-    ClaimedInstance, Database, NodePayload, ScheduleId, WorkerStatusUpdate, WorkflowInstanceId,
-    WorkflowSchedule, WorkflowVersionId,
+    ArchiveRecord, ClaimedInstance, Database, NodePayload, ScheduleId, WorkerStatusUpdate,
+    WorkflowInstanceId, WorkflowSchedule, WorkflowVersionId,
 };
 use crate::execution_graph::{Completion, ExecutionState, SLEEP_WORKER_ID};
 use crate::messages::execution::{ExecutionNode, NodeStatus};
@@ -314,6 +314,29 @@ struct RunnerProfile {
     collect_ready: Duration,
     dispatch_queue: Duration,
     finalize_instances: Duration,
+    // Detailed finalize breakdown
+    finalize_detail: FinalizeProfile,
+}
+
+#[derive(Default)]
+struct FinalizeProfile {
+    /// Phase 1: Apply completions and categorize (in-memory)
+    apply_completions: Duration,
+    /// Phase 2: Update execution graphs in DB
+    db_update: Duration,
+    /// Phase 2: Complete instances (delete + collect archive data)
+    db_complete: Duration,
+    /// Phase 2: Fail instances (delete + collect archive data)
+    db_fail: Duration,
+    /// Phase 2: Release instances
+    db_release: Duration,
+    /// Phase 3: Eviction from active set
+    eviction: Duration,
+    /// Counts for context
+    update_count: usize,
+    complete_count: usize,
+    fail_count: usize,
+    release_count: usize,
 }
 
 impl RunnerProfile {
@@ -459,10 +482,11 @@ impl InstanceRunner {
             // 7. Process completed instances
             if profile_interval.is_some() {
                 let started_at = Instant::now();
-                self.finalize_completed_instances().await?;
+                self.finalize_completed_instances(Some(&mut profile.finalize_detail))
+                    .await?;
                 profile.finalize_instances += started_at.elapsed();
             } else {
-                self.finalize_completed_instances().await?;
+                self.finalize_completed_instances(None).await?;
             }
 
             // Small sleep to avoid tight loop when idle
@@ -478,6 +502,7 @@ impl InstanceRunner {
             if let Some(interval) = profile_interval {
                 profile.loops += 1;
                 if last_profile.elapsed() >= interval {
+                    let fd = &profile.finalize_detail;
                     info!(
                         runner_id = %self.config.runner_id,
                         loops = profile.loops,
@@ -490,6 +515,16 @@ impl InstanceRunner {
                         ready_ms = profile.collect_ready.as_millis() as u64,
                         dispatch_ms = profile.dispatch_queue.as_millis() as u64,
                         finalize_ms = profile.finalize_instances.as_millis() as u64,
+                        fin_apply_ms = fd.apply_completions.as_millis() as u64,
+                        fin_update_ms = fd.db_update.as_millis() as u64,
+                        fin_update_n = fd.update_count,
+                        fin_complete_ms = fd.db_complete.as_millis() as u64,
+                        fin_complete_n = fd.complete_count,
+                        fin_fail_ms = fd.db_fail.as_millis() as u64,
+                        fin_fail_n = fd.fail_count,
+                        fin_release_ms = fd.db_release.as_millis() as u64,
+                        fin_release_n = fd.release_count,
+                        fin_evict_ms = fd.eviction.as_millis() as u64,
                         "runner profile"
                     );
                     profile.reset();
@@ -1189,8 +1224,40 @@ impl InstanceRunner {
             }
 
             let claimed_count = claimed.len();
+
+            // Batch load payloads for all instances that have execution_graph (cold start)
+            let instances_needing_payloads: Vec<WorkflowInstanceId> = claimed
+                .iter()
+                .filter(|c| c.execution_graph.is_some())
+                .map(|c| c.id)
+                .collect();
+
+            let all_payloads = if !instances_needing_payloads.is_empty() {
+                self.db
+                    .load_node_payloads_batch(&instances_needing_payloads)
+                    .await?
+            } else {
+                Vec::new()
+            };
+
+            // Group payloads by instance_id for fast lookup
+            let mut payloads_by_instance: HashMap<
+                Uuid,
+                Vec<(String, Option<Vec<u8>>, Option<Vec<u8>>)>,
+            > = HashMap::new();
+            for payload in all_payloads {
+                payloads_by_instance
+                    .entry(payload.instance_id.0)
+                    .or_default()
+                    .push((payload.node_id, payload.inputs, payload.result));
+            }
+
             for instance in claimed {
-                if let Err(e) = self.initialize_instance(instance).await {
+                let payloads = payloads_by_instance.remove(&instance.id.0);
+                if let Err(e) = self
+                    .initialize_instance_with_payloads(instance, payloads)
+                    .await
+                {
                     error!(error = %e, "Failed to initialize claimed instance");
                 }
             }
@@ -1204,8 +1271,12 @@ impl InstanceRunner {
         Ok(())
     }
 
-    /// Initialize a claimed instance
-    async fn initialize_instance(&self, claimed: ClaimedInstance) -> InstanceRunnerResult<()> {
+    /// Initialize a claimed instance with pre-loaded payloads
+    async fn initialize_instance_with_payloads(
+        &self,
+        claimed: ClaimedInstance,
+        payloads: Option<Vec<(String, Option<Vec<u8>>, Option<Vec<u8>>)>>,
+    ) -> InstanceRunnerResult<()> {
         let version_id = claimed
             .workflow_version_id
             .ok_or_else(|| InstanceRunnerError::Worker("Instance has no version".into()))?;
@@ -1219,19 +1290,17 @@ impl InstanceRunner {
                 // Restore from persisted state (stripped graph - metadata only)
                 let mut state = ExecutionState::from_bytes(&bytes)?;
 
-                // Hydrate with payloads from node_payloads table (cold start recovery)
-                let payloads = self.db.load_node_payloads(claimed.id).await?;
-                if !payloads.is_empty() {
-                    let payload_tuples: Vec<(String, Option<Vec<u8>>, Option<Vec<u8>>)> = payloads
-                        .into_iter()
-                        .map(|p| (p.node_id, p.inputs, p.result))
-                        .collect();
-                    state.hydrate_payloads(&payload_tuples);
-                    debug!(
-                        instance_id = %claimed.id,
-                        payload_count = payload_tuples.len(),
-                        "Hydrated payloads from cold storage"
-                    );
+                // Hydrate with payloads (pre-loaded in batch for efficiency)
+                if let Some(payload_tuples) = payloads {
+                    if !payload_tuples.is_empty() {
+                        let count = payload_tuples.len();
+                        state.hydrate_payloads(&payload_tuples);
+                        debug!(
+                            instance_id = %claimed.id,
+                            payload_count = count,
+                            "Hydrated payloads from cold storage"
+                        );
+                    }
                 }
 
                 // Recover any nodes that were running when previous owner crashed
@@ -1943,7 +2012,10 @@ impl InstanceRunner {
     }
 
     /// Finalize completed instances
-    async fn finalize_completed_instances(&self) -> InstanceRunnerResult<()> {
+    async fn finalize_completed_instances(
+        &self,
+        mut profile: Option<&mut FinalizeProfile>,
+    ) -> InstanceRunnerResult<()> {
         // Collect batches for different operation types
         // (instance_id, result_payload, graph_bytes)
         let mut to_complete: Vec<(WorkflowInstanceId, Option<Vec<u8>>, Vec<u8>)> = Vec::new();
@@ -1960,6 +2032,7 @@ impl InstanceRunner {
         let mut payloads_to_save: Vec<NodePayload> = Vec::new();
 
         // Phase 1: Apply completions and categorize instances
+        let phase1_start = Instant::now();
         {
             let mut instances = self.active_instances.write().await;
 
@@ -2010,22 +2083,42 @@ impl InstanceRunner {
 
                     Some(result)
                 } else {
-                    None
+                    // No new completions - but check if workflow is already complete/failed.
+                    // This handles reclaimed instances where the terminal state was persisted
+                    // but the archive failed (e.g., lease expired).
+                    let status_check = instance.state.check_workflow_completion(&instance.dag);
+                    if status_check.workflow_completed || status_check.workflow_failed {
+                        Some(status_check)
+                    } else {
+                        None
+                    }
                 };
 
                 // Check for workflow completion/failure
+                // For terminal states, we:
+                // 1. Update DB with STRIPPED graph (just statuses, no payloads) for crash safety
+                // 2. Archive FULL graph to completed_instances
+                // 3. Delete from workflow_instances
                 if let Some(ref result) = completion_result {
                     if result.workflow_completed {
-                        let graph_bytes = instance.state.to_bytes_fully_stripped();
+                        // Stripped graph for workflow_instances (status only, for crash recovery)
+                        let stripped_bytes = instance.state.to_bytes_fully_stripped();
+                        to_update.push((instance.instance_id, stripped_bytes, None));
+                        // Full graph for archive - includes all inputs/outputs
+                        let full_bytes = instance.state.to_bytes();
                         complete_meta.insert(instance.instance_id, instance.workflow_name.clone());
                         to_complete.push((
                             instance.instance_id,
                             result.result_payload.clone(),
-                            graph_bytes,
+                            full_bytes,
                         ));
                         continue;
                     } else if result.workflow_failed {
-                        let graph_bytes = instance.state.to_bytes_fully_stripped();
+                        // Stripped graph for workflow_instances (status only, for crash recovery)
+                        let stripped_bytes = instance.state.to_bytes_fully_stripped();
+                        to_update.push((instance.instance_id, stripped_bytes, None));
+                        // Full graph for archive - includes all inputs/outputs
+                        let full_bytes = instance.state.to_bytes();
                         fail_meta.insert(
                             instance.instance_id,
                             (instance.workflow_name.clone(), result.error_message.clone()),
@@ -2033,7 +2126,7 @@ impl InstanceRunner {
                         to_fail.push((
                             instance.instance_id,
                             result.result_payload.clone(),
-                            graph_bytes,
+                            full_bytes,
                         ));
                         continue;
                     }
@@ -2057,92 +2150,29 @@ impl InstanceRunner {
                 }
             }
         }
+        if let Some(ref mut p) = profile {
+            p.apply_completions += phase1_start.elapsed();
+        }
 
         // Phase 2: Execute batch operations
         let mut completed_ids: HashSet<WorkflowInstanceId> = HashSet::new();
         let mut released_ids: HashSet<WorkflowInstanceId> = HashSet::new();
         let mut lost_lease_ids: HashSet<WorkflowInstanceId> = HashSet::new();
+        // Track all instances we attempted to complete/fail (for eviction regardless of success)
+        let mut attempted_terminal_ids: HashSet<WorkflowInstanceId> = HashSet::new();
         let batch_size = self.config.completion_batch_size.max(1);
 
-        // Batch complete
-        if !to_complete.is_empty() {
-            for chunk in to_complete.chunks(batch_size) {
-                match self
-                    .db
-                    .complete_instances_batch(&self.config.runner_id, chunk)
-                    .await
-                {
-                    Ok(succeeded) => {
-                        let mut metrics = self.metrics.lock().await;
-                        for id in &succeeded {
-                            completed_ids.insert(*id);
-                            metrics.instances_completed += 1;
-                            if let Some(workflow_name) = complete_meta.get(id) {
-                                info!(
-                                    instance_id = %id,
-                                    workflow = %workflow_name,
-                                    "Instance completed successfully"
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!(error = %e, "Failed to complete instances batch");
-                    }
-                }
-            }
-        }
+        // Collect archive records for background archiving
+        let mut all_archive_records: Vec<ArchiveRecord> = Vec::new();
 
-        // Batch fail
-        if !to_fail.is_empty() {
-            for chunk in to_fail.chunks(batch_size) {
-                match self
-                    .db
-                    .fail_instances_batch(&self.config.runner_id, chunk)
-                    .await
-                {
-                    Ok(succeeded) => {
-                        let mut metrics = self.metrics.lock().await;
-                        for id in &succeeded {
-                            completed_ids.insert(*id);
-                            metrics.instances_failed += 1;
-                            if let Some((workflow_name, error_msg)) = fail_meta.get(id) {
-                                warn!(
-                                    instance_id = %id,
-                                    workflow = %workflow_name,
-                                    error = ?error_msg,
-                                    "Instance failed"
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!(error = %e, "Failed to fail instances batch");
-                    }
-                }
-            }
-        }
-
-        // Batch release
-        if !to_release.is_empty() {
-            for chunk in to_release.chunks(batch_size) {
-                match self
-                    .db
-                    .release_instances_batch(&self.config.runner_id, chunk)
-                    .await
-                {
-                    Ok(succeeded) => {
-                        released_ids.extend(succeeded);
-                    }
-                    Err(e) => {
-                        error!(error = %e, "Failed to release instances batch");
-                    }
-                }
-            }
-        }
-
-        // Batch update
+        // IMPORTANT: Update execution graphs FIRST, before attempting complete/fail.
+        // This ensures the completed/failed state is persisted, so if the delete fails
+        // (e.g., lease expired), the instance can be reclaimed with the terminal state.
+        let update_start = Instant::now();
         if !to_update.is_empty() {
+            if let Some(ref mut p) = profile {
+                p.update_count += to_update.len();
+            }
             for chunk in to_update.chunks(batch_size) {
                 match self
                     .db
@@ -2167,13 +2197,139 @@ impl InstanceRunner {
                 }
             }
         }
+        if let Some(ref mut p) = profile {
+            p.db_update += update_start.elapsed();
+        }
+
+        // Batch complete (fast path: delete from queue, collect archive data)
+        let complete_start = Instant::now();
+        if !to_complete.is_empty() {
+            if let Some(ref mut p) = profile {
+                p.complete_count += to_complete.len();
+            }
+            // Track all IDs we're attempting to complete (for eviction)
+            for (id, _, _) in &to_complete {
+                attempted_terminal_ids.insert(*id);
+            }
+            for chunk in to_complete.chunks(batch_size) {
+                match self
+                    .db
+                    .complete_instances_batch(&self.config.runner_id, chunk)
+                    .await
+                {
+                    Ok((succeeded, archive_records)) => {
+                        let mut metrics = self.metrics.lock().await;
+                        for id in &succeeded {
+                            completed_ids.insert(*id);
+                            metrics.instances_completed += 1;
+                            if let Some(workflow_name) = complete_meta.get(id) {
+                                info!(
+                                    instance_id = %id,
+                                    workflow = %workflow_name,
+                                    "Instance completed successfully"
+                                );
+                            }
+                        }
+                        all_archive_records.extend(archive_records);
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Failed to complete instances batch");
+                    }
+                }
+            }
+        }
+        if let Some(ref mut p) = profile {
+            p.db_complete += complete_start.elapsed();
+        }
+
+        // Batch fail (fast path: delete from queue, collect archive data)
+        let fail_start = Instant::now();
+        if !to_fail.is_empty() {
+            if let Some(ref mut p) = profile {
+                p.fail_count += to_fail.len();
+            }
+            // Track all IDs we're attempting to fail (for eviction)
+            for (id, _, _) in &to_fail {
+                attempted_terminal_ids.insert(*id);
+            }
+            for chunk in to_fail.chunks(batch_size) {
+                match self
+                    .db
+                    .fail_instances_batch(&self.config.runner_id, chunk)
+                    .await
+                {
+                    Ok((succeeded, archive_records)) => {
+                        let mut metrics = self.metrics.lock().await;
+                        for id in &succeeded {
+                            completed_ids.insert(*id);
+                            metrics.instances_failed += 1;
+                            if let Some((workflow_name, error_msg)) = fail_meta.get(id) {
+                                warn!(
+                                    instance_id = %id,
+                                    workflow = %workflow_name,
+                                    error = ?error_msg,
+                                    "Instance failed"
+                                );
+                            }
+                        }
+                        all_archive_records.extend(archive_records);
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Failed to fail instances batch");
+                    }
+                }
+            }
+        }
+        if let Some(ref mut p) = profile {
+            p.db_fail += fail_start.elapsed();
+        }
+
+        // Spawn background task to archive to completed_instances (fire-and-forget)
+        if !all_archive_records.is_empty() {
+            let db = self.db.clone();
+            let record_count = all_archive_records.len();
+            tokio::spawn(async move {
+                if let Err(e) = db.archive_instances_batch(&all_archive_records).await {
+                    error!(error = %e, count = record_count, "Failed to archive instances (background)");
+                }
+            });
+        }
+
+        // Batch release
+        let release_start = Instant::now();
+        if !to_release.is_empty() {
+            if let Some(ref mut p) = profile {
+                p.release_count += to_release.len();
+            }
+            for chunk in to_release.chunks(batch_size) {
+                match self
+                    .db
+                    .release_instances_batch(&self.config.runner_id, chunk)
+                    .await
+                {
+                    Ok(succeeded) => {
+                        released_ids.extend(succeeded);
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Failed to release instances batch");
+                    }
+                }
+            }
+        }
+        if let Some(ref mut p) = profile {
+            p.db_release += release_start.elapsed();
+        }
 
         // Save node payloads (inputs + results) to separate table
-        // This is INSERT-only and can be done in parallel with other operations
+        // Fire-and-forget: spawn background task so we don't block the main loop
         if !payloads_to_save.is_empty() {
-            if let Err(e) = self.db.save_node_payloads_batch(&payloads_to_save).await {
-                error!(error = %e, count = payloads_to_save.len(), "Failed to save node payloads");
-            }
+            let db = self.db.clone();
+            let payload_count = payloads_to_save.len();
+            tokio::spawn(async move {
+                if let Err(e) = db.save_node_payloads_batch(&payloads_to_save).await {
+                    error!(error = %e, count = payload_count, "Failed to save node payloads");
+                }
+            });
         }
 
         // Record duration for completed/failed instances into the rolling metric
@@ -2193,6 +2349,10 @@ impl InstanceRunner {
         }
 
         // Phase 3: Remove finalized instances from active set
+        // We evict ALL instances we attempted to complete/fail, not just those that succeeded.
+        // If completion failed (e.g., lease expired), the instance will be reclaimed with
+        // the already-persisted terminal state, and the reclaim logic will detect completion.
+        let eviction_start = Instant::now();
         let mut instances = self.active_instances.write().await;
         for id in completed_ids {
             instances.remove(&id.0);
@@ -2202,6 +2362,14 @@ impl InstanceRunner {
         }
         for id in lost_lease_ids {
             instances.remove(&id.0);
+        }
+        // Evict instances we attempted to complete/fail even if the DB operation failed
+        for id in attempted_terminal_ids {
+            instances.remove(&id.0);
+        }
+        drop(instances);
+        if let Some(ref mut p) = profile {
+            p.eviction += eviction_start.elapsed();
         }
 
         Ok(())
