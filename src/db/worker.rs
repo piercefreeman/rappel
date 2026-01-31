@@ -15,13 +15,15 @@
 use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
-use sqlx::Row;
+use sqlx::{Row, types::Json};
 use uuid::Uuid;
 
 use super::{
     Database, DbError, DbResult, ScheduleId, ScheduleType, WorkerStatusUpdate, WorkflowInstanceId,
     WorkflowSchedule, WorkflowVersion, WorkflowVersionId,
 };
+use crate::messages::execution::{BackoffConfig, NodeKind, NodeStatus};
+use crate::workflow_state::ActionExecutionUpdate;
 
 /// Batch update for execution graphs: (instance_id, graph_bytes, next_wakeup_time)
 pub type ExecutionGraphUpdate = (WorkflowInstanceId, Vec<u8>, Option<DateTime<Utc>>);
@@ -1167,6 +1169,272 @@ impl Database {
     }
 
     // ========================================================================
+    // Action Execution Archives (metadata-only history)
+    // ========================================================================
+
+    /// Save action execution metadata for a batch of executions.
+    ///
+    /// Uses an upsert keyed by (instance_id, execution_id) to keep the latest
+    /// metadata for each execution without rewriting payloads.
+    pub async fn save_action_execution_archives_batch(
+        &self,
+        updates: &[ActionExecutionUpdate],
+    ) -> DbResult<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let filtered: Vec<&ActionExecutionUpdate> = updates
+            .iter()
+            .filter(|update| update.execution_id.is_some())
+            .collect();
+
+        if filtered.is_empty() {
+            return Ok(());
+        }
+
+        let instance_ids: Vec<Uuid> = filtered.iter().map(|u| u.instance_id.0).collect();
+        let node_ids: Vec<&str> = filtered.iter().map(|u| u.node_id.as_str()).collect();
+        let action_ids: Vec<&str> = filtered.iter().map(|u| u.action_id.as_str()).collect();
+        let execution_ids: Vec<&str> = filtered
+            .iter()
+            .map(|u| u.execution_id.as_deref().unwrap())
+            .collect();
+        let statuses: Vec<i32> = filtered.iter().map(|u| u.status as i32).collect();
+        let attempt_numbers: Vec<i32> = filtered.iter().map(|u| u.attempt_number).collect();
+        let max_retries: Vec<i32> = filtered.iter().map(|u| u.max_retries).collect();
+        let worker_ids: Vec<Option<String>> =
+            filtered.iter().map(|u| u.worker_id.clone()).collect();
+        let started_at_ms: Vec<Option<i64>> = filtered.iter().map(|u| u.started_at_ms).collect();
+        let completed_at_ms: Vec<Option<i64>> =
+            filtered.iter().map(|u| u.completed_at_ms).collect();
+        let duration_ms: Vec<Option<i64>> = filtered.iter().map(|u| u.duration_ms).collect();
+        let parent_execution_ids: Vec<Option<String>> = filtered
+            .iter()
+            .map(|u| u.parent_execution_id.clone())
+            .collect();
+        let spread_indices: Vec<Option<i32>> = filtered.iter().map(|u| u.spread_index).collect();
+        let loop_indices: Vec<Option<i32>> = filtered.iter().map(|u| u.loop_index).collect();
+        let waiting_for: Vec<Json<Vec<String>>> = filtered
+            .iter()
+            .map(|u| Json(u.waiting_for.clone()))
+            .collect();
+        let completed_counts: Vec<i32> = filtered.iter().map(|u| u.completed_count).collect();
+        let node_kinds: Vec<i32> = filtered.iter().map(|u| u.node_kind as i32).collect();
+        let errors: Vec<Option<String>> = filtered.iter().map(|u| u.error.clone()).collect();
+        let error_types: Vec<Option<String>> =
+            filtered.iter().map(|u| u.error_type.clone()).collect();
+        let timeout_seconds: Vec<i32> = filtered.iter().map(|u| u.timeout_seconds).collect();
+        let timeout_retry_limits: Vec<i32> =
+            filtered.iter().map(|u| u.timeout_retry_limit).collect();
+        let backoff_kinds: Vec<i32> = filtered.iter().map(|u| u.backoff.kind).collect();
+        let backoff_base_delay_ms: Vec<i32> =
+            filtered.iter().map(|u| u.backoff.base_delay_ms).collect();
+        let backoff_multipliers: Vec<f64> = filtered.iter().map(|u| u.backoff.multiplier).collect();
+        let sleep_wakeup_time_ms: Vec<Option<i64>> =
+            filtered.iter().map(|u| u.sleep_wakeup_time_ms).collect();
+
+        sqlx::query(
+            r#"
+            INSERT INTO action_execution_archives (
+                instance_id,
+                node_id,
+                action_id,
+                execution_id,
+                status,
+                attempt_number,
+                max_retries,
+                worker_id,
+                started_at_ms,
+                completed_at_ms,
+                duration_ms,
+                parent_execution_id,
+                spread_index,
+                loop_index,
+                waiting_for,
+                completed_count,
+                node_kind,
+                error,
+                error_type,
+                timeout_seconds,
+                timeout_retry_limit,
+                backoff_kind,
+                backoff_base_delay_ms,
+                backoff_multiplier,
+                sleep_wakeup_time_ms
+            )
+            SELECT *
+            FROM UNNEST(
+                $1::uuid[],
+                $2::text[],
+                $3::text[],
+                $4::text[],
+                $5::int4[],
+                $6::int4[],
+                $7::int4[],
+                $8::text[],
+                $9::int8[],
+                $10::int8[],
+                $11::int8[],
+                $12::text[],
+                $13::int4[],
+                $14::int4[],
+                $15::jsonb[],
+                $16::int4[],
+                $17::int4[],
+                $18::text[],
+                $19::text[],
+                $20::int4[],
+                $21::int4[],
+                $22::int4[],
+                $23::int4[],
+                $24::float8[],
+                $25::int8[]
+            )
+            ON CONFLICT (instance_id, execution_id) DO UPDATE SET
+                node_id = EXCLUDED.node_id,
+                action_id = EXCLUDED.action_id,
+                status = EXCLUDED.status,
+                attempt_number = EXCLUDED.attempt_number,
+                max_retries = EXCLUDED.max_retries,
+                worker_id = EXCLUDED.worker_id,
+                started_at_ms = EXCLUDED.started_at_ms,
+                completed_at_ms = EXCLUDED.completed_at_ms,
+                duration_ms = EXCLUDED.duration_ms,
+                parent_execution_id = EXCLUDED.parent_execution_id,
+                spread_index = EXCLUDED.spread_index,
+                loop_index = EXCLUDED.loop_index,
+                waiting_for = EXCLUDED.waiting_for,
+                completed_count = EXCLUDED.completed_count,
+                node_kind = EXCLUDED.node_kind,
+                error = EXCLUDED.error,
+                error_type = EXCLUDED.error_type,
+                timeout_seconds = EXCLUDED.timeout_seconds,
+                timeout_retry_limit = EXCLUDED.timeout_retry_limit,
+                backoff_kind = EXCLUDED.backoff_kind,
+                backoff_base_delay_ms = EXCLUDED.backoff_base_delay_ms,
+                backoff_multiplier = EXCLUDED.backoff_multiplier,
+                sleep_wakeup_time_ms = EXCLUDED.sleep_wakeup_time_ms
+            "#,
+        )
+        .bind(&instance_ids)
+        .bind(&node_ids)
+        .bind(&action_ids)
+        .bind(&execution_ids)
+        .bind(&statuses)
+        .bind(&attempt_numbers)
+        .bind(&max_retries)
+        .bind(&worker_ids)
+        .bind(&started_at_ms)
+        .bind(&completed_at_ms)
+        .bind(&duration_ms)
+        .bind(&parent_execution_ids)
+        .bind(&spread_indices)
+        .bind(&loop_indices)
+        .bind(&waiting_for)
+        .bind(&completed_counts)
+        .bind(&node_kinds)
+        .bind(&errors)
+        .bind(&error_types)
+        .bind(&timeout_seconds)
+        .bind(&timeout_retry_limits)
+        .bind(&backoff_kinds)
+        .bind(&backoff_base_delay_ms)
+        .bind(&backoff_multipliers)
+        .bind(&sleep_wakeup_time_ms)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Load action execution metadata for multiple instances in a single query.
+    pub async fn load_action_execution_archives_batch(
+        &self,
+        instance_ids: &[WorkflowInstanceId],
+    ) -> DbResult<Vec<ActionExecutionArchive>> {
+        if instance_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<Uuid> = instance_ids.iter().map(|id| id.0).collect();
+
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                instance_id,
+                node_id,
+                action_id,
+                execution_id,
+                status,
+                attempt_number,
+                max_retries,
+                worker_id,
+                started_at_ms,
+                completed_at_ms,
+                duration_ms,
+                parent_execution_id,
+                spread_index,
+                loop_index,
+                waiting_for,
+                completed_count,
+                node_kind,
+                error,
+                error_type,
+                timeout_seconds,
+                timeout_retry_limit,
+                backoff_kind,
+                backoff_base_delay_ms,
+                backoff_multiplier,
+                sleep_wakeup_time_ms
+            FROM action_execution_archives
+            WHERE instance_id = ANY($1)
+            "#,
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let status: i32 = row.get("status");
+                let node_kind: i32 = row.get("node_kind");
+                let waiting_for: Json<Vec<String>> = row.get("waiting_for");
+                ActionExecutionArchive {
+                    instance_id: WorkflowInstanceId(row.get("instance_id")),
+                    node_id: row.get("node_id"),
+                    action_id: row.get("action_id"),
+                    execution_id: row.get("execution_id"),
+                    status: NodeStatus::try_from(status).unwrap_or(NodeStatus::Unspecified),
+                    attempt_number: row.get("attempt_number"),
+                    max_retries: row.get("max_retries"),
+                    worker_id: row.get("worker_id"),
+                    started_at_ms: row.get("started_at_ms"),
+                    completed_at_ms: row.get("completed_at_ms"),
+                    duration_ms: row.get("duration_ms"),
+                    parent_execution_id: row.get("parent_execution_id"),
+                    spread_index: row.get("spread_index"),
+                    loop_index: row.get("loop_index"),
+                    waiting_for: waiting_for.0,
+                    completed_count: row.get("completed_count"),
+                    node_kind: NodeKind::try_from(node_kind).unwrap_or(NodeKind::Unspecified),
+                    error: row.get("error"),
+                    error_type: row.get("error_type"),
+                    timeout_seconds: row.get("timeout_seconds"),
+                    timeout_retry_limit: row.get("timeout_retry_limit"),
+                    backoff: BackoffConfig {
+                        kind: row.get("backoff_kind"),
+                        base_delay_ms: row.get("backoff_base_delay_ms"),
+                        multiplier: row.get("backoff_multiplier"),
+                    },
+                    sleep_wakeup_time_ms: row.get("sleep_wakeup_time_ms"),
+                }
+            })
+            .collect())
+    }
+
+    // ========================================================================
     // Node Payloads (inputs/results stored separately for performance)
     // ========================================================================
 
@@ -1180,6 +1448,7 @@ impl Database {
         }
 
         let instance_ids: Vec<Uuid> = payloads.iter().map(|p| p.instance_id.0).collect();
+        let action_ids: Vec<&str> = payloads.iter().map(|p| p.action_id.as_str()).collect();
         let execution_ids: Vec<&str> = payloads.iter().map(|p| p.execution_id.as_str()).collect();
         let inputs: Vec<Option<&[u8]>> = payloads.iter().map(|p| p.inputs.as_deref()).collect();
         let results: Vec<Option<&[u8]>> = payloads.iter().map(|p| p.result.as_deref()).collect();
@@ -1187,11 +1456,12 @@ impl Database {
         // Pure INSERT - each execution_id is unique
         sqlx::query(
             r#"
-            INSERT INTO node_payloads (instance_id, execution_id, inputs, result)
-            SELECT * FROM unnest($1::uuid[], $2::text[], $3::bytea[], $4::bytea[])
+            INSERT INTO node_payloads (instance_id, node_id, execution_id, inputs, result)
+            SELECT * FROM unnest($1::uuid[], $2::text[], $3::text[], $4::bytea[], $5::bytea[])
             "#,
         )
         .bind(&instance_ids)
+        .bind(&action_ids)
         .bind(&execution_ids)
         .bind(&inputs)
         .bind(&results)
@@ -1203,7 +1473,7 @@ impl Database {
 
     /// Load all node payloads for an instance.
     ///
-    /// Used during cold start recovery to reconstruct the full ExecutionState.
+    /// Used during cold start recovery to reconstruct the in-memory WorkflowState.
     /// Payloads are keyed by execution_id (unique per action run).
     pub async fn load_node_payloads(
         &self,
@@ -1211,7 +1481,7 @@ impl Database {
     ) -> DbResult<Vec<NodePayload>> {
         let rows = sqlx::query(
             r#"
-            SELECT instance_id, execution_id, inputs, result
+            SELECT instance_id, node_id, execution_id, inputs, result
             FROM node_payloads
             WHERE instance_id = $1 AND execution_id IS NOT NULL
             "#,
@@ -1224,6 +1494,7 @@ impl Database {
             .iter()
             .map(|row| NodePayload {
                 instance_id: WorkflowInstanceId(row.get("instance_id")),
+                action_id: row.get("node_id"),
                 execution_id: row.get("execution_id"),
                 inputs: row.get("inputs"),
                 result: row.get("result"),
@@ -1247,7 +1518,7 @@ impl Database {
 
         let rows = sqlx::query(
             r#"
-            SELECT instance_id, execution_id, inputs, result
+            SELECT instance_id, node_id, execution_id, inputs, result
             FROM node_payloads
             WHERE instance_id = ANY($1) AND execution_id IS NOT NULL
             "#,
@@ -1260,6 +1531,7 @@ impl Database {
             .iter()
             .map(|row| NodePayload {
                 instance_id: WorkflowInstanceId(row.get("instance_id")),
+                action_id: row.get("node_id"),
                 execution_id: row.get("execution_id"),
                 inputs: row.get("inputs"),
                 result: row.get("result"),
@@ -1272,10 +1544,39 @@ impl Database {
 #[derive(Debug, Clone)]
 pub struct NodePayload {
     pub instance_id: WorkflowInstanceId,
+    pub action_id: String,
     /// Unique execution ID for this specific run (generated by mark_running)
     pub execution_id: String,
     pub inputs: Option<Vec<u8>>,
     pub result: Option<Vec<u8>>,
+}
+
+/// Metadata archive for a single action execution (no payloads).
+#[derive(Debug, Clone)]
+pub struct ActionExecutionArchive {
+    pub instance_id: WorkflowInstanceId,
+    pub node_id: String,
+    pub action_id: String,
+    pub execution_id: String,
+    pub status: NodeStatus,
+    pub attempt_number: i32,
+    pub max_retries: i32,
+    pub worker_id: Option<String>,
+    pub started_at_ms: Option<i64>,
+    pub completed_at_ms: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub parent_execution_id: Option<String>,
+    pub spread_index: Option<i32>,
+    pub loop_index: Option<i32>,
+    pub waiting_for: Vec<String>,
+    pub completed_count: i32,
+    pub node_kind: NodeKind,
+    pub error: Option<String>,
+    pub error_type: Option<String>,
+    pub timeout_seconds: i32,
+    pub timeout_retry_limit: i32,
+    pub backoff: BackoffConfig,
+    pub sleep_wakeup_time_ms: Option<i64>,
 }
 
 /// A claimed instance ready for local execution

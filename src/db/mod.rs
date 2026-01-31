@@ -26,7 +26,8 @@ use thiserror::Error;
 
 // Re-export types from worker module
 pub use worker::{
-    ArchiveRecord, ClaimedInstance, ExecutionGraphUpdate, InstanceFinalization, NodePayload,
+    ActionExecutionArchive, ArchiveRecord, ClaimedInstance, ExecutionGraphUpdate,
+    InstanceFinalization, NodePayload,
 };
 
 // ============================================================================

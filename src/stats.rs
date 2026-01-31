@@ -505,8 +505,7 @@ impl InstanceThroughputTracker {
         let window_secs = self.window.as_secs_f64();
 
         // Count total instances (completed + failed) in window
-        let instances_in_window =
-            self.completed_timestamps.len() + self.failed_timestamps.len();
+        let instances_in_window = self.completed_timestamps.len() + self.failed_timestamps.len();
 
         let instances_per_sec = if window_secs > 0.0 {
             instances_in_window as f64 / window_secs

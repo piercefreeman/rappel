@@ -10,7 +10,7 @@
 //! │                          InstanceRunner                                  │
 //! │                                                                          │
 //! │  ┌──────────────────┐     ┌──────────────────┐                          │
-//! │  │  Claim Instances │────▶│  ExecutionState  │                          │
+//! │  │  Claim Instances │────▶│  WorkflowState   │                          │
 //! │  │  (with leases)   │     │  (per instance)  │                          │
 //! │  └──────────────────┘     └────────┬─────────┘                          │
 //! │                                    │                                     │
@@ -54,14 +54,12 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
-use crate::ast_evaluator::ExpressionEvaluator;
-use crate::dag::{DAG, DAGConverter, DAGNode};
+use crate::dag::{DAG, DAGConverter};
 use crate::db::{
     ArchiveRecord, ClaimedInstance, Database, NodePayload, ScheduleId, WorkerStatusUpdate,
     WorkflowInstanceId, WorkflowSchedule, WorkflowVersionId,
 };
-use crate::execution_graph::{Completion, ExecutionState, PayloadTuple, SLEEP_WORKER_ID};
-use crate::messages::execution::{ExecutionNode, NodeKind, NodeStatus};
+use crate::messages::execution::{NodeKind, NodeStatus};
 use crate::messages::proto;
 use crate::messages::proto::WorkflowArguments;
 use crate::messages::{MessageError, decode_message, encode_message};
@@ -71,6 +69,12 @@ use crate::schedule::{apply_jitter, next_cron_run, next_interval_run};
 use crate::stats::LifecycleStats;
 use crate::value::WorkflowValue;
 use crate::worker::{ActionDispatchPayload, PythonWorkerPool};
+use crate::workflow_state::ExecutionState;
+use crate::workflow_state::{
+    ActionExecutionUpdate, ActionNodeArchive, ActionPayload, ActionUpdate, Completion,
+    InstanceRehydrate, ReadyAction, RehydrateResult, SLEEP_WORKER_ID, WorkflowState,
+    WorkflowStateError, WorkflowStateSnapshot, WorkflowStateUpdate,
+};
 
 /// Default lease duration for instance ownership (60 seconds)
 pub const DEFAULT_LEASE_SECONDS: i64 = 60;
@@ -107,6 +111,9 @@ pub enum InstanceRunnerError {
 
     #[error("Message error: {0}")]
     Message(#[from] MessageError),
+
+    #[error("Workflow state error: {0}")]
+    WorkflowState(#[from] WorkflowStateError),
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] prost::DecodeError),
@@ -190,19 +197,22 @@ impl Default for InstanceRunnerConfig {
 struct ActiveInstance {
     instance_id: WorkflowInstanceId,
     workflow_name: String,
-    dag: Arc<DAG>,
-    state: ExecutionState,
+    state: WorkflowState,
     /// Actions currently being executed by workers
     in_flight: HashSet<String>,
-    /// Count of ready_queue nodes already queued for dispatch.
-    queued_ready_count: usize,
+    /// Ready actions discovered from state transitions.
+    ready_actions: VecDeque<ReadyAction>,
     /// Pending completions to be batched
     pending_completions: Vec<Completion>,
+    /// Pending payloads to persist
+    pending_payloads: Vec<ActionPayload>,
     /// When this instance was claimed by this runner
     claimed_at: Instant,
     /// When this instance last made progress (completion received)
     last_progress_at: Instant,
 }
+
+type PayloadLookup = HashMap<(Uuid, String), (Option<Vec<u8>>, Option<Vec<u8>>)>;
 
 /// Metrics snapshot for the instance runner
 #[derive(Debug, Clone, Default)]
@@ -234,6 +244,7 @@ struct QueuedAction {
     timeout_seconds: u32,
     max_retries: u32,
     attempt_number: u32,
+    inputs: Option<Vec<u8>>,
 }
 
 type DispatchQueueKey = (Uuid, String);
@@ -676,10 +687,9 @@ impl InstanceRunner {
                 }
 
                 // Get timeout duration for error message
-                let timeout_seconds = instance
-                    .state
-                    .graph
-                    .nodes
+                let snapshot = instance.state.get_state();
+                let timeout_seconds = snapshot
+                    .executions
                     .get(&entry.node_id)
                     .map(|n| n.timeout_seconds)
                     .unwrap_or(0);
@@ -723,21 +733,16 @@ impl InstanceRunner {
 
         for instance in instances.values_mut() {
             let mut due_completions = Vec::new();
+            let snapshot = instance.state.get_state();
 
-            for (node_id, exec_node) in instance.state.graph.nodes.iter() {
-                let status =
-                    NodeStatus::try_from(exec_node.status).unwrap_or(NodeStatus::Unspecified);
-                if status != NodeStatus::Running {
+            for (node_id, exec_node) in snapshot.executions.iter() {
+                if exec_node.status != NodeStatus::Running {
                     continue;
                 }
-
-                // Use the structured node_kind field instead of string matching
-                let is_sleep = NodeKind::try_from(exec_node.node_kind) == Ok(NodeKind::Sleep);
-                if !is_sleep {
+                if exec_node.node_kind != NodeKind::Sleep {
                     continue;
                 }
-
-                let Some(wakeup_ms) = Self::sleep_wakeup_time_ms(exec_node) else {
+                let Some(wakeup_ms) = exec_node.sleep_wakeup_time_ms else {
                     continue;
                 };
                 if now_ms < wakeup_ms {
@@ -1242,34 +1247,157 @@ impl InstanceRunner {
 
             let claimed_count = claimed.len();
 
-            // Batch load payloads for all instances that have execution_graph (cold start)
-            let instances_needing_payloads: Vec<WorkflowInstanceId> = claimed
+            // Batch load archives + payloads for instances that have execution_graph (cold start)
+            let instances_needing_archives: Vec<WorkflowInstanceId> = claimed
                 .iter()
                 .filter(|c| c.execution_graph.is_some())
                 .map(|c| c.id)
                 .collect();
 
-            let all_payloads = if !instances_needing_payloads.is_empty() {
+            let all_payloads = if !instances_needing_archives.is_empty() {
                 self.db
-                    .load_node_payloads_batch(&instances_needing_payloads)
+                    .load_node_payloads_batch(&instances_needing_archives)
                     .await?
             } else {
                 Vec::new()
             };
 
-            // Group payloads by instance_id for fast lookup
-            let mut payloads_by_instance: HashMap<Uuid, Vec<PayloadTuple>> = HashMap::new();
+            let all_archives = if !instances_needing_archives.is_empty() {
+                self.db
+                    .load_action_execution_archives_batch(&instances_needing_archives)
+                    .await?
+            } else {
+                Vec::new()
+            };
+
+            let mut payloads_by_execution: PayloadLookup = HashMap::new();
             for payload in all_payloads {
-                payloads_by_instance
-                    .entry(payload.instance_id.0)
+                payloads_by_execution.insert(
+                    (payload.instance_id.0, payload.execution_id.clone()),
+                    (payload.inputs, payload.result),
+                );
+            }
+
+            let mut archives_by_instance: HashMap<Uuid, Vec<ActionNodeArchive>> = HashMap::new();
+            for archive in all_archives {
+                let payloads = payloads_by_execution
+                    .get(&(archive.instance_id.0, archive.execution_id.clone()))
+                    .cloned()
+                    .unwrap_or((None, None));
+                archives_by_instance
+                    .entry(archive.instance_id.0)
                     .or_default()
-                    .push((payload.execution_id, payload.inputs, payload.result));
+                    .push(ActionNodeArchive {
+                        node_id: archive.node_id,
+                        action_id: archive.action_id,
+                        execution_id: archive.execution_id,
+                        status: archive.status,
+                        attempt_number: archive.attempt_number,
+                        max_retries: archive.max_retries,
+                        worker_id: archive.worker_id,
+                        started_at_ms: archive.started_at_ms,
+                        completed_at_ms: archive.completed_at_ms,
+                        duration_ms: archive.duration_ms,
+                        parent_execution_id: archive.parent_execution_id,
+                        spread_index: archive.spread_index,
+                        loop_index: archive.loop_index,
+                        waiting_for: archive.waiting_for,
+                        completed_count: archive.completed_count,
+                        node_kind: archive.node_kind,
+                        error: archive.error,
+                        error_type: archive.error_type,
+                        timeout_seconds: archive.timeout_seconds,
+                        timeout_retry_limit: archive.timeout_retry_limit,
+                        backoff: archive.backoff,
+                        inputs: payloads.0,
+                        result: payloads.1,
+                    });
+            }
+
+            if !payloads_by_execution.is_empty() {
+                let mut graphs_by_instance: HashMap<Uuid, Vec<u8>> = HashMap::new();
+                for instance in &claimed {
+                    if let Some(graph_bytes) = &instance.execution_graph {
+                        graphs_by_instance.insert(instance.id.0, graph_bytes.clone());
+                    }
+                }
+
+                for (instance_id, graph_bytes) in graphs_by_instance {
+                    if archives_by_instance.contains_key(&instance_id) {
+                        continue;
+                    }
+                    if !payloads_by_execution
+                        .keys()
+                        .any(|(id, _)| *id == instance_id)
+                    {
+                        continue;
+                    }
+
+                    let exec_state = match ExecutionState::from_bytes(&graph_bytes) {
+                        Ok(state) => state,
+                        Err(err) => {
+                            warn!(
+                                instance_id = %instance_id,
+                                error = %err,
+                                "Failed to decode execution graph for payload hydration"
+                            );
+                            continue;
+                        }
+                    };
+
+                    let mut derived_archives = Vec::new();
+                    for (node_id, exec_node) in &exec_state.graph.nodes {
+                        let Some(exec_id) = exec_node.execution_id.as_ref() else {
+                            continue;
+                        };
+                        let Some((inputs, result)) =
+                            payloads_by_execution.get(&(instance_id, exec_id.clone()))
+                        else {
+                            continue;
+                        };
+
+                        let status = NodeStatus::try_from(exec_node.status)
+                            .unwrap_or(NodeStatus::Unspecified);
+                        let node_kind = NodeKind::try_from(exec_node.node_kind)
+                            .unwrap_or(NodeKind::Unspecified);
+
+                        derived_archives.push(ActionNodeArchive {
+                            node_id: node_id.clone(),
+                            action_id: exec_node.template_id.clone(),
+                            execution_id: exec_id.clone(),
+                            status,
+                            attempt_number: exec_node.attempt_number,
+                            max_retries: exec_node.max_retries,
+                            worker_id: exec_node.worker_id.clone(),
+                            started_at_ms: exec_node.started_at_ms,
+                            completed_at_ms: exec_node.completed_at_ms,
+                            duration_ms: exec_node.duration_ms,
+                            parent_execution_id: exec_node.parent_execution_id.clone(),
+                            spread_index: exec_node.spread_index,
+                            loop_index: exec_node.loop_index,
+                            waiting_for: exec_node.waiting_for.clone(),
+                            completed_count: exec_node.completed_count,
+                            node_kind,
+                            error: exec_node.error.clone(),
+                            error_type: exec_node.error_type.clone(),
+                            timeout_seconds: exec_node.timeout_seconds,
+                            timeout_retry_limit: exec_node.timeout_retry_limit,
+                            backoff: exec_node.backoff.clone().unwrap_or_default(),
+                            inputs: inputs.clone(),
+                            result: result.clone(),
+                        });
+                    }
+
+                    if !derived_archives.is_empty() {
+                        archives_by_instance.insert(instance_id, derived_archives);
+                    }
+                }
             }
 
             for instance in claimed {
-                let payloads = payloads_by_instance.remove(&instance.id.0);
+                let archives = archives_by_instance.remove(&instance.id.0);
                 if let Err(e) = self
-                    .initialize_instance_with_payloads(instance, payloads)
+                    .initialize_instance_with_payloads(instance, archives)
                     .await
                 {
                     error!(error = %e, "Failed to initialize claimed instance");
@@ -1285,11 +1413,11 @@ impl InstanceRunner {
         Ok(())
     }
 
-    /// Initialize a claimed instance with pre-loaded payloads
+    /// Initialize a claimed instance with pre-loaded archives
     async fn initialize_instance_with_payloads(
         &self,
         claimed: ClaimedInstance,
-        payloads: Option<Vec<PayloadTuple>>,
+        action_nodes_archive: Option<Vec<ActionNodeArchive>>,
     ) -> InstanceRunnerResult<()> {
         let version_id = claimed
             .workflow_version_id
@@ -1298,61 +1426,30 @@ impl InstanceRunner {
         // Load or get cached DAG
         let dag = self.get_or_load_dag(version_id).await?;
 
-        // Initialize or restore execution state
-        let (state, stalled_completions) = match claimed.execution_graph {
-            Some(bytes) => {
-                // Restore from persisted state (stripped graph - metadata only)
-                let mut state = ExecutionState::from_bytes(&bytes)?;
-
-                // Hydrate with payloads (pre-loaded in batch for efficiency)
-                if let Some(payload_tuples) = payloads
-                    && !payload_tuples.is_empty()
-                {
-                    let count = payload_tuples.len();
-                    state.hydrate_payloads(&payload_tuples);
-                    debug!(
-                        instance_id = %claimed.id,
-                        payload_count = count,
-                        "Hydrated payloads from cold storage"
-                    );
-                }
-
-                // Recover any nodes that were running when previous owner crashed
-                state.recover_running_nodes();
-
-                // Recover completed nodes whose successors weren't advanced
-                // (e.g. runner crashed after action completed but before next
-                // nodes were determined)
-                let stalled = state.find_stalled_completions(&dag);
-
-                self.metrics.lock().await.orphans_recovered += 1;
-                (state, stalled)
-            }
-            None => {
-                // New instance - initialize from DAG and inputs
-                let mut state = ExecutionState::new();
-
-                let inputs: WorkflowArguments = claimed
-                    .input_payload
-                    .as_ref()
-                    .map(|b| decode_message(b))
-                    .transpose()?
-                    .unwrap_or_default();
-
-                state.initialize_from_dag(&dag, &inputs);
-                (state, Vec::new())
-            }
+        let instance_rehydrate = InstanceRehydrate {
+            instance_id: claimed.id,
+            workflow_name: claimed.workflow_name.clone(),
+            input_payload: claimed.input_payload.clone(),
+            execution_graph: claimed.execution_graph.clone(),
+            dag: Arc::clone(&dag),
         };
+
+        let archives = action_nodes_archive.as_deref().unwrap_or(&[]);
+        let RehydrateResult { state, update } =
+            WorkflowState::rehydrate(instance_rehydrate, archives)?;
+        if claimed.execution_graph.is_some() {
+            self.metrics.lock().await.orphans_recovered += 1;
+        }
 
         let now = Instant::now();
         let active = ActiveInstance {
             instance_id: claimed.id,
             workflow_name: claimed.workflow_name,
-            dag,
             state,
             in_flight: HashSet::new(),
-            queued_ready_count: 0,
-            pending_completions: stalled_completions,
+            ready_actions: VecDeque::from(update.ready_actions),
+            pending_completions: Vec::new(),
+            pending_payloads: update.payloads,
             claimed_at: now,
             last_progress_at: now,
         };
@@ -1400,182 +1497,56 @@ impl InstanceRunner {
         Ok(dag)
     }
 
-    /// Collect ready actions from all active instances and enqueue them.
-    ///
-    /// Inline nodes (spreads, sleeps, control flow) are handled immediately and
-    /// removed from the ready_queue. Worker actions are added to the dispatch
-    /// queue but REMAIN in ready_queue until actually dispatched - this ensures
-    /// crash recovery can find them.
+    /// Collect ready worker/sleep actions from workflow state and enqueue them.
     async fn collect_ready_actions(&self) -> InstanceRunnerResult<()> {
         let mut instances = self.active_instances.write().await;
         let mut queue = self.dispatch_queue.lock().await;
         let mut queue_keys = self.dispatch_queue_keys.lock().await;
 
-        for (_, instance) in instances.iter_mut() {
-            let ready_len = instance.state.graph.ready_queue.len();
-            if ready_len == 0 {
-                continue;
-            }
-            if instance.queued_ready_count > ready_len {
-                warn!(
-                    instance_id = %instance.instance_id,
-                    queued_ready_count = instance.queued_ready_count,
-                    ready_len,
-                    "Queued ready count exceeds ready queue length; correcting"
-                );
-                instance.queued_ready_count = ready_len;
-            }
-            if instance.queued_ready_count == ready_len {
-                continue;
-            }
-
-            // Peek at ready nodes without draining - we'll selectively remove them
-            // Worker actions stay in ready_queue until dispatch (for crash recovery)
-            let ready_nodes = instance.state.peek_ready_queue();
-
-            for node_id in ready_nodes {
-                // Skip if already in flight
-                if instance.in_flight.contains(&node_id) {
+        for instance in instances.values_mut() {
+            while let Some(action) = instance.ready_actions.pop_front() {
+                if instance.in_flight.contains(&action.node_id) {
                     continue;
                 }
 
-                // Skip if already in dispatch queue (avoid duplicates)
-                let queue_key = (instance.instance_id.0, node_id.clone());
+                let queue_key = (instance.instance_id.0, action.node_id.clone());
                 if queue_keys.contains(&queue_key) {
                     continue;
                 }
 
-                // Resolve the execution node + DAG template node
-                let exec_node = match instance.state.graph.nodes.get(&node_id) {
-                    Some(n) => n.clone(),
-                    None => {
-                        warn!(node_id = %node_id, "Ready node not found in execution graph");
-                        // Remove invalid node from ready_queue
-                        instance.state.remove_from_ready_queue(&node_id);
-                        continue;
-                    }
-                };
-                let template_id = exec_node.template_id.clone();
-                let dag_node = match instance.dag.nodes.get(&template_id) {
-                    Some(n) => n.clone(),
-                    None => {
-                        warn!(node_id = %node_id, template_id = %template_id, "Ready node not found in DAG");
-                        // Remove invalid node from ready_queue
-                        instance.state.remove_from_ready_queue(&node_id);
-                        continue;
-                    }
-                };
-
-                // Handle spread nodes inline - remove from ready_queue immediately
-                if dag_node.is_spread && exec_node.spread_index.is_none() {
-                    // Remove from ready_queue since we're handling it now
-                    instance.state.remove_from_ready_queue(&node_id);
-
-                    let mut completion_error = None;
-                    let items = match dag_node.spread_collection_expr.as_ref() {
-                        Some(expr) => {
-                            match ExpressionEvaluator::evaluate(
-                                expr,
-                                &instance.state.build_scope_for_node(&node_id),
-                            ) {
-                                Ok(WorkflowValue::List(items))
-                                | Ok(WorkflowValue::Tuple(items)) => items,
-                                Ok(WorkflowValue::Null) => Vec::new(),
-                                Ok(other) => {
-                                    completion_error = Some(format!(
-                                        "Spread collection must be list or tuple, got {:?}",
-                                        other
-                                    ));
-                                    Vec::new()
-                                }
-                                Err(e) => {
-                                    completion_error =
-                                        Some(format!("Spread collection evaluation error: {}", e));
-                                    Vec::new()
-                                }
-                            }
-                        }
-                        None => {
-                            completion_error =
-                                Some("Spread node missing collection expression".to_string());
-                            Vec::new()
-                        }
-                    };
-
-                    if completion_error.is_none() {
-                        instance
-                            .state
-                            .expand_spread(&template_id, items, &instance.dag);
-                    }
-
-                    let completion = Completion {
-                        node_id: node_id.clone(),
-                        success: completion_error.is_none(),
-                        result: None,
-                        error: completion_error.clone(),
-                        error_type: completion_error
-                            .as_ref()
-                            .map(|_| "SpreadEvaluationError".to_string()),
-                        worker_id: "inline".to_string(),
-                        duration_ms: 0,
-                        worker_duration_ms: Some(0),
-                    };
-                    instance.pending_completions.push(completion);
-                    continue;
-                }
-
-                // Handle durable sleep actions inline - schedule_sleep_action calls mark_running
-                // which removes from ready_queue
-                if NodeKind::try_from(exec_node.node_kind) == Ok(NodeKind::Sleep) {
-                    if let Err(e) = self
-                        .schedule_sleep_action(instance, &node_id, &dag_node)
-                        .await
-                    {
-                        warn!(node_id = %node_id, error = %e, "Failed to schedule sleep action");
+                if action.node_kind == NodeKind::Sleep {
+                    let node_id = action.node_id.clone();
+                    if let Err(e) = self.schedule_sleep_action(instance, action).await {
+                        warn!(
+                            node_id = %node_id,
+                            error = %e,
+                            "Failed to schedule sleep action"
+                        );
                     }
                     continue;
                 }
 
-                // Check if this is a worker action - enqueue it
-                // NOTE: We do NOT remove from ready_queue here - that happens in
-                // dispatch_from_queue when we call mark_running. This ensures crash
-                // recovery can find pending actions that were queued but not dispatched.
-                if let (Some(module_name), Some(action_name)) =
-                    (dag_node.module_name.clone(), dag_node.action_name.clone())
-                {
-                    let timeout_seconds = instance.state.get_timeout_seconds(&node_id);
-                    let max_retries = instance.state.get_max_retries(&node_id);
-                    let attempt_number = instance.state.get_attempt_number(&node_id);
+                let (Some(module_name), Some(action_name)) =
+                    (action.module_name.clone(), action.action_name.clone())
+                else {
+                    warn!(
+                        node_id = %action.node_id,
+                        "Ready action missing module/action; skipping"
+                    );
+                    continue;
+                };
 
-                    queue.push_back(QueuedAction {
-                        instance_id: instance.instance_id.0,
-                        node_id: node_id.clone(),
-                        module_name,
-                        action_name,
-                        timeout_seconds,
-                        max_retries,
-                        attempt_number,
-                    });
-                    queue_keys.insert(queue_key);
-                    instance.queued_ready_count += 1;
-                } else {
-                    // Inline node - execute locally, remove from ready_queue
-                    instance.state.remove_from_ready_queue(&node_id);
-
-                    let result = self.execute_inline_node(instance, &node_id, &dag_node);
-
-                    let completion = Completion {
-                        node_id: node_id.clone(),
-                        success: result.is_ok(),
-                        result: result.ok(),
-                        error: None,
-                        error_type: None,
-                        worker_id: "inline".to_string(),
-                        duration_ms: 0,
-                        worker_duration_ms: Some(0),
-                    };
-                    instance.pending_completions.push(completion);
-                }
+                queue.push_back(QueuedAction {
+                    instance_id: instance.instance_id.0,
+                    node_id: action.node_id.clone(),
+                    module_name,
+                    action_name,
+                    timeout_seconds: action.timeout_seconds,
+                    max_retries: action.max_retries,
+                    attempt_number: action.attempt_number,
+                    inputs: action.inputs.clone(),
+                });
+                queue_keys.insert(queue_key);
             }
         }
 
@@ -1612,13 +1583,6 @@ impl InstanceRunner {
             return Ok(());
         }
 
-        let mut queued_removals_by_instance: HashMap<Uuid, usize> = HashMap::new();
-        for action in &actions_to_dispatch {
-            *queued_removals_by_instance
-                .entry(action.instance_id)
-                .or_insert(0) += 1;
-        }
-
         // Group actions by instance for efficient updates
         let mut by_instance: HashMap<Uuid, Vec<&QueuedAction>> = HashMap::new();
         for action in &actions_to_dispatch {
@@ -1632,13 +1596,12 @@ impl InstanceRunner {
         let now_ms = Utc::now().timestamp_millis();
         let mut timeout_entries: Vec<(i64, InFlightAction)> = Vec::new();
         let mut prepared_actions: Vec<PreparedAction> = Vec::new();
+        let mut touched_instances: HashSet<Uuid> = HashSet::new();
 
         {
             let mut instances = self.active_instances.write().await;
             for (instance_id, actions) in &by_instance {
                 if let Some(instance) = instances.get_mut(instance_id) {
-                    let mut dispatched_nodes: Vec<String> = Vec::new();
-
                     for action in actions {
                         // Acquire a worker slot
                         let worker_idx = match self.worker_pool.try_acquire_slot() {
@@ -1654,25 +1617,19 @@ impl InstanceRunner {
                         };
                         let worker_id = format!("worker-{}", worker_idx);
 
-                        let inputs_bytes = instance
-                            .state
-                            .get_inputs_for_node(&action.node_id, &instance.dag);
-                        let inputs: proto::WorkflowArguments = inputs_bytes
+                        let inputs: proto::WorkflowArguments = action
+                            .inputs
                             .as_ref()
                             .and_then(|bytes| decode_message(bytes).ok())
                             .unwrap_or_default();
 
-                        instance.state.mark_running_no_queue_removal(
-                            &action.node_id,
-                            &worker_id,
-                            inputs_bytes.clone(),
-                        );
-                        dispatched_nodes.push(action.node_id.clone());
-
-                        // Set started_at_ms for timeout tracking
-                        if let Some(node) = instance.state.graph.nodes.get_mut(&action.node_id) {
-                            node.started_at_ms = Some(now_ms);
-                        }
+                        let update = instance.state.finished_action(ActionUpdate::Started {
+                            node_id: action.node_id.clone(),
+                            worker_id: worker_id.clone(),
+                            inputs: action.inputs.clone(),
+                        });
+                        self.apply_state_update(instance, update);
+                        touched_instances.insert(*instance_id);
 
                         instance.in_flight.insert(action.node_id.clone());
 
@@ -1696,18 +1653,31 @@ impl InstanceRunner {
                             worker_idx,
                         });
                     }
-
-                    if !dispatched_nodes.is_empty() {
-                        instance
-                            .state
-                            .remove_from_ready_queue_batch(&dispatched_nodes);
-                    }
-
-                    if let Some(removed) = queued_removals_by_instance.get(instance_id) {
-                        instance.queued_ready_count =
-                            instance.queued_ready_count.saturating_sub(*removed);
-                    }
                 }
+            }
+        }
+
+        // Persist metadata updates for started actions before dispatching to workers
+        if !touched_instances.is_empty() {
+            let mut updates: Vec<(WorkflowInstanceId, Vec<u8>, Option<DateTime<Utc>>)> = Vec::new();
+            let mut exec_updates = Vec::new();
+            let mut instances = self.active_instances.write().await;
+            for instance_id in &touched_instances {
+                if let Some(instance) = instances.get_mut(instance_id) {
+                    let snapshot = instance.state.get_state();
+                    updates.push((instance.instance_id, snapshot.encoded_graph, None));
+                    exec_updates.extend(instance.state.get_updated_executions());
+                }
+            }
+            if !updates.is_empty() {
+                self.db
+                    .update_execution_graphs_batch(&self.config.runner_id, &updates)
+                    .await?;
+            }
+            if !exec_updates.is_empty() {
+                self.db
+                    .save_action_execution_archives_batch(&exec_updates)
+                    .await?;
             }
         }
 
@@ -1727,46 +1697,6 @@ impl InstanceRunner {
 
         // Phase 2: Sync state to DB (before sending to workers)
         // This ensures if we crash, the DB shows the actions were attempted
-        {
-            let instances = self.active_instances.read().await;
-            let updates: Vec<_> = by_instance
-                .keys()
-                .filter_map(|instance_id| {
-                    instances.get(instance_id).map(|instance| {
-                        let graph_bytes = instance.state.to_bytes_fully_stripped();
-                        let next_wakeup = instance
-                            .state
-                            .graph
-                            .next_wakeup_time
-                            .map(|ms| Utc.timestamp_millis_opt(ms).unwrap());
-                        (instance.instance_id, graph_bytes, next_wakeup)
-                    })
-                })
-                .collect();
-
-            if !updates.is_empty() {
-                match self
-                    .db
-                    .update_execution_graphs_batch(&self.config.runner_id, &updates)
-                    .await
-                {
-                    Ok(updated_ids) => {
-                        for (id, _, _) in &updates {
-                            if updated_ids.contains(id) {
-                                debug!(instance_id = %id, "Synced running state to DB before dispatch");
-                            } else {
-                                warn!(instance_id = %id, "Lost lease while syncing state before dispatch");
-                                // TODO: Handle lost lease - re-enqueue actions
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!(error = %e, "Failed to sync state to DB before dispatch");
-                    }
-                }
-            }
-        }
-
         // Phase 3: Actually send to workers
         for prepared in prepared_actions {
             let instances = self.active_instances.read().await;
@@ -1871,16 +1801,21 @@ impl InstanceRunner {
     async fn schedule_sleep_action(
         &self,
         instance: &mut ActiveInstance,
-        node_id: &str,
-        _dag_node: &DAGNode,
+        action: ReadyAction,
     ) -> InstanceRunnerResult<()> {
-        let inputs_bytes = instance.state.get_inputs_for_node(node_id, &instance.dag);
-        let inputs = Self::decode_workflow_arguments(inputs_bytes.as_deref());
+        let inputs = Self::decode_workflow_arguments(action.inputs.as_deref());
         let duration_ms = Self::sleep_duration_ms_from_args(&inputs);
 
         if duration_ms <= 0 {
+            let start_update = instance.state.finished_action(ActionUpdate::Started {
+                node_id: action.node_id.clone(),
+                worker_id: SLEEP_WORKER_ID.to_string(),
+                inputs: action.inputs.clone(),
+            });
+            self.apply_state_update(instance, start_update);
+
             let completion = Completion {
-                node_id: node_id.to_string(),
+                node_id: action.node_id.clone(),
                 success: true,
                 result: Some(Self::build_null_result_payload()),
                 error: None,
@@ -1889,22 +1824,21 @@ impl InstanceRunner {
                 duration_ms: 0,
                 worker_duration_ms: Some(0), // Instant sleep (duration <= 0)
             };
-            instance.pending_completions.push(completion);
+            let finish_update = instance
+                .state
+                .finished_action(ActionUpdate::Completed(completion));
+            self.apply_state_update(instance, finish_update);
             return Ok(());
         }
 
-        instance
-            .state
-            .mark_running(node_id, SLEEP_WORKER_ID, inputs_bytes);
+        let update = instance.state.finished_action(ActionUpdate::Started {
+            node_id: action.node_id.clone(),
+            worker_id: SLEEP_WORKER_ID.to_string(),
+            inputs: action.inputs.clone(),
+        });
+        self.apply_state_update(instance, update);
 
-        // For sleep nodes, we need to set started_at_ms immediately so the wakeup
-        // time can be calculated. Unlike worker actions, sleeps don't report duration.
-        let now_ms = Utc::now().timestamp_millis();
-        if let Some(node) = instance.state.graph.nodes.get_mut(node_id) {
-            node.started_at_ms = Some(now_ms);
-        }
-
-        instance.in_flight.insert(node_id.to_string());
+        instance.in_flight.insert(action.node_id.clone());
         self.metrics.lock().await.actions_dispatched += 1;
 
         Ok(())
@@ -1950,13 +1884,6 @@ impl InstanceRunner {
         }
     }
 
-    fn sleep_wakeup_time_ms(exec_node: &ExecutionNode) -> Option<i64> {
-        let started_at_ms = exec_node.started_at_ms?;
-        let inputs = Self::decode_workflow_arguments(exec_node.inputs.as_deref());
-        let duration_ms = Self::sleep_duration_ms_from_args(&inputs);
-        Some(started_at_ms + duration_ms)
-    }
-
     fn sleep_wakeup_datetime_ms(next_wakeup_ms: Option<i64>) -> Option<chrono::DateTime<Utc>> {
         next_wakeup_ms.and_then(|ms| Utc.timestamp_millis_opt(ms).single())
     }
@@ -1971,54 +1898,56 @@ impl InstanceRunner {
         encode_message(&args)
     }
 
-    fn refresh_sleep_state(instance: &mut ActiveInstance) -> bool {
-        let has_ready = !instance.state.graph.ready_queue.is_empty();
-        let has_pending_completions = !instance.pending_completions.is_empty();
-        let mut has_non_sleep_running = false;
-        let mut sleep_wakeups: Vec<i64> = Vec::new();
+    fn compute_next_wakeup_ms(
+        snapshot: &WorkflowStateSnapshot,
+        instance: &ActiveInstance,
+    ) -> Option<i64> {
+        if !snapshot.ready_queue.is_empty() {
+            return None;
+        }
+        if !instance.pending_completions.is_empty() {
+            return None;
+        }
 
-        for exec_node in instance.state.graph.nodes.values() {
-            let status = NodeStatus::try_from(exec_node.status).unwrap_or(NodeStatus::Unspecified);
-            if status != NodeStatus::Running {
+        let mut sleep_wakeups: Vec<i64> = Vec::new();
+        for exec_node in snapshot.executions.values() {
+            if exec_node.status != NodeStatus::Running {
                 continue;
             }
-
-            // Use the structured node_kind field instead of looking up the DAG
-            let is_sleep = NodeKind::try_from(exec_node.node_kind) == Ok(NodeKind::Sleep);
-
-            if is_sleep {
-                if let Some(wakeup) = Self::sleep_wakeup_time_ms(exec_node) {
-                    sleep_wakeups.push(wakeup);
-                }
-            } else {
-                has_non_sleep_running = true;
+            if exec_node.node_kind != NodeKind::Sleep {
+                return None;
+            }
+            if let Some(wakeup) = exec_node.sleep_wakeup_time_ms {
+                sleep_wakeups.push(wakeup);
             }
         }
 
-        if has_ready || has_pending_completions || has_non_sleep_running || sleep_wakeups.is_empty()
-        {
-            instance.state.graph.next_wakeup_time = None;
-            return false;
-        }
-
-        if let Some(next_wakeup) = sleep_wakeups.into_iter().min() {
-            instance.state.graph.next_wakeup_time = Some(next_wakeup);
-            true
-        } else {
-            instance.state.graph.next_wakeup_time = None;
-            false
-        }
+        sleep_wakeups.into_iter().min()
     }
 
-    /// Execute an inline node (assignment, branch, join) locally without sending to a worker.
-    /// Returns the result bytes to store if successful.
-    fn execute_inline_node(
-        &self,
-        instance: &mut ActiveInstance,
-        node_id: &str,
-        dag_node: &DAGNode,
-    ) -> Result<Vec<u8>, String> {
-        crate::executor::execute_inline_node(&mut instance.state, &instance.dag, node_id, dag_node)
+    fn has_pending_work(snapshot: &WorkflowStateSnapshot, instance: &ActiveInstance) -> bool {
+        if !snapshot.ready_queue.is_empty() {
+            return true;
+        }
+        if !instance.ready_actions.is_empty() {
+            return true;
+        }
+        if !instance.pending_completions.is_empty() {
+            return true;
+        }
+        snapshot
+            .executions
+            .values()
+            .any(|node| node.status == NodeStatus::Pending)
+    }
+
+    fn apply_state_update(&self, instance: &mut ActiveInstance, update: WorkflowStateUpdate) {
+        if !update.ready_actions.is_empty() {
+            instance.ready_actions.extend(update.ready_actions);
+        }
+        if !update.payloads.is_empty() {
+            instance.pending_payloads.extend(update.payloads);
+        }
     }
 
     /// Finalize completed instances
@@ -2040,152 +1969,105 @@ impl InstanceRunner {
 
         // Collect node payloads to save (inputs + results for completed actions)
         let mut payloads_to_save: Vec<NodePayload> = Vec::new();
+        let mut execution_updates: Vec<ActionExecutionUpdate> = Vec::new();
 
         // Phase 1: Apply completions and categorize instances
         let phase1_start = Instant::now();
         {
             let mut instances = self.active_instances.write().await;
 
-            for (_, instance) in instances.iter_mut() {
-                // Recover stalled completions: if no work is pending and nothing
-                // is in flight, check for nodes that completed but whose
-                // successors were never advanced (e.g. the runner crashed after
-                // an action finished but before the next nodes were determined).
-                // Inject them as pending completions so the normal flow handles
-                // them.
-                if instance.pending_completions.is_empty()
-                    && !instance.state.has_pending_work()
+            for instance in instances.values_mut() {
+                let mut instance_changed = false;
+
+                if !instance.pending_completions.is_empty() {
+                    let completions = std::mem::take(&mut instance.pending_completions);
+                    for completion in completions {
+                        let update = instance
+                            .state
+                            .finished_action(ActionUpdate::Completed(completion));
+                        self.apply_state_update(instance, update);
+                    }
+                    instance.last_progress_at = Instant::now();
+                    instance_changed = true;
+                }
+
+                if !instance.pending_payloads.is_empty() {
+                    for payload in instance.pending_payloads.drain(..) {
+                        payloads_to_save.push(NodePayload {
+                            instance_id: instance.instance_id,
+                            action_id: payload.action_id,
+                            execution_id: payload.execution_id,
+                            inputs: payload.inputs,
+                            result: payload.result,
+                        });
+                    }
+                    instance_changed = true;
+                }
+
+                let updates = instance.state.get_updated_executions();
+                if !updates.is_empty() {
+                    execution_updates.extend(updates);
+                    instance_changed = true;
+                }
+
+                let snapshot = instance.state.get_state();
+
+                if snapshot.workflow_completed {
+                    let graph_bytes = snapshot.encoded_graph.clone();
+                    to_update.push((instance.instance_id, graph_bytes.clone(), None));
+                    complete_meta.insert(instance.instance_id, instance.workflow_name.clone());
+                    to_complete.push((
+                        instance.instance_id,
+                        snapshot.result_payload.clone(),
+                        graph_bytes,
+                    ));
+                    continue;
+                }
+                if snapshot.workflow_failed {
+                    let graph_bytes = snapshot.encoded_graph.clone();
+                    to_update.push((instance.instance_id, graph_bytes.clone(), None));
+                    fail_meta.insert(
+                        instance.instance_id,
+                        (
+                            instance.workflow_name.clone(),
+                            snapshot.error_message.clone(),
+                        ),
+                    );
+                    to_fail.push((
+                        instance.instance_id,
+                        snapshot.result_payload.clone(),
+                        graph_bytes,
+                    ));
+                    continue;
+                }
+
+                let next_wakeup_ms = Self::compute_next_wakeup_ms(&snapshot, instance);
+                let next_wakeup = Self::sleep_wakeup_datetime_ms(next_wakeup_ms);
+
+                if next_wakeup_ms.is_some() {
+                    to_release.push((instance.instance_id, snapshot.encoded_graph, next_wakeup));
+                } else if !Self::has_pending_work(&snapshot, instance)
                     && instance.in_flight.is_empty()
                 {
-                    let stalled = instance.state.find_stalled_completions(&instance.dag);
-                    if !stalled.is_empty() {
-                        debug!(
-                            instance_id = %instance.instance_id,
-                            stalled_count = stalled.len(),
-                            "Recovering stalled completions for active instance"
-                        );
-                        instance.pending_completions = stalled;
-                    }
-                }
-
-                // Apply any remaining completions
-                let completion_result = if !instance.pending_completions.is_empty() {
-                    let completions = std::mem::take(&mut instance.pending_completions);
-
-                    // Capture payloads BEFORE apply_completions_batch.
-                    // Each node has a unique execution_id (set during mark_running) that we use
-                    // as the key for payload storage. This works across loop iterations because
-                    // the archived node keeps its execution_id.
-                    for completion in &completions {
-                        if let Some(node) = instance.state.graph.nodes.get(&completion.node_id) {
-                            if let Some(exec_id) = &node.execution_id {
-                                payloads_to_save.push(NodePayload {
-                                    instance_id: instance.instance_id,
-                                    execution_id: exec_id.clone(),
-                                    inputs: node.inputs.clone(),
-                                    result: completion.result.clone(),
-                                });
-                            }
-                        }
-                    }
-
-                    let result = instance
-                        .state
-                        .apply_completions_batch(completions, &instance.dag);
-
-                    // Mark progress when completions are applied
-                    instance.last_progress_at = Instant::now();
-
-                    Some(result)
-                } else {
-                    // No new completions - but check if workflow is already complete/failed.
-                    // This handles reclaimed instances where the terminal state was persisted
-                    // but the archive failed (e.g., lease expired).
-                    let status_check = instance.state.check_workflow_completion(&instance.dag);
-                    if status_check.workflow_completed || status_check.workflow_failed {
-                        Some(status_check)
-                    } else {
-                        None
-                    }
-                };
-
-                // Check for workflow completion/failure
-                // For terminal states, we:
-                // 1. Update DB with STRIPPED graph (just statuses, no payloads) for crash safety
-                // 2. Archive FULL graph to completed_instances
-                // 3. Delete from workflow_instances
-                if let Some(ref result) = completion_result {
-                    if result.workflow_completed {
-                        // Stripped graph for workflow_instances (status only, for crash recovery)
-                        let stripped_bytes = instance.state.to_bytes_fully_stripped();
-                        to_update.push((instance.instance_id, stripped_bytes, None));
-                        // Full graph for archive - includes all inputs/outputs
-                        let full_bytes = instance.state.to_bytes();
-                        complete_meta.insert(instance.instance_id, instance.workflow_name.clone());
-                        to_complete.push((
-                            instance.instance_id,
-                            result.result_payload.clone(),
-                            full_bytes,
-                        ));
-                        continue;
-                    } else if result.workflow_failed {
-                        // Stripped graph for workflow_instances (status only, for crash recovery)
-                        let stripped_bytes = instance.state.to_bytes_fully_stripped();
-                        to_update.push((instance.instance_id, stripped_bytes, None));
-                        // Full graph for archive - includes all inputs/outputs
-                        let full_bytes = instance.state.to_bytes();
-                        fail_meta.insert(
-                            instance.instance_id,
-                            (instance.workflow_name.clone(), result.error_message.clone()),
-                        );
-                        to_fail.push((
-                            instance.instance_id,
-                            result.result_payload.clone(),
-                            full_bytes,
-                        ));
-                        continue;
-                    }
-                }
-
-                let previous_wakeup = instance.state.graph.next_wakeup_time;
-                let fully_sleeping = Self::refresh_sleep_state(instance);
-                let next_wakeup =
-                    Self::sleep_wakeup_datetime_ms(instance.state.graph.next_wakeup_time);
-
-                if fully_sleeping {
-                    let graph_bytes = instance.state.to_bytes_fully_stripped();
-                    to_release.push((instance.instance_id, graph_bytes, next_wakeup));
-                } else if !instance.state.has_pending_work() && instance.in_flight.is_empty() {
-                    // Instance has no work and isn't complete - this is an anomalous state.
-                    // Release it so another runner (or this one on next claim) can try to
-                    // make progress. This prevents indefinite stalls.
                     warn!(
                         instance_id = %instance.instance_id,
                         workflow = %instance.workflow_name,
                         "Instance has no pending work but is not complete; releasing"
                     );
-                    let graph_bytes = instance.state.to_bytes_fully_stripped();
-                    to_release.push((instance.instance_id, graph_bytes, next_wakeup));
+                    to_release.push((instance.instance_id, snapshot.encoded_graph, next_wakeup));
                 } else if instance.in_flight.is_empty()
                     && instance.last_progress_at.elapsed() > DEFAULT_STALENESS_TIMEOUT
                 {
-                    // Instance has pending work but hasn't made progress in too long.
-                    // This catches stuck instances where nodes are in ready_queue but
-                    // never get dispatched (e.g., due to queued_ready_count mismatch).
-                    // Release it so it can be reclaimed with a fresh state.
                     warn!(
                         instance_id = %instance.instance_id,
                         workflow = %instance.workflow_name,
                         stale_secs = instance.last_progress_at.elapsed().as_secs(),
-                        pending_nodes = instance.state.graph.ready_queue.len(),
+                        pending_nodes = snapshot.ready_queue.len(),
                         "Instance stalled with pending work; releasing"
                     );
-                    let graph_bytes = instance.state.to_bytes_fully_stripped();
-                    to_release.push((instance.instance_id, graph_bytes, next_wakeup));
-                } else if instance.state.graph.next_wakeup_time != previous_wakeup {
-                    // Wakeup time changed
-                    let graph_bytes = instance.state.to_bytes_fully_stripped();
-                    to_update.push((instance.instance_id, graph_bytes, next_wakeup));
+                    to_release.push((instance.instance_id, snapshot.encoded_graph, next_wakeup));
+                } else if instance_changed {
+                    to_update.push((instance.instance_id, snapshot.encoded_graph, next_wakeup));
                 }
             }
         }
@@ -2238,6 +2120,22 @@ impl InstanceRunner {
         }
         if let Some(ref mut p) = profile {
             p.db_update += update_start.elapsed();
+        }
+
+        if !execution_updates.is_empty()
+            && let Err(e) = self
+                .db
+                .save_action_execution_archives_batch(&execution_updates)
+                .await
+        {
+            error!(error = %e, "Failed to save action execution archives");
+        }
+
+        // Save node payloads (inputs + results) before completing/failing instances.
+        if !payloads_to_save.is_empty()
+            && let Err(e) = self.db.save_node_payloads_batch(&payloads_to_save).await
+        {
+            error!(error = %e, count = payloads_to_save.len(), "Failed to save node payloads");
         }
 
         // Batch complete (fast path: delete from queue, collect archive data)
@@ -2367,17 +2265,7 @@ impl InstanceRunner {
             p.db_release += release_start.elapsed();
         }
 
-        // Save node payloads (inputs + results) to separate table
-        // Fire-and-forget: spawn background task so we don't block the main loop
-        if !payloads_to_save.is_empty() {
-            let db = self.db.clone();
-            let payload_count = payloads_to_save.len();
-            tokio::spawn(async move {
-                if let Err(e) = db.save_node_payloads_batch(&payloads_to_save).await {
-                    error!(error = %e, count = payload_count, "Failed to save node payloads");
-                }
-            });
-        }
+        // Payloads already persisted before completion/failure.
 
         // Record duration for completed/failed instances into the rolling metric
         if !completed_ids.is_empty() {
@@ -2428,11 +2316,11 @@ impl InstanceRunner {
 
         let releases: Vec<_> = instances
             .into_values()
-            .map(|mut instance| {
-                Self::refresh_sleep_state(&mut instance);
-                let next_wakeup =
-                    Self::sleep_wakeup_datetime_ms(instance.state.graph.next_wakeup_time);
-                let graph_bytes = instance.state.to_bytes_fully_stripped();
+            .map(|instance| {
+                let snapshot = instance.state.get_state();
+                let next_wakeup_ms = Self::compute_next_wakeup_ms(&snapshot, &instance);
+                let next_wakeup = Self::sleep_wakeup_datetime_ms(next_wakeup_ms);
+                let graph_bytes = snapshot.encoded_graph;
                 (instance.instance_id, graph_bytes, next_wakeup)
             })
             .collect();

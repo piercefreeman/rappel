@@ -26,9 +26,9 @@ use uuid::Uuid;
 
 use crate::config::WebappConfig;
 use crate::db::{Database, ScheduleId, WorkerStatus, WorkflowVersionId, WorkflowVersionSummary};
-use crate::execution_graph::ExecutionState;
 use crate::messages::execution::{ExecutionGraph, NodeKind, NodeStatus};
 use crate::pool_status::PoolTimeSeries;
+use crate::workflow_state::ExecutionState;
 
 /// Webapp server handle
 pub struct WebappServer {
@@ -292,20 +292,14 @@ async fn workflow_run_detail(
     let dag = decode_dag_from_proto(&version.program_proto);
 
     // Build execution graph status data (used for DAG rendering)
-    let graph_data = if let Ok(Some(graph_bytes)) = state
-        .database
-        .get_instance_execution_graph(crate::db::WorkflowInstanceId(instance_id))
-        .await
-    {
-        if let Some(graph) = decode_execution_graph(&graph_bytes) {
+    // Load and hydrate to ensure inputs/results are available even for active instances
+    let graph_data =
+        if let Some(graph) = load_and_hydrate_execution_graph(&state.database, instance_id).await {
             let action_status = build_action_status_from_execution_graph(&dag, &graph);
             build_filtered_execution_graph(&dag, &action_status)
         } else {
             build_filtered_execution_graph(&dag, &std::collections::HashMap::new())
-        }
-    } else {
-        build_filtered_execution_graph(&dag, &std::collections::HashMap::new())
-    };
+        };
 
     Html(render_workflow_run_page(
         &state.templates,
@@ -362,12 +356,7 @@ async fn get_workflow_run_data(
     let page = query.page.unwrap_or(1).max(1);
     let include_nodes = query.include_nodes.unwrap_or(true);
 
-    if let Ok(Some(graph_bytes)) = state
-        .database
-        .get_instance_execution_graph(crate::db::WorkflowInstanceId(instance_id))
-        .await
-        && let Some(graph) = decode_execution_graph(&graph_bytes)
-    {
+    if let Some(graph) = load_and_hydrate_execution_graph(&state.database, instance_id).await {
         let action_logs = synthesize_action_logs_from_execution_graph(instance_id, &dag, &graph);
         if include_nodes {
             nodes = build_node_contexts_from_action_logs(&action_logs);
@@ -419,12 +408,7 @@ async fn get_workflow_action_logs(
     let dag = decode_dag_from_proto(&version.program_proto);
     let mut logs = Vec::new();
 
-    if let Ok(Some(graph_bytes)) = state
-        .database
-        .get_instance_execution_graph(crate::db::WorkflowInstanceId(instance_id))
-        .await
-        && let Some(graph) = decode_execution_graph(&graph_bytes)
-    {
+    if let Some(graph) = load_and_hydrate_execution_graph(&state.database, instance_id).await {
         let action_logs = synthesize_action_logs_from_execution_graph(instance_id, &dag, &graph);
         logs = action_logs
             .iter()
@@ -469,12 +453,7 @@ async fn export_workflow_instance(
     let mut nodes = Vec::new();
     let mut timeline = Vec::new();
 
-    if let Ok(Some(graph_bytes)) = state
-        .database
-        .get_instance_execution_graph(crate::db::WorkflowInstanceId(instance_id))
-        .await
-        && let Some(graph) = decode_execution_graph(&graph_bytes)
-    {
+    if let Some(graph) = load_and_hydrate_execution_graph(&state.database, instance_id).await {
         let action_logs = synthesize_action_logs_from_execution_graph(instance_id, &dag, &graph);
         nodes = build_node_contexts_from_action_logs(&action_logs);
         // Get all timeline entries without pagination
@@ -1816,18 +1795,44 @@ fn build_filtered_execution_graph(
     }
 }
 
-fn decode_execution_graph(bytes: &[u8]) -> Option<ExecutionGraph> {
-    if bytes.is_empty() {
-        return None;
-    }
+/// Load execution graph and hydrate with payloads from node_payloads table.
+/// This ensures that even stripped graphs (from active instances) have their
+/// inputs/results restored for display.
+async fn load_and_hydrate_execution_graph(
+    database: &crate::db::Database,
+    instance_id: Uuid,
+) -> Option<ExecutionGraph> {
+    // Load the raw graph bytes
+    let graph_bytes = database
+        .get_instance_execution_graph(crate::db::WorkflowInstanceId(instance_id))
+        .await
+        .ok()
+        .flatten()?;
 
-    match ExecutionState::from_bytes(bytes) {
-        Ok(state) => Some(state.graph),
+    // Decode to ExecutionState (so we can hydrate)
+    let mut state = match ExecutionState::from_bytes(&graph_bytes) {
+        Ok(s) => s,
         Err(err) => {
             error!(?err, "failed to decode execution graph");
-            None
+            return None;
         }
+    };
+
+    // Load payloads from node_payloads table
+    if let Ok(payloads) = database
+        .load_node_payloads(crate::db::WorkflowInstanceId(instance_id))
+        .await
+        && !payloads.is_empty()
+    {
+        // Convert to PayloadTuple format (execution_id, inputs, result)
+        let payload_tuples: Vec<_> = payloads
+            .into_iter()
+            .map(|p| (p.execution_id, p.inputs, p.result))
+            .collect();
+        state.hydrate_payloads(&payload_tuples);
     }
+
+    Some(state.graph)
 }
 
 fn datetime_from_ms(ms: i64) -> Option<chrono::DateTime<Utc>> {
@@ -1887,8 +1892,7 @@ fn synthesize_action_logs_from_execution_graph(
         if exec_node.attempts.is_empty() {
             // Only include if the node has completed (has duration_ms) or has meaningful state
             // Skip nodes that were just started but never completed (0ms incomplete entries)
-            let status =
-                NodeStatus::try_from(exec_node.status).unwrap_or(NodeStatus::Unspecified);
+            let status = NodeStatus::try_from(exec_node.status).unwrap_or(NodeStatus::Unspecified);
             let is_terminal = matches!(
                 status,
                 NodeStatus::Completed
@@ -3368,10 +3372,7 @@ mod tests {
             internal_nodes.contains("branch_1"),
             "Branch should be internal"
         );
-        assert!(
-            internal_nodes.contains("input"),
-            "Input should be internal"
-        );
+        assert!(internal_nodes.contains("input"), "Input should be internal");
     }
 
     #[test]
@@ -3382,10 +3383,7 @@ mod tests {
             "action_call".to_string(),
             "call action".to_string(),
         );
-        assert_eq!(
-            determine_node_kind_from_dag(&action_node),
-            NodeKind::Action
-        );
+        assert_eq!(determine_node_kind_from_dag(&action_node), NodeKind::Action);
 
         // Test sleep node (action_name == "sleep" takes precedence)
         let mut sleep_node = crate::dag::DAGNode::new(
@@ -3415,10 +3413,7 @@ mod tests {
             "spread".to_string(),
         );
         spread_node.is_spread = true;
-        assert_eq!(
-            determine_node_kind_from_dag(&spread_node),
-            NodeKind::Spread
-        );
+        assert_eq!(determine_node_kind_from_dag(&spread_node), NodeKind::Spread);
 
         // Test assignment node
         let assign_node = crate::dag::DAGNode::new(
@@ -3445,9 +3440,6 @@ mod tests {
             "output".to_string(),
             "output".to_string(),
         );
-        assert_eq!(
-            determine_node_kind_from_dag(&output_node),
-            NodeKind::Output
-        );
+        assert_eq!(determine_node_kind_from_dag(&output_node), NodeKind::Output);
     }
 }

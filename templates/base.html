@@ -16,7 +16,7 @@
         /* Grid background pattern for depth */
         .bg-grid {
             background-image:
-                linear-gradient(to right, rgb(39 39 42 / 0.5) 1px, transparent 1px);
+                linear-gradient(to right, rgb(212 212 216 / 0.5) 1px, transparent 1px);
             background-size: 80px 100%;
         }
         .dark .bg-grid {
@@ -25,6 +25,15 @@
         }
         /* Diagonal stripe pattern for idle/inactive regions */
         .bg-stripes {
+            background-image: repeating-linear-gradient(
+                -45deg,
+                transparent,
+                transparent 4px,
+                rgb(212 212 216 / 0.3) 4px,
+                rgb(212 212 216 / 0.3) 8px
+            );
+        }
+        .dark .bg-stripes {
             background-image: repeating-linear-gradient(
                 -45deg,
                 transparent,
