@@ -20,9 +20,10 @@ use rappel::messages::{
 };
 use rappel::value::workflow_value_from_proto_bytes;
 use rappel::workflow_arguments_to_json;
+use rappel::workflow_state::ExecutionState;
 use rappel::{
-    Completion, DAGConverter, DAGHelper, DAGNode, EdgeType, ExecutionState, ExpressionEvaluator,
-    WorkflowValue, validate_program,
+    Completion, DAGConverter, DAGHelper, DAGNode, EdgeType, ExpressionEvaluator, WorkflowValue,
+    validate_program,
 };
 
 #[derive(Debug, Parser)]
