@@ -231,6 +231,8 @@
                     <tr class="border-b border-zinc-200 dark:border-zinc-800">
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-medium text-zinc-500">Pool</th>
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-medium text-zinc-500">Active Instances</th>
+                        <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-medium text-zinc-500">Instances/sec</th>
+                        <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-medium text-zinc-500">Instances/min</th>
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-medium text-zinc-500">Total Completed</th>
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-medium text-zinc-500">Median Duration</th>
                         <th class="px-4 py-3 text-left text-xs uppercase tracking-wider font-medium text-zinc-500">Median Dequeue</th>
@@ -242,6 +244,8 @@
                         <tr class="border-b border-zinc-100 dark:border-zinc-800/50 hover:bg-zinc-50 dark:hover:bg-zinc-900/50 transition-colors">
                             <td class="px-4 py-3 font-mono text-xs text-zinc-600 dark:text-zinc-400">{{ row.pool_id }}</td>
                             <td class="px-4 py-3 text-zinc-600 dark:text-zinc-400 tabular-nums">{{ row.active_instances }}</td>
+                            <td class="px-4 py-3 text-zinc-600 dark:text-zinc-400 tabular-nums">{{ row.instances_per_sec }}</td>
+                            <td class="px-4 py-3 text-zinc-600 dark:text-zinc-400 tabular-nums">{{ row.instances_per_min }}</td>
                             <td class="px-4 py-3 text-zinc-600 dark:text-zinc-400 tabular-nums">{{ row.total_completed }}</td>
                             <td class="px-4 py-3 text-zinc-600 dark:text-zinc-400 font-mono text-xs tabular-nums">{{ row.median_duration }}</td>
                             <td class="px-4 py-3 text-zinc-600 dark:text-zinc-400 font-mono text-xs tabular-nums">

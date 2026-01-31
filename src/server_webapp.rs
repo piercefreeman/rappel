@@ -1312,6 +1312,8 @@ struct ActionStatusRow {
 struct InstanceStatusRow {
     pool_id: String,
     active_instances: i32,
+    instances_per_sec: String,
+    instances_per_min: String,
     total_completed: i64,
     median_duration: String,
     median_dequeue_ms: Option<i64>,
@@ -1354,6 +1356,8 @@ fn render_workers_page(templates: &Tera, statuses: &[WorkerStatus], window_minut
             InstanceStatusRow {
                 pool_id: status.pool_id.to_string(),
                 active_instances: status.active_instance_count,
+                instances_per_sec: format!("{:.2}", status.instances_per_sec),
+                instances_per_min: format!("{:.2}", status.instances_per_min),
                 total_completed: status.total_instances_completed,
                 median_duration,
                 median_dequeue_ms: status.median_dequeue_ms,
