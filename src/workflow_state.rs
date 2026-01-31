@@ -436,13 +436,23 @@ impl ExecutionState {
                     return None;
                 }
                 let result = node.result.as_ref()?.clone();
-                if node.targets.is_empty() {
+                let mut targets = node.targets.clone();
+                if targets.is_empty()
+                    && let Some(dag_node) = dag.nodes.get(&node.template_id)
+                {
+                    if let Some(dag_targets) = dag_node.targets.clone() {
+                        targets = dag_targets;
+                    } else if let Some(target) = dag_node.target.clone() {
+                        targets = vec![target];
+                    }
+                }
+                if targets.is_empty() {
                     return None;
                 }
                 Some(RehydrateEntry {
                     node_id: node_id.clone(),
                     template_id: node.template_id.clone(),
-                    targets: node.targets.clone(),
+                    targets,
                     result,
                     completed_at_ms: node.completed_at_ms.unwrap_or(0),
                 })
@@ -458,59 +468,56 @@ impl ExecutionState {
                 .map(|n| n.node_type.clone())
                 .unwrap_or_default();
 
-            if let Ok(args) = decode_message::<WorkflowArguments>(&entry.result) {
-                for arg in &args.arguments {
-                    if arg.key == "result" {
-                        if let Some(value) = &arg.value {
-                            let workflow_value = WorkflowValue::from_proto(value);
-                            let targets = entry.targets.clone();
+            if entry.result.is_empty() {
+                continue;
+            }
+            if let Some(workflow_value) =
+                crate::inline_executor::extract_result_value(&entry.result)
+            {
+                let targets = entry.targets.clone();
 
-                            if targets.len() > 1 {
-                                match &workflow_value {
-                                    WorkflowValue::Tuple(items) | WorkflowValue::List(items) => {
-                                        for (target, item) in targets.iter().zip(items.iter()) {
-                                            self.store_variable_for_node(
-                                                &entry.node_id,
-                                                &node_type,
-                                                target,
-                                                item,
-                                            );
-                                        }
-                                    }
-                                    _ => {
-                                        warn!(
-                                            node_id = %entry.node_id,
-                                            targets = ?targets,
-                                            "Value is not iterable for tuple unpacking"
-                                        );
-                                        for target in &targets {
-                                            self.store_variable_for_node(
-                                                &entry.node_id,
-                                                &node_type,
-                                                target,
-                                                &workflow_value,
-                                            );
-                                        }
-                                    }
-                                }
-                            } else {
-                                for target in &targets {
-                                    self.store_variable_for_node(
-                                        &entry.node_id,
-                                        &node_type,
-                                        target,
-                                        &workflow_value,
-                                    );
-                                }
+                if targets.len() > 1 {
+                    match &workflow_value {
+                        WorkflowValue::Tuple(items) | WorkflowValue::List(items) => {
+                            for (target, item) in targets.iter().zip(items.iter()) {
+                                self.store_variable_for_node(
+                                    &entry.node_id,
+                                    &node_type,
+                                    target,
+                                    item,
+                                );
                             }
                         }
-                        break;
+                        _ => {
+                            warn!(
+                                node_id = %entry.node_id,
+                                targets = ?targets,
+                                "Value is not iterable for tuple unpacking"
+                            );
+                            for target in &targets {
+                                self.store_variable_for_node(
+                                    &entry.node_id,
+                                    &node_type,
+                                    target,
+                                    &workflow_value,
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    for target in &targets {
+                        self.store_variable_for_node(
+                            &entry.node_id,
+                            &node_type,
+                            target,
+                            &workflow_value,
+                        );
                     }
                 }
             } else {
                 warn!(
                     node_id = %entry.node_id,
-                    "Failed to decode result as WorkflowArguments, storing raw bytes"
+                    "Failed to decode result value, storing raw bytes"
                 );
                 for target in &entry.targets {
                     self.store_raw_variable_for_node(
@@ -552,6 +559,13 @@ impl ExecutionState {
         // Create execution nodes for all DAG nodes
         for (node_id, node) in &dag.nodes {
             let (max_retries, timeout_seconds, backoff) = Self::extract_policies(&node.policies);
+            let targets = if let Some(targets) = node.targets.clone() {
+                targets
+            } else if let Some(target) = node.target.clone() {
+                vec![target]
+            } else {
+                Vec::new()
+            };
 
             let exec_node = ExecutionNode {
                 template_id: node_id.clone(),
@@ -575,7 +589,7 @@ impl ExecutionState {
                 backoff: Some(backoff),
                 loop_index: None,
                 loop_accumulators: None,
-                targets: node.target.clone().map(|t| vec![t]).unwrap_or_default(),
+                targets,
                 node_kind: determine_node_kind(node) as i32,
                 parent_execution_id: None,
                 iteration_index: None,
@@ -1438,67 +1452,61 @@ impl ExecutionState {
                     if !node.targets.is_empty()
                         && let Some(result_bytes) = &completion.result
                     {
-                        // Decode as WorkflowArguments and extract the "result" entry's value
-                        if let Ok(args) = decode_message::<WorkflowArguments>(result_bytes) {
-                            for arg in &args.arguments {
-                                if arg.key == "result" {
-                                    if let Some(value) = &arg.value {
-                                        let workflow_value = WorkflowValue::from_proto(value);
-                                        let targets = node.targets.clone();
+                        if result_bytes.is_empty() {
+                            // No value to store (empty payload)
+                            continue;
+                        }
+                        if let Some(workflow_value) =
+                            crate::inline_executor::extract_result_value(result_bytes)
+                        {
+                            let targets = node.targets.clone();
 
-                                        // Unpack tuples/lists when there are multiple targets
-                                        if targets.len() > 1 {
-                                            match &workflow_value {
-                                                WorkflowValue::Tuple(items)
-                                                | WorkflowValue::List(items) => {
-                                                    for (target, item) in
-                                                        targets.iter().zip(items.iter())
-                                                    {
-                                                        self.store_variable_for_node(
-                                                            &completion.node_id,
-                                                            &node_type,
-                                                            target,
-                                                            item,
-                                                        );
-                                                    }
-                                                }
-                                                _ => {
-                                                    // Non-iterable value with multiple targets - store as-is
-                                                    warn!(
-                                                        node_id = %completion.node_id,
-                                                        targets = ?targets,
-                                                        "Value is not iterable for tuple unpacking"
-                                                    );
-                                                    for target in &targets {
-                                                        self.store_variable_for_node(
-                                                            &completion.node_id,
-                                                            &node_type,
-                                                            target,
-                                                            &workflow_value,
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            // Single target - store entire value
-                                            for target in &targets {
-                                                self.store_variable_for_node(
-                                                    &completion.node_id,
-                                                    &node_type,
-                                                    target,
-                                                    &workflow_value,
-                                                );
-                                            }
+                            // Unpack tuples/lists when there are multiple targets
+                            if targets.len() > 1 {
+                                match &workflow_value {
+                                    WorkflowValue::Tuple(items) | WorkflowValue::List(items) => {
+                                        for (target, item) in targets.iter().zip(items.iter()) {
+                                            self.store_variable_for_node(
+                                                &completion.node_id,
+                                                &node_type,
+                                                target,
+                                                item,
+                                            );
                                         }
                                     }
-                                    break;
+                                    _ => {
+                                        // Non-iterable value with multiple targets - store as-is
+                                        warn!(
+                                            node_id = %completion.node_id,
+                                            targets = ?targets,
+                                            "Value is not iterable for tuple unpacking"
+                                        );
+                                        for target in &targets {
+                                            self.store_variable_for_node(
+                                                &completion.node_id,
+                                                &node_type,
+                                                target,
+                                                &workflow_value,
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Single target - store entire value
+                                for target in &targets {
+                                    self.store_variable_for_node(
+                                        &completion.node_id,
+                                        &node_type,
+                                        target,
+                                        &workflow_value,
+                                    );
                                 }
                             }
                         } else {
                             // Fallback: store raw bytes if decode fails
                             warn!(
                                 node_id = %completion.node_id,
-                                "Failed to decode result as WorkflowArguments, storing raw bytes"
+                                "Failed to decode result value, storing raw bytes"
                             );
                             for target in &node.targets.clone() {
                                 self.store_raw_variable_for_node(

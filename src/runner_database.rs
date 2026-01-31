@@ -1279,11 +1279,16 @@ impl InstanceRunner {
             }
 
             let mut archives_by_instance: HashMap<Uuid, Vec<ActionNodeArchive>> = HashMap::new();
+            let mut archive_exec_ids: HashMap<Uuid, HashSet<String>> = HashMap::new();
             for archive in all_archives {
                 let payloads = payloads_by_execution
                     .get(&(archive.instance_id.0, archive.execution_id.clone()))
                     .cloned()
                     .unwrap_or((None, None));
+                archive_exec_ids
+                    .entry(archive.instance_id.0)
+                    .or_default()
+                    .insert(archive.execution_id.clone());
                 archives_by_instance
                     .entry(archive.instance_id.0)
                     .or_default()
@@ -1323,9 +1328,6 @@ impl InstanceRunner {
                 }
 
                 for (instance_id, graph_bytes) in graphs_by_instance {
-                    if archives_by_instance.contains_key(&instance_id) {
-                        continue;
-                    }
                     if !payloads_by_execution
                         .keys()
                         .any(|(id, _)| *id == instance_id)
@@ -1346,10 +1348,14 @@ impl InstanceRunner {
                     };
 
                     let mut derived_archives = Vec::new();
+                    let existing_exec_ids = archive_exec_ids.entry(instance_id).or_default();
                     for (node_id, exec_node) in &exec_state.graph.nodes {
                         let Some(exec_id) = exec_node.execution_id.as_ref() else {
                             continue;
                         };
+                        if existing_exec_ids.contains(exec_id) {
+                            continue;
+                        }
                         let Some((inputs, result)) =
                             payloads_by_execution.get(&(instance_id, exec_id.clone()))
                         else {
@@ -1386,10 +1392,14 @@ impl InstanceRunner {
                             inputs: inputs.clone(),
                             result: result.clone(),
                         });
+                        existing_exec_ids.insert(exec_id.clone());
                     }
 
                     if !derived_archives.is_empty() {
-                        archives_by_instance.insert(instance_id, derived_archives);
+                        archives_by_instance
+                            .entry(instance_id)
+                            .or_default()
+                            .extend(derived_archives);
                     }
                 }
             }
