@@ -1003,12 +1003,6 @@ impl ExecutionState {
     /// Store a value in the variables map
     pub fn store_variable(&mut self, name: &str, value: &WorkflowValue) {
         let bytes = workflow_value_to_proto_bytes(value);
-        tracing::info!(
-            name = %name,
-            value = ?value,
-            bytes_len = bytes.len(),
-            "store_variable: storing variable"
-        );
         self.graph.variables.insert(name.to_string(), bytes);
     }
 

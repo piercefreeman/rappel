@@ -2412,9 +2412,9 @@ impl DAGConverter {
         // Check if any calls are fn_calls - if so, the aggregator should NOT have targets
         // because fn_call return nodes handle variable storage via target propagation.
         // Otherwise, the aggregator completion would overwrite the correct values with Null.
-        let has_fn_calls = calls.iter().any(|call| {
-            matches!(call.kind, Some(ast::call::Kind::Function(_)))
-        });
+        let has_fn_calls = calls
+            .iter()
+            .any(|call| matches!(call.kind, Some(ast::call::Kind::Function(_))));
 
         // Create a node for each call
         let mut call_node_ids = Vec::new();
