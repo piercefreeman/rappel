@@ -1470,6 +1470,19 @@ impl InstanceRunner {
             self.metrics.lock().await.orphans_recovered += 1;
         }
 
+        // Check if workflow failed during startup (e.g., guard evaluation error)
+        if update.workflow_failed {
+            warn!(
+                instance_id = %claimed.id,
+                error = ?update.error_message,
+                "Workflow failed during startup"
+            );
+            self.db
+                .fail_instance_with_result(claimed.id, update.result_payload.as_deref())
+                .await?;
+            return Ok(());
+        }
+
         let now = Instant::now();
         let active = ActiveInstance {
             instance_id: claimed.id,

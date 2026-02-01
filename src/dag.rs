@@ -950,7 +950,14 @@ impl DAGConverter {
                             }
                         }
 
-                        if let Some(targets) = node.targets.as_ref() {
+                        // Propagate targets from fn_call to expanded return nodes
+                        // Check both node.targets (multiple) and node.target (single)
+                        let fn_call_targets: Option<Vec<String>> = node
+                            .targets
+                            .clone()
+                            .or_else(|| node.target.as_ref().map(|t| vec![t.clone()]));
+
+                        if let Some(targets) = fn_call_targets {
                             let expanded_return_ids: Vec<_> = target
                                 .nodes
                                 .iter()
