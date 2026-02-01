@@ -206,6 +206,12 @@ pub fn execute_inline_node(
 
                         // Handle tuple unpacking for return nodes (from expanded fn_call)
                         if let Some(targets) = &dag_node.targets {
+                            tracing::info!(
+                                node_id = %node_id,
+                                targets = ?targets,
+                                value = ?value,
+                                "Return node with targets (plural)"
+                            );
                             if targets.len() > 1 {
                                 match &value {
                                     WorkflowValue::Tuple(items) | WorkflowValue::List(items) => {
@@ -242,6 +248,13 @@ pub fn execute_inline_node(
                                 }
                             } else {
                                 for target in targets {
+                                    tracing::info!(
+                                        node_id = %node_id,
+                                        target = %target,
+                                        value = ?value,
+                                        node_type = %dag_node.node_type,
+                                        "Storing return value via targets (single)"
+                                    );
                                     state.store_variable_for_node(
                                         node_id,
                                         &dag_node.node_type,
@@ -256,16 +269,24 @@ pub fn execute_inline_node(
                                 }
                             }
                         } else if let Some(target) = &dag_node.target {
+                            tracing::info!(
+                                node_id = %node_id,
+                                target = %target,
+                                value = ?value,
+                                node_type = %dag_node.node_type,
+                                "BEFORE storing return value"
+                            );
                             state.store_variable_for_node(
                                 node_id,
                                 &dag_node.node_type,
                                 target,
                                 &value,
                             );
-                            debug!(
+                            tracing::info!(
                                 node_id = %node_id,
                                 target = %target,
-                                "Stored return value"
+                                value = ?value,
+                                "AFTER storing return value"
                             );
                         }
 
