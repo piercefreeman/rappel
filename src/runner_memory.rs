@@ -291,7 +291,7 @@ async fn dispatch_ready_nodes(
             };
 
             if completion_error.is_none() {
-                instance
+                let _ = instance
                     .state
                     .expand_spread(&template_id, items, &instance.dag);
             }

@@ -101,7 +101,7 @@ COPY --from=wheel-builder /repo/target/wheels /tmp/wheels
 RUN --mount=type=cache,target=/root/.cache/uv \
     set -eux; wheel=$(ls /tmp/wheels/rappel-*.whl | head -n 1); uv pip install --no-cache-dir "$wheel"
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --no-cache-dir ".[tests]"
+    uv pip install --no-cache-dir --no-sources ".[tests]"
 
 ENV RAPPEL_HTTP_PORT=24117 \
     RAPPEL_GRPC_PORT=24118

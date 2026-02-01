@@ -471,60 +471,46 @@ impl ExecutionState {
             if entry.result.is_empty() {
                 continue;
             }
-            if let Some(workflow_value) =
-                crate::inline_executor::extract_result_value(&entry.result)
-            {
-                let targets = entry.targets.clone();
+            let Some(workflow_value) = crate::inline_executor::extract_result_value(&entry.result)
+            else {
+                warn!(
+                    node_id = %entry.node_id,
+                    "Failed to decode result value; skipping variable storage"
+                );
+                continue;
+            };
 
-                if targets.len() > 1 {
-                    match &workflow_value {
-                        WorkflowValue::Tuple(items) | WorkflowValue::List(items) => {
-                            for (target, item) in targets.iter().zip(items.iter()) {
-                                self.store_variable_for_node(
-                                    &entry.node_id,
-                                    &node_type,
-                                    target,
-                                    item,
-                                );
-                            }
-                        }
-                        _ => {
-                            warn!(
-                                node_id = %entry.node_id,
-                                targets = ?targets,
-                                "Value is not iterable for tuple unpacking"
-                            );
-                            for target in &targets {
-                                self.store_variable_for_node(
-                                    &entry.node_id,
-                                    &node_type,
-                                    target,
-                                    &workflow_value,
-                                );
-                            }
+            let targets = entry.targets.clone();
+            if targets.len() > 1 {
+                match &workflow_value {
+                    WorkflowValue::Tuple(items) | WorkflowValue::List(items) => {
+                        for (target, item) in targets.iter().zip(items.iter()) {
+                            self.store_variable_for_node(&entry.node_id, &node_type, target, item);
                         }
                     }
-                } else {
-                    for target in &targets {
-                        self.store_variable_for_node(
-                            &entry.node_id,
-                            &node_type,
-                            target,
-                            &workflow_value,
+                    _ => {
+                        warn!(
+                            node_id = %entry.node_id,
+                            targets = ?targets,
+                            "Value is not iterable for tuple unpacking"
                         );
+                        for target in &targets {
+                            self.store_variable_for_node(
+                                &entry.node_id,
+                                &node_type,
+                                target,
+                                &workflow_value,
+                            );
+                        }
                     }
                 }
             } else {
-                warn!(
-                    node_id = %entry.node_id,
-                    "Failed to decode result value, storing raw bytes"
-                );
-                for target in &entry.targets {
-                    self.store_raw_variable_for_node(
+                for target in &targets {
+                    self.store_variable_for_node(
                         &entry.node_id,
                         &node_type,
                         target,
-                        entry.result.clone(),
+                        &workflow_value,
                     );
                 }
             }
@@ -1333,17 +1319,26 @@ impl ExecutionState {
 
                 // Build result payload from the "result" variable
                 if let Some(result_value_bytes) = self.graph.variables.get("result") {
-                    if let Ok(value) = decode_message::<crate::messages::proto::WorkflowArgumentValue>(
-                        result_value_bytes,
-                    ) {
-                        let args = WorkflowArguments {
-                            arguments: vec![crate::messages::proto::WorkflowArgument {
-                                key: "result".to_string(),
-                                value: Some(value),
-                            }],
-                        };
-                        result.result_payload = Some(encode_message(&args));
-                    }
+                    let value = if let Ok(value) = decode_message::<
+                        crate::messages::proto::WorkflowArgumentValue,
+                    >(result_value_bytes)
+                    {
+                        value
+                    } else if let Some(workflow_value) =
+                        crate::inline_executor::extract_result_value(result_value_bytes)
+                    {
+                        workflow_value.to_proto()
+                    } else {
+                        warn!("Failed to decode result variable, storing null payload");
+                        WorkflowValue::Null.to_proto()
+                    };
+                    let args = WorkflowArguments {
+                        arguments: vec![crate::messages::proto::WorkflowArgument {
+                            key: "result".to_string(),
+                            value: Some(value),
+                        }],
+                    };
+                    result.result_payload = Some(encode_message(&args));
                 } else {
                     let args = WorkflowArguments {
                         arguments: vec![crate::messages::proto::WorkflowArgument {
@@ -1452,13 +1447,25 @@ impl ExecutionState {
                     if !node.targets.is_empty()
                         && let Some(result_bytes) = &completion.result
                     {
-                        if result_bytes.is_empty() {
-                            // No value to store (empty payload)
-                            continue;
-                        }
-                        if let Some(workflow_value) =
-                            crate::inline_executor::extract_result_value(result_bytes)
-                        {
+                        let workflow_value = if result_bytes.is_empty() {
+                            warn!(
+                                node_id = %completion.node_id,
+                                "Empty result payload; skipping variable storage"
+                            );
+                            None
+                        } else {
+                            let decoded =
+                                crate::inline_executor::extract_result_value(result_bytes);
+                            if decoded.is_none() {
+                                warn!(
+                                    node_id = %completion.node_id,
+                                    "Failed to decode result value; skipping variable storage"
+                                );
+                            }
+                            decoded
+                        };
+
+                        if let Some(workflow_value) = workflow_value {
                             let targets = node.targets.clone();
 
                             // Unpack tuples/lists when there are multiple targets
@@ -1501,20 +1508,6 @@ impl ExecutionState {
                                         &workflow_value,
                                     );
                                 }
-                            }
-                        } else {
-                            // Fallback: store raw bytes if decode fails
-                            warn!(
-                                node_id = %completion.node_id,
-                                "Failed to decode result value, storing raw bytes"
-                            );
-                            for target in &node.targets.clone() {
-                                self.store_raw_variable_for_node(
-                                    &completion.node_id,
-                                    &node_type,
-                                    target,
-                                    result_bytes.clone(),
-                                );
                             }
                         }
                     }
@@ -1969,17 +1962,26 @@ impl ExecutionState {
                 if let Some(result_value_bytes) = self.graph.variables.get("result") {
                     // result_value_bytes is a WorkflowArgumentValue
                     // Wrap it in WorkflowArguments with key "result"
-                    if let Ok(value) = decode_message::<crate::messages::proto::WorkflowArgumentValue>(
-                        result_value_bytes,
-                    ) {
-                        let args = WorkflowArguments {
-                            arguments: vec![crate::messages::proto::WorkflowArgument {
-                                key: "result".to_string(),
-                                value: Some(value),
-                            }],
-                        };
-                        result.result_payload = Some(encode_message(&args));
-                    }
+                    let value = if let Ok(value) = decode_message::<
+                        crate::messages::proto::WorkflowArgumentValue,
+                    >(result_value_bytes)
+                    {
+                        value
+                    } else if let Some(workflow_value) =
+                        crate::inline_executor::extract_result_value(result_value_bytes)
+                    {
+                        workflow_value.to_proto()
+                    } else {
+                        warn!("Failed to decode result variable, storing null payload");
+                        WorkflowValue::Null.to_proto()
+                    };
+                    let args = WorkflowArguments {
+                        arguments: vec![crate::messages::proto::WorkflowArgument {
+                            key: "result".to_string(),
+                            value: Some(value),
+                        }],
+                    };
+                    result.result_payload = Some(encode_message(&args));
                 } else {
                     let args = WorkflowArguments {
                         arguments: vec![crate::messages::proto::WorkflowArgument {
@@ -2114,12 +2116,17 @@ impl ExecutionState {
     }
 
     /// Expand a spread node into N concrete execution nodes
-    pub fn expand_spread(&mut self, spread_node_id: &str, items: Vec<WorkflowValue>, dag: &DAG) {
+    pub fn expand_spread(
+        &mut self,
+        spread_node_id: &str,
+        items: Vec<WorkflowValue>,
+        dag: &DAG,
+    ) -> Vec<String> {
         let dag_node = match dag.nodes.get(spread_node_id) {
             Some(n) => n,
             None => {
                 warn!("Spread node {} not found in DAG", spread_node_id);
-                return;
+                return Vec::new();
             }
         };
 
@@ -2127,7 +2134,7 @@ impl ExecutionState {
             Some(id) => id.clone(),
             None => {
                 warn!("Spread node {} has no aggregates_to", spread_node_id);
-                return;
+                return Vec::new();
             }
         };
 
@@ -2197,6 +2204,8 @@ impl ExecutionState {
             count = expanded_ids.len(),
             "Expanded spread into concrete nodes"
         );
+
+        expanded_ids
     }
 
     /// Check if there are any nodes still running or pending
@@ -2547,13 +2556,8 @@ impl WorkflowState {
     fn process_ready_nodes(&mut self, node_ids: Vec<String>) -> WorkflowStateUpdate {
         let mut update = WorkflowStateUpdate::default();
         let mut queue: VecDeque<String> = node_ids.into();
-        let mut seen: HashSet<String> = HashSet::new();
 
         while let Some(node_id) = queue.pop_front() {
-            if !seen.insert(node_id.clone()) {
-                continue;
-            }
-
             let Some(exec_node) = self.inner.graph.nodes.get(&node_id) else {
                 continue;
             };
@@ -2566,7 +2570,14 @@ impl WorkflowState {
 
             let is_worker_action = dag_node.module_name.is_some() && dag_node.action_name.is_some();
 
-            if node_kind == NodeKind::Sleep || is_worker_action {
+            if node_kind == NodeKind::Sleep {
+                let inputs = self.inner.get_inputs_for_node(&node_id, &self.dag);
+                update
+                    .ready_actions
+                    .push(self.build_ready_action(&node_id, exec_node, &dag_node, inputs));
+                continue;
+            }
+            if node_kind == NodeKind::Action && is_worker_action {
                 let inputs = self.inner.get_inputs_for_node(&node_id, &self.dag);
                 update
                     .ready_actions
@@ -2607,7 +2618,10 @@ impl WorkflowState {
                 };
 
                 if completion_error.is_none() {
-                    self.inner.expand_spread(&template_id, items, &self.dag);
+                    let expanded = self.inner.expand_spread(&template_id, items, &self.dag);
+                    for child_id in expanded {
+                        queue.push_back(child_id);
+                    }
                 }
 
                 Completion {
@@ -4351,7 +4365,7 @@ mod tests {
             WorkflowValue::Int(2),
             WorkflowValue::Int(3),
         ];
-        state.expand_spread("spread_1", items, &dag);
+        let _ = state.expand_spread("spread_1", items, &dag);
 
         // Verify expanded nodes have Action kind and parent set
         for i in 0..3 {

@@ -175,7 +175,8 @@ pub fn execute_inline_node(
             let should_store_list = dag_node
                 .targets
                 .as_ref()
-                .map(|targets| targets.len() == 1)
+                .map(|targets| !targets.is_empty())
+                .or_else(|| dag_node.target.as_ref().map(|_| true))
                 .unwrap_or(false);
 
             if should_store_list {

@@ -545,7 +545,7 @@ class WhileLoopWorkflow(Workflow):
         current = 0
         iterations = 0
 
-        while current < limit:
+        for _ in range(limit):
             current = await increment_counter(current)
             iterations = iterations + 1
 

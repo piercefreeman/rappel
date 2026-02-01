@@ -262,7 +262,7 @@ impl InMemoryWorkflowExecutor {
                 };
 
                 if completion_error.is_none() {
-                    self.state.expand_spread(&template_id, items, &self.dag);
+                    let _ = self.state.expand_spread(&template_id, items, &self.dag);
                 }
 
                 self.pending_completions.push(Completion {
