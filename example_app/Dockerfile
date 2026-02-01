@@ -100,6 +100,8 @@ ENV PATH="/opt/venv/bin:${PATH}"
 COPY --from=wheel-builder /repo/target/wheels /tmp/wheels
 RUN --mount=type=cache,target=/root/.cache/uv \
     set -eux; wheel=$(ls /tmp/wheels/rappel-*.whl | head -n 1); uv pip install --no-cache-dir "$wheel"
+# Remove uv.lock to avoid path dependency issues (it references ../python which doesn't exist in container)
+RUN rm -f uv.lock
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --no-cache-dir --no-sources ".[tests]"
 
