@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable, Mapping, Optional, Sequence
+from uuid import UUID, uuid4
 
 from proto import ast_pb2 as ir
 
@@ -46,7 +47,7 @@ class VariableValue:
 
 @dataclass(frozen=True)
 class ActionResultValue:
-    node_id: str
+    node_id: UUID
     action_name: str
     iteration_index: Optional[int] = None
     result_index: Optional[int] = None
@@ -140,12 +141,13 @@ class NodeStatus(Enum):
 
 @dataclass
 class ExecutionNode:
-    node_id: str
+    node_id: UUID
     node_type: str
     label: str
     status: NodeStatus
     template_id: Optional[str] = None
     iteration_index: Optional[int] = None
+    instance_suffix: Optional[str] = None
     parent_id: Optional[str] = None
     targets: list[str] = field(default_factory=list)
     action: Optional[ActionCallSpec] = None
@@ -155,8 +157,8 @@ class ExecutionNode:
 
 @dataclass(frozen=True)
 class ExecutionEdge:
-    source: str
-    target: str
+    source: UUID
+    target: UUID
     edge_type: EdgeType = EdgeType.STATE_MACHINE
 
 
@@ -182,12 +184,39 @@ class RunnerState:
 
     In short, RunnerState is the ground-truth runtime DAG: symbolic assignments
     plus control/data edges, suitable for replay and visualization.
+
+    Cycle walkthrough (mid-loop example):
+    Suppose we are partway through:
+    - results = []
+    - for item in items:
+        - action_result = @action(item)
+        - results = results + [action_result + 1]
+
+    On a single iteration update:
+    1) The runner queues an action node for @action(item).
+       - A new execution node is created with a UUID id.
+       - Its assignments map action_result -> ActionResultValue(node_id).
+       - Data-flow edges are added from the node that last defined `item`.
+    2) The runner queues the assignment node for results update.
+       - The RHS expression is materialized:
+         results + [action_result + 1] becomes a BinaryOpValue whose tree
+         contains the ActionResultValue from step (1), plus a LiteralValue(1).
+       - Data-flow edges are added from the prior results definition node and
+         from the action node created in step (1).
+       - Latest assignment tracking is updated so `results` now points to this
+         new execution node.
+
+    After this iteration, the state graph has explicit nodes for the current
+    action and the results update. Subsequent iterations repeat the same
+    sequence, producing a chain of assignments where replay can reconstruct the
+    incremental `results` value by following data-flow edges.
+
     """
 
     def __init__(
         self,
         dag: Optional[DAG] = None,
-        nodes: Optional[Mapping[str, ExecutionNode]] = None,
+        nodes: Optional[Mapping[UUID, ExecutionNode]] = None,
         edges: Optional[Iterable[ExecutionEdge]] = None,
         *,
         link_queued_nodes: bool = True,
@@ -195,11 +224,10 @@ class RunnerState:
         self._dag = dag
         self.nodes = dict(nodes or {})
         self.edges: set[ExecutionEdge] = set(edges or [])
-        self.ready_queue: list[str] = []
-        self.timeline: list[str] = []
-        self._counters: dict[str, int] = {}
+        self.ready_queue: list[UUID] = []
+        self.timeline: list[UUID] = []
         self._link_queued_nodes = link_queued_nodes
-        self._latest_assignments: dict[str, str] = {}
+        self._latest_assignments: dict[str, UUID] = {}
 
         if self.nodes or self.edges:
             self._rehydrate_state()
@@ -216,6 +244,11 @@ class RunnerState:
 
         Use this when stepping through a compiled DAG so the runtime state mirrors
         the template node (assignments, action results, and data-flow edges).
+
+        Example IR:
+        - total = a + b
+        When the AssignmentNode template is queued, the execution node records
+        the symbolic BinaryOpValue and updates data-flow edges from a/b.
         """
         if self._dag is None:
             raise RunnerStateError("runner state has no DAG template")
@@ -223,7 +256,7 @@ class RunnerState:
         if template is None:
             raise RunnerStateError(f"template node not found: {template_id}")
 
-        node_id = self._build_execution_id(template_id, iteration_index, instance_suffix)
+        node_id = uuid4()
         node = ExecutionNode(
             node_id=node_id,
             node_type=template.node_type,
@@ -231,6 +264,7 @@ class RunnerState:
             status=NodeStatus.QUEUED,
             template_id=template_id,
             iteration_index=iteration_index,
+            instance_suffix=instance_suffix,
             parent_id=parent_id,
             targets=self._node_targets(template),
         )
@@ -246,7 +280,7 @@ class RunnerState:
         node_type: str,
         label: str,
         *,
-        node_id: Optional[str] = None,
+        node_id: Optional[UUID] = None,
         template_id: Optional[str] = None,
         targets: Optional[Sequence[str]] = None,
         iteration_index: Optional[int] = None,
@@ -259,9 +293,11 @@ class RunnerState:
 
         Use this for ad-hoc nodes (tests, synthetic steps) and as a common
         builder for higher-level queue helpers like queue_action.
+
+        Example:
+        - queue_node(node_type="assignment", label="results = []")
         """
-        base_id = node_id or template_id or self._next_id(node_type)
-        node_id = self._build_execution_id(base_id, iteration_index, instance_suffix)
+        node_id = node_id or uuid4()
         node = ExecutionNode(
             node_id=node_id,
             node_type=node_type,
@@ -269,6 +305,7 @@ class RunnerState:
             status=NodeStatus.QUEUED,
             template_id=template_id,
             iteration_index=iteration_index,
+            instance_suffix=instance_suffix,
             parent_id=parent_id,
             targets=list(targets or []),
             action=action,
@@ -276,40 +313,6 @@ class RunnerState:
         )
         self._register_node(node)
         return node
-
-    def queue_action(
-        self,
-        action_name: str,
-        *,
-        targets: Optional[Sequence[str]] = None,
-        kwargs: Optional[Mapping[str, ValueExpr]] = None,
-        module_name: Optional[str] = None,
-        iteration_index: Optional[int] = None,
-        instance_suffix: Optional[str] = None,
-    ) -> ActionResultValue:
-        """Queue an action call from raw parameters and return a symbolic result.
-
-        Use this when constructing runner state programmatically without IR
-        objects, while still wiring data-flow edges and assignments.
-        """
-        spec = ActionCallSpec(
-            action_name=action_name,
-            module_name=module_name,
-            kwargs=dict(kwargs or {}),
-        )
-        node = self.queue_node(
-            node_type="action_call",
-            label=f"@{action_name}()",
-            targets=targets,
-            iteration_index=iteration_index,
-            instance_suffix=instance_suffix,
-            action=spec,
-        )
-        for value in spec.kwargs.values():
-            self._record_data_flow_from_value(node.node_id, value)
-        result = self._assign_action_results(node, action_name, targets, iteration_index)
-        node.value_expr = result
-        return result
 
     def queue_action_call(
         self,
@@ -324,6 +327,11 @@ class RunnerState:
 
         Use this during IR -> runner-state conversion (including spreads) so
         action arguments are converted to symbolic expressions.
+
+        Example IR:
+        - @double(value=item)
+        With local_scope={"item": LiteralValue(2)}, the queued action uses a
+        literal argument and links data-flow to the literal's source nodes.
         """
         spec = self._action_spec_from_ir(action, local_scope)
         node = self.queue_node(
@@ -340,71 +348,24 @@ class RunnerState:
         node.value_expr = result
         return result
 
-    def record_assignment(
-        self,
-        *,
-        targets: Sequence[str],
-        expr: ir.Expr,
-        node_id: Optional[str] = None,
-        label: Optional[str] = None,
-    ) -> ExecutionNode:
-        """Record an IR assignment as a runtime node with symbolic values.
-
-        Use this when interpreting IR statements into the unrolled runtime graph.
-        """
-        value_expr = self._expr_to_value(expr)
-        return self.record_assignment_value(
-            targets=targets,
-            value_expr=value_expr,
-            node_id=node_id,
-            label=label,
-        )
-
-    def record_assignment_value(
-        self,
-        *,
-        targets: Sequence[str],
-        value_expr: ValueExpr,
-        node_id: Optional[str] = None,
-        label: Optional[str] = None,
-    ) -> ExecutionNode:
-        """Record a symbolic assignment node and update data-flow/definitions.
-
-        Use this for assignments created programmatically after ValueExpr
-        construction (tests or state rewrites).
-        """
-        exec_node_id = node_id or self._next_id("assignment")
-        node = self.queue_node(
-            node_type="assignment",
-            label=label or "assignment",
-            node_id=exec_node_id,
-            targets=targets,
-            value_expr=value_expr,
-        )
-        self._record_data_flow_from_value(exec_node_id, value_expr)
-        assignments = self._build_assignments(targets, value_expr)
-        node.assignments.update(assignments)
-        self._mark_latest_assignments(node.node_id, assignments)
-        return node
-
-    def mark_running(self, node_id: str) -> None:
+    def mark_running(self, node_id: UUID) -> None:
         node = self._get_node(node_id)
         node.status = NodeStatus.RUNNING
 
-    def mark_completed(self, node_id: str) -> None:
+    def mark_completed(self, node_id: UUID) -> None:
         node = self._get_node(node_id)
         node.status = NodeStatus.COMPLETED
         if node_id in self.ready_queue:
             self.ready_queue.remove(node_id)
 
-    def mark_failed(self, node_id: str) -> None:
+    def mark_failed(self, node_id: UUID) -> None:
         node = self._get_node(node_id)
         node.status = NodeStatus.FAILED
         if node_id in self.ready_queue:
             self.ready_queue.remove(node_id)
 
     def add_edge(
-        self, source: str, target: str, edge_type: EdgeType = EdgeType.STATE_MACHINE
+        self, source: UUID, target: UUID, edge_type: EdgeType = EdgeType.STATE_MACHINE
     ) -> None:
         self._register_edge(ExecutionEdge(source=source, target=target, edge_type=edge_type))
 
@@ -413,6 +374,10 @@ class RunnerState:
 
         Use this for all queued nodes so the ready queue, timeline, and implicit
         state-machine edge ordering remain consistent.
+
+        Example:
+        - queue node A then node B with link_queued_nodes=True
+        This creates a state-machine edge A -> B automatically.
         """
         if node.node_id in self.nodes:
             raise RunnerStateError(f"execution node already queued: {node.node_id}")
@@ -430,6 +395,10 @@ class RunnerState:
 
         Use this when loading a snapshot so timeline ordering, latest assignment
         tracking, and ready queue reflect the current node set.
+
+        Example:
+        - Given nodes {A, B} and edge A -> B, rehydration restores timeline
+          [A, B] and marks the latest assignment targets from node B.
         """
         self.timeline = self._build_timeline()
         self._latest_assignments.clear()
@@ -446,13 +415,14 @@ class RunnerState:
                 if self.nodes[node_id].status == NodeStatus.QUEUED
             ]
 
-    def _build_timeline(self) -> list[str]:
+    def _build_timeline(self) -> list[UUID]:
         if not self.edges:
             return list(self.nodes.keys())
-        adjacency: dict[str, list[str]] = {node_id: [] for node_id in self.nodes}
-        in_degree: dict[str, int] = {node_id: 0 for node_id in self.nodes}
+        adjacency: dict[UUID, list[UUID]] = {node_id: [] for node_id in self.nodes}
+        in_degree: dict[UUID, int] = {node_id: 0 for node_id in self.nodes}
         for edge in sorted(
-            self.edges, key=lambda edge: (edge.source, edge.target, edge.edge_type.value)
+            self.edges,
+            key=lambda edge: (str(edge.source), str(edge.target), edge.edge_type.value),
         ):
             if edge.edge_type != EdgeType.STATE_MACHINE:
                 continue
@@ -461,45 +431,25 @@ class RunnerState:
             adjacency[edge.source].append(edge.target)
             in_degree[edge.target] += 1
 
-        queue = sorted(node_id for node_id, degree in in_degree.items() if degree == 0)
-        order: list[str] = []
+        queue = sorted((node_id for node_id, degree in in_degree.items() if degree == 0), key=str)
+        order: list[UUID] = []
         while queue:
             node_id = queue.pop(0)
             order.append(node_id)
-            for neighbor in sorted(adjacency.get(node_id, [])):
+            for neighbor in sorted(adjacency.get(node_id, []), key=str):
                 in_degree[neighbor] -= 1
                 if in_degree[neighbor] == 0:
                     queue.append(neighbor)
-            queue.sort()
+            queue.sort(key=str)
 
         remaining = [node_id for node_id in self.nodes if node_id not in order]
-        return order + sorted(remaining)
+        return order + sorted(remaining, key=str)
 
-    def _get_node(self, node_id: str) -> ExecutionNode:
+    def _get_node(self, node_id: UUID) -> ExecutionNode:
         node = self.nodes.get(node_id)
         if node is None:
             raise RunnerStateError(f"execution node not found: {node_id}")
         return node
-
-    def _next_id(self, prefix: str) -> str:
-        count = self._counters.get(prefix, 0) + 1
-        self._counters[prefix] = count
-        return f"{prefix}_{count}"
-
-    def _build_execution_id(
-        self,
-        base_id: str,
-        iteration_index: Optional[int],
-        instance_suffix: Optional[str],
-    ) -> str:
-        if instance_suffix and iteration_index is not None:
-            raise RunnerStateError("provide either instance_suffix or iteration_index")
-        suffix = instance_suffix
-        if suffix is None and iteration_index is not None:
-            suffix = f"iter_{iteration_index}"
-        if suffix:
-            return f"{base_id}[{suffix}]"
-        return base_id
 
     def _node_targets(self, node: DAGNode) -> list[str]:
         if isinstance(
@@ -524,6 +474,11 @@ class RunnerState:
 
         Use this right after queue_template_node so assignments, action result
         references, and data-flow edges are populated from the template.
+
+        Example IR:
+        - total = @sum(values=items)
+        The ActionCallNode template produces an ActionResultValue and defines
+        total via assignments on the execution node.
         """
         if isinstance(template, AssignmentNode):
             if template.assign_expr is None:
@@ -576,6 +531,10 @@ class RunnerState:
 
         Use this when an action produces one or more results that are assigned
         to variables (including tuple unpacking).
+
+        Example IR:
+        - a, b = @pair()
+        This yields ActionResultValue(node_id, result_index=0/1) for a and b.
         """
         result_ref = ActionResultValue(
             node_id=node.node_id,
@@ -597,6 +556,10 @@ class RunnerState:
 
         Use this for single-target assignments, tuple unpacking, and action
         multi-result binding to keep definitions explicit.
+
+        Example IR:
+        - a, b = [1, 2]
+        Produces {"a": LiteralValue(1), "b": LiteralValue(2)}.
         """
         value = self._materialize_value(value)
         targets_list = list(targets)
@@ -635,6 +598,11 @@ class RunnerState:
 
         Use this before storing assignments so values are self-contained and
         list concatenations are simplified.
+
+        Example IR:
+        - xs = [1]
+        - ys = xs + [2]
+        Materialization turns ys into ListValue([1, 2]) rather than keeping xs.
         """
         resolved = self._resolve_value_tree(value, set())
         if isinstance(resolved, BinaryOpValue) and resolved.op == ir.BinaryOperator.BINARY_OP_ADD:
@@ -653,6 +621,14 @@ class RunnerState:
 
         Use this when materializing expressions so variables become their
         defining expression while guarding against cycles.
+
+        Example IR:
+        - x = 1
+        - y = x + 2
+        When materializing y, the VariableValue("x") is replaced with the
+        LiteralValue(1), yielding a BinaryOpValue(1 + 2) instead of a reference
+        to x. This makes downstream replay use the symbolic expression rather
+        than requiring a separate variable lookup.
         """
         if not isinstance(value, VariableValue):
             return value
@@ -674,6 +650,11 @@ class RunnerState:
         """Recursively resolve variable references throughout a value tree.
 
         Use this as the core materialization step before assignment storage.
+
+        Example IR:
+        - z = (x + y) * 2
+        The tree walk replaces VariableValue("x")/("y") with their latest
+        symbolic definitions before storing z.
         """
         if isinstance(value, VariableValue):
             return self._resolve_variable_value(value, seen)
@@ -730,21 +711,29 @@ class RunnerState:
             return SpreadValue(collection=collection, loop_var=value.loop_var, action=action)
         return value
 
-    def _mark_latest_assignments(self, node_id: str, assignments: Mapping[str, ValueExpr]) -> None:
+    def _mark_latest_assignments(self, node_id: UUID, assignments: Mapping[str, ValueExpr]) -> None:
         for target in assignments:
             self._latest_assignments[target] = node_id
 
-    def _record_data_flow_from_value(self, node_id: str, value: ValueExpr) -> None:
+    def _record_data_flow_from_value(self, node_id: UUID, value: ValueExpr) -> None:
         """Add data-flow edges implied by a value expression.
 
         Use this when a node consumes an expression so upstream dependencies are
         encoded in the runtime graph.
+
+        Example IR:
+        - total = @sum(values)
+        A data-flow edge is added from the values assignment node to the action.
         """
         source_ids = self._value_source_nodes(value)
         self._record_data_flow_edges(node_id, source_ids)
 
-    def _record_data_flow_edges(self, node_id: str, source_ids: set[str]) -> None:
-        """Register data-flow edges from sources to the given node."""
+    def _record_data_flow_edges(self, node_id: UUID, source_ids: set[UUID]) -> None:
+        """Register data-flow edges from sources to the given node.
+
+        Example:
+        - sources {A, B} and node C produce edges A -> C and B -> C.
+        """
         for source_id in source_ids:
             if source_id == node_id:
                 continue
@@ -752,8 +741,13 @@ class RunnerState:
                 ExecutionEdge(source=source_id, target=node_id, edge_type=EdgeType.DATA_FLOW)
             )
 
-    def _value_source_nodes(self, value: ValueExpr) -> set[str]:
-        """Find execution node ids that supply data to the given value."""
+    def _value_source_nodes(self, value: ValueExpr) -> set[UUID]:
+        """Find execution node ids that supply data to the given value.
+
+        Example IR:
+        - total = a + @sum(values)
+        Returns the latest assignment node for a and the action node for sum().
+        """
         if isinstance(value, ActionResultValue):
             return {value.node_id}
         if isinstance(value, VariableValue):
@@ -764,12 +758,12 @@ class RunnerState:
         if isinstance(value, UnaryOpValue):
             return self._value_source_nodes(value.operand)
         if isinstance(value, ListValue):
-            sources: set[str] = set()
+            sources: set[UUID] = set()
             for item in value.elements:
                 sources.update(self._value_source_nodes(item))
             return sources
         if isinstance(value, DictValue):
-            sources = set()
+            sources: set[UUID] = set()
             for entry in value.entries:
                 sources.update(self._value_source_nodes(entry.key))
                 sources.update(self._value_source_nodes(entry.value))
@@ -779,7 +773,7 @@ class RunnerState:
         if isinstance(value, DotValue):
             return self._value_source_nodes(value.object)
         if isinstance(value, FunctionCallValue):
-            sources = set()
+            sources: set[UUID] = set()
             for arg in value.args:
                 sources.update(self._value_source_nodes(arg))
             for arg in value.kwargs.values():
@@ -801,6 +795,10 @@ class RunnerState:
 
         Use this when interpreting IR statements or DAG templates into the
         runtime state; it queues actions and spreads as needed.
+
+        Example IR:
+        - total = base + 1
+        Produces BinaryOpValue(VariableValue("base"), LiteralValue(1)).
         """
         kind = expr.WhichOneof("kind")
         match kind:
@@ -880,6 +878,11 @@ class RunnerState:
         """Convert an IR call (action/function) into a ValueExpr.
 
         Use this for parallel expressions that contain mixed call types.
+
+        Example IR:
+        - parallel { @double(x), helper(x) }
+        Action calls become ActionResultValue nodes; function calls become
+        FunctionCallValue expressions.
         """
         kind = call.WhichOneof("kind")
         match kind:
@@ -904,6 +907,10 @@ class RunnerState:
 
         Use this when converting IR spreads so known list collections unroll to
         explicit action calls, while unknown collections stay symbolic.
+
+        Example IR:
+        - spread [1, 2]:item -> @double(value=item)
+        Produces a ListValue of ActionResultValue entries for each item.
         """
         collection = self._expr_to_value(spread.collection, local_scope)
         if isinstance(collection, ListValue):
@@ -935,6 +942,10 @@ class RunnerState:
 
         Use this when converting IR so literals and list concatenations are
         simplified early.
+
+        Example IR:
+        - total = 1 + 2
+        Produces LiteralValue(3) instead of a BinaryOpValue.
         """
         if op == ir.BinaryOperator.BINARY_OP_ADD:
             if isinstance(left, ListValue) and isinstance(right, ListValue):
@@ -946,7 +957,12 @@ class RunnerState:
         return BinaryOpValue(left=left, op=op, right=right)
 
     def _unary_op_value(self, op: ir.UnaryOperator, operand: ValueExpr) -> ValueExpr:
-        """Build a unary-op value with constant folding for literals."""
+        """Build a unary-op value with constant folding for literals.
+
+        Example IR:
+        - neg = -1
+        Produces LiteralValue(-1) instead of UnaryOpValue.
+        """
         if isinstance(operand, LiteralValue):
             folded = self._fold_literal_unary(op, operand.value)
             if folded is not None:
@@ -954,7 +970,12 @@ class RunnerState:
         return UnaryOpValue(op=op, operand=operand)
 
     def _index_value(self, obj_value: ValueExpr, idx_value: ValueExpr) -> ValueExpr:
-        """Build an index value, folding list literals when possible."""
+        """Build an index value, folding list literals when possible.
+
+        Example IR:
+        - first = [10, 20][0]
+        Produces LiteralValue(10) when the list is fully literal.
+        """
         if isinstance(obj_value, ListValue) and isinstance(idx_value, LiteralValue):
             if isinstance(idx_value.value, int) and 0 <= idx_value.value < len(obj_value.elements):
                 return obj_value.elements[idx_value.value]
@@ -964,6 +985,10 @@ class RunnerState:
         """Extract an action call spec from a DAG node.
 
         Use this when queueing nodes from the DAG template.
+
+        Example:
+        - ActionCallNode(action_name="double", kwargs={"value": "$x"})
+        Produces ActionCallSpec(action_name="double", kwargs={"value": VariableValue("x")}).
         """
         kwargs = {name: self._expr_to_value(expr) for name, expr in node.kwarg_exprs.items()}
         return ActionCallSpec(
@@ -977,7 +1002,12 @@ class RunnerState:
         action: ir.ActionCall,
         local_scope: Optional[Mapping[str, ValueExpr]] = None,
     ) -> ActionCallSpec:
-        """Extract an action call spec from IR, applying local scope bindings."""
+        """Extract an action call spec from IR, applying local scope bindings.
+
+        Example IR:
+        - @double(value=item) with local_scope["item"]=LiteralValue(2)
+        Produces kwargs {"value": LiteralValue(2)}.
+        """
         kwargs = {kw.name: self._expr_to_value(kw.value, local_scope) for kw in action.kwargs}
         module_name = action.module_name if action.HasField("module_name") else None
         return ActionCallSpec(
@@ -988,7 +1018,11 @@ class RunnerState:
 
     @staticmethod
     def _literal_value(lit: ir.Literal) -> Any:
-        """Convert an IR literal into a Python value."""
+        """Convert an IR literal into a Python value.
+
+        Example IR:
+        - Literal(int_value=3) -> 3
+        """
         kind = lit.WhichOneof("value")
         match kind:
             case "int_value":
@@ -1012,7 +1046,11 @@ class RunnerState:
         left: Any,
         right: Any,
     ) -> Optional[Any]:
-        """Try to fold a literal binary operation to a concrete value."""
+        """Try to fold a literal binary operation to a concrete value.
+
+        Example:
+        - (1, 2, BINARY_OP_ADD) -> 3
+        """
         try:
             match op:
                 case ir.BinaryOperator.BINARY_OP_ADD:
@@ -1043,7 +1081,11 @@ class RunnerState:
 
     @staticmethod
     def _fold_literal_unary(op: ir.UnaryOperator, operand: Any) -> Optional[Any]:
-        """Try to fold a literal unary operation to a concrete value."""
+        """Try to fold a literal unary operation to a concrete value.
+
+        Example:
+        - (UNARY_OP_NEG, 4) -> -4
+        """
         try:
             match op:
                 case ir.UnaryOperator.UNARY_OP_NEG:
@@ -1057,14 +1099,117 @@ class RunnerState:
             return None
         return None
 
+    # Test harness helpers (not used in main runtime).
+
+    def queue_action(
+        self,
+        action_name: str,
+        *,
+        targets: Optional[Sequence[str]] = None,
+        kwargs: Optional[Mapping[str, ValueExpr]] = None,
+        module_name: Optional[str] = None,
+        iteration_index: Optional[int] = None,
+        instance_suffix: Optional[str] = None,
+    ) -> ActionResultValue:
+        """Queue an action call from raw parameters and return a symbolic result.
+
+        Use this when constructing runner state programmatically without IR
+        objects, while still wiring data-flow edges and assignments.
+
+        Example:
+        - queue_action("double", targets=["out"], kwargs={"value": LiteralValue(2)})
+        Defines out via an ActionResultValue and records data-flow from the literal.
+        """
+        spec = ActionCallSpec(
+            action_name=action_name,
+            module_name=module_name,
+            kwargs=dict(kwargs or {}),
+        )
+        node = self.queue_node(
+            node_type="action_call",
+            label=f"@{action_name}()",
+            targets=targets,
+            iteration_index=iteration_index,
+            instance_suffix=instance_suffix,
+            action=spec,
+        )
+        for value in spec.kwargs.values():
+            self._record_data_flow_from_value(node.node_id, value)
+        result = self._assign_action_results(node, action_name, targets, iteration_index)
+        node.value_expr = result
+        return result
+
+    def record_assignment(
+        self,
+        *,
+        targets: Sequence[str],
+        expr: ir.Expr,
+        node_id: Optional[UUID] = None,
+        label: Optional[str] = None,
+    ) -> ExecutionNode:
+        """Record an IR assignment as a runtime node with symbolic values.
+
+        Use this when interpreting IR statements into the unrolled runtime graph.
+
+        Example IR:
+        - results = []
+        Produces an assignment node with targets ["results"] and a ListValue([]).
+        """
+        value_expr = self._expr_to_value(expr)
+        return self.record_assignment_value(
+            targets=targets,
+            value_expr=value_expr,
+            node_id=node_id,
+            label=label,
+        )
+
+    def record_assignment_value(
+        self,
+        *,
+        targets: Sequence[str],
+        value_expr: ValueExpr,
+        node_id: Optional[UUID] = None,
+        label: Optional[str] = None,
+    ) -> ExecutionNode:
+        """Record a symbolic assignment node and update data-flow/definitions.
+
+        Use this for assignments created programmatically after ValueExpr
+        construction (tests or state rewrites).
+
+        Example:
+        - record_assignment_value(targets=["x"], value_expr=LiteralValue(1))
+        Creates an assignment node with x bound to LiteralValue(1).
+        """
+        exec_node_id = node_id or uuid4()
+        node = self.queue_node(
+            node_type="assignment",
+            label=label or "assignment",
+            node_id=exec_node_id,
+            targets=targets,
+            value_expr=value_expr,
+        )
+        self._record_data_flow_from_value(exec_node_id, value_expr)
+        assignments = self._build_assignments(targets, value_expr)
+        node.assignments.update(assignments)
+        self._mark_latest_assignments(node.node_id, assignments)
+        return node
+
 
 def format_value(expr: ValueExpr) -> str:
-    """Render a ValueExpr to a python-like string for debugging/visualization."""
+    """Render a ValueExpr to a python-like string for debugging/visualization.
+
+    Example:
+    - BinaryOpValue(VariableValue("a"), +, LiteralValue(1)) -> "a + 1"
+    """
     return _format_value(expr, 0)
 
 
 def _format_value(expr: ValueExpr, parent_prec: int) -> str:
-    """Recursive ValueExpr formatter with operator precedence handling."""
+    """Recursive ValueExpr formatter with operator precedence handling.
+
+    Example:
+    - (a + b) * c renders with parentheses when needed.
+    """
     if isinstance(expr, LiteralValue):
         return _format_literal(expr.value)
     if isinstance(expr, VariableValue):
@@ -1124,7 +1269,11 @@ def _format_value(expr: ValueExpr, parent_prec: int) -> str:
 
 
 def _binary_operator(op: ir.BinaryOperator) -> tuple[str, int]:
-    """Map binary operator enums to (symbol, precedence) for formatting."""
+    """Map binary operator enums to (symbol, precedence) for formatting.
+
+    Example:
+    - BINARY_OP_ADD -> ("+", 40)
+    """
     match op:
         case ir.BinaryOperator.BINARY_OP_OR:
             return "or", 10
@@ -1165,7 +1314,11 @@ def _binary_operator(op: ir.BinaryOperator) -> tuple[str, int]:
 
 
 def _unary_operator(op: ir.UnaryOperator) -> tuple[str, int]:
-    """Map unary operator enums to (symbol, precedence) for formatting."""
+    """Map unary operator enums to (symbol, precedence) for formatting.
+
+    Example:
+    - UNARY_OP_NEG -> ("-", 60)
+    """
     match op:
         case ir.UnaryOperator.UNARY_OP_NEG:
             return "-", 60
@@ -1178,7 +1331,11 @@ def _unary_operator(op: ir.UnaryOperator) -> tuple[str, int]:
 
 
 def _precedence(kind: str) -> int:
-    """Return precedence for non-operator constructs like index/dot."""
+    """Return precedence for non-operator constructs like index/dot.
+
+    Example:
+    - "index" -> 80
+    """
     match kind:
         case "index" | "dot":
             return 80
@@ -1187,7 +1344,11 @@ def _precedence(kind: str) -> int:
 
 
 def _format_literal(value: Any) -> str:
-    """Format Python literals as source-like text."""
+    """Format Python literals as source-like text.
+
+    Example:
+    - "hi" -> "\"hi\""
+    """
     if value is None:
         return "None"
     if isinstance(value, bool):

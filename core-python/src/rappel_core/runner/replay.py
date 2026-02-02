@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
+from uuid import UUID
 
 from proto import ast_pb2 as ir
 
@@ -34,14 +35,33 @@ class ReplayResult:
     variables: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class EvalContext:
+    state: RunnerState
+    action_results: Mapping[UUID, Any]
+    cache: dict[tuple[UUID, str], Any]
+    index: Mapping[UUID, int]
+    timeline: Sequence[UUID]
+    incoming_data: Mapping[UUID, Sequence[UUID]]
+
+
 def replay_variables(
     state: RunnerState,
-    action_results: Mapping[str, Any],
+    action_results: Mapping[UUID, Any],
 ) -> ReplayResult:
     variables: dict[str, Any] = {}
-    cache: dict[tuple[str, str], Any] = {}
-    timeline = state.timeline or list(state.nodes.keys())
+    cache: dict[tuple[UUID, str], Any] = {}
+    timeline: Sequence[UUID] = state.timeline or list(state.nodes.keys())
     index = {node_id: idx for idx, node_id in enumerate(timeline)}
+    incoming_data = _build_incoming_data_map(state, index)
+    ctx = EvalContext(
+        state=state,
+        action_results=action_results,
+        cache=cache,
+        index=index,
+        timeline=timeline,
+        incoming_data=incoming_data,
+    )
 
     for node_id in timeline:
         node = state.nodes.get(node_id)
@@ -49,135 +69,91 @@ def replay_variables(
             continue
         for target in node.assignments:
             variables[target] = _evaluate_assignment(
-                state, node_id, target, action_results, cache, index, timeline, set()
+                ctx,
+                node_id,
+                target,
+                set(),
             )
 
     return ReplayResult(variables=variables)
 
 
 def _evaluate_assignment(
-    state: RunnerState,
-    node_id: str,
+    ctx: EvalContext,
+    node_id: UUID,
     target: str,
-    action_results: Mapping[str, Any],
-    cache: dict[tuple[str, str], Any],
-    index: Mapping[str, int],
-    timeline: Sequence[str],
-    stack: set[tuple[str, str]],
+    stack: set[tuple[UUID, str]],
 ) -> Any:
     key = (node_id, target)
-    if key in cache:
-        return cache[key]
+    if key in ctx.cache:
+        return ctx.cache[key]
     if key in stack:
         raise ReplayError(f"recursive assignment detected for {target} in {node_id}")
 
-    node = state.nodes.get(node_id)
+    node = ctx.state.nodes.get(node_id)
     if node is None or target not in node.assignments:
         raise ReplayError(f"missing assignment for {target} in {node_id}")
 
     stack.add(key)
     value = _evaluate_value(
         node.assignments[target],
-        action_results,
-        state,
+        ctx,
         node_id,
-        cache,
-        index,
-        timeline,
         stack,
     )
     stack.remove(key)
-    cache[key] = value
+    ctx.cache[key] = value
     return value
 
 
 def _evaluate_value(
     expr: ValueExpr,
-    action_results: Mapping[str, Any],
-    state: RunnerState,
-    current_node_id: str,
-    cache: dict[tuple[str, str], Any],
-    index: Mapping[str, int],
-    timeline: Sequence[str],
-    stack: set[tuple[str, str]],
+    ctx: EvalContext,
+    current_node_id: UUID,
+    stack: set[tuple[UUID, str]],
 ) -> Any:
     if isinstance(expr, LiteralValue):
         return expr.value
     if isinstance(expr, VariableValue):
         return _resolve_variable(
-            state,
+            ctx,
             current_node_id,
             expr.name,
-            action_results,
-            cache,
-            index,
-            timeline,
             stack,
         )
     if isinstance(expr, ActionResultValue):
-        return _resolve_action_result(expr, action_results)
+        return _resolve_action_result(expr, ctx)
     if isinstance(expr, BinaryOpValue):
         left = _evaluate_value(
-            expr.left, action_results, state, current_node_id, cache, index, timeline, stack
+            expr.left, ctx, current_node_id, stack
         )
         right = _evaluate_value(
-            expr.right, action_results, state, current_node_id, cache, index, timeline, stack
+            expr.right, ctx, current_node_id, stack
         )
         return _apply_binary(expr.op, left, right)
     if isinstance(expr, UnaryOpValue):
         operand = _evaluate_value(
-            expr.operand,
-            action_results,
-            state,
-            current_node_id,
-            cache,
-            index,
-            timeline,
-            stack,
+            expr.operand, ctx, current_node_id, stack
         )
         return _apply_unary(expr.op, operand)
     if isinstance(expr, ListValue):
         return [
-            _evaluate_value(
-                item, action_results, state, current_node_id, cache, index, timeline, stack
-            )
+            _evaluate_value(item, ctx, current_node_id, stack)
             for item in expr.elements
         ]
     if isinstance(expr, DictValue):
         return {
-            _evaluate_value(
-                entry.key,
-                action_results,
-                state,
-                current_node_id,
-                cache,
-                index,
-                timeline,
-                stack,
-            ): _evaluate_value(
-                entry.value,
-                action_results,
-                state,
-                current_node_id,
-                cache,
-                index,
-                timeline,
-                stack,
+            _evaluate_value(entry.key, ctx, current_node_id, stack): _evaluate_value(
+                entry.value, ctx, current_node_id, stack
             )
             for entry in expr.entries
         }
     if isinstance(expr, IndexValue):
-        obj = _evaluate_value(
-            expr.object, action_results, state, current_node_id, cache, index, timeline, stack
-        )
-        idx = _evaluate_value(
-            expr.index, action_results, state, current_node_id, cache, index, timeline, stack
-        )
+        obj = _evaluate_value(expr.object, ctx, current_node_id, stack)
+        idx = _evaluate_value(expr.index, ctx, current_node_id, stack)
         return obj[idx]
     if isinstance(expr, DotValue):
-        obj = _evaluate_value(
-            expr.object, action_results, state, current_node_id, cache, index, timeline, stack
-        )
+        obj = _evaluate_value(expr.object, ctx, current_node_id, stack)
         if isinstance(obj, dict):
             if expr.attribute in obj:
                 return obj[expr.attribute]
@@ -189,12 +165,8 @@ def _evaluate_value(
     if isinstance(expr, FunctionCallValue):
         return _evaluate_function_call(
             expr,
-            action_results,
-            state,
+            ctx,
             current_node_id,
-            cache,
-            index,
-            timeline,
             stack,
         )
     if isinstance(expr, SpreadValue):
@@ -203,66 +175,44 @@ def _evaluate_value(
 
 
 def _resolve_variable(
-    state: RunnerState,
-    current_node_id: str,
+    ctx: EvalContext,
+    current_node_id: UUID,
     name: str,
-    action_results: Mapping[str, Any],
-    cache: dict[tuple[str, str], Any],
-    index: Mapping[str, int],
-    timeline: Sequence[str],
-    stack: set[tuple[str, str]],
+    stack: set[tuple[UUID, str]],
 ) -> Any:
-    source_node_id = _find_variable_source_node(state, current_node_id, name, index, timeline)
+    source_node_id = _find_variable_source_node(
+        ctx, current_node_id, name
+    )
     if source_node_id is None:
-        raise ReplayError(f"variable not found: {name}")
+        raise ReplayError(f"variable not found via data-flow edges: {name}")
     return _evaluate_assignment(
-        state,
+        ctx,
         source_node_id,
         name,
-        action_results,
-        cache,
-        index,
-        timeline,
         stack,
     )
 
 
 def _find_variable_source_node(
-    state: RunnerState,
-    current_node_id: str,
+    ctx: EvalContext,
+    current_node_id: UUID,
     name: str,
-    index: Mapping[str, int],
-    timeline: Sequence[str],
-) -> Optional[str]:
-    candidates: list[str] = []
-    for edge in state.edges:
-        if edge.edge_type != EdgeType.DATA_FLOW or edge.target != current_node_id:
+) -> Optional[UUID]:
+    sources = ctx.incoming_data.get(current_node_id, ())
+    current_idx = ctx.index.get(current_node_id, len(ctx.index))
+    for source_id in sources:
+        if ctx.index.get(source_id, -1) > current_idx:
             continue
-        node = state.nodes.get(edge.source)
-        if node is None:
-            continue
-        if name in node.assignments:
-            candidates.append(edge.source)
-
-    if candidates:
-        current_idx = index.get(current_node_id, len(timeline))
-        eligible = [node_id for node_id in candidates if index.get(node_id, -1) <= current_idx]
-        if eligible:
-            return max(eligible, key=lambda node_id: index.get(node_id, -1))
-        return max(candidates, key=lambda node_id: index.get(node_id, -1))
-
-    current_idx = index.get(current_node_id, len(timeline))
-    for node_id in reversed(timeline[: current_idx + 1]):
-        node = state.nodes.get(node_id)
+        node = ctx.state.nodes.get(source_id)
         if node is not None and name in node.assignments:
-            return node_id
+            return source_id
     return None
 
 
-def _resolve_action_result(expr: ActionResultValue, action_results: Mapping[str, Any]) -> Any:
-    if expr.node_id not in action_results:
+def _resolve_action_result(expr: ActionResultValue, ctx: EvalContext) -> Any:
+    if expr.node_id not in ctx.action_results:
         raise ReplayError(f"missing action result for {expr.node_id}")
-    value = action_results[expr.node_id]
+    value = ctx.action_results[expr.node_id]
     if expr.result_index is None:
         return value
     try:
@@ -275,24 +225,16 @@ def _resolve_action_result(expr: ActionResultValue, action_results: Mapping[str,
 
 def _evaluate_function_call(
     expr: FunctionCallValue,
-    action_results: Mapping[str, Any],
-    state: RunnerState,
-    current_node_id: str,
-    cache: dict[tuple[str, str], Any],
-    index: Mapping[str, int],
-    timeline: Sequence[str],
-    stack: set[tuple[str, str]],
+    ctx: EvalContext,
+    current_node_id: UUID,
+    stack: set[tuple[UUID, str]],
 ) -> Any:
     args = [
-        _evaluate_value(
-            arg, action_results, state, current_node_id, cache, index, timeline, stack
-        )
+        _evaluate_value(arg, ctx, current_node_id, stack)
         for arg in expr.args
     ]
     kwargs = {
-        name: _evaluate_value(
-            value, action_results, state, current_node_id, cache, index, timeline, stack
-        )
+        name: _evaluate_value(value, ctx, current_node_id, stack)
         for name, value in expr.kwargs.items()
     }
 
@@ -395,3 +337,17 @@ def _is_exception_value(value: Any) -> bool:
     if isinstance(value, dict) and "type" in value and "message" in value:
         return True
     return False
+
+
+def _build_incoming_data_map(
+    state: RunnerState,
+    index: Mapping[UUID, int],
+) -> dict[UUID, list[UUID]]:
+    incoming: dict[UUID, list[UUID]] = {}
+    for edge in state.edges:
+        if edge.edge_type != EdgeType.DATA_FLOW:
+            continue
+        incoming.setdefault(edge.target, []).append(edge.source)
+    for target, sources in incoming.items():
+        sources.sort(key=lambda node_id: (index.get(node_id, -1), str(node_id)), reverse=True)
+    return incoming

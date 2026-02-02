@@ -6,6 +6,7 @@ import argparse
 import asyncio
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from proto import ast_pb2 as ir
 
@@ -139,11 +140,11 @@ async def _action_handler(action: ir.ActionCall, kwargs: dict[str, Any]) -> Any:
             raise ExecutionError(f"unknown action: {action.action_name}")
 
 
-def _build_runner_demo_state() -> tuple[RunnerState, dict[str, int]]:
+def _build_runner_demo_state() -> tuple[RunnerState, dict[UUID, int]]:
     state = RunnerState()
     state.record_assignment(targets=["results"], expr=_list([]), label="results = []")
 
-    action_results: dict[str, int] = {}
+    action_results: dict[UUID, int] = {}
     for idx, item in enumerate([1, 2]):
         action_ref = state.queue_action(
             "action",
