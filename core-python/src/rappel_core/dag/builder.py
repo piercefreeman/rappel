@@ -1,295 +1,50 @@
-"""DAG representation and IR -> DAG converter."""
+"""IR -> DAG conversion and graph builder."""
 
 from __future__ import annotations
 
 import copy
 import uuid
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Dict, Iterable, List, NoReturn, Optional, Sequence, Set
+from typing import Dict, Iterable, List, Optional, Sequence, Set
 
 from proto import ast_pb2 as ir
 
-EXCEPTION_SCOPE_VAR = "__rappel_exception__"
-
-
-class DagConversionError(Exception):
-    """Raised when IR -> DAG conversion fails."""
-
-
-def assert_never(value: NoReturn) -> NoReturn:
-    raise AssertionError(f"Unhandled value: {value!r}")
-
-
-class EdgeType(str, Enum):
-    STATE_MACHINE = "state_machine"
-    DATA_FLOW = "data_flow"
-
-
-@dataclass
-class DAGEdge:
-    source: str
-    target: str
-    edge_type: EdgeType
-    condition: Optional[str] = None
-    variable: Optional[str] = None
-    guard_expr: Optional[ir.Expr] = None
-    is_else: bool = False
-    exception_types: Optional[List[str]] = None
-    exception_depth: Optional[int] = None
-    is_loop_back: bool = False
-    guard_string: Optional[str] = None
-
-    @staticmethod
-    def state_machine(source: str, target: str) -> "DAGEdge":
-        return DAGEdge(
-            source=source,
-            target=target,
-            edge_type=EdgeType.STATE_MACHINE,
-        )
-
-    @staticmethod
-    def state_machine_with_condition(source: str, target: str, condition: str) -> "DAGEdge":
-        return DAGEdge(
-            source=source,
-            target=target,
-            edge_type=EdgeType.STATE_MACHINE,
-            condition=condition,
-        )
-
-    @staticmethod
-    def state_machine_with_guard(source: str, target: str, guard: ir.Expr) -> "DAGEdge":
-        return DAGEdge(
-            source=source,
-            target=target,
-            edge_type=EdgeType.STATE_MACHINE,
-            condition="guarded",
-            guard_expr=copy.deepcopy(guard),
-        )
-
-    @staticmethod
-    def state_machine_else(source: str, target: str) -> "DAGEdge":
-        return DAGEdge(
-            source=source,
-            target=target,
-            edge_type=EdgeType.STATE_MACHINE,
-            condition="else",
-            is_else=True,
-        )
-
-    @staticmethod
-    def state_machine_with_exception(
-        source: str,
-        target: str,
-        exception_types: List[str],
-    ) -> "DAGEdge":
-        normalized = (
-            []
-            if len(exception_types) == 1 and exception_types[0] == "Exception"
-            else list(exception_types)
-        )
-        condition = "except:*" if not normalized else f"except:{','.join(normalized)}"
-        return DAGEdge(
-            source=source,
-            target=target,
-            edge_type=EdgeType.STATE_MACHINE,
-            condition=condition,
-            exception_types=normalized,
-        )
-
-    @staticmethod
-    def state_machine_success(source: str, target: str) -> "DAGEdge":
-        return DAGEdge(
-            source=source,
-            target=target,
-            edge_type=EdgeType.STATE_MACHINE,
-            condition="success",
-        )
-
-    @staticmethod
-    def data_flow(source: str, target: str, variable: str) -> "DAGEdge":
-        return DAGEdge(
-            source=source,
-            target=target,
-            edge_type=EdgeType.DATA_FLOW,
-            variable=variable,
-        )
-
-    def with_loop_back(self, is_loop_back: bool) -> "DAGEdge":
-        self.is_loop_back = is_loop_back
-        return self
-
-    def with_guard(self, guard: str) -> "DAGEdge":
-        self.guard_string = guard
-        return self
-
-
-@dataclass
-class DAGNode:
-    id: str
-    node_type: str
-    label: str
-    node_uuid: uuid.UUID = field(default_factory=uuid.uuid4)
-    function_name: Optional[str] = None
-    is_aggregator: bool = False
-    aggregates_from: Optional[str] = None
-    is_fn_call: bool = False
-    called_function: Optional[str] = None
-    is_input: bool = False
-    is_output: bool = False
-    io_vars: Optional[List[str]] = None
-    action_name: Optional[str] = None
-    module_name: Optional[str] = None
-    kwargs: Optional[Dict[str, str]] = None
-    kwarg_exprs: Optional[Dict[str, ir.Expr]] = None
-    target: Optional[str] = None
-    targets: Optional[List[str]] = None
-    is_spread: bool = False
-    spread_loop_var: Optional[str] = None
-    spread_collection_expr: Optional[ir.Expr] = None
-    aggregates_to: Optional[str] = None
-    guard_expr: Optional[ir.Expr] = None
-    assign_expr: Optional[ir.Expr] = None
-    join_required_count: Optional[int] = None
-    policies: List[ir.PolicyBracket] = field(default_factory=list)
-
-    @staticmethod
-    def new(node_id: str, node_type: str, label: str) -> "DAGNode":
-        return DAGNode(id=node_id, node_type=node_type, label=label)
-
-    def with_function_name(self, name: str) -> "DAGNode":
-        self.function_name = name
-        return self
-
-    def with_action(self, action_name: str, module_name: Optional[str]) -> "DAGNode":
-        self.action_name = action_name
-        self.module_name = module_name
-        return self
-
-    def with_kwargs(self, kwargs: Dict[str, str]) -> "DAGNode":
-        self.kwargs = dict(kwargs)
-        return self
-
-    def with_kwarg_exprs(self, kwarg_exprs: Dict[str, ir.Expr]) -> "DAGNode":
-        self.kwarg_exprs = {name: copy.deepcopy(expr) for name, expr in kwarg_exprs.items()}
-        return self
-
-    def with_target(self, target: str) -> "DAGNode":
-        self.target = target
-        self.targets = [target]
-        return self
-
-    def with_targets(self, targets: Sequence[str]) -> "DAGNode":
-        self.targets = list(targets)
-        if targets:
-            self.target = targets[0]
-        return self
-
-    def with_input(self, vars_list: Sequence[str]) -> "DAGNode":
-        self.is_input = True
-        self.io_vars = list(vars_list)
-        return self
-
-    def with_output(self, vars_list: Sequence[str]) -> "DAGNode":
-        self.is_output = True
-        self.io_vars = list(vars_list)
-        return self
-
-    def with_fn_call(self, called_function: str) -> "DAGNode":
-        self.is_fn_call = True
-        self.called_function = called_function
-        return self
-
-    def with_aggregator(self, source_id: str) -> "DAGNode":
-        self.is_aggregator = True
-        self.aggregates_from = source_id
-        return self
-
-    def with_guard(self, guard_expr: ir.Expr) -> "DAGNode":
-        self.guard_expr = copy.deepcopy(guard_expr)
-        return self
-
-    def with_assign_expr(self, assign_expr: ir.Expr) -> "DAGNode":
-        self.assign_expr = copy.deepcopy(assign_expr)
-        return self
-
-    def with_policies(self, policies: Sequence[ir.PolicyBracket]) -> "DAGNode":
-        self.policies = list(policies)
-        return self
-
-    def with_spread(self, loop_var: str, collection_expr: ir.Expr) -> "DAGNode":
-        self.is_spread = True
-        self.spread_loop_var = loop_var
-        self.spread_collection_expr = copy.deepcopy(collection_expr)
-        return self
-
-    def with_aggregates_to(self, aggregator_id: str) -> "DAGNode":
-        self.aggregates_to = aggregator_id
-        return self
-
-    def with_join_required_count(self, count: int) -> "DAGNode":
-        self.join_required_count = count
-        return self
-
-
-@dataclass
-class DAG:
-    nodes: Dict[str, DAGNode] = field(default_factory=dict)
-    edges: List[DAGEdge] = field(default_factory=list)
-    entry_node: Optional[str] = None
-
-    def add_node(self, node: DAGNode) -> None:
-        if self.entry_node is None:
-            self.entry_node = node.id
-        self.nodes[node.id] = node
-
-    def add_edge(self, edge: DAGEdge) -> None:
-        self.edges.append(edge)
-
-    def get_incoming_edges(self, node_id: str) -> List[DAGEdge]:
-        return [edge for edge in self.edges if edge.target == node_id]
-
-    def get_outgoing_edges(self, node_id: str) -> List[DAGEdge]:
-        return [edge for edge in self.edges if edge.source == node_id]
-
-    def get_state_machine_edges(self) -> List[DAGEdge]:
-        return [edge for edge in self.edges if edge.edge_type == EdgeType.STATE_MACHINE]
-
-    def get_data_flow_edges(self) -> List[DAGEdge]:
-        return [edge for edge in self.edges if edge.edge_type == EdgeType.DATA_FLOW]
-
-    def get_functions(self) -> List[str]:
-        functions: Set[str] = set()
-        for node in self.nodes.values():
-            if node.function_name is not None:
-                functions.add(node.function_name)
-        return sorted(functions)
-
-    def get_nodes_for_function(self, function_name: str) -> Dict[str, DAGNode]:
-        return {
-            node_id: node
-            for node_id, node in self.nodes.items()
-            if node.function_name == function_name
-        }
-
-    def get_edges_for_function(self, function_name: str) -> List[DAGEdge]:
-        fn_nodes = set(self.get_nodes_for_function(function_name).keys())
-        return [edge for edge in self.edges if edge.source in fn_nodes and edge.target in fn_nodes]
-
-
-@dataclass
-class ConvertedSubgraph:
-    entry: Optional[str]
-    exits: List[str]
-    nodes: List[str]
-    is_noop: bool
-
-    @staticmethod
-    def noop() -> "ConvertedSubgraph":
-        return ConvertedSubgraph(entry=None, exits=[], nodes=[], is_noop=True)
+from .models import (
+    DAG,
+    EXCEPTION_SCOPE_VAR,
+    ConvertedSubgraph,
+    DagConversionError,
+    DAGEdge,
+    EdgeType,
+    assert_never,
+)
+from .nodes import (
+    ActionCallNode,
+    AggregatorNode,
+    AssignmentNode,
+    BranchNode,
+    BreakNode,
+    ContinueNode,
+    DAGNode,
+    ExpressionNode,
+    FnCallNode,
+    InputNode,
+    JoinNode,
+    OutputNode,
+    ParallelNode,
+    ReturnNode,
+)
+from .validate import validate_dag
 
 
 class DAGConverter:
+    """Convert IR programs into a DAG with control + data-flow edges.
+
+    The converter preserves rich metadata so the runtime can schedule correctly
+    and the graph visualizer can render readable labels/guards. For example,
+    `results = parallel: @a() @b()` becomes a parallel node, two call nodes,
+    and an aggregator join, all linked by control and data edges.
+    """
+
     def __init__(self) -> None:
         self.dag = DAG()
         self.node_counter = 0
@@ -448,12 +203,11 @@ class DAGConverter:
                             if expr is None:
                                 continue
                             bind_id = f"{child_prefix}:bind_{input_name}_{idx}"
-                            label = f"{input_name} = ..."
-                            bind_node = (
-                                DAGNode.new(bind_id, "assignment", label)
-                                .with_target(input_name)
-                                .with_assign_expr(expr)
-                                .with_function_name(called_fn)
+                            bind_node = AssignmentNode(
+                                id=bind_id,
+                                targets=[input_name],
+                                assign_expr=expr,
+                                function_name=called_fn,
                             )
                             target.add_node(bind_node)
                             bind_ids.append(bind_id)
@@ -475,12 +229,12 @@ class DAGConverter:
                                 expanded_id.startswith(child_prefix)
                                 and action_node.node_type == "action_call"
                             ):
-                                action_node.is_spread = True
-                                action_node.spread_loop_var = node.spread_loop_var
-                                action_node.spread_collection_expr = copy.deepcopy(
-                                    node.spread_collection_expr
-                                )
-                                action_node.aggregates_to = node.aggregates_to
+                                if isinstance(action_node, ActionCallNode):
+                                    action_node.spread_loop_var = node.spread_loop_var
+                                    action_node.spread_collection_expr = copy.deepcopy(
+                                        node.spread_collection_expr
+                                    )
+                                    action_node.aggregates_to = node.aggregates_to
 
                     if exception_edges:
                         expanded_action_ids = [
@@ -529,10 +283,12 @@ class DAGConverter:
             cloned.id = new_id
             cloned.node_uuid = uuid.uuid4()
             if id_prefix:
-                if cloned.aggregates_to and cloned.aggregates_to in fn_node_ids:
-                    cloned.aggregates_to = f"{id_prefix}:{cloned.aggregates_to}"
-                if cloned.aggregates_from and cloned.aggregates_from in fn_node_ids:
-                    cloned.aggregates_from = f"{id_prefix}:{cloned.aggregates_from}"
+                if isinstance(cloned, (ActionCallNode, FnCallNode)):
+                    if cloned.aggregates_to and cloned.aggregates_to in fn_node_ids:
+                        cloned.aggregates_to = f"{id_prefix}:{cloned.aggregates_to}"
+                if isinstance(cloned, AggregatorNode):
+                    if cloned.aggregates_from and cloned.aggregates_from in fn_node_ids:
+                        cloned.aggregates_from = f"{id_prefix}:{cloned.aggregates_from}"
 
             id_map[old_id] = new_id
 
@@ -648,17 +404,13 @@ class DAGConverter:
                 continue
             if node.node_type == "join":
                 continue
-            if node.is_input and node.io_vars:
+            if node.is_input and isinstance(node, InputNode):
                 for input_name in node.io_vars:
                     var_modifications.setdefault(input_name, []).append(node_id)
-            if node.target:
-                if not (node.node_type == "return" and node.target in var_modifications):
-                    var_modifications.setdefault(node.target, []).append(node_id)
-            if node.targets:
-                for target in node.targets:
-                    if node.node_type == "return" and target in var_modifications:
-                        continue
-                    var_modifications.setdefault(target, []).append(node_id)
+            for target in self._targets_for_node(node):
+                if node.node_type == "return" and target in var_modifications:
+                    continue
+                var_modifications.setdefault(target, []).append(node_id)
 
         var_modifications_clone = {k: list(v) for k, v in var_modifications.items()}
 
@@ -668,27 +420,27 @@ class DAGConverter:
                 node_guard_exprs.setdefault(edge.source, []).append(edge.guard_expr)
 
         def uses_var(node: DAGNode, var_name: str) -> bool:
-            if node.kwargs:
+            if isinstance(node, (ActionCallNode, FnCallNode)):
                 for value in node.kwargs.values():
                     if value == f"${var_name}":
                         return True
 
-            if node.assign_expr and self.expr_uses_var(node.assign_expr, var_name):
-                return True
+            if isinstance(node, (AssignmentNode, FnCallNode, ReturnNode)) and node.assign_expr:
+                if self.expr_uses_var(node.assign_expr, var_name):
+                    return True
 
             for guard in node_guard_exprs.get(node.id, []):
                 if self.expr_uses_var(guard, var_name):
                     return True
 
-            if node.kwarg_exprs:
+            if isinstance(node, (ActionCallNode, FnCallNode)):
                 for expr in node.kwarg_exprs.values():
                     if self.expr_uses_var(expr, var_name):
                         return True
 
-            if node.spread_collection_expr and self.expr_uses_var(
-                node.spread_collection_expr, var_name
-            ):
-                return True
+            if isinstance(node, ActionCallNode) and node.spread_collection_expr:
+                if self.expr_uses_var(node.spread_collection_expr, var_name):
+                    return True
 
             return False
 
@@ -819,11 +571,7 @@ class DAGConverter:
             source_node = dag.nodes.get(edge.source)
             if source_node is None:
                 continue
-            defined_vars: List[str] = []
-            if source_node.target:
-                defined_vars.append(source_node.target)
-            if source_node.targets:
-                defined_vars.extend(source_node.targets)
+            defined_vars = self._targets_for_node(source_node)
 
             for var in defined_vars:
                 dag.edges.append(DAGEdge.data_flow(edge.source, edge.target, var))
@@ -833,9 +581,10 @@ class DAGConverter:
                 continue
             if not (node.label.startswith("end for ") or node.label.startswith("end while ")):
                 continue
-            if not node.targets:
+            join_targets = self._targets_for_node(node)
+            if not join_targets:
                 continue
-            for var in node.targets:
+            for var in join_targets:
                 for node_id in order:
                     if node_id in nodes_in_loop:
                         continue
@@ -854,14 +603,10 @@ class DAGConverter:
         self.var_modifications.clear()
 
         input_id = self.next_id(f"{fn_def.name}_input")
-        input_label = (
-            "input: []" if not fn_def.io.inputs else f"input: [{', '.join(fn_def.io.inputs)}]"
-        )
-
-        input_node = (
-            DAGNode.new(input_id, "input", input_label)
-            .with_function_name(fn_def.name)
-            .with_input(fn_def.io.inputs)
+        input_node = InputNode(
+            id=input_id,
+            io_vars=list(fn_def.io.inputs),
+            function_name=fn_def.name,
         )
         self.dag.add_node(input_node)
 
@@ -879,13 +624,10 @@ class DAGConverter:
             frontier = converted.exits
 
         output_id = self.next_id(f"{fn_def.name}_output")
-        output_label = f"output: [{', '.join(fn_def.io.outputs)}]"
-
-        output_node = (
-            DAGNode.new(output_id, "output", output_label)
-            .with_function_name(fn_def.name)
-            .with_output(fn_def.io.outputs)
-            .with_join_required_count(1)
+        output_node = OutputNode(
+            id=output_id,
+            io_vars=list(fn_def.io.outputs),
+            function_name=fn_def.name,
         )
         self.dag.add_node(output_node)
 
@@ -1038,15 +780,9 @@ class DAGConverter:
                 | "dot"
             ):
                 node_id = self.next_id("assign")
-                target = targets[0] if targets else "_"
-                label = f"{', '.join(targets)} = ..." if len(targets) > 1 else f"{target} = ..."
-                node = (
-                    DAGNode.new(node_id, "assignment", label)
-                    .with_targets(targets)
-                    .with_assign_expr(value)
-                )
+                node = AssignmentNode(id=node_id, targets=targets, assign_expr=value)
                 if self.current_function:
-                    node = node.with_function_name(self.current_function)
+                    node.function_name = self.current_function
                 self.dag.add_node(node)
                 for t in targets:
                     self.track_var_definition(t, node_id)
@@ -1063,24 +799,17 @@ class DAGConverter:
         call: ir.FunctionCall,
     ) -> List[str]:
         node_id = self.next_id("fn_call")
-        label = (
-            f"{call.name}() -> {', '.join(targets)}"
-            if len(targets) > 1
-            else f"{call.name}() -> {target}"
-        )
-
         kwargs, kwarg_exprs = self.extract_fn_call_args(call)
         call_expr = ir.Expr(function_call=copy.deepcopy(call))
-        node = (
-            DAGNode.new(node_id, "fn_call", label)
-            .with_fn_call(call.name)
-            .with_kwargs(kwargs)
-            .with_kwarg_exprs(kwarg_exprs)
-            .with_targets(targets)
-            .with_assign_expr(call_expr)
+        node = FnCallNode(
+            id=node_id,
+            called_function=call.name,
+            kwargs=kwargs,
+            kwarg_exprs=kwarg_exprs,
+            targets=list(targets),
+            assign_expr=call_expr,
+            function_name=self.current_function,
         )
-        if self.current_function:
-            node = node.with_function_name(self.current_function)
         self.dag.add_node(node)
 
         for t in targets:
@@ -1094,30 +823,19 @@ class DAGConverter:
         targets: Sequence[str],
     ) -> List[str]:
         node_id = self.next_id("action")
-        if not targets:
-            label = f"@{action.action_name}()"
-        elif len(targets) == 1:
-            label = f"@{action.action_name}() -> {targets[0]}"
-        else:
-            label = f"@{action.action_name}() -> ({', '.join(targets)})"
-
         kwargs = self.extract_kwargs(action.kwargs)
         kwarg_exprs = self.extract_kwarg_exprs(action.kwargs)
         module_name = action.module_name if action.HasField("module_name") else None
-
-        node = (
-            DAGNode.new(node_id, "action_call", label)
-            .with_action(action.action_name, module_name)
-            .with_kwargs(kwargs)
-            .with_kwarg_exprs(kwarg_exprs)
-            .with_policies(action.policies)
+        node = ActionCallNode(
+            id=node_id,
+            action_name=action.action_name,
+            module_name=module_name,
+            kwargs=kwargs,
+            kwarg_exprs=kwarg_exprs,
+            policies=list(action.policies),
+            targets=list(targets) if targets else None,
+            function_name=self.current_function,
         )
-
-        if targets:
-            node = node.with_targets(targets)
-
-        if self.current_function:
-            node = node.with_function_name(self.current_function)
         self.dag.add_node(node)
 
         for t in targets:
@@ -1224,8 +942,6 @@ class DAGConverter:
     def convert_spread_expr(self, spread: ir.SpreadExpr, targets: Sequence[str]) -> List[str]:
         action = spread.action
         action_id = self.next_id("spread_action")
-        action_label = f"@{action.action_name}() [spread over {spread.loop_var}]"
-
         kwargs = self.extract_kwargs(action.kwargs)
         kwarg_exprs = self.extract_kwarg_exprs(action.kwargs)
         collection_expr = (
@@ -1235,33 +951,26 @@ class DAGConverter:
 
         agg_id = self.next_id("aggregator")
         module_name = action.module_name if action.HasField("module_name") else None
-
-        action_node = (
-            DAGNode.new(action_id, "action_call", action_label)
-            .with_action(action.action_name, module_name)
-            .with_kwargs(kwargs)
-            .with_kwarg_exprs(kwarg_exprs)
-            .with_spread(spread.loop_var, collection_expr)
-            .with_target(spread_result_var)
-            .with_aggregates_to(agg_id)
+        action_node = ActionCallNode(
+            id=action_id,
+            action_name=action.action_name,
+            module_name=module_name,
+            kwargs=kwargs,
+            kwarg_exprs=kwarg_exprs,
+            target=spread_result_var,
+            aggregates_to=agg_id,
+            spread_loop_var=spread.loop_var,
+            spread_collection_expr=collection_expr,
+            function_name=self.current_function,
         )
-        if self.current_function:
-            action_node = action_node.with_function_name(self.current_function)
         self.dag.add_node(action_node)
-
-        target_label = (
-            f"aggregate -> {targets[0]}"
-            if len(targets) == 1
-            else f"aggregate -> ({', '.join(targets)})"
-            if targets
-            else "aggregate"
+        agg_node = AggregatorNode(
+            id=agg_id,
+            aggregates_from=action_id,
+            targets=list(targets) if targets else None,
+            aggregator_kind="aggregate",
+            function_name=self.current_function,
         )
-
-        agg_node = DAGNode.new(agg_id, "aggregator", target_label).with_aggregator(action_id)
-        if targets:
-            agg_node = agg_node.with_targets(targets)
-        if self.current_function:
-            agg_node = agg_node.with_function_name(self.current_function)
         self.dag.add_node(agg_node)
 
         self.dag.add_edge(DAGEdge.state_machine(action_id, agg_id))
@@ -1277,8 +986,6 @@ class DAGConverter:
     ) -> List[str]:
         action = spread.action
         action_id = self.next_id("spread_action")
-        action_label = f"@{action.action_name}() [spread over {spread.loop_var}]"
-
         kwargs = self.extract_kwargs(action.kwargs)
         kwarg_exprs = self.extract_kwarg_exprs(action.kwargs)
         collection_expr = (
@@ -1288,32 +995,26 @@ class DAGConverter:
 
         agg_id = self.next_id("aggregator")
         module_name = action.module_name if action.HasField("module_name") else None
-
-        action_node = (
-            DAGNode.new(action_id, "action_call", action_label)
-            .with_action(action.action_name, module_name)
-            .with_kwargs(kwargs)
-            .with_kwarg_exprs(kwarg_exprs)
-            .with_spread(spread.loop_var, collection_expr)
-            .with_target(spread_result_var)
-            .with_aggregates_to(agg_id)
+        action_node = ActionCallNode(
+            id=action_id,
+            action_name=action.action_name,
+            module_name=module_name,
+            kwargs=kwargs,
+            kwarg_exprs=kwarg_exprs,
+            target=spread_result_var,
+            aggregates_to=agg_id,
+            spread_loop_var=spread.loop_var,
+            spread_collection_expr=collection_expr,
+            function_name=self.current_function,
         )
-        if self.current_function:
-            action_node = action_node.with_function_name(self.current_function)
         self.dag.add_node(action_node)
-
-        target_label = (
-            f"aggregate -> {targets[0]}"
-            if len(targets) == 1
-            else f"aggregate -> ({', '.join(targets)})"
-            if targets
-            else "aggregate"
+        agg_node = AggregatorNode(
+            id=agg_id,
+            aggregates_from=action_id,
+            targets=list(targets) if targets else None,
+            aggregator_kind="aggregate",
+            function_name=self.current_function,
         )
-        agg_node = DAGNode.new(agg_id, "aggregator", target_label).with_aggregator(action_id)
-        if targets:
-            agg_node = agg_node.with_targets(targets)
-        if self.current_function:
-            agg_node = agg_node.with_function_name(self.current_function)
         self.dag.add_node(agg_node)
 
         self.dag.add_edge(DAGEdge.state_machine(action_id, agg_id))
@@ -1338,9 +1039,7 @@ class DAGConverter:
         result_nodes: List[str] = []
 
         parallel_id = self.next_id("parallel")
-        parallel_node = DAGNode.new(parallel_id, "parallel", "parallel")
-        if self.current_function:
-            parallel_node = parallel_node.with_function_name(self.current_function)
+        parallel_node = ParallelNode(id=parallel_id, function_name=self.current_function)
         self.dag.add_node(parallel_node)
         result_nodes.append(parallel_id)
 
@@ -1356,47 +1055,34 @@ class DAGConverter:
             if kind == "action":
                 action = call.action
                 call_id = self.next_id("parallel_action")
-                label = (
-                    f"@{action.action_name}() [{idx}] -> {call_target}"
-                    if call_target
-                    else f"@{action.action_name}() [{idx}]"
-                )
                 kwargs = self.extract_kwargs(action.kwargs)
                 kwarg_exprs = self.extract_kwarg_exprs(action.kwargs)
                 module_name = action.module_name if action.HasField("module_name") else None
-                node = (
-                    DAGNode.new(call_id, "action_call", label)
-                    .with_action(action.action_name, module_name)
-                    .with_kwargs(kwargs)
-                    .with_kwarg_exprs(kwarg_exprs)
+                node = ActionCallNode(
+                    id=call_id,
+                    action_name=action.action_name,
+                    module_name=module_name,
+                    kwargs=kwargs,
+                    kwarg_exprs=kwarg_exprs,
+                    parallel_index=idx,
+                    target=call_target,
+                    aggregates_to=agg_id if list_aggregate else None,
+                    function_name=self.current_function,
                 )
-                if call_target:
-                    node = node.with_target(call_target)
-                if list_aggregate:
-                    node = node.with_aggregates_to(agg_id)
-                if self.current_function:
-                    node = node.with_function_name(self.current_function)
             elif kind == "function":
                 func = call.function
                 call_id = self.next_id("parallel_fn_call")
-                label = (
-                    f"{func.name}() [{idx}] -> {call_target}"
-                    if call_target
-                    else f"{func.name}() [{idx}]"
-                )
                 kwargs, kwarg_exprs = self.extract_fn_call_args(func)
-                node = (
-                    DAGNode.new(call_id, "fn_call", label)
-                    .with_fn_call(func.name)
-                    .with_kwargs(kwargs)
-                    .with_kwarg_exprs(kwarg_exprs)
+                node = FnCallNode(
+                    id=call_id,
+                    called_function=func.name,
+                    kwargs=kwargs,
+                    kwarg_exprs=kwarg_exprs,
+                    parallel_index=idx,
+                    target=call_target,
+                    aggregates_to=agg_id if list_aggregate else None,
+                    function_name=self.current_function,
                 )
-                if call_target:
-                    node = node.with_target(call_target)
-                if list_aggregate:
-                    node = node.with_aggregates_to(agg_id)
-                if self.current_function:
-                    node = node.with_function_name(self.current_function)
             elif kind is None:
                 continue
             else:
@@ -1415,19 +1101,13 @@ class DAGConverter:
             )
 
         aggregator_targets = [] if has_fn_calls else list(targets)
-        target_label = (
-            f"parallel_aggregate -> {aggregator_targets[0]}"
-            if len(aggregator_targets) == 1
-            else f"parallel_aggregate -> ({', '.join(aggregator_targets)})"
-            if aggregator_targets
-            else "parallel_aggregate"
+        agg_node = AggregatorNode(
+            id=agg_id,
+            aggregates_from=parallel_id,
+            targets=aggregator_targets if aggregator_targets else None,
+            aggregator_kind="parallel",
+            function_name=self.current_function,
         )
-
-        agg_node = DAGNode.new(agg_id, "aggregator", target_label).with_aggregator(parallel_id)
-        if aggregator_targets:
-            agg_node = agg_node.with_targets(aggregator_targets)
-        if self.current_function:
-            agg_node = agg_node.with_function_name(self.current_function)
         self.dag.add_node(agg_node)
         result_nodes.append(agg_id)
 
@@ -1462,22 +1142,24 @@ class DAGConverter:
         init_id = self.next_id("loop_init")
         init_label = f"{loop_i_var} = 0"
         init_expr = ir.Expr(literal=ir.Literal(int_value=0))
-        init_node = (
-            DAGNode.new(init_id, "assignment", init_label)
-            .with_target(loop_i_var)
-            .with_assign_expr(init_expr)
+        init_node = AssignmentNode(
+            id=init_id,
+            targets=[loop_i_var],
+            assign_expr=init_expr,
+            label_hint=init_label,
+            function_name=self.current_function,
         )
-        if self.current_function:
-            init_node = init_node.with_function_name(self.current_function)
         self.dag.add_node(init_node)
         self.track_var_definition(loop_i_var, init_id)
         nodes.append(init_id)
 
         cond_id = self.next_id("loop_cond")
         cond_label = f"for {loop_vars_str} in {collection_str}"
-        cond_node = DAGNode.new(cond_id, "branch", cond_label).with_join_required_count(1)
-        if self.current_function:
-            cond_node = cond_node.with_function_name(self.current_function)
+        cond_node = BranchNode(
+            id=cond_id,
+            description=cond_label,
+            function_name=self.current_function,
+        )
         self.dag.add_node(cond_node)
         nodes.append(cond_id)
 
@@ -1495,14 +1177,13 @@ class DAGConverter:
             )
         )
         extract_label = f"{loop_vars_str} = {collection_str}[{loop_i_var}]"
-        extract_node = (
-            DAGNode.new(extract_id, "assignment", extract_label)
-            .with_targets(for_loop.loop_vars)
-            .with_assign_expr(index_expr)
-            .with_join_required_count(1)
+        extract_node = AssignmentNode(
+            id=extract_id,
+            targets=list(for_loop.loop_vars),
+            assign_expr=index_expr,
+            label_hint=extract_label,
+            function_name=self.current_function,
         )
-        if self.current_function:
-            extract_node = extract_node.with_function_name(self.current_function)
         self.dag.add_node(extract_node)
         nodes.append(extract_id)
 
@@ -1545,14 +1226,13 @@ class DAGConverter:
                 right=ir.Expr(literal=ir.Literal(int_value=1)),
             )
         )
-        incr_node = (
-            DAGNode.new(incr_id, "assignment", incr_label)
-            .with_target(loop_i_var)
-            .with_assign_expr(incr_expr)
-            .with_join_required_count(1)
+        incr_node = AssignmentNode(
+            id=incr_id,
+            targets=[loop_i_var],
+            assign_expr=incr_expr,
+            label_hint=incr_label,
+            function_name=self.current_function,
         )
-        if self.current_function:
-            incr_node = incr_node.with_function_name(self.current_function)
         self.dag.add_node(incr_node)
         self.track_var_definition(loop_i_var, incr_id)
         nodes.append(incr_id)
@@ -1566,9 +1246,11 @@ class DAGConverter:
         self.dag.add_edge(DAGEdge.state_machine(incr_id, cond_id).with_loop_back(True))
 
         exit_label = f"end for {loop_vars_str}"
-        exit_node = DAGNode.new(exit_id, "join", exit_label).with_join_required_count(1)
-        if self.current_function:
-            exit_node = exit_node.with_function_name(self.current_function)
+        exit_node = JoinNode(
+            id=exit_id,
+            description=exit_label,
+            function_name=self.current_function,
+        )
         if body_targets:
             exit_node.targets = list(body_targets)
             for target in body_targets:
@@ -1598,9 +1280,11 @@ class DAGConverter:
 
         cond_id = self.next_id("loop_cond")
         cond_label = f"while {condition_str}"
-        cond_node = DAGNode.new(cond_id, "branch", cond_label).with_join_required_count(1)
-        if self.current_function:
-            cond_node = cond_node.with_function_name(self.current_function)
+        cond_node = BranchNode(
+            id=cond_id,
+            description=cond_label,
+            function_name=self.current_function,
+        )
         self.dag.add_node(cond_node)
         nodes.append(cond_id)
 
@@ -1630,11 +1314,12 @@ class DAGConverter:
         self.loop_exit_stack.pop()
         nodes.extend(body_graph.nodes)
 
-        continue_node = DAGNode.new(
-            continue_id, "assignment", "loop_continue"
-        ).with_join_required_count(1)
-        if self.current_function:
-            continue_node = continue_node.with_function_name(self.current_function)
+        continue_node = AssignmentNode(
+            id=continue_id,
+            targets=[],
+            label_hint="loop_continue",
+            function_name=self.current_function,
+        )
         self.dag.add_node(continue_node)
         nodes.append(continue_id)
 
@@ -1654,9 +1339,11 @@ class DAGConverter:
         self.dag.add_edge(DAGEdge.state_machine(continue_id, cond_id).with_loop_back(True))
 
         exit_label = f"end while {condition_str}"
-        exit_node = DAGNode.new(exit_id, "join", exit_label).with_join_required_count(1)
-        if self.current_function:
-            exit_node = exit_node.with_function_name(self.current_function)
+        exit_node = JoinNode(
+            id=exit_id,
+            description=exit_label,
+            function_name=self.current_function,
+        )
         if body_targets:
             exit_node.targets = list(body_targets)
             for target in body_targets:
@@ -1677,9 +1364,11 @@ class DAGConverter:
         nodes: List[str] = []
 
         branch_id = self.next_id("branch")
-        branch_node = DAGNode.new(branch_id, "branch", "branch")
-        if self.current_function:
-            branch_node = branch_node.with_function_name(self.current_function)
+        branch_node = BranchNode(
+            id=branch_id,
+            description="branch",
+            function_name=self.current_function,
+        )
         self.dag.add_node(branch_node)
         nodes.append(branch_id)
 
@@ -1733,9 +1422,11 @@ class DAGConverter:
         join_id: Optional[str] = None
         if join_needed:
             join_id = self.next_id("join")
-            join_node = DAGNode.new(join_id, "join", "join").with_join_required_count(1)
-            if self.current_function:
-                join_node = join_node.with_function_name(self.current_function)
+            join_node = JoinNode(
+                id=join_id,
+                description="join",
+                function_name=self.current_function,
+            )
             self.dag.add_node(join_node)
             nodes.append(join_id)
 
@@ -1849,9 +1540,11 @@ class DAGConverter:
             join_id: Optional[str] = None
             if join_needed:
                 join_id = self.next_id("join")
-                join_node = DAGNode.new(join_id, "join", "join").with_join_required_count(1)
-                if self.current_function:
-                    join_node = join_node.with_function_name(self.current_function)
+                join_node = JoinNode(
+                    id=join_id,
+                    description="join",
+                    function_name=self.current_function,
+                )
                 self.dag.add_node(join_node)
                 nodes.append(join_id)
 
@@ -1898,13 +1591,13 @@ class DAGConverter:
         binding_id = self.next_id("exc_bind")
         label = f"{exception_var} = {EXCEPTION_SCOPE_VAR}"
         assign_expr = ir.Expr(variable=ir.Variable(name=EXCEPTION_SCOPE_VAR))
-        node = (
-            DAGNode.new(binding_id, "assignment", label)
-            .with_target(exception_var)
-            .with_assign_expr(assign_expr)
+        node = AssignmentNode(
+            id=binding_id,
+            targets=[exception_var],
+            assign_expr=assign_expr,
+            label_hint=label,
+            function_name=self.current_function,
         )
-        if self.current_function:
-            node = node.with_function_name(self.current_function)
         self.dag.add_node(node)
         self.track_var_definition(exception_var, binding_id)
 
@@ -1918,14 +1611,15 @@ class DAGConverter:
 
     def convert_return(self, ret: ir.ReturnStmt) -> List[str]:
         node_id = self.next_id("return")
-        node = DAGNode.new(node_id, "return", "return").with_join_required_count(1)
+        node = ReturnNode(
+            id=node_id,
+            function_name=self.current_function,
+        )
 
         if ret.HasField("value"):
             node.assign_expr = copy.deepcopy(ret.value)
             node.target = "result"
 
-        if self.current_function:
-            node = node.with_function_name(self.current_function)
         has_target = node.target is not None
         self.dag.add_node(node)
 
@@ -1940,9 +1634,7 @@ class DAGConverter:
         loop_exit = self.loop_exit_stack[-1]
 
         node_id = self.next_id("break")
-        node = DAGNode.new(node_id, "break", "break")
-        if self.current_function:
-            node = node.with_function_name(self.current_function)
+        node = BreakNode(id=node_id, function_name=self.current_function)
         self.dag.add_node(node)
 
         self.dag.add_edge(DAGEdge.state_machine(node_id, loop_exit))
@@ -1955,9 +1647,7 @@ class DAGConverter:
         loop_incr = self.loop_incr_stack[-1]
 
         node_id = self.next_id("continue")
-        node = DAGNode.new(node_id, "continue", "continue")
-        if self.current_function:
-            node = node.with_function_name(self.current_function)
+        node = ContinueNode(id=node_id, function_name=self.current_function)
         self.dag.add_node(node)
 
         self.dag.add_edge(DAGEdge.state_machine(node_id, loop_incr))
@@ -1976,14 +1666,13 @@ class DAGConverter:
             case "function_call":
                 node_id = self.next_id("fn_call")
                 kwargs, kwarg_exprs = self.extract_fn_call_args(expr.function_call)
-                node = (
-                    DAGNode.new(node_id, "fn_call", f"{expr.function_call.name}()")
-                    .with_fn_call(expr.function_call.name)
-                    .with_kwargs(kwargs)
-                    .with_kwarg_exprs(kwarg_exprs)
+                node = FnCallNode(
+                    id=node_id,
+                    called_function=expr.function_call.name,
+                    kwargs=kwargs,
+                    kwarg_exprs=kwarg_exprs,
+                    function_name=self.current_function,
                 )
-                if self.current_function:
-                    node = node.with_function_name(self.current_function)
                 self.dag.add_node(node)
                 return [node_id]
             case (
@@ -1999,9 +1688,7 @@ class DAGConverter:
                 | "spread_expr"
             ):
                 node_id = self.next_id("expr")
-                node = DAGNode.new(node_id, "expression", "expr")
-                if self.current_function:
-                    node = node.with_function_name(self.current_function)
+                node = ExpressionNode(id=node_id, function_name=self.current_function)
                 self.dag.add_node(node)
                 return [node_id]
             case None:
@@ -2017,6 +1704,25 @@ class DAGConverter:
     def push_unique_target(targets: List[str], target: str) -> None:
         if target not in targets:
             targets.append(target)
+
+    @staticmethod
+    def _targets_for_node(node: DAGNode) -> List[str]:
+        if isinstance(
+            node,
+            (
+                AssignmentNode,
+                ActionCallNode,
+                FnCallNode,
+                AggregatorNode,
+                ReturnNode,
+                JoinNode,
+            ),
+        ):
+            if node.targets:
+                return list(node.targets)
+            if node.target:
+                return [node.target]
+        return []
 
     @classmethod
     def collect_assigned_targets(
@@ -2107,12 +1813,11 @@ class DAGConverter:
             self.dag.add_edge(edge)
 
     def node_uses_variable(self, node: DAGNode, var_name: str) -> bool:
-        if node.kwargs:
+        if isinstance(node, (ActionCallNode, FnCallNode)):
             for value in node.kwargs.values():
                 if value == f"${var_name}":
                     return True
 
-        if node.kwarg_exprs:
             for expr in node.kwarg_exprs.values():
                 if self.expr_uses_var(expr, var_name):
                     return True
@@ -2231,89 +1936,3 @@ class DAGConverter:
 
 def convert_to_dag(program: ir.Program) -> DAG:
     return DAGConverter().convert(program)
-
-
-def validate_dag(dag: DAG) -> None:
-    validate_edges_reference_existing_nodes(dag)
-    validate_output_nodes_have_no_outgoing_edges(dag)
-    validate_loop_incr_edges(dag)
-    validate_no_duplicate_state_machine_edges(dag)
-    validate_input_nodes_have_no_incoming_edges(dag)
-
-
-def validate_edges_reference_existing_nodes(dag: DAG) -> None:
-    for edge in dag.edges:
-        if edge.source not in dag.nodes:
-            raise DagConversionError(
-                f"DAG edge references non-existent source node '{edge.source}' -> '{edge.target}'"
-            )
-        if edge.target not in dag.nodes:
-            raise DagConversionError(
-                "DAG edge references non-existent target node "
-                f"'{edge.target}' (from '{edge.source}', edge_type={edge.edge_type}, "
-                f"exception_types={edge.exception_types})"
-            )
-
-
-def validate_output_nodes_have_no_outgoing_edges(dag: DAG) -> None:
-    for node_id, node in dag.nodes.items():
-        if node.node_type == "output" and ":" not in node_id:
-            for edge in dag.edges:
-                if (
-                    edge.source == node_id
-                    and edge.edge_type == EdgeType.STATE_MACHINE
-                    and edge.exception_types is None
-                ):
-                    raise DagConversionError(
-                        "Main output node "
-                        f"'{node_id}' has non-exception outgoing state machine edge to "
-                        f"'{edge.target}'"
-                    )
-
-
-def validate_loop_incr_edges(dag: DAG) -> None:
-    for node_id in dag.nodes:
-        if "loop_incr" not in node_id:
-            continue
-        for edge in dag.edges:
-            if edge.source != node_id or edge.edge_type != EdgeType.STATE_MACHINE:
-                continue
-            if edge.exception_types is not None:
-                continue
-            if edge.is_loop_back and "loop_cond" in edge.target:
-                continue
-            raise DagConversionError(
-                "Loop increment node "
-                f"'{node_id}' has unexpected state machine edge to '{edge.target}'. "
-                "Loop_incr should only have loop_back edges to loop_cond or exception edges. "
-                "This suggests incorrect 'last_real_node' tracking during function expansion."
-            )
-
-
-def validate_no_duplicate_state_machine_edges(dag: DAG) -> None:
-    seen: Set[str] = set()
-    for edge in dag.edges:
-        if edge.edge_type != EdgeType.STATE_MACHINE:
-            continue
-        if edge.exception_types is None:
-            key = (
-                f"{edge.source}->{edge.target}:loop_back={edge.is_loop_back},is_else={edge.is_else},"
-                f"guard={edge.guard_string}"
-            )
-            if key in seen:
-                raise DagConversionError(
-                    "Duplicate state machine edge: "
-                    f"{edge.source} -> {edge.target} (loop_back={edge.is_loop_back}, "
-                    f"is_else={edge.is_else})"
-                )
-            seen.add(key)
-
-
-def validate_input_nodes_have_no_incoming_edges(dag: DAG) -> None:
-    for node_id, node in dag.nodes.items():
-        if node.is_input:
-            for edge in dag.edges:
-                if edge.target == node_id and edge.edge_type == EdgeType.STATE_MACHINE:
-                    raise DagConversionError(
-                        f"Input node '{node_id}' has incoming state machine edge from '{edge.source}'"
-                    )
