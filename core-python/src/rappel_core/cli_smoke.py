@@ -13,6 +13,8 @@ from .dag import convert_to_dag
 from .dag_viz import render_dag_image
 from .ir_executor import ExecutionError, StatementExecutor
 from .ir_format import format_program
+from .runner import RunnerState, replay_variables
+from .runner.state import LiteralValue
 from .worker_pool import WorkerBridgeServer
 
 
@@ -26,6 +28,10 @@ def _variable(name: str) -> ir.Expr:
 
 def _binary(left: ir.Expr, op: ir.BinaryOperator, right: ir.Expr) -> ir.Expr:
     return ir.Expr(binary_op=ir.BinaryOp(left=left, op=op, right=right))
+
+
+def _list(items: list[ir.Expr]) -> ir.Expr:
+    return ir.Expr(list=ir.ListExpr(elements=items))
 
 
 def _build_program() -> ir.Program:
@@ -133,6 +139,32 @@ async def _action_handler(action: ir.ActionCall, kwargs: dict[str, Any]) -> Any:
             raise ExecutionError(f"unknown action: {action.action_name}")
 
 
+def _build_runner_demo_state() -> tuple[RunnerState, dict[str, int]]:
+    state = RunnerState()
+    state.record_assignment(targets=["results"], expr=_list([]), label="results = []")
+
+    action_results: dict[str, int] = {}
+    for idx, item in enumerate([1, 2]):
+        action_ref = state.queue_action(
+            "action",
+            targets=["action_result"],
+            iteration_index=idx,
+            kwargs={"item": LiteralValue(item)},
+        )
+        action_results[action_ref.node_id] = item
+        action_plus = _binary(
+            _variable("action_result"),
+            ir.BinaryOperator.BINARY_OP_ADD,
+            _literal_int(2),
+        )
+        concat_expr = _binary(
+            _variable("results"), ir.BinaryOperator.BINARY_OP_ADD, _list([action_plus])
+        )
+        state.record_assignment(targets=["results"], expr=concat_expr)
+
+    return state, action_results
+
+
 async def _run_smoke(base: int) -> int:
     program = _build_program()
     inputs = {"base": base}
@@ -146,6 +178,10 @@ async def _run_smoke(base: int) -> int:
     executor = StatementExecutor(program, _action_handler)
     result = await executor.execute_program(inputs=inputs)
     print("Execution result: %s" % result)
+
+    demo_state, action_results = _build_runner_demo_state()
+    replayed = replay_variables(demo_state, action_results)
+    print("Runner replay variables: %s" % replayed.variables)
 
     bridge = await WorkerBridgeServer.start(None)
     try:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from proto import ast_pb2 as ir
 
@@ -150,43 +150,59 @@ class ExecutionNode:
     targets: list[str] = field(default_factory=list)
     action: Optional[ActionCallSpec] = None
     value_expr: Optional[ValueExpr] = None
+    assignments: dict[str, ValueExpr] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(frozen=True)
 class ExecutionEdge:
     source: str
     target: str
     edge_type: EdgeType = EdgeType.STATE_MACHINE
 
 
-@dataclass
-class VariableUpdate:
-    node_id: str
-    targets: list[str]
-    value: ValueExpr
-
-
 class RunnerState:
     """Track queued/executed DAG nodes with an unrolled, symbolic state.
 
-    This state only records nodes that are actually queued or executed, so
-    control-flow constructs like loops become explicit iteration nodes. Values
-    are stored as symbolic expressions so action results can be replayed without
-    needing the concrete payloads immediately.
+    Design overview:
+    - The runner state is not a variable heap; it is the runtime graph itself,
+      unrolled to the exact nodes that have been queued or executed.
+    - Each execution node stores assignments as symbolic expressions so action
+      results can be replayed later without having the concrete payloads.
+    - Data-flow edges encode which execution node supplies a value to another,
+      while state-machine edges encode execution ordering and control flow. This
+      mirrors how the ground truth IR->DAG functions.
+
+    Expected usage:
+    - Callers queue nodes as the program executes (ie. the DAG template is
+      walked) so loops and spreads expand into explicit iterations.
+    - Callers never mutate variables directly; they record assignments on nodes
+      and let replay walk the graph to reconstruct values.
+    - Persisted state can be rehydrated only with nodes/edges. The constructor will
+      rebuild in-memory cache (like timeline ordering and latest assignment tracking).
+
+    In short, RunnerState is the ground-truth runtime DAG: symbolic assignments
+    plus control/data edges, suitable for replay and visualization.
     """
 
-    def __init__(self, dag: Optional[DAG] = None, *, link_queued_nodes: bool = True) -> None:
+    def __init__(
+        self,
+        dag: Optional[DAG] = None,
+        nodes: Optional[Mapping[str, ExecutionNode]] = None,
+        edges: Optional[Iterable[ExecutionEdge]] = None,
+        *,
+        link_queued_nodes: bool = True,
+    ) -> None:
         self._dag = dag
-        self.nodes: dict[str, ExecutionNode] = {}
-        self.edges: list[ExecutionEdge] = []
-        self.variables: dict[str, ValueExpr] = {}
-        self.variable_sources: dict[str, str] = {}
+        self.nodes = dict(nodes or {})
+        self.edges: set[ExecutionEdge] = set(edges or [])
         self.ready_queue: list[str] = []
         self.timeline: list[str] = []
-        self.variable_updates: list[VariableUpdate] = []
         self._counters: dict[str, int] = {}
         self._link_queued_nodes = link_queued_nodes
-        self._edge_keys: set[tuple[str, str, EdgeType]] = set()
+        self._latest_assignments: dict[str, str] = {}
+
+        if self.nodes or self.edges:
+            self._rehydrate_state()
 
     def queue_template_node(
         self,
@@ -196,6 +212,11 @@ class RunnerState:
         instance_suffix: Optional[str] = None,
         parent_id: Optional[str] = None,
     ) -> ExecutionNode:
+        """Queue a runtime node based on the DAG template and apply its effects.
+
+        Use this when stepping through a compiled DAG so the runtime state mirrors
+        the template node (assignments, action results, and data-flow edges).
+        """
         if self._dag is None:
             raise RunnerStateError("runner state has no DAG template")
         template = self._dag.nodes.get(template_id)
@@ -234,6 +255,11 @@ class RunnerState:
         action: Optional[ActionCallSpec] = None,
         value_expr: Optional[ValueExpr] = None,
     ) -> ExecutionNode:
+        """Create a runtime node directly without a DAG template.
+
+        Use this for ad-hoc nodes (tests, synthetic steps) and as a common
+        builder for higher-level queue helpers like queue_action.
+        """
         base_id = node_id or template_id or self._next_id(node_type)
         node_id = self._build_execution_id(base_id, iteration_index, instance_suffix)
         node = ExecutionNode(
@@ -261,6 +287,11 @@ class RunnerState:
         iteration_index: Optional[int] = None,
         instance_suffix: Optional[str] = None,
     ) -> ActionResultValue:
+        """Queue an action call from raw parameters and return a symbolic result.
+
+        Use this when constructing runner state programmatically without IR
+        objects, while still wiring data-flow edges and assignments.
+        """
         spec = ActionCallSpec(
             action_name=action_name,
             module_name=module_name,
@@ -289,6 +320,11 @@ class RunnerState:
         instance_suffix: Optional[str] = None,
         local_scope: Optional[Mapping[str, ValueExpr]] = None,
     ) -> ActionResultValue:
+        """Queue an action call from IR, respecting a local scope for loop vars.
+
+        Use this during IR -> runner-state conversion (including spreads) so
+        action arguments are converted to symbolic expressions.
+        """
         spec = self._action_spec_from_ir(action, local_scope)
         node = self.queue_node(
             node_type="action_call",
@@ -298,9 +334,8 @@ class RunnerState:
             instance_suffix=instance_suffix,
             action=spec,
         )
-        for kwarg in action.kwargs:
-            if kwarg.HasField("value"):
-                self._record_data_flow_from_expr(node.node_id, kwarg.value, local_scope)
+        for value in spec.kwargs.values():
+            self._record_data_flow_from_value(node.node_id, value)
         result = self._assign_action_results(node, spec.action_name, targets, iteration_index)
         node.value_expr = result
         return result
@@ -313,13 +348,15 @@ class RunnerState:
         node_id: Optional[str] = None,
         label: Optional[str] = None,
     ) -> ExecutionNode:
-        exec_node_id = node_id or self._next_id("assignment")
+        """Record an IR assignment as a runtime node with symbolic values.
+
+        Use this when interpreting IR statements into the unrolled runtime graph.
+        """
         value_expr = self._expr_to_value(expr)
-        self._record_data_flow_from_expr(exec_node_id, expr)
         return self.record_assignment_value(
             targets=targets,
             value_expr=value_expr,
-            node_id=exec_node_id,
+            node_id=node_id,
             label=label,
         )
 
@@ -331,6 +368,11 @@ class RunnerState:
         node_id: Optional[str] = None,
         label: Optional[str] = None,
     ) -> ExecutionNode:
+        """Record a symbolic assignment node and update data-flow/definitions.
+
+        Use this for assignments created programmatically after ValueExpr
+        construction (tests or state rewrites).
+        """
         exec_node_id = node_id or self._next_id("assignment")
         node = self.queue_node(
             node_type="assignment",
@@ -340,7 +382,9 @@ class RunnerState:
             value_expr=value_expr,
         )
         self._record_data_flow_from_value(exec_node_id, value_expr)
-        self._assign_targets(node.node_id, targets, value_expr)
+        assignments = self._build_assignments(targets, value_expr)
+        node.assignments.update(assignments)
+        self._mark_latest_assignments(node.node_id, assignments)
         return node
 
     def mark_running(self, node_id: str) -> None:
@@ -365,6 +409,11 @@ class RunnerState:
         self._register_edge(ExecutionEdge(source=source, target=target, edge_type=edge_type))
 
     def _register_node(self, node: ExecutionNode) -> None:
+        """Insert a node into the runtime bookkeeping and optional control flow.
+
+        Use this for all queued nodes so the ready queue, timeline, and implicit
+        state-machine edge ordering remain consistent.
+        """
         if node.node_id in self.nodes:
             raise RunnerStateError(f"execution node already queued: {node.node_id}")
         self.nodes[node.node_id] = node
@@ -374,11 +423,57 @@ class RunnerState:
         self.timeline.append(node.node_id)
 
     def _register_edge(self, edge: ExecutionEdge) -> None:
-        key = (edge.source, edge.target, edge.edge_type)
-        if key in self._edge_keys:
-            return
-        self._edge_keys.add(key)
-        self.edges.append(edge)
+        self.edges.add(edge)
+
+    def _rehydrate_state(self) -> None:
+        """Rebuild derived structures from persisted nodes and edges.
+
+        Use this when loading a snapshot so timeline ordering, latest assignment
+        tracking, and ready queue reflect the current node set.
+        """
+        self.timeline = self._build_timeline()
+        self._latest_assignments.clear()
+        for node_id in self.timeline:
+            node = self.nodes.get(node_id)
+            if node is None:
+                continue
+            for target in node.assignments:
+                self._latest_assignments[target] = node_id
+        if not self.ready_queue:
+            self.ready_queue = [
+                node_id
+                for node_id in self.timeline
+                if self.nodes[node_id].status == NodeStatus.QUEUED
+            ]
+
+    def _build_timeline(self) -> list[str]:
+        if not self.edges:
+            return list(self.nodes.keys())
+        adjacency: dict[str, list[str]] = {node_id: [] for node_id in self.nodes}
+        in_degree: dict[str, int] = {node_id: 0 for node_id in self.nodes}
+        for edge in sorted(
+            self.edges, key=lambda edge: (edge.source, edge.target, edge.edge_type.value)
+        ):
+            if edge.edge_type != EdgeType.STATE_MACHINE:
+                continue
+            if edge.source not in adjacency or edge.target not in adjacency:
+                continue
+            adjacency[edge.source].append(edge.target)
+            in_degree[edge.target] += 1
+
+        queue = sorted(node_id for node_id, degree in in_degree.items() if degree == 0)
+        order: list[str] = []
+        while queue:
+            node_id = queue.pop(0)
+            order.append(node_id)
+            for neighbor in sorted(adjacency.get(node_id, [])):
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+            queue.sort()
+
+        remaining = [node_id for node_id in self.nodes if node_id not in order]
+        return order + sorted(remaining)
 
     def _get_node(self, node_id: str) -> ExecutionNode:
         node = self.nodes.get(node_id)
@@ -425,18 +520,25 @@ class RunnerState:
         return []
 
     def _apply_template_node(self, exec_node: ExecutionNode, template: DAGNode) -> None:
+        """Apply DAG template semantics to a queued execution node.
+
+        Use this right after queue_template_node so assignments, action result
+        references, and data-flow edges are populated from the template.
+        """
         if isinstance(template, AssignmentNode):
             if template.assign_expr is None:
                 return
             value_expr = self._expr_to_value(template.assign_expr)
             exec_node.value_expr = value_expr
-            self._record_data_flow_from_expr(exec_node.node_id, template.assign_expr)
-            self._assign_targets(exec_node.node_id, self._node_targets(template), value_expr)
+            self._record_data_flow_from_value(exec_node.node_id, value_expr)
+            assignments = self._build_assignments(self._node_targets(template), value_expr)
+            exec_node.assignments.update(assignments)
+            self._mark_latest_assignments(exec_node.node_id, assignments)
             return
 
         if isinstance(template, ActionCallNode):
             for expr in template.kwarg_exprs.values():
-                self._record_data_flow_from_expr(exec_node.node_id, expr)
+                self._record_data_flow_from_value(exec_node.node_id, self._expr_to_value(expr))
             exec_node.value_expr = self._assign_action_results(
                 exec_node,
                 template.action_name,
@@ -448,16 +550,20 @@ class RunnerState:
         if isinstance(template, FnCallNode) and template.assign_expr is not None:
             value_expr = self._expr_to_value(template.assign_expr)
             exec_node.value_expr = value_expr
-            self._record_data_flow_from_expr(exec_node.node_id, template.assign_expr)
-            self._assign_targets(exec_node.node_id, self._node_targets(template), value_expr)
+            self._record_data_flow_from_value(exec_node.node_id, value_expr)
+            assignments = self._build_assignments(self._node_targets(template), value_expr)
+            exec_node.assignments.update(assignments)
+            self._mark_latest_assignments(exec_node.node_id, assignments)
             return
 
         if isinstance(template, ReturnNode) and template.assign_expr is not None:
             value_expr = self._expr_to_value(template.assign_expr)
             exec_node.value_expr = value_expr
-            self._record_data_flow_from_expr(exec_node.node_id, template.assign_expr)
+            self._record_data_flow_from_value(exec_node.node_id, value_expr)
             target = template.target or "result"
-            self._assign_targets(exec_node.node_id, [target], value_expr)
+            assignments = self._build_assignments([target], value_expr)
+            exec_node.assignments.update(assignments)
+            self._mark_latest_assignments(exec_node.node_id, assignments)
 
     def _assign_action_results(
         self,
@@ -466,101 +572,179 @@ class RunnerState:
         targets: Optional[Sequence[str]],
         iteration_index: Optional[int],
     ) -> ActionResultValue:
+        """Create symbolic action results and map them to targets.
+
+        Use this when an action produces one or more results that are assigned
+        to variables (including tuple unpacking).
+        """
         result_ref = ActionResultValue(
             node_id=node.node_id,
             action_name=action_name,
             iteration_index=iteration_index,
         )
-        if not targets:
-            return result_ref
-
-        target_list = list(targets)
-        if len(target_list) == 1:
-            self._assign_targets(node.node_id, target_list, result_ref)
-            return result_ref
-
-        for idx, target in enumerate(target_list):
-            ref = ActionResultValue(
-                node_id=node.node_id,
-                action_name=action_name,
-                iteration_index=iteration_index,
-                result_index=idx,
-            )
-            self._assign_targets(node.node_id, [target], ref)
+        assignments = self._build_assignments(targets or [], result_ref)
+        if assignments:
+            node.assignments.update(assignments)
+            self._mark_latest_assignments(node.node_id, assignments)
         return result_ref
 
-    def _assign_targets(
+    def _build_assignments(
         self,
-        node_id: str,
         targets: Sequence[str],
         value: ValueExpr,
-    ) -> None:
+    ) -> dict[str, ValueExpr]:
+        """Expand an assignment into per-target symbolic values.
+
+        Use this for single-target assignments, tuple unpacking, and action
+        multi-result binding to keep definitions explicit.
+        """
+        value = self._materialize_value(value)
         targets_list = list(targets)
         if not targets_list:
-            return
+            return {}
 
         if len(targets_list) == 1:
-            self._store_variable(node_id, targets_list, value)
-            return
+            return {targets_list[0]: value}
 
         if isinstance(value, ListValue):
             if len(value.elements) != len(targets_list):
                 raise RunnerStateError("tuple unpacking mismatch")
-            for target, item in zip(targets_list, value.elements, strict=True):
-                self._store_variable(node_id, [target], item)
-            return
+            return {target: item for target, item in zip(targets_list, value.elements, strict=True)}
 
         if isinstance(value, ActionResultValue):
-            for idx, target in enumerate(targets_list):
-                ref = ActionResultValue(
+            return {
+                target: ActionResultValue(
                     node_id=value.node_id,
                     action_name=value.action_name,
                     iteration_index=value.iteration_index,
                     result_index=idx,
                 )
-                self._store_variable(node_id, [target], ref)
-            return
+                for idx, target in enumerate(targets_list)
+            }
 
         if isinstance(value, FunctionCallValue):
-            for idx, target in enumerate(targets_list):
-                index_expr = IndexValue(
-                    object=value,
-                    index=LiteralValue(idx),
-                )
-                self._store_variable(node_id, [target], index_expr)
-            return
+            return {
+                target: IndexValue(object=value, index=LiteralValue(idx))
+                for idx, target in enumerate(targets_list)
+            }
 
         raise RunnerStateError("tuple unpacking mismatch")
 
-    def _store_variable(self, node_id: str, targets: Sequence[str], value: ValueExpr) -> None:
-        for target in targets:
-            self.variables[target] = value
-            self.variable_sources[target] = node_id
-        self.variable_updates.append(
-            VariableUpdate(node_id=node_id, targets=list(targets), value=value)
-        )
+    def _materialize_value(self, value: ValueExpr) -> ValueExpr:
+        """Inline variable references and apply light constant folding.
 
-    def _record_data_flow_from_expr(
+        Use this before storing assignments so values are self-contained and
+        list concatenations are simplified.
+        """
+        resolved = self._resolve_value_tree(value, set())
+        if isinstance(resolved, BinaryOpValue) and resolved.op == ir.BinaryOperator.BINARY_OP_ADD:
+            left = resolved.left
+            right = resolved.right
+            if isinstance(left, ListValue) and isinstance(right, ListValue):
+                return ListValue(elements=left.elements + right.elements)
+        return resolved
+
+    def _resolve_variable_value(
         self,
-        node_id: str,
-        expr: ir.Expr,
-        local_scope: Optional[Mapping[str, ValueExpr]] = None,
-    ) -> None:
-        source_ids: set[str] = set()
-        for name in self._expr_variable_names(expr):
-            if local_scope is not None and name in local_scope:
-                source_ids.update(self._value_source_nodes(local_scope[name]))
-                continue
-            source = self.variable_sources.get(name)
-            if source is not None:
-                source_ids.add(source)
-        self._record_data_flow_edges(node_id, source_ids)
+        value: ValueExpr,
+        seen: set[str],
+    ) -> ValueExpr:
+        """Resolve a variable to its latest symbolic definition.
+
+        Use this when materializing expressions so variables become their
+        defining expression while guarding against cycles.
+        """
+        if not isinstance(value, VariableValue):
+            return value
+        if value.name in seen:
+            return value
+        node_id = self._latest_assignments.get(value.name)
+        if node_id is None:
+            return value
+        node = self.nodes.get(node_id)
+        if node is None:
+            return value
+        assigned = node.assignments.get(value.name)
+        if assigned is None:
+            return value
+        seen.add(value.name)
+        return self._resolve_variable_value(assigned, seen)
+
+    def _resolve_value_tree(self, value: ValueExpr, seen: set[str]) -> ValueExpr:
+        """Recursively resolve variable references throughout a value tree.
+
+        Use this as the core materialization step before assignment storage.
+        """
+        if isinstance(value, VariableValue):
+            return self._resolve_variable_value(value, seen)
+        if isinstance(value, BinaryOpValue):
+            left = self._resolve_value_tree(value.left, set(seen))
+            right = self._resolve_value_tree(value.right, set(seen))
+            return BinaryOpValue(left=left, op=value.op, right=right)
+        if isinstance(value, UnaryOpValue):
+            operand = self._resolve_value_tree(value.operand, set(seen))
+            return UnaryOpValue(op=value.op, operand=operand)
+        if isinstance(value, ListValue):
+            return ListValue(
+                elements=tuple(self._resolve_value_tree(item, set(seen)) for item in value.elements)
+            )
+        if isinstance(value, DictValue):
+            return DictValue(
+                entries=tuple(
+                    DictEntryValue(
+                        key=self._resolve_value_tree(entry.key, set(seen)),
+                        value=self._resolve_value_tree(entry.value, set(seen)),
+                    )
+                    for entry in value.entries
+                )
+            )
+        if isinstance(value, IndexValue):
+            obj = self._resolve_value_tree(value.object, set(seen))
+            idx = self._resolve_value_tree(value.index, set(seen))
+            return IndexValue(object=obj, index=idx)
+        if isinstance(value, DotValue):
+            obj = self._resolve_value_tree(value.object, set(seen))
+            return DotValue(object=obj, attribute=value.attribute)
+        if isinstance(value, FunctionCallValue):
+            args = tuple(self._resolve_value_tree(arg, set(seen)) for arg in value.args)
+            kwargs = {
+                name: self._resolve_value_tree(arg, set(seen)) for name, arg in value.kwargs.items()
+            }
+            return FunctionCallValue(
+                name=value.name,
+                args=args,
+                kwargs=kwargs,
+                global_function=value.global_function,
+            )
+        if isinstance(value, SpreadValue):
+            collection = self._resolve_value_tree(value.collection, set(seen))
+            kwargs = {
+                name: self._resolve_value_tree(arg, set(seen))
+                for name, arg in value.action.kwargs.items()
+            }
+            action = ActionCallSpec(
+                action_name=value.action.action_name,
+                module_name=value.action.module_name,
+                kwargs=kwargs,
+            )
+            return SpreadValue(collection=collection, loop_var=value.loop_var, action=action)
+        return value
+
+    def _mark_latest_assignments(self, node_id: str, assignments: Mapping[str, ValueExpr]) -> None:
+        for target in assignments:
+            self._latest_assignments[target] = node_id
 
     def _record_data_flow_from_value(self, node_id: str, value: ValueExpr) -> None:
+        """Add data-flow edges implied by a value expression.
+
+        Use this when a node consumes an expression so upstream dependencies are
+        encoded in the runtime graph.
+        """
         source_ids = self._value_source_nodes(value)
         self._record_data_flow_edges(node_id, source_ids)
 
     def _record_data_flow_edges(self, node_id: str, source_ids: set[str]) -> None:
+        """Register data-flow edges from sources to the given node."""
         for source_id in source_ids:
             if source_id == node_id:
                 continue
@@ -569,10 +753,11 @@ class RunnerState:
             )
 
     def _value_source_nodes(self, value: ValueExpr) -> set[str]:
+        """Find execution node ids that supply data to the given value."""
         if isinstance(value, ActionResultValue):
             return {value.node_id}
         if isinstance(value, VariableValue):
-            source = self.variable_sources.get(value.name)
+            source = self._latest_assignments.get(value.name)
             return {source} if source is not None else set()
         if isinstance(value, BinaryOpValue):
             return self._value_source_nodes(value.left) | self._value_source_nodes(value.right)
@@ -607,84 +792,16 @@ class RunnerState:
             return sources
         return set()
 
-    def _expr_variable_names(self, expr: ir.Expr) -> set[str]:
-        kind = expr.WhichOneof("kind")
-        match kind:
-            case "literal" | None:
-                return set()
-            case "variable":
-                return {expr.variable.name}
-            case "binary_op":
-                return self._expr_variable_names(expr.binary_op.left) | self._expr_variable_names(
-                    expr.binary_op.right
-                )
-            case "unary_op":
-                return self._expr_variable_names(expr.unary_op.operand)
-            case "list":
-                names: set[str] = set()
-                for item in expr.list.elements:
-                    names.update(self._expr_variable_names(item))
-                return names
-            case "dict":
-                names = set()
-                for entry in expr.dict.entries:
-                    names.update(self._expr_variable_names(entry.key))
-                    names.update(self._expr_variable_names(entry.value))
-                return names
-            case "index":
-                return self._expr_variable_names(expr.index.object) | self._expr_variable_names(
-                    expr.index.index
-                )
-            case "dot":
-                return self._expr_variable_names(expr.dot.object)
-            case "function_call":
-                names = set()
-                for arg in expr.function_call.args:
-                    names.update(self._expr_variable_names(arg))
-                for kw in expr.function_call.kwargs:
-                    if kw.HasField("value"):
-                        names.update(self._expr_variable_names(kw.value))
-                return names
-            case "action_call":
-                names = set()
-                for kw in expr.action_call.kwargs:
-                    if kw.HasField("value"):
-                        names.update(self._expr_variable_names(kw.value))
-                return names
-            case "parallel_expr":
-                names = set()
-                for call in expr.parallel_expr.calls:
-                    call_kind = call.WhichOneof("kind")
-                    match call_kind:
-                        case "action":
-                            for kw in call.action.kwargs:
-                                if kw.HasField("value"):
-                                    names.update(self._expr_variable_names(kw.value))
-                        case "function":
-                            for arg in call.function.args:
-                                names.update(self._expr_variable_names(arg))
-                            for kw in call.function.kwargs:
-                                if kw.HasField("value"):
-                                    names.update(self._expr_variable_names(kw.value))
-                        case None:
-                            continue
-                        case _:
-                            assert_never(call_kind)
-                return names
-            case "spread_expr":
-                names = self._expr_variable_names(expr.spread_expr.collection)
-                for kw in expr.spread_expr.action.kwargs:
-                    if kw.HasField("value"):
-                        names.update(self._expr_variable_names(kw.value))
-                return names
-            case _:
-                assert_never(kind)
-
     def _expr_to_value(
         self,
         expr: ir.Expr,
         local_scope: Optional[Mapping[str, ValueExpr]] = None,
     ) -> ValueExpr:
+        """Convert an IR expression into a symbolic ValueExpr tree.
+
+        Use this when interpreting IR statements or DAG templates into the
+        runtime state; it queues actions and spreads as needed.
+        """
         kind = expr.WhichOneof("kind")
         match kind:
             case "literal":
@@ -693,8 +810,6 @@ class RunnerState:
                 name = expr.variable.name
                 if local_scope is not None and name in local_scope:
                     return local_scope[name]
-                if name in self.variables:
-                    return self.variables[name]
                 return VariableValue(name)
             case "binary_op":
                 left = self._expr_to_value(expr.binary_op.left, local_scope)
@@ -762,6 +877,10 @@ class RunnerState:
         call: ir.Call,
         local_scope: Optional[Mapping[str, ValueExpr]],
     ) -> ValueExpr:
+        """Convert an IR call (action/function) into a ValueExpr.
+
+        Use this for parallel expressions that contain mixed call types.
+        """
         kind = call.WhichOneof("kind")
         match kind:
             case "action":
@@ -781,6 +900,11 @@ class RunnerState:
         spread: ir.SpreadExpr,
         local_scope: Optional[Mapping[str, ValueExpr]],
     ) -> ValueExpr:
+        """Materialize a spread expression into concrete calls or a symbolic spread.
+
+        Use this when converting IR spreads so known list collections unroll to
+        explicit action calls, while unknown collections stay symbolic.
+        """
         collection = self._expr_to_value(spread.collection, local_scope)
         if isinstance(collection, ListValue):
             results: list[ValueExpr] = []
@@ -807,6 +931,11 @@ class RunnerState:
         left: ValueExpr,
         right: ValueExpr,
     ) -> ValueExpr:
+        """Build a binary-op value with simple constant folding.
+
+        Use this when converting IR so literals and list concatenations are
+        simplified early.
+        """
         if op == ir.BinaryOperator.BINARY_OP_ADD:
             if isinstance(left, ListValue) and isinstance(right, ListValue):
                 return ListValue(elements=left.elements + right.elements)
@@ -817,6 +946,7 @@ class RunnerState:
         return BinaryOpValue(left=left, op=op, right=right)
 
     def _unary_op_value(self, op: ir.UnaryOperator, operand: ValueExpr) -> ValueExpr:
+        """Build a unary-op value with constant folding for literals."""
         if isinstance(operand, LiteralValue):
             folded = self._fold_literal_unary(op, operand.value)
             if folded is not None:
@@ -824,12 +954,17 @@ class RunnerState:
         return UnaryOpValue(op=op, operand=operand)
 
     def _index_value(self, obj_value: ValueExpr, idx_value: ValueExpr) -> ValueExpr:
+        """Build an index value, folding list literals when possible."""
         if isinstance(obj_value, ListValue) and isinstance(idx_value, LiteralValue):
             if isinstance(idx_value.value, int) and 0 <= idx_value.value < len(obj_value.elements):
                 return obj_value.elements[idx_value.value]
         return IndexValue(object=obj_value, index=idx_value)
 
     def _action_spec_from_node(self, node: ActionCallNode) -> ActionCallSpec:
+        """Extract an action call spec from a DAG node.
+
+        Use this when queueing nodes from the DAG template.
+        """
         kwargs = {name: self._expr_to_value(expr) for name, expr in node.kwarg_exprs.items()}
         return ActionCallSpec(
             action_name=node.action_name,
@@ -842,6 +977,7 @@ class RunnerState:
         action: ir.ActionCall,
         local_scope: Optional[Mapping[str, ValueExpr]] = None,
     ) -> ActionCallSpec:
+        """Extract an action call spec from IR, applying local scope bindings."""
         kwargs = {kw.name: self._expr_to_value(kw.value, local_scope) for kw in action.kwargs}
         module_name = action.module_name if action.HasField("module_name") else None
         return ActionCallSpec(
@@ -852,6 +988,7 @@ class RunnerState:
 
     @staticmethod
     def _literal_value(lit: ir.Literal) -> Any:
+        """Convert an IR literal into a Python value."""
         kind = lit.WhichOneof("value")
         match kind:
             case "int_value":
@@ -875,6 +1012,7 @@ class RunnerState:
         left: Any,
         right: Any,
     ) -> Optional[Any]:
+        """Try to fold a literal binary operation to a concrete value."""
         try:
             match op:
                 case ir.BinaryOperator.BINARY_OP_ADD:
@@ -905,6 +1043,7 @@ class RunnerState:
 
     @staticmethod
     def _fold_literal_unary(op: ir.UnaryOperator, operand: Any) -> Optional[Any]:
+        """Try to fold a literal unary operation to a concrete value."""
         try:
             match op:
                 case ir.UnaryOperator.UNARY_OP_NEG:
@@ -920,10 +1059,12 @@ class RunnerState:
 
 
 def format_value(expr: ValueExpr) -> str:
+    """Render a ValueExpr to a python-like string for debugging/visualization."""
     return _format_value(expr, 0)
 
 
 def _format_value(expr: ValueExpr, parent_prec: int) -> str:
+    """Recursive ValueExpr formatter with operator precedence handling."""
     if isinstance(expr, LiteralValue):
         return _format_literal(expr.value)
     if isinstance(expr, VariableValue):
@@ -983,6 +1124,7 @@ def _format_value(expr: ValueExpr, parent_prec: int) -> str:
 
 
 def _binary_operator(op: ir.BinaryOperator) -> tuple[str, int]:
+    """Map binary operator enums to (symbol, precedence) for formatting."""
     match op:
         case ir.BinaryOperator.BINARY_OP_OR:
             return "or", 10
@@ -1023,6 +1165,7 @@ def _binary_operator(op: ir.BinaryOperator) -> tuple[str, int]:
 
 
 def _unary_operator(op: ir.UnaryOperator) -> tuple[str, int]:
+    """Map unary operator enums to (symbol, precedence) for formatting."""
     match op:
         case ir.UnaryOperator.UNARY_OP_NEG:
             return "-", 60
@@ -1035,6 +1178,7 @@ def _unary_operator(op: ir.UnaryOperator) -> tuple[str, int]:
 
 
 def _precedence(kind: str) -> int:
+    """Return precedence for non-operator constructs like index/dot."""
     match kind:
         case "index" | "dot":
             return 80
@@ -1043,6 +1187,7 @@ def _precedence(kind: str) -> int:
 
 
 def _format_literal(value: Any) -> str:
+    """Format Python literals as source-like text."""
     if value is None:
         return "None"
     if isinstance(value, bool):

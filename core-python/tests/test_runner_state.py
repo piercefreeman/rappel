@@ -36,7 +36,14 @@ def test_runner_state_unrolls_loop_assignments() -> None:
     )
     state.record_assignment(targets=["results"], expr=concat_expr)
 
-    results = state.variables["results"]
+    results = None
+    for node_id in reversed(state.timeline):
+        node = state.nodes[node_id]
+        if "results" in node.assignments:
+            results = node.assignments["results"]
+            break
+
+    assert results is not None
     assert isinstance(results, ListValue)
     assert len(results.elements) == 2
 

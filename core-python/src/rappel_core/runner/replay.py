@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from proto import ast_pb2 as ir
 
-from ..dag import assert_never
+from ..dag import EdgeType, assert_never
 from .state import (
     ActionResultValue,
     BinaryOpValue,
@@ -38,74 +38,146 @@ def replay_variables(
     state: RunnerState,
     action_results: Mapping[str, Any],
 ) -> ReplayResult:
-    env: dict[str, Any] = {}
+    variables: dict[str, Any] = {}
+    cache: dict[tuple[str, str], Any] = {}
+    timeline = state.timeline or list(state.nodes.keys())
+    index = {node_id: idx for idx, node_id in enumerate(timeline)}
 
-    if state.variable_updates:
-        for update in state.variable_updates:
-            value = _evaluate_value(update.value, env, action_results)
-            _assign_targets(env, update.targets, value)
-    else:
-        for name, expr in state.variables.items():
-            env[name] = _evaluate_value(expr, env, action_results)
+    for node_id in timeline:
+        node = state.nodes.get(node_id)
+        if node is None or not node.assignments:
+            continue
+        for target in node.assignments:
+            variables[target] = _evaluate_assignment(
+                state, node_id, target, action_results, cache, index, timeline, set()
+            )
 
-    return ReplayResult(variables=env)
+    return ReplayResult(variables=variables)
 
 
-def _assign_targets(env: dict[str, Any], targets: Sequence[str], value: Any) -> None:
-    targets_list = list(targets)
-    if not targets_list:
-        return
+def _evaluate_assignment(
+    state: RunnerState,
+    node_id: str,
+    target: str,
+    action_results: Mapping[str, Any],
+    cache: dict[tuple[str, str], Any],
+    index: Mapping[str, int],
+    timeline: Sequence[str],
+    stack: set[tuple[str, str]],
+) -> Any:
+    key = (node_id, target)
+    if key in cache:
+        return cache[key]
+    if key in stack:
+        raise ReplayError(f"recursive assignment detected for {target} in {node_id}")
 
-    if len(targets_list) == 1:
-        env[targets_list[0]] = value
-        return
+    node = state.nodes.get(node_id)
+    if node is None or target not in node.assignments:
+        raise ReplayError(f"missing assignment for {target} in {node_id}")
 
-    if isinstance(value, (list, tuple)):
-        if len(value) != len(targets_list):
-            raise ReplayError("tuple unpacking mismatch")
-        for target, item in zip(targets_list, value, strict=True):
-            env[target] = item
-        return
-
-    for target in targets_list:
-        env[target] = value
+    stack.add(key)
+    value = _evaluate_value(
+        node.assignments[target],
+        action_results,
+        state,
+        node_id,
+        cache,
+        index,
+        timeline,
+        stack,
+    )
+    stack.remove(key)
+    cache[key] = value
+    return value
 
 
 def _evaluate_value(
     expr: ValueExpr,
-    env: Mapping[str, Any],
     action_results: Mapping[str, Any],
+    state: RunnerState,
+    current_node_id: str,
+    cache: dict[tuple[str, str], Any],
+    index: Mapping[str, int],
+    timeline: Sequence[str],
+    stack: set[tuple[str, str]],
 ) -> Any:
     if isinstance(expr, LiteralValue):
         return expr.value
     if isinstance(expr, VariableValue):
-        if expr.name in env:
-            return env[expr.name]
-        raise ReplayError(f"variable not found: {expr.name}")
+        return _resolve_variable(
+            state,
+            current_node_id,
+            expr.name,
+            action_results,
+            cache,
+            index,
+            timeline,
+            stack,
+        )
     if isinstance(expr, ActionResultValue):
         return _resolve_action_result(expr, action_results)
     if isinstance(expr, BinaryOpValue):
-        left = _evaluate_value(expr.left, env, action_results)
-        right = _evaluate_value(expr.right, env, action_results)
+        left = _evaluate_value(
+            expr.left, action_results, state, current_node_id, cache, index, timeline, stack
+        )
+        right = _evaluate_value(
+            expr.right, action_results, state, current_node_id, cache, index, timeline, stack
+        )
         return _apply_binary(expr.op, left, right)
     if isinstance(expr, UnaryOpValue):
-        operand = _evaluate_value(expr.operand, env, action_results)
+        operand = _evaluate_value(
+            expr.operand,
+            action_results,
+            state,
+            current_node_id,
+            cache,
+            index,
+            timeline,
+            stack,
+        )
         return _apply_unary(expr.op, operand)
     if isinstance(expr, ListValue):
-        return [_evaluate_value(item, env, action_results) for item in expr.elements]
+        return [
+            _evaluate_value(
+                item, action_results, state, current_node_id, cache, index, timeline, stack
+            )
+            for item in expr.elements
+        ]
     if isinstance(expr, DictValue):
         return {
-            _evaluate_value(entry.key, env, action_results): _evaluate_value(
-                entry.value, env, action_results
+            _evaluate_value(
+                entry.key,
+                action_results,
+                state,
+                current_node_id,
+                cache,
+                index,
+                timeline,
+                stack,
+            ): _evaluate_value(
+                entry.value,
+                action_results,
+                state,
+                current_node_id,
+                cache,
+                index,
+                timeline,
+                stack,
             )
             for entry in expr.entries
         }
     if isinstance(expr, IndexValue):
-        obj = _evaluate_value(expr.object, env, action_results)
-        idx = _evaluate_value(expr.index, env, action_results)
+        obj = _evaluate_value(
+            expr.object, action_results, state, current_node_id, cache, index, timeline, stack
+        )
+        idx = _evaluate_value(
+            expr.index, action_results, state, current_node_id, cache, index, timeline, stack
+        )
         return obj[idx]
     if isinstance(expr, DotValue):
-        obj = _evaluate_value(expr.object, env, action_results)
+        obj = _evaluate_value(
+            expr.object, action_results, state, current_node_id, cache, index, timeline, stack
+        )
         if isinstance(obj, dict):
             if expr.attribute in obj:
                 return obj[expr.attribute]
@@ -115,10 +187,76 @@ def _evaluate_value(
         except AttributeError as exc:
             raise ReplayError(f"attribute '{expr.attribute}' not found") from exc
     if isinstance(expr, FunctionCallValue):
-        return _evaluate_function_call(expr, env, action_results)
+        return _evaluate_function_call(
+            expr,
+            action_results,
+            state,
+            current_node_id,
+            cache,
+            index,
+            timeline,
+            stack,
+        )
     if isinstance(expr, SpreadValue):
         raise ReplayError("cannot replay unresolved spread expression")
     assert_never(expr)
+
+
+def _resolve_variable(
+    state: RunnerState,
+    current_node_id: str,
+    name: str,
+    action_results: Mapping[str, Any],
+    cache: dict[tuple[str, str], Any],
+    index: Mapping[str, int],
+    timeline: Sequence[str],
+    stack: set[tuple[str, str]],
+) -> Any:
+    source_node_id = _find_variable_source_node(state, current_node_id, name, index, timeline)
+    if source_node_id is None:
+        raise ReplayError(f"variable not found: {name}")
+    return _evaluate_assignment(
+        state,
+        source_node_id,
+        name,
+        action_results,
+        cache,
+        index,
+        timeline,
+        stack,
+    )
+
+
+def _find_variable_source_node(
+    state: RunnerState,
+    current_node_id: str,
+    name: str,
+    index: Mapping[str, int],
+    timeline: Sequence[str],
+) -> Optional[str]:
+    candidates: list[str] = []
+    for edge in state.edges:
+        if edge.edge_type != EdgeType.DATA_FLOW or edge.target != current_node_id:
+            continue
+        node = state.nodes.get(edge.source)
+        if node is None:
+            continue
+        if name in node.assignments:
+            candidates.append(edge.source)
+
+    if candidates:
+        current_idx = index.get(current_node_id, len(timeline))
+        eligible = [node_id for node_id in candidates if index.get(node_id, -1) <= current_idx]
+        if eligible:
+            return max(eligible, key=lambda node_id: index.get(node_id, -1))
+        return max(candidates, key=lambda node_id: index.get(node_id, -1))
+
+    current_idx = index.get(current_node_id, len(timeline))
+    for node_id in reversed(timeline[: current_idx + 1]):
+        node = state.nodes.get(node_id)
+        if node is not None and name in node.assignments:
+            return node_id
+    return None
 
 
 def _resolve_action_result(expr: ActionResultValue, action_results: Mapping[str, Any]) -> Any:
@@ -137,12 +275,25 @@ def _resolve_action_result(expr: ActionResultValue, action_results: Mapping[str,
 
 def _evaluate_function_call(
     expr: FunctionCallValue,
-    env: Mapping[str, Any],
     action_results: Mapping[str, Any],
+    state: RunnerState,
+    current_node_id: str,
+    cache: dict[tuple[str, str], Any],
+    index: Mapping[str, int],
+    timeline: Sequence[str],
+    stack: set[tuple[str, str]],
 ) -> Any:
-    args = [_evaluate_value(arg, env, action_results) for arg in expr.args]
+    args = [
+        _evaluate_value(
+            arg, action_results, state, current_node_id, cache, index, timeline, stack
+        )
+        for arg in expr.args
+    ]
     kwargs = {
-        name: _evaluate_value(value, env, action_results) for name, value in expr.kwargs.items()
+        name: _evaluate_value(
+            value, action_results, state, current_node_id, cache, index, timeline, stack
+        )
+        for name, value in expr.kwargs.items()
     }
 
     if (
