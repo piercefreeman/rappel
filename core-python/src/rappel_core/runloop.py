@@ -56,6 +56,7 @@ class RunLoop:
         self._stop = asyncio.Event()
         self._instances_idle = asyncio.Event()
         self._completed_executors: set[UUID] = set()
+        self._task_errors: list[BaseException] = []
 
     def register_executor(self, executor: RunnerExecutor, entry_node: UUID) -> UUID:
         """Register an executor and its entry node, returning an executor id."""
@@ -81,24 +82,32 @@ class RunLoop:
         process_instances_task = asyncio.create_task(self._process_instances(result))
         poll_task = asyncio.create_task(self._poll_completions())
         process_task = asyncio.create_task(self._process_completions(result))
+        tasks = [poll_instances_task, process_instances_task, poll_task, process_task]
+        for task in tasks:
+            task.add_done_callback(self._capture_task_error)
 
         if not self._inflight and self._executors:
             self._stop.set()
 
         await self._stop.wait()
-        poll_instances_task.cancel()
-        process_instances_task.cancel()
-        poll_task.cancel()
-        process_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await poll_instances_task
-        with contextlib.suppress(asyncio.CancelledError):
-            await process_instances_task
-        with contextlib.suppress(asyncio.CancelledError):
-            await poll_task
-        with contextlib.suppress(asyncio.CancelledError):
-            await process_task
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if self._task_errors:
+            raise self._task_errors[0]
         return result
+
+    def _capture_task_error(self, task: "asyncio.Task[None]") -> None:
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is None:
+            return
+        self._task_errors.append(exc)
+        self._stop.set()
 
     async def _poll_completions(self) -> None:
         while not self._stop.is_set():

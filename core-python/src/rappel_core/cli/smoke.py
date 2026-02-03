@@ -11,16 +11,16 @@ from uuid import UUID
 
 from proto import ast_pb2 as ir
 
-from .dag import DAG, convert_to_dag
-from .dag_viz import render_dag_image
-from .ir_examples import EXAMPLES
-from .ir_executor import ExecutionError, StatementExecutor
-from .ir_format import format_program
-from .backends import MemoryBackend, QueuedInstance
-from .runloop import RunLoop
-from .runner import RunnerState, replay_variables
-from .runner.state import LiteralValue
-from .workers import InlineWorkerPool
+from ..backends import MemoryBackend, QueuedInstance
+from ..dag import DAG, convert_to_dag
+from ..dag_viz import render_dag_image
+from ..ir_examples import EXAMPLES
+from ..ir_executor import ExecutionError, StatementExecutor
+from ..ir_format import format_program
+from ..runloop import RunLoop
+from ..runner import RunnerState, replay_variables
+from ..runner.state import LiteralValue
+from ..workers import InlineWorkerPool
 
 
 def _literal_int(value: int) -> ir.Expr:

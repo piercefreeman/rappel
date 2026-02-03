@@ -569,6 +569,12 @@ class RunnerState:
                 for idx, target in enumerate(targets_list)
             }
 
+        if isinstance(value, IndexValue):
+            return {
+                target: IndexValue(object=value, index=LiteralValue(idx))
+                for idx, target in enumerate(targets_list)
+            }
+
         raise RunnerStateError("tuple unpacking mismatch")
 
     def _materialize_value(self, value: ValueExpr) -> ValueExpr:

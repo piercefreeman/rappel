@@ -2,6 +2,7 @@
 
 from .base import ActionDone, BaseBackend, GraphUpdate, InstanceDone, QueuedInstance
 from .memory import MemoryBackend
+from .postgres import PostgresBackend
 
 __all__ = [
     "ActionDone",
@@ -10,4 +11,5 @@ __all__ = [
     "InstanceDone",
     "QueuedInstance",
     "MemoryBackend",
+    "PostgresBackend",
 ]
