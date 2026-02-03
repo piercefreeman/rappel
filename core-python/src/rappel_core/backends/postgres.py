@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import pickle
 import sys
 from threading import Lock
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 from uuid import uuid4
 
 from psycopg_pool import ConnectionPool
@@ -48,6 +49,9 @@ class PostgresBackend(BaseBackend):
         self._dsn = dsn
         self._pool = self._get_pool(dsn)
         self._ensure_schema()
+
+    def batching(self) -> contextlib.AbstractContextManager[BaseBackend]:
+        return _postgres_batch(self)
 
     def save_graphs(self, graphs: Sequence[GraphUpdate]) -> None:
         if not graphs:
@@ -109,6 +113,20 @@ class PostgresBackend(BaseBackend):
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM queued_instances")
+
+    def clear_all(self) -> None:
+        """Delete all persisted runner data for a clean benchmark run."""
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    TRUNCATE runner_graph_updates,
+                             runner_actions_done,
+                             runner_instances_done,
+                             queued_instances
+                    RESTART IDENTITY
+                    """
+                )
 
     def _fetch_queued_instances(self, size: int) -> list[QueuedInstance]:
         if size <= 0:
@@ -192,10 +210,15 @@ class PostgresBackend(BaseBackend):
         if not rows:
             return
         with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                with cur.copy(query) as copy:
-                    for row in rows:
-                        copy.write_row(row)
+            self._copy_rows_in(conn, query, rows)
+
+    def _copy_rows_in(self, conn: Any, query: str, rows: Sequence[Sequence[Any]]) -> None:
+        if not rows:
+            return
+        with conn.cursor() as cur:
+            with cur.copy(query) as copy:
+                for row in rows:
+                    copy.write_row(row)
 
     @classmethod
     def _get_pool(cls, dsn: str) -> ConnectionPool:
@@ -227,3 +250,68 @@ class PostgresBackend(BaseBackend):
         if not isinstance(value, QueuedInstance):
             raise TypeError("queued instance payload did not decode to QueuedInstance")
         return value
+
+
+class _PostgresBatch(BaseBackend):
+    def __init__(self, backend: PostgresBackend, conn: Any) -> None:
+        self._backend = backend
+        self._conn = conn
+
+    def save_graphs(self, graphs: Sequence[GraphUpdate]) -> None:
+        if not graphs:
+            return
+        payloads = [(self._backend._serialize(graph),) for graph in graphs]
+        self._backend._copy_rows_in(
+            self._conn,
+            "COPY runner_graph_updates (state) FROM STDIN",
+            payloads,
+        )
+
+    def save_actions_done(self, actions: Sequence[ActionDone]) -> None:
+        if not actions:
+            return
+        payloads = [
+            (
+                action.node_id,
+                action.action_name,
+                action.attempt,
+                self._backend._serialize(action.result),
+            )
+            for action in actions
+        ]
+        self._backend._copy_rows_in(
+            self._conn,
+            "COPY runner_actions_done (node_id, action_name, attempt, result) FROM STDIN",
+            payloads,
+        )
+
+    def save_instances_done(self, instances: Sequence[InstanceDone]) -> None:
+        if not instances:
+            return
+        payloads = [
+            (
+                instance.executor_id,
+                instance.entry_node,
+                self._backend._serialize_optional(instance.result),
+                self._backend._serialize_optional(instance.error),
+            )
+            for instance in instances
+        ]
+        self._backend._copy_rows_in(
+            self._conn,
+            "COPY runner_instances_done (executor_id, entry_node, result, error) FROM STDIN",
+            payloads,
+        )
+
+    async def get_queued_instances(self, size: int) -> list[QueuedInstance]:
+        return await self._backend.get_queued_instances(size)
+
+
+@contextlib.contextmanager
+def _postgres_batch(backend: PostgresBackend) -> Iterator[_PostgresBatch]:
+    pool = backend._pool
+    if pool is None:
+        raise RuntimeError("Postgres connection pool not initialized")
+    with pool.connection() as conn:
+        with conn.transaction():
+            yield _PostgresBatch(backend, conn)

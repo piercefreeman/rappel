@@ -212,6 +212,7 @@ class RunnerState:
         self.timeline: list[UUID] = []
         self._link_queued_nodes = link_queued_nodes
         self._latest_assignments: dict[str, UUID] = {}
+        self._graph_dirty = False
 
         if self.nodes or self.edges:
             self._rehydrate_state()
@@ -337,6 +338,23 @@ class RunnerState:
         if node_id in self.ready_queue:
             self.ready_queue.remove(node_id)
 
+    def increment_action_attempt(self, node_id: UUID) -> None:
+        node = self._get_node(node_id)
+        if node.node_type != "action_call":
+            raise RunnerStateError("action attempt increment requires an action_call node")
+        node.action_attempt += 1
+        self._mark_graph_dirty()
+
+    def consume_graph_dirty_for_durable_execution(self) -> bool:
+        """Return and clear the graph dirty bit for durable execution.
+
+        Only action nodes and their retry parameters must be persisted; other
+        nodes are deterministic from the ground-truth DAG definition.
+        """
+        dirty = self._graph_dirty
+        self._graph_dirty = False
+        return dirty
+
     def add_edge(
         self, source: UUID, target: UUID, edge_type: EdgeType = EdgeType.STATE_MACHINE
     ) -> None:
@@ -356,12 +374,17 @@ class RunnerState:
             raise RunnerStateError(f"execution node already queued: {node.node_id}")
         self.nodes[node.node_id] = node
         self.ready_queue.append(node.node_id)
+        if node.node_type == "action_call":
+            self._mark_graph_dirty()
         if self._link_queued_nodes and self.timeline:
             self._register_edge(ExecutionEdge(source=self.timeline[-1], target=node.node_id))
         self.timeline.append(node.node_id)
 
     def _register_edge(self, edge: ExecutionEdge) -> None:
         self.edges.add(edge)
+
+    def _mark_graph_dirty(self) -> None:
+        self._graph_dirty = True
 
     def _rehydrate_state(self) -> None:
         """Rebuild derived structures from persisted nodes and edges.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence, TYPE_CHECKING
@@ -58,6 +59,10 @@ class ActionDone:
 
 class BaseBackend(ABC):
     """Abstract persistence backend for runner state."""
+
+    def batching(self) -> contextlib.AbstractContextManager["BaseBackend"]:
+        """Return a context manager that batches related persistence calls."""
+        return contextlib.nullcontext(self)
 
     @abstractmethod
     def save_graphs(self, graphs: Sequence[GraphUpdate]) -> None:

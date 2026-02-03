@@ -42,11 +42,16 @@ class RunLoop:
         backend: BaseBackend,
         *,
         instance_batch_size: int = 25,
+        instance_done_batch_size: int | None = None,
         poll_interval: float = 0.05,
     ) -> None:
         self._worker_pool = worker_pool
         self._backend = backend
         self._instance_batch_size = max(1, instance_batch_size)
+        self._instance_done_batch_size = max(
+            1,
+            instance_done_batch_size if instance_done_batch_size is not None else instance_batch_size,
+        )
         self._poll_interval = max(0.0, poll_interval)
         self._executors: dict[UUID, RunnerExecutor] = {}
         self._entry_nodes: dict[UUID, UUID] = {}
@@ -56,6 +61,7 @@ class RunLoop:
         self._stop = asyncio.Event()
         self._instances_idle = asyncio.Event()
         self._completed_executors: set[UUID] = set()
+        self._instances_done_pending: list[InstanceDone] = []
         self._task_errors: list[BaseException] = []
 
     def register_executor(self, executor: RunnerExecutor, entry_node: UUID) -> UUID:
@@ -77,6 +83,7 @@ class RunLoop:
                 raise RunLoopError(f"missing entry node for executor {executor_id}")
             step = executor.increment(entry_node)
             self._queue_actions(executor_id, executor, step.actions)
+            self._finalize_executor_if_done(executor_id, executor)
 
         poll_instances_task = asyncio.create_task(self._poll_instances())
         process_instances_task = asyncio.create_task(self._process_instances(result))
@@ -95,6 +102,7 @@ class RunLoop:
         for task in tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        self._flush_instances_done()
         if self._task_errors:
             raise self._task_errors[0]
         return result
@@ -200,17 +208,28 @@ class RunLoop:
         if self._has_inflight(executor_id):
             return
         result_payload, error_payload = self._compute_instance_payload(executor)
-        self._backend.save_instances_done(
-            [
-                InstanceDone(
-                    executor_id=executor_id,
-                    entry_node=self._entry_nodes[executor_id],
-                    result=result_payload,
-                    error=error_payload,
-                )
-            ]
+        self._queue_instance_done(
+            InstanceDone(
+                executor_id=executor_id,
+                entry_node=self._entry_nodes[executor_id],
+                result=result_payload,
+                error=error_payload,
+            )
         )
         self._completed_executors.add(executor_id)
+
+    def _queue_instance_done(self, instance_done: InstanceDone) -> None:
+        self._instances_done_pending.append(instance_done)
+        if len(self._instances_done_pending) >= self._instance_done_batch_size:
+            self._flush_instances_done()
+
+    def _flush_instances_done(self) -> None:
+        if not self._instances_done_pending:
+            return
+        pending = self._instances_done_pending
+        self._instances_done_pending = []
+        with self._backend.batching() as backend:
+            backend.save_instances_done(pending)
 
     def _has_inflight(self, executor_id: UUID) -> bool:
         return any(exec_id == executor_id for exec_id, _ in self._inflight)

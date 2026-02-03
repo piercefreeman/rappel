@@ -126,7 +126,7 @@ class RunnerExecutor:
             if node.node_type != "action_call" or node.status != NodeStatus.RUNNING:
                 continue
             if self._can_retry(node):
-                node.action_attempt += 1
+                self._state.increment_action_attempt(node.node_id)
                 node.status = NodeStatus.QUEUED
                 if node.node_id not in self._state.ready_queue:
                     self._state.ready_queue.append(node.node_id)
@@ -235,7 +235,7 @@ class RunnerExecutor:
             if self._is_exception_value(action_value):
                 exception_value = action_value
                 if self._can_retry(node):
-                    node.action_attempt += 1
+                    self._state.increment_action_attempt(node.node_id)
                     node.status = NodeStatus.QUEUED
                     if node.node_id not in self._state.ready_queue:
                         self._state.ready_queue.append(node.node_id)
@@ -935,16 +935,19 @@ class RunnerExecutor:
     def _persist_updates(self, *, actions_done: Sequence[ActionDone]) -> None:
         if self._backend is None:
             return
-        if actions_done:
-            self._backend.save_actions_done(list(actions_done))
-        self._backend.save_graphs(
-            [
-                GraphUpdate(
-                    nodes=dict(self._state.nodes),
-                    edges=set(self._state.edges),
+        graph_dirty = self._state.consume_graph_dirty_for_durable_execution()
+        with self._backend.batching() as backend:
+            if actions_done:
+                backend.save_actions_done(list(actions_done))
+            if graph_dirty:
+                backend.save_graphs(
+                    [
+                        GraphUpdate(
+                            nodes=dict(self._state.nodes),
+                            edges=set(self._state.edges),
+                        )
+                    ]
                 )
-            ]
-        )
 
     def _action_name_for_node(self, node: ExecutionNode) -> str:
         if node.action is not None:

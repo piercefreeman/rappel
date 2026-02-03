@@ -132,7 +132,7 @@ def _queue_benchmark_instances(
 async def _run_benchmark(count_per_case: int, base: int, batch_size: int) -> None:
     cases = _build_cases(base)
     backend = PostgresBackend()
-    backend.clear_queue()
+    backend.clear_all()
     total = _queue_benchmark_instances(backend, cases, count_per_case, batch_size=batch_size)
     print(f"Queued {total} instances across {len(cases)} IR jobs")
 
