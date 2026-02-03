@@ -92,6 +92,7 @@ class RunLoop:
                 raise RunLoopError(f"missing entry node for executor {executor_id}")
             step = executor.increment(entry_node)
             initial_steps.append((executor_id, executor, step))
+        # Ensure durable state is persisted before any first actions are queued.
         self._action_queue_pending += 1
         try:
             await self._persist_steps(initial_steps)
@@ -179,6 +180,7 @@ class RunLoop:
                     steps.append((executor_id, executor, step))
             self._action_queue_pending += 1
             try:
+                # Wait for persistence to complete before dispatching new actions.
                 await self._persist_steps(steps)
                 for executor_id, executor, step in steps:
                     if step.actions:
@@ -214,6 +216,7 @@ class RunLoop:
                 steps.append((executor_id, executor, step))
             self._action_queue_pending += 1
             try:
+                # Persist queued node state before any actions execute.
                 await self._persist_steps(steps)
                 for executor_id, executor, step in steps:
                     if step.actions:
@@ -359,6 +362,7 @@ class RunLoop:
                 continue
             futures.append(await self._enqueue_persistence(step.updates))
         if futures:
+            # Block until the persistence batch is flushed and durable.
             await asyncio.gather(*futures)
 
     async def _enqueue_persistence(
@@ -410,6 +414,7 @@ class RunLoop:
             return
         try:
             with self._backend.batching() as backend:
+                # Persist in a single batch so action dispatch waits on this commit.
                 if actions_done:
                     backend.save_actions_done(actions_done)
                 if graph_updates:

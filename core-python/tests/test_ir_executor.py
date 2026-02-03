@@ -61,6 +61,18 @@ class TestRehydrationAtEachStep:
     These tests ensure that at each step of executor execution, the resulting
     action DB objects and snapshot of state nodes/edges can recreate the full
     graph exactly as intended when rehydrated (simulating crash recovery).
+
+    IMPORTANT: In production, only the following data is persisted to the database:
+      1. nodes: Mapping[UUID, ExecutionNode] - the runtime execution nodes
+      2. edges: Iterable[ExecutionEdge] - control flow and data flow edges
+      3. action_results: Mapping[UUID, Any] - the return values of completed actions
+
+    Everything else (timeline ordering, latest_assignments tracking, ready_queue)
+    is rebuilt from these three pieces via RunnerState._rehydrate_state(). The DAG
+    template is assumed to be available as it represents the immutable "program".
+
+    These tests intentionally only use nodes/edges/action_results when creating
+    rehydrated executors to match what production crash recovery has access to.
     """
 
     def _snapshot_state(
@@ -68,7 +80,12 @@ class TestRehydrationAtEachStep:
         state: RunnerState,
         action_results: dict[UUID, Any],
     ) -> tuple[dict[UUID, ExecutionNode], set[ExecutionEdge], dict[UUID, Any]]:
-        """Create a deep copy snapshot of the current state for rehydration testing."""
+        """Create a deep copy snapshot of the current state for rehydration testing.
+
+        Only captures what production persists: nodes, edges, and action_results.
+        Derived state (timeline, latest_assignments, ready_queue) is NOT captured
+        as it must be rebuilt from these three pieces on recovery.
+        """
         nodes_snapshot = {
             node_id: ExecutionNode(
                 node_id=node.node_id,
@@ -95,7 +112,12 @@ class TestRehydrationAtEachStep:
         edges: set[ExecutionEdge],
         action_results: dict[UUID, Any],
     ) -> RunnerExecutor:
-        """Create a new executor from a state snapshot, simulating crash recovery."""
+        """Create a new executor from a state snapshot, simulating crash recovery.
+
+        Uses only nodes/edges/action_results (what production has) plus the DAG
+        template. The RunnerState constructor will call _rehydrate_state() to
+        rebuild timeline, latest_assignments, and ready_queue from these inputs.
+        """
         return RunnerExecutor(
             dag,
             nodes=nodes,
