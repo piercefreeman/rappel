@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Generic, Iterable, Mapping, Optional, Sequence, TypeVar
 from uuid import UUID, uuid4
 
 from proto import ast_pb2 as ir
@@ -131,6 +131,218 @@ ValueExpr = (
     | SpreadValue
 )
 
+TExpr = TypeVar("TExpr")
+
+
+class ValueExprVisitor(Generic[TExpr]):
+    """Visit ValueExpr nodes with explicit handlers.
+
+    Example:
+    - A visitor can count nodes in `a + 1` by visiting a BinaryOpValue and its children.
+    """
+
+    def visit(self, expr: ValueExpr) -> TExpr:
+        if isinstance(expr, LiteralValue):
+            return self.visit_literal(expr)
+        if isinstance(expr, VariableValue):
+            return self.visit_variable(expr)
+        if isinstance(expr, ActionResultValue):
+            return self.visit_action_result(expr)
+        if isinstance(expr, BinaryOpValue):
+            return self.visit_binary(expr)
+        if isinstance(expr, UnaryOpValue):
+            return self.visit_unary(expr)
+        if isinstance(expr, ListValue):
+            return self.visit_list(expr)
+        if isinstance(expr, DictValue):
+            return self.visit_dict(expr)
+        if isinstance(expr, IndexValue):
+            return self.visit_index(expr)
+        if isinstance(expr, DotValue):
+            return self.visit_dot(expr)
+        if isinstance(expr, FunctionCallValue):
+            return self.visit_function_call(expr)
+        if isinstance(expr, SpreadValue):
+            return self.visit_spread(expr)
+        assert_never(expr)
+
+    def visit_literal(self, expr: LiteralValue) -> TExpr:
+        raise NotImplementedError
+
+    def visit_variable(self, expr: VariableValue) -> TExpr:
+        raise NotImplementedError
+
+    def visit_action_result(self, expr: ActionResultValue) -> TExpr:
+        raise NotImplementedError
+
+    def visit_binary(self, expr: BinaryOpValue) -> TExpr:
+        raise NotImplementedError
+
+    def visit_unary(self, expr: UnaryOpValue) -> TExpr:
+        raise NotImplementedError
+
+    def visit_list(self, expr: ListValue) -> TExpr:
+        raise NotImplementedError
+
+    def visit_dict(self, expr: DictValue) -> TExpr:
+        raise NotImplementedError
+
+    def visit_index(self, expr: IndexValue) -> TExpr:
+        raise NotImplementedError
+
+    def visit_dot(self, expr: DotValue) -> TExpr:
+        raise NotImplementedError
+
+    def visit_function_call(self, expr: FunctionCallValue) -> TExpr:
+        raise NotImplementedError
+
+    def visit_spread(self, expr: SpreadValue) -> TExpr:
+        raise NotImplementedError
+
+
+class _ValueExprResolver(ValueExprVisitor[ValueExpr]):
+    """Resolve variables inside a ValueExpr tree without executing actions.
+
+    Example IR:
+    - y = x + 1 (where x -> LiteralValue(2))
+    Produces BinaryOpValue(LiteralValue(2), +, LiteralValue(1)).
+    """
+
+    def __init__(
+        self,
+        resolve_variable: Callable[[str, set[str]], ValueExpr],
+        seen: set[str],
+    ) -> None:
+        self._resolve_variable = resolve_variable
+        self._seen = seen
+
+    def visit_literal(self, expr: LiteralValue) -> ValueExpr:
+        return expr
+
+    def visit_variable(self, expr: VariableValue) -> ValueExpr:
+        return self._resolve_variable(expr.name, self._seen)
+
+    def visit_action_result(self, expr: ActionResultValue) -> ValueExpr:
+        return expr
+
+    def visit_binary(self, expr: BinaryOpValue) -> ValueExpr:
+        return BinaryOpValue(
+            left=self.visit(expr.left),
+            op=expr.op,
+            right=self.visit(expr.right),
+        )
+
+    def visit_unary(self, expr: UnaryOpValue) -> ValueExpr:
+        return UnaryOpValue(
+            op=expr.op,
+            operand=self.visit(expr.operand),
+        )
+
+    def visit_list(self, expr: ListValue) -> ValueExpr:
+        return ListValue(elements=tuple(self.visit(item) for item in expr.elements))
+
+    def visit_dict(self, expr: DictValue) -> ValueExpr:
+        return DictValue(
+            entries=tuple(
+                DictEntryValue(
+                    key=self.visit(entry.key),
+                    value=self.visit(entry.value),
+                )
+                for entry in expr.entries
+            )
+        )
+
+    def visit_index(self, expr: IndexValue) -> ValueExpr:
+        return IndexValue(
+            object=self.visit(expr.object),
+            index=self.visit(expr.index),
+        )
+
+    def visit_dot(self, expr: DotValue) -> ValueExpr:
+        return DotValue(
+            object=self.visit(expr.object),
+            attribute=expr.attribute,
+        )
+
+    def visit_function_call(self, expr: FunctionCallValue) -> ValueExpr:
+        return FunctionCallValue(
+            name=expr.name,
+            args=tuple(self.visit(arg) for arg in expr.args),
+            kwargs={name: self.visit(value) for name, value in expr.kwargs.items()},
+            global_function=expr.global_function,
+        )
+
+    def visit_spread(self, expr: SpreadValue) -> ValueExpr:
+        collection = self.visit(expr.collection)
+        kwargs = {name: self.visit(value) for name, value in expr.action.kwargs.items()}
+        action = ActionCallSpec(
+            action_name=expr.action.action_name,
+            module_name=expr.action.module_name,
+            kwargs=kwargs,
+        )
+        return SpreadValue(collection=collection, loop_var=expr.loop_var, action=action)
+
+
+class _ValueExprSourceCollector(ValueExprVisitor[set[UUID]]):
+    """Collect execution node ids that supply data to a ValueExpr tree.
+
+    Example IR:
+    - total = a + @sum(values)
+    Returns the node ids that last defined `a` and the action node for sum().
+    """
+
+    def __init__(self, resolve_variable: Callable[[str], Optional[UUID]]) -> None:
+        self._resolve_variable = resolve_variable
+
+    def visit_literal(self, expr: LiteralValue) -> set[UUID]:
+        return set()
+
+    def visit_variable(self, expr: VariableValue) -> set[UUID]:
+        source = self._resolve_variable(expr.name)
+        return {source} if source is not None else set()
+
+    def visit_action_result(self, expr: ActionResultValue) -> set[UUID]:
+        return {expr.node_id}
+
+    def visit_binary(self, expr: BinaryOpValue) -> set[UUID]:
+        return self.visit(expr.left) | self.visit(expr.right)
+
+    def visit_unary(self, expr: UnaryOpValue) -> set[UUID]:
+        return self.visit(expr.operand)
+
+    def visit_list(self, expr: ListValue) -> set[UUID]:
+        sources: set[UUID] = set()
+        for item in expr.elements:
+            sources.update(self.visit(item))
+        return sources
+
+    def visit_dict(self, expr: DictValue) -> set[UUID]:
+        sources: set[UUID] = set()
+        for entry in expr.entries:
+            sources.update(self.visit(entry.key))
+            sources.update(self.visit(entry.value))
+        return sources
+
+    def visit_index(self, expr: IndexValue) -> set[UUID]:
+        return self.visit(expr.object) | self.visit(expr.index)
+
+    def visit_dot(self, expr: DotValue) -> set[UUID]:
+        return self.visit(expr.object)
+
+    def visit_function_call(self, expr: FunctionCallValue) -> set[UUID]:
+        sources: set[UUID] = set()
+        for arg in expr.args:
+            sources.update(self.visit(arg))
+        for arg in expr.kwargs.values():
+            sources.update(self.visit(arg))
+        return sources
+
+    def visit_spread(self, expr: SpreadValue) -> set[UUID]:
+        sources = self.visit(expr.collection)
+        for arg in expr.action.kwargs.values():
+            sources.update(self.visit(arg))
+        return sources
+
 
 class NodeStatus(Enum):
     QUEUED = "queued"
@@ -146,9 +358,6 @@ class ExecutionNode:
     label: str
     status: NodeStatus
     template_id: Optional[str] = None
-    iteration_index: Optional[int] = None
-    instance_suffix: Optional[str] = None
-    parent_id: Optional[str] = None
     targets: list[str] = field(default_factory=list)
     action: Optional[ActionCallSpec] = None
     value_expr: Optional[ValueExpr] = None
@@ -237,8 +446,6 @@ class RunnerState:
         template_id: str,
         *,
         iteration_index: Optional[int] = None,
-        instance_suffix: Optional[str] = None,
-        parent_id: Optional[str] = None,
     ) -> ExecutionNode:
         """Queue a runtime node based on the DAG template and apply its effects.
 
@@ -263,16 +470,13 @@ class RunnerState:
             label=template.label,
             status=NodeStatus.QUEUED,
             template_id=template_id,
-            iteration_index=iteration_index,
-            instance_suffix=instance_suffix,
-            parent_id=parent_id,
             targets=self._node_targets(template),
         )
         if isinstance(template, ActionCallNode):
             node.action = self._action_spec_from_node(template)
 
         self._register_node(node)
-        self._apply_template_node(node, template)
+        self._apply_template_node(node, template, iteration_index)
         return node
 
     def queue_node(
@@ -283,9 +487,6 @@ class RunnerState:
         node_id: Optional[UUID] = None,
         template_id: Optional[str] = None,
         targets: Optional[Sequence[str]] = None,
-        iteration_index: Optional[int] = None,
-        instance_suffix: Optional[str] = None,
-        parent_id: Optional[str] = None,
         action: Optional[ActionCallSpec] = None,
         value_expr: Optional[ValueExpr] = None,
     ) -> ExecutionNode:
@@ -304,9 +505,6 @@ class RunnerState:
             label=label,
             status=NodeStatus.QUEUED,
             template_id=template_id,
-            iteration_index=iteration_index,
-            instance_suffix=instance_suffix,
-            parent_id=parent_id,
             targets=list(targets or []),
             action=action,
             value_expr=value_expr,
@@ -320,7 +518,6 @@ class RunnerState:
         *,
         targets: Optional[Sequence[str]] = None,
         iteration_index: Optional[int] = None,
-        instance_suffix: Optional[str] = None,
         local_scope: Optional[Mapping[str, ValueExpr]] = None,
     ) -> ActionResultValue:
         """Queue an action call from IR, respecting a local scope for loop vars.
@@ -338,8 +535,6 @@ class RunnerState:
             node_type="action_call",
             label=f"@{spec.action_name}()",
             targets=targets,
-            iteration_index=iteration_index,
-            instance_suffix=instance_suffix,
             action=spec,
         )
         for value in spec.kwargs.values():
@@ -469,7 +664,12 @@ class RunnerState:
                 return [node.target]
         return []
 
-    def _apply_template_node(self, exec_node: ExecutionNode, template: DAGNode) -> None:
+    def _apply_template_node(
+        self,
+        exec_node: ExecutionNode,
+        template: DAGNode,
+        iteration_index: Optional[int],
+    ) -> None:
         """Apply DAG template semantics to a queued execution node.
 
         Use this right after queue_template_node so assignments, action result
@@ -498,7 +698,7 @@ class RunnerState:
                 exec_node,
                 template.action_name,
                 template.targets or ([template.target] if template.target else None),
-                exec_node.iteration_index,
+                iteration_index,
             )
             return
 
@@ -614,10 +814,10 @@ class RunnerState:
 
     def _resolve_variable_value(
         self,
-        value: ValueExpr,
+        name: str,
         seen: set[str],
     ) -> ValueExpr:
-        """Resolve a variable to its latest symbolic definition.
+        """Resolve a variable name to its latest symbolic definition.
 
         Use this when materializing expressions so variables become their
         defining expression while guarding against cycles.
@@ -630,21 +830,21 @@ class RunnerState:
         to x. This makes downstream replay use the symbolic expression rather
         than requiring a separate variable lookup.
         """
-        if not isinstance(value, VariableValue):
-            return value
-        if value.name in seen:
-            return value
-        node_id = self._latest_assignments.get(value.name)
+        if name in seen:
+            return VariableValue(name)
+        node_id = self._latest_assignments.get(name)
         if node_id is None:
-            return value
+            return VariableValue(name)
         node = self.nodes.get(node_id)
         if node is None:
-            return value
-        assigned = node.assignments.get(value.name)
+            return VariableValue(name)
+        assigned = node.assignments.get(name)
         if assigned is None:
-            return value
-        seen.add(value.name)
-        return self._resolve_variable_value(assigned, seen)
+            return VariableValue(name)
+        if isinstance(assigned, VariableValue):
+            seen.add(name)
+            return self._resolve_variable_value(assigned.name, seen)
+        return assigned
 
     def _resolve_value_tree(self, value: ValueExpr, seen: set[str]) -> ValueExpr:
         """Recursively resolve variable references throughout a value tree.
@@ -656,60 +856,8 @@ class RunnerState:
         The tree walk replaces VariableValue("x")/("y") with their latest
         symbolic definitions before storing z.
         """
-        if isinstance(value, VariableValue):
-            return self._resolve_variable_value(value, seen)
-        if isinstance(value, BinaryOpValue):
-            left = self._resolve_value_tree(value.left, set(seen))
-            right = self._resolve_value_tree(value.right, set(seen))
-            return BinaryOpValue(left=left, op=value.op, right=right)
-        if isinstance(value, UnaryOpValue):
-            operand = self._resolve_value_tree(value.operand, set(seen))
-            return UnaryOpValue(op=value.op, operand=operand)
-        if isinstance(value, ListValue):
-            return ListValue(
-                elements=tuple(self._resolve_value_tree(item, set(seen)) for item in value.elements)
-            )
-        if isinstance(value, DictValue):
-            return DictValue(
-                entries=tuple(
-                    DictEntryValue(
-                        key=self._resolve_value_tree(entry.key, set(seen)),
-                        value=self._resolve_value_tree(entry.value, set(seen)),
-                    )
-                    for entry in value.entries
-                )
-            )
-        if isinstance(value, IndexValue):
-            obj = self._resolve_value_tree(value.object, set(seen))
-            idx = self._resolve_value_tree(value.index, set(seen))
-            return IndexValue(object=obj, index=idx)
-        if isinstance(value, DotValue):
-            obj = self._resolve_value_tree(value.object, set(seen))
-            return DotValue(object=obj, attribute=value.attribute)
-        if isinstance(value, FunctionCallValue):
-            args = tuple(self._resolve_value_tree(arg, set(seen)) for arg in value.args)
-            kwargs = {
-                name: self._resolve_value_tree(arg, set(seen)) for name, arg in value.kwargs.items()
-            }
-            return FunctionCallValue(
-                name=value.name,
-                args=args,
-                kwargs=kwargs,
-                global_function=value.global_function,
-            )
-        if isinstance(value, SpreadValue):
-            collection = self._resolve_value_tree(value.collection, set(seen))
-            kwargs = {
-                name: self._resolve_value_tree(arg, set(seen))
-                for name, arg in value.action.kwargs.items()
-            }
-            action = ActionCallSpec(
-                action_name=value.action.action_name,
-                module_name=value.action.module_name,
-                kwargs=kwargs,
-            )
-            return SpreadValue(collection=collection, loop_var=value.loop_var, action=action)
-        return value
+        resolver = _ValueExprResolver(self._resolve_variable_value, seen)
+        return resolver.visit(value)
 
     def _mark_latest_assignments(self, node_id: UUID, assignments: Mapping[str, ValueExpr]) -> None:
         for target in assignments:
@@ -748,43 +896,8 @@ class RunnerState:
         - total = a + @sum(values)
         Returns the latest assignment node for a and the action node for sum().
         """
-        if isinstance(value, ActionResultValue):
-            return {value.node_id}
-        if isinstance(value, VariableValue):
-            source = self._latest_assignments.get(value.name)
-            return {source} if source is not None else set()
-        if isinstance(value, BinaryOpValue):
-            return self._value_source_nodes(value.left) | self._value_source_nodes(value.right)
-        if isinstance(value, UnaryOpValue):
-            return self._value_source_nodes(value.operand)
-        if isinstance(value, ListValue):
-            sources: set[UUID] = set()
-            for item in value.elements:
-                sources.update(self._value_source_nodes(item))
-            return sources
-        if isinstance(value, DictValue):
-            sources: set[UUID] = set()
-            for entry in value.entries:
-                sources.update(self._value_source_nodes(entry.key))
-                sources.update(self._value_source_nodes(entry.value))
-            return sources
-        if isinstance(value, IndexValue):
-            return self._value_source_nodes(value.object) | self._value_source_nodes(value.index)
-        if isinstance(value, DotValue):
-            return self._value_source_nodes(value.object)
-        if isinstance(value, FunctionCallValue):
-            sources: set[UUID] = set()
-            for arg in value.args:
-                sources.update(self._value_source_nodes(arg))
-            for arg in value.kwargs.values():
-                sources.update(self._value_source_nodes(arg))
-            return sources
-        if isinstance(value, SpreadValue):
-            sources = self._value_source_nodes(value.collection)
-            for arg in value.action.kwargs.values():
-                sources.update(self._value_source_nodes(arg))
-            return sources
-        return set()
+        collector = _ValueExprSourceCollector(self._latest_assignments.get)
+        return collector.visit(value)
 
     def _expr_to_value(
         self,
@@ -1109,7 +1222,6 @@ class RunnerState:
         kwargs: Optional[Mapping[str, ValueExpr]] = None,
         module_name: Optional[str] = None,
         iteration_index: Optional[int] = None,
-        instance_suffix: Optional[str] = None,
     ) -> ActionResultValue:
         """Queue an action call from raw parameters and return a symbolic result.
 
@@ -1129,8 +1241,6 @@ class RunnerState:
             node_type="action_call",
             label=f"@{action_name}()",
             targets=targets,
-            iteration_index=iteration_index,
-            instance_suffix=instance_suffix,
             action=spec,
         )
         for value in spec.kwargs.values():

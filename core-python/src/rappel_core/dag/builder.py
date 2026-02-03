@@ -1,4 +1,10 @@
-"""IR -> DAG conversion and graph builder."""
+"""IR -> DAG conversion and graph builder.
+
+This module turns the IR AST into a DAG that captures control flow (state-machine edges),
+data flow (variable definition/use edges), and exception handling paths. It also supports
+expanding function calls by inlining the callee graph into the caller graph so the runtime
+can execute a single, flattened template.
+"""
 
 from __future__ import annotations
 
@@ -39,10 +45,18 @@ from .validate import validate_dag
 class DAGConverter:
     """Convert IR programs into a DAG with control + data-flow edges.
 
-    The converter preserves rich metadata so the runtime can schedule correctly
-    and the graph visualizer can render readable labels/guards. For example,
-    `results = parallel: @a() @b()` becomes a parallel node, two call nodes,
-    and an aggregator join, all linked by control and data edges.
+    Design overview:
+    - Each IR statement becomes one or more DAG nodes (assignments, calls, joins, etc).
+    - State-machine edges encode control flow, including branches, loops, and exceptions.
+    - Data-flow edges link variable definitions to later uses so scheduling and replay
+      can trace dependencies.
+    - Function calls are expanded by cloning callee nodes with a stable prefix, then
+      wiring caller -> callee arguments via synthetic assignments.
+
+    Example IR:
+    - results = parallel: @a() @b()
+    Yields a parallel node, two call nodes, and a join/aggregator node connected by
+    control edges, plus data-flow edges from each call's result into the aggregator.
     """
 
     def __init__(self) -> None:
@@ -57,6 +71,16 @@ class DAGConverter:
         self.try_depth = 0
 
     def convert(self, program: ir.Program) -> DAG:
+        """Convert a full IR program into a flattened, executable DAG.
+
+        This chooses an entry function, expands all reachable function calls,
+        remaps exception edges to expanded call entries, adds global data-flow
+        edges, and validates the resulting graph.
+
+        Example entry selection:
+        - If a function named "main" exists, it is used as the entry point.
+        - Otherwise, the first non-dunder function becomes the entry.
+        """
         unexpanded = self.convert_with_pointers(program)
 
         entry_fn = None
@@ -81,6 +105,12 @@ class DAGConverter:
         return dag
 
     def convert_with_pointers(self, program: ir.Program) -> DAG:
+        """Convert each function into its own DAG fragment without inlining calls.
+
+        The resulting graph preserves per-function node ids and keeps function
+        calls as call nodes. This is primarily used as the input to
+        expand_functions, which will inline and prefix the callee graphs.
+        """
         self.dag = DAG()
         self.node_counter = 0
         self.function_defs.clear()
@@ -96,6 +126,12 @@ class DAGConverter:
         return dag
 
     def remap_exception_targets(self, dag: DAG) -> None:
+        """Redirect exception edges to expanded call entries and dedupe edges.
+
+        After function expansion, exception edges may still point at a call
+        prefix (the "virtual" target). We map those prefixes to the first
+        node id in the expanded call subtree, then remove duplicate edges.
+        """
         call_entry_map = self.build_call_entry_map(dag)
         for edge in [edge for edge in dag.edges if edge.exception_types is not None]:
             if edge.target in dag.nodes:
@@ -119,6 +155,12 @@ class DAGConverter:
 
     @staticmethod
     def build_call_entry_map(dag: DAG) -> Dict[str, str]:
+        """Return a mapping from call prefixes to their first expanded node id.
+
+        Example:
+        - Expanded nodes: "foo:call_1:action_3", "foo:call_1:return_4"
+        - Mapping entry: "foo:call_1" -> "foo:call_1:action_3"
+        """
         mapping: Dict[str, str] = {}
         for node_id in dag.nodes:
             parts = node_id.split(":")
@@ -130,6 +172,7 @@ class DAGConverter:
         return mapping
 
     def expand_functions(self, unexpanded: DAG, entry_fn: str) -> DAG:
+        """Inline the entry function and all reachable calls into a new DAG."""
         expanded = DAG()
         visited_calls: Set[str] = set()
         self.expand_function_recursive(unexpanded, entry_fn, expanded, visited_calls, None)
@@ -143,6 +186,17 @@ class DAGConverter:
         visited_calls: Set[str],
         id_prefix: Optional[str],
     ) -> Optional[tuple[str, str]]:
+        """Inline a function into the target DAG and return (first, last) node ids.
+
+        The expansion clones nodes from the callee, prefixes their ids with the
+        call site, wires argument binding nodes before the callee entry, and
+        rewrites edges and aggregation pointers.
+
+        Example:
+        - Caller node "call_2" invokes function "foo".
+        - Expanded ids become "call_2:foo_input_1", "call_2:action_3", etc.
+        - The return node's targets are rewritten to match the call assignment.
+        """
         fn_nodes = unexpanded.get_nodes_for_function(fn_name)
         if not fn_nodes:
             return None
@@ -194,6 +248,7 @@ class DAGConverter:
                 if expansion is not None:
                     child_first, child_last = expansion
 
+                    # Bind call arguments to callee input names before entry.
                     bind_ids: List[str] = []
                     fn_def = self.function_defs.get(called_fn)
                     if fn_def is not None and fn_def.io.inputs:
@@ -213,6 +268,7 @@ class DAGConverter:
                             bind_ids.append(bind_id)
 
                     if bind_ids:
+                        # Chain bindings in order, then connect to callee entry.
                         for idx in range(1, len(bind_ids)):
                             prev = bind_ids[idx - 1]
                             nxt = bind_ids[idx]
@@ -224,6 +280,7 @@ class DAGConverter:
                     id_map[f"{old_id}_last"] = child_last
 
                     if node.is_spread:
+                        # Propagate spread metadata to expanded action nodes.
                         for expanded_id, action_node in list(target.nodes.items()):
                             if (
                                 expanded_id.startswith(child_prefix)
@@ -237,6 +294,7 @@ class DAGConverter:
                                     action_node.aggregates_to = node.aggregates_to
 
                     if exception_edges:
+                        # Exception edges from the call become exception edges from each action.
                         expanded_action_ids = [
                             expanded_id
                             for expanded_id, expanded_node in target.nodes.items()
@@ -260,6 +318,7 @@ class DAGConverter:
                         else None
                     )
                     if fn_call_targets:
+                        # Return nodes inside the callee bind back to the call targets.
                         expanded_return_ids = [
                             expanded_id
                             for expanded_id, expanded_node in target.nodes.items()
@@ -283,6 +342,7 @@ class DAGConverter:
             cloned.id = new_id
             cloned.node_uuid = uuid.uuid4()
             if id_prefix:
+                # Keep aggregator wiring aligned with the prefixed node ids.
                 if isinstance(cloned, (ActionCallNode, FnCallNode)):
                     if cloned.aggregates_to and cloned.aggregates_to in fn_node_ids:
                         cloned.aggregates_to = f"{id_prefix}:{cloned.aggregates_to}"
@@ -324,6 +384,7 @@ class DAGConverter:
                 if target_node and target_node.is_fn_call:
                     continue
 
+            # Default to the original edge target if it was not expanded.
             new_target = id_map.get(edge.target, edge.target)
 
             cloned_edge = copy.deepcopy(edge)
@@ -337,6 +398,11 @@ class DAGConverter:
         return None
 
     def get_topo_order(self, dag: DAG, node_ids: Set[str]) -> List[str]:
+        """Return a topological order for the given node subset.
+
+        Only state-machine edges are considered and loop-back edges are ignored
+        so loops do not collapse the ordering.
+        """
         in_degree: Dict[str, int] = {node_id: 0 for node_id in node_ids}
         adjacency: Dict[str, List[str]] = {node_id: [] for node_id in node_ids}
 
@@ -362,6 +428,17 @@ class DAGConverter:
         return order
 
     def add_global_data_flow_edges(self, dag: DAG) -> None:
+        """Recompute and add data-flow edges for the full expanded DAG.
+
+        This rebuilds data-flow edges at the global level so variable uses in
+        guards, loop bodies, and expanded functions all point to the correct
+        definition nodes.
+
+        Example:
+        - x = 1
+        - if x > 0: @action(x)
+        The guard and action both receive data-flow edges from the assignment.
+        """
         existing_data_flow = [
             copy.deepcopy(edge) for edge in dag.edges if edge.edge_type == EdgeType.DATA_FLOW
         ]
@@ -371,6 +448,7 @@ class DAGConverter:
         in_degree: Dict[str, int] = {node_id: 0 for node_id in node_ids}
         adjacency: Dict[str, List[str]] = {node_id: [] for node_id in node_ids}
 
+        # Build a topo order for state-machine edges (without loop backs).
         for edge in dag.get_state_machine_edges():
             if edge.is_loop_back:
                 continue
@@ -391,12 +469,14 @@ class DAGConverter:
                     if in_degree[neighbor] == 0:
                         queue.append(neighbor)
 
+        # Keep loop-back state-machine edges to reapply data-flow across iterations.
         loop_back_edges = [
             copy.deepcopy(edge)
             for edge in dag.edges
             if edge.edge_type == EdgeType.STATE_MACHINE and edge.is_loop_back
         ]
 
+        # Track all nodes that define each variable in topo order.
         var_modifications: Dict[str, List[str]] = {}
         for node_id in order:
             node = dag.nodes.get(node_id)
@@ -414,6 +494,7 @@ class DAGConverter:
 
         var_modifications_clone = {k: list(v) for k, v in var_modifications.items()}
 
+        # Guard expressions count as variable uses that should receive data edges.
         node_guard_exprs: Dict[str, List[ir.Expr]] = {}
         for edge in dag.edges:
             if edge.guard_expr is not None:
@@ -448,6 +529,8 @@ class DAGConverter:
             (edge.source, edge.target, edge.variable) for edge in existing_data_flow
         }
 
+        # Exception edges start from action calls; we skip data edges that would
+        # imply dependencies through exception-only paths.
         exception_action_sources: Set[str] = {
             edge.source
             for edge in dag.edges
@@ -494,6 +577,8 @@ class DAGConverter:
                     reachable = reachable_via_normal_edges.get(mod_node, set())
                     next_mod_reachable = next_mod in reachable
 
+                # Add data edges to each downstream use until the next reachable
+                # modification of the same variable.
                 for pos, node_id in enumerate(order):
                     if pos <= mod_pos:
                         continue
@@ -519,6 +604,7 @@ class DAGConverter:
         loop_back_targets: Set[str] = {edge.target for edge in loop_back_edges}
         nodes_in_loop: Set[str] = set(loop_back_sources)
 
+        # Walk backwards from loop-back sources to find all nodes in the loop body.
         queue = list(loop_back_sources)
         visited: Set[str] = set(loop_back_sources)
         while queue:
@@ -537,6 +623,8 @@ class DAGConverter:
                 if mod_node not in nodes_in_loop:
                     continue
 
+                # Inside loops we allow data-flow to loop-internal nodes and
+                # to reachable nodes outside the loop body.
                 for node_id in order:
                     if node_id == mod_node:
                         continue
@@ -562,11 +650,13 @@ class DAGConverter:
                                 edge.is_loop_back = True
                             dag.edges.append(edge)
 
+                # Self edges inside loops keep loop-carried variables explicit.
                 self_key = (mod_node, mod_node, var_name)
                 if self_key not in seen_edges:
                     seen_edges.add(self_key)
                     dag.edges.append(DAGEdge.data_flow(mod_node, mod_node, var_name))
 
+        # Loop-back state-machine edges also imply data-flow for defined vars.
         for edge in loop_back_edges:
             source_node = dag.nodes.get(edge.source)
             if source_node is None:
@@ -576,6 +666,7 @@ class DAGConverter:
             for var in defined_vars:
                 dag.edges.append(DAGEdge.data_flow(edge.source, edge.target, var))
 
+        # After loops, connect loop "join" nodes to downstream uses of their targets.
         for node in dag.nodes.values():
             if node.node_type != "join":
                 continue
@@ -598,6 +689,15 @@ class DAGConverter:
         dag.edges.extend(existing_data_flow)
 
     def convert_function(self, fn_def: ir.FunctionDef) -> None:
+        """Convert a single function body into a DAG fragment.
+
+        This creates input/output nodes, converts each statement in order, and
+        adds per-function data-flow edges based on variable definitions.
+
+        Example IR:
+        - def main(x): y = x + 1; return y
+        Produces input -> assignment -> return -> output with x/y data edges.
+        """
         self.current_function = fn_def.name
         self.current_scope_vars.clear()
         self.var_modifications.clear()
@@ -651,11 +751,18 @@ class DAGConverter:
         self.current_function = None
 
     def next_id(self, prefix: str) -> str:
+        """Generate a stable node id for the current conversion session."""
         self.node_counter += 1
         return f"{prefix}_{self.node_counter}"
 
     @staticmethod
     def build_loop_guard(loop_i_var: str, collection: Optional[ir.Expr]) -> Optional[ir.Expr]:
+        """Build a guard expression for loop continuation based on collection length.
+
+        Example:
+        - loop_i_var="__loop_1_i", collection=items
+        - guard becomes "__loop_1_i < len(items)"
+        """
         if collection is None:
             return None
         return ir.Expr(
@@ -674,6 +781,11 @@ class DAGConverter:
         )
 
     def convert_block(self, block: ir.Block) -> ConvertedSubgraph:
+        """Convert a block into a connected subgraph.
+
+        This stitches statement graphs together with state-machine edges and
+        returns entry/exits for the caller to connect.
+        """
         nodes: List[str] = []
         entry: Optional[str] = None
         frontier: Optional[List[str]] = None
@@ -705,6 +817,7 @@ class DAGConverter:
         )
 
     def convert_statement(self, stmt: ir.Statement) -> ConvertedSubgraph:
+        """Convert a single statement into a subgraph with entry/exit nodes."""
         kind = stmt.WhichOneof("kind")
         match kind:
             case "assignment":
@@ -753,6 +866,12 @@ class DAGConverter:
         )
 
     def convert_assignment(self, assign: ir.Assignment) -> List[str]:
+        """Convert an assignment into one or more DAG nodes.
+
+        Example IR:
+        - x = @action()
+        Produces a call node with target x and tracks x as defined at that node.
+        """
         value = assign.value
         if value is None:
             return []
@@ -798,6 +917,7 @@ class DAGConverter:
         targets: Sequence[str],
         call: ir.FunctionCall,
     ) -> List[str]:
+        """Convert a function call assignment into a FnCallNode."""
         node_id = self.next_id("fn_call")
         kwargs, kwarg_exprs = self.extract_fn_call_args(call)
         call_expr = ir.Expr(function_call=copy.deepcopy(call))
@@ -822,6 +942,7 @@ class DAGConverter:
         action: ir.ActionCall,
         targets: Sequence[str],
     ) -> List[str]:
+        """Convert an action call into an ActionCallNode and track target bindings."""
         node_id = self.next_id("action")
         kwargs = self.extract_kwargs(action.kwargs)
         kwarg_exprs = self.extract_kwarg_exprs(action.kwargs)
@@ -844,6 +965,7 @@ class DAGConverter:
         return [node_id]
 
     def extract_kwargs(self, kwargs: Iterable[ir.Kwarg]) -> Dict[str, str]:
+        """Convert kwarg expressions into their string forms for labels/guards."""
         result: Dict[str, str] = {}
         for kwarg in kwargs:
             if kwarg.HasField("value"):
@@ -851,6 +973,7 @@ class DAGConverter:
         return result
 
     def extract_kwarg_exprs(self, kwargs: Iterable[ir.Kwarg]) -> Dict[str, ir.Expr]:
+        """Copy kwarg expressions so nodes can inspect or rewrite them later."""
         result: Dict[str, ir.Expr] = {}
         for kwarg in kwargs:
             if kwarg.HasField("value"):
@@ -860,6 +983,7 @@ class DAGConverter:
     def extract_fn_call_args(
         self, call: ir.FunctionCall
     ) -> tuple[Dict[str, str], Dict[str, ir.Expr]]:
+        """Build kwargs/kwarg_exprs by merging positional args with known inputs."""
         kwargs = self.extract_kwargs(call.kwargs)
         kwarg_exprs = self.extract_kwarg_exprs(call.kwargs)
 
@@ -881,6 +1005,7 @@ class DAGConverter:
         return kwargs, kwarg_exprs
 
     def expr_to_string(self, expr: ir.Expr) -> str:
+        """Render a best-effort string for UI labels and quick debugging."""
         kind = expr.WhichOneof("kind")
         match kind:
             case "variable":
@@ -919,6 +1044,7 @@ class DAGConverter:
                 assert_never(kind)
 
     def literal_to_string(self, lit: ir.Literal) -> str:
+        """Render a literal to a stable string for labels."""
         kind = lit.WhichOneof("value")
         match kind:
             case "int_value":
@@ -937,9 +1063,17 @@ class DAGConverter:
                 assert_never(kind)
 
     def convert_spread_action(self, spread: ir.SpreadAction) -> List[str]:
+        """Convert a spread action without explicit targets."""
         return self.convert_spread_action_with_targets(spread, [])
 
     def convert_spread_expr(self, spread: ir.SpreadExpr, targets: Sequence[str]) -> List[str]:
+        """Convert a spread expression into an action + aggregator pair.
+
+        Example IR:
+        - results = spread items: @do(item)
+        Produces a spread action node (one per item at runtime) and an
+        aggregator node that collects the spread results into results.
+        """
         action = spread.action
         action_id = self.next_id("spread_action")
         kwargs = self.extract_kwargs(action.kwargs)
@@ -984,6 +1118,7 @@ class DAGConverter:
     def convert_spread_action_with_targets(
         self, spread: ir.SpreadAction, targets: Sequence[str]
     ) -> List[str]:
+        """Convert a spread action statement into action + aggregator nodes."""
         action = spread.action
         action_id = self.next_id("spread_action")
         kwargs = self.extract_kwargs(action.kwargs)
@@ -1026,9 +1161,11 @@ class DAGConverter:
         return [action_id, agg_id]
 
     def convert_parallel_block(self, parallel: ir.ParallelBlock) -> List[str]:
+        """Convert a parallel block statement without assignment targets."""
         return self.convert_parallel_block_with_targets(parallel.calls, [])
 
     def convert_parallel_expr(self, parallel: ir.ParallelExpr, targets: Sequence[str]) -> List[str]:
+        """Convert a parallel expression with assignment targets."""
         return self.convert_parallel_block_with_targets(parallel.calls, targets)
 
     def convert_parallel_block_with_targets(
@@ -1036,6 +1173,12 @@ class DAGConverter:
         calls: Sequence[ir.Call],
         targets: Sequence[str],
     ) -> List[str]:
+        """Convert a parallel block/expression into a parallel node + calls + join.
+
+        Example IR:
+        - a, b = parallel: @x() @y()
+        Produces a parallel node, two call nodes, and an aggregator/join node.
+        """
         result_nodes: List[str] = []
 
         parallel_id = self.next_id("parallel")
@@ -1117,6 +1260,12 @@ class DAGConverter:
         return result_nodes
 
     def convert_for_loop(self, for_loop: ir.ForLoop) -> ConvertedSubgraph:
+        """Convert a for-loop into explicit loop init/cond/body/incr/exit nodes.
+
+        Example IR:
+        - for item in items: @work(item)
+        Expands into init (i = 0), cond, extract, body, incr, and loop join.
+        """
         nodes: List[str] = []
 
         loop_id = self.next_id("loop")
@@ -1271,6 +1420,7 @@ class DAGConverter:
         )
 
     def convert_while_loop(self, while_loop: ir.WhileLoop) -> ConvertedSubgraph:
+        """Convert a while-loop into explicit condition/body/continue/exit nodes."""
         nodes: List[str] = []
 
         if not while_loop.HasField("condition"):
@@ -1361,6 +1511,7 @@ class DAGConverter:
         )
 
     def convert_conditional(self, cond: ir.Conditional) -> ConvertedSubgraph:
+        """Convert an if/elif/else tree into a branch + optional join graph."""
         nodes: List[str] = []
 
         branch_id = self.next_id("branch")
@@ -1475,6 +1626,7 @@ class DAGConverter:
     def build_compound_guard(
         self, prior_guards: Sequence[ir.Expr], current_condition: Optional[ir.Expr]
     ) -> ir.Expr:
+        """Build a guard for elif branches: not prior_guards and current_condition."""
         parts: List[ir.Expr] = []
         for guard in prior_guards:
             parts.append(
@@ -1508,6 +1660,7 @@ class DAGConverter:
         return result
 
     def convert_try_except(self, try_except: ir.TryExcept) -> ConvertedSubgraph:
+        """Convert try/except blocks into exception-aware edges and optional join."""
         self.try_depth += 1
         current_depth = self.try_depth
         try:
@@ -1588,6 +1741,12 @@ class DAGConverter:
     def prepend_exception_binding(
         self, exception_var: str, graph: ConvertedSubgraph
     ) -> ConvertedSubgraph:
+        """Insert an exception binding node before a handler graph.
+
+        Example:
+        - except Exception as err: ...
+        Inserts "err = __exception__" before the handler body.
+        """
         binding_id = self.next_id("exc_bind")
         label = f"{exception_var} = {EXCEPTION_SCOPE_VAR}"
         assign_expr = ir.Expr(variable=ir.Variable(name=EXCEPTION_SCOPE_VAR))
@@ -1610,6 +1769,7 @@ class DAGConverter:
         return ConvertedSubgraph(entry=binding_id, exits=exits, nodes=nodes, is_noop=False)
 
     def convert_return(self, ret: ir.ReturnStmt) -> List[str]:
+        """Convert a return statement into a ReturnNode."""
         node_id = self.next_id("return")
         node = ReturnNode(
             id=node_id,
@@ -1629,6 +1789,7 @@ class DAGConverter:
         return [node_id]
 
     def convert_break(self) -> ConvertedSubgraph:
+        """Convert a break statement by wiring to the loop exit node."""
         if not self.loop_exit_stack:
             raise DagConversionError("break statement outside of loop")
         loop_exit = self.loop_exit_stack[-1]
@@ -1642,6 +1803,7 @@ class DAGConverter:
         return ConvertedSubgraph(entry=node_id, exits=[], nodes=[node_id], is_noop=False)
 
     def convert_continue(self) -> ConvertedSubgraph:
+        """Convert a continue statement by wiring to the loop increment node."""
         if not self.loop_incr_stack:
             raise DagConversionError("continue statement outside of loop")
         loop_incr = self.loop_incr_stack[-1]
@@ -1655,6 +1817,7 @@ class DAGConverter:
         return ConvertedSubgraph(entry=node_id, exits=[], nodes=[node_id], is_noop=False)
 
     def convert_expr_statement(self, expr_stmt: ir.ExprStmt) -> List[str]:
+        """Convert an expression statement into a node (or a no-op)."""
         if not expr_stmt.HasField("expr"):
             return []
 
@@ -1697,16 +1860,19 @@ class DAGConverter:
                 assert_never(kind)
 
     def track_var_definition(self, var_name: str, node_id: str) -> None:
+        """Record that a variable is defined at the given node."""
         self.current_scope_vars[var_name] = node_id
         self.var_modifications.setdefault(var_name, []).append(node_id)
 
     @staticmethod
     def push_unique_target(targets: List[str], target: str) -> None:
+        """Append a target if it is not already present."""
         if target not in targets:
             targets.append(target)
 
     @staticmethod
     def _targets_for_node(node: DAGNode) -> List[str]:
+        """Return assignment targets for nodes that bind variables."""
         if isinstance(
             node,
             (
@@ -1728,6 +1894,11 @@ class DAGConverter:
     def collect_assigned_targets(
         cls, statements: Iterable[ir.Statement], targets: List[str]
     ) -> None:
+        """Collect assignment targets from a statement list, recursively.
+
+        This is used to determine loop join node targets so data-flow edges
+        can carry loop-carried variables out of the loop body.
+        """
         for stmt in statements:
             kind = stmt.WhichOneof("kind")
             match kind:
@@ -1777,11 +1948,13 @@ class DAGConverter:
                     assert_never(kind)
 
     def add_data_flow_edges_for_function(self, function_name: str) -> None:
+        """Add per-function data-flow edges after a function conversion."""
         fn_node_ids = set(self.dag.get_nodes_for_function(function_name).keys())
         order = self.get_execution_order_for_nodes(fn_node_ids)
         self.add_data_flow_from_definitions(function_name, order)
 
     def add_data_flow_from_definitions(self, function_name: str, order: List[str]) -> None:
+        """Add data-flow edges using the current variable definition history."""
         fn_node_ids = set(self.dag.get_nodes_for_function(function_name).keys())
         edges_to_add: List[tuple[str, str, str]] = []
 
@@ -1813,6 +1986,7 @@ class DAGConverter:
             self.dag.add_edge(edge)
 
     def node_uses_variable(self, node: DAGNode, var_name: str) -> bool:
+        """Return True if a node's arguments reference the variable."""
         if isinstance(node, (ActionCallNode, FnCallNode)):
             for value in node.kwargs.values():
                 if value == f"${var_name}":
@@ -1826,6 +2000,7 @@ class DAGConverter:
 
     @staticmethod
     def expr_uses_var(expr: ir.Expr, var_name: str) -> bool:
+        """Return True if an expression tree references the variable name."""
         kind = expr.WhichOneof("kind")
         match kind:
             case "literal":
@@ -1910,6 +2085,7 @@ class DAGConverter:
                 assert_never(kind)
 
     def get_execution_order_for_nodes(self, node_ids: Set[str]) -> List[str]:
+        """Topologically order nodes using state-machine edges (ignoring loop backs)."""
         in_degree = {node_id: 0 for node_id in node_ids}
         adjacency = {node_id: [] for node_id in node_ids}
 

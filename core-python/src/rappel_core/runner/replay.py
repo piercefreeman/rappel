@@ -21,7 +21,7 @@ from .state import (
     RunnerState,
     SpreadValue,
     UnaryOpValue,
-    ValueExpr,
+    ValueExprVisitor,
     VariableValue,
 )
 
@@ -43,6 +43,85 @@ class EvalContext:
     index: Mapping[UUID, int]
     timeline: Sequence[UUID]
     incoming_data: Mapping[UUID, Sequence[UUID]]
+
+
+class ValueExprEvaluator(ValueExprVisitor[Any]):
+    """Evaluate ValueExpr nodes into concrete Python values.
+
+    Example:
+    - BinaryOpValue(VariableValue("a"), +, LiteralValue(1)) becomes the
+      current value of a plus 1.
+    """
+
+    def __init__(
+        self,
+        ctx: EvalContext,
+        current_node_id: UUID,
+        stack: set[tuple[UUID, str]],
+    ) -> None:
+        self._ctx = ctx
+        self._current_node_id = current_node_id
+        self._stack = stack
+
+    def visit_literal(self, expr: LiteralValue) -> Any:
+        return expr.value
+
+    def visit_variable(self, expr: VariableValue) -> Any:
+        return _resolve_variable(
+            self._ctx,
+            self._current_node_id,
+            expr.name,
+            self._stack,
+        )
+
+    def visit_action_result(self, expr: ActionResultValue) -> Any:
+        return _resolve_action_result(expr, self._ctx)
+
+    def visit_binary(self, expr: BinaryOpValue) -> Any:
+        left = self.visit(expr.left)
+        right = self.visit(expr.right)
+        return _apply_binary(expr.op, left, right)
+
+    def visit_unary(self, expr: UnaryOpValue) -> Any:
+        operand = self.visit(expr.operand)
+        return _apply_unary(expr.op, operand)
+
+    def visit_list(self, expr: ListValue) -> Any:
+        return [self.visit(item) for item in expr.elements]
+
+    def visit_dict(self, expr: DictValue) -> Any:
+        return {self.visit(entry.key): self.visit(entry.value) for entry in expr.entries}
+
+    def visit_index(self, expr: IndexValue) -> Any:
+        obj = self.visit(expr.object)
+        idx = self.visit(expr.index)
+        return obj[idx]
+
+    def visit_dot(self, expr: DotValue) -> Any:
+        obj = self.visit(expr.object)
+        if isinstance(obj, dict):
+            if expr.attribute in obj:
+                return obj[expr.attribute]
+            raise ReplayError(f"dict has no key '{expr.attribute}'")
+        try:
+            return object.__getattribute__(obj, expr.attribute)
+        except AttributeError as exc:
+            raise ReplayError(f"attribute '{expr.attribute}' not found") from exc
+
+    def visit_function_call(self, expr: FunctionCallValue) -> Any:
+        args = [self.visit(arg) for arg in expr.args]
+        kwargs = {name: self.visit(value) for name, value in expr.kwargs.items()}
+
+        if (
+            expr.global_function
+            and expr.global_function != ir.GlobalFunction.GLOBAL_FUNCTION_UNSPECIFIED
+        ):
+            return _evaluate_global_function(expr.global_function, args, kwargs)
+
+        raise ReplayError(f"cannot replay non-global function call: {expr.name}")
+
+    def visit_spread(self, expr: SpreadValue) -> Any:
+        raise ReplayError("cannot replay unresolved spread expression")
 
 
 def replay_variables(
@@ -95,83 +174,11 @@ def _evaluate_assignment(
         raise ReplayError(f"missing assignment for {target} in {node_id}")
 
     stack.add(key)
-    value = _evaluate_value(
-        node.assignments[target],
-        ctx,
-        node_id,
-        stack,
-    )
+    evaluator = ValueExprEvaluator(ctx, node_id, stack)
+    value = evaluator.visit(node.assignments[target])
     stack.remove(key)
     ctx.cache[key] = value
     return value
-
-
-def _evaluate_value(
-    expr: ValueExpr,
-    ctx: EvalContext,
-    current_node_id: UUID,
-    stack: set[tuple[UUID, str]],
-) -> Any:
-    if isinstance(expr, LiteralValue):
-        return expr.value
-    if isinstance(expr, VariableValue):
-        return _resolve_variable(
-            ctx,
-            current_node_id,
-            expr.name,
-            stack,
-        )
-    if isinstance(expr, ActionResultValue):
-        return _resolve_action_result(expr, ctx)
-    if isinstance(expr, BinaryOpValue):
-        left = _evaluate_value(
-            expr.left, ctx, current_node_id, stack
-        )
-        right = _evaluate_value(
-            expr.right, ctx, current_node_id, stack
-        )
-        return _apply_binary(expr.op, left, right)
-    if isinstance(expr, UnaryOpValue):
-        operand = _evaluate_value(
-            expr.operand, ctx, current_node_id, stack
-        )
-        return _apply_unary(expr.op, operand)
-    if isinstance(expr, ListValue):
-        return [
-            _evaluate_value(item, ctx, current_node_id, stack)
-            for item in expr.elements
-        ]
-    if isinstance(expr, DictValue):
-        return {
-            _evaluate_value(entry.key, ctx, current_node_id, stack): _evaluate_value(
-                entry.value, ctx, current_node_id, stack
-            )
-            for entry in expr.entries
-        }
-    if isinstance(expr, IndexValue):
-        obj = _evaluate_value(expr.object, ctx, current_node_id, stack)
-        idx = _evaluate_value(expr.index, ctx, current_node_id, stack)
-        return obj[idx]
-    if isinstance(expr, DotValue):
-        obj = _evaluate_value(expr.object, ctx, current_node_id, stack)
-        if isinstance(obj, dict):
-            if expr.attribute in obj:
-                return obj[expr.attribute]
-            raise ReplayError(f"dict has no key '{expr.attribute}'")
-        try:
-            return object.__getattribute__(obj, expr.attribute)
-        except AttributeError as exc:
-            raise ReplayError(f"attribute '{expr.attribute}' not found") from exc
-    if isinstance(expr, FunctionCallValue):
-        return _evaluate_function_call(
-            expr,
-            ctx,
-            current_node_id,
-            stack,
-        )
-    if isinstance(expr, SpreadValue):
-        raise ReplayError("cannot replay unresolved spread expression")
-    assert_never(expr)
 
 
 def _resolve_variable(
@@ -221,30 +228,6 @@ def _resolve_action_result(expr: ActionResultValue, ctx: EvalContext) -> Any:
         raise ReplayError(
             f"action result for {expr.node_id} has no index {expr.result_index}"
         ) from exc
-
-
-def _evaluate_function_call(
-    expr: FunctionCallValue,
-    ctx: EvalContext,
-    current_node_id: UUID,
-    stack: set[tuple[UUID, str]],
-) -> Any:
-    args = [
-        _evaluate_value(arg, ctx, current_node_id, stack)
-        for arg in expr.args
-    ]
-    kwargs = {
-        name: _evaluate_value(value, ctx, current_node_id, stack)
-        for name, value in expr.kwargs.items()
-    }
-
-    if (
-        expr.global_function
-        and expr.global_function != ir.GlobalFunction.GLOBAL_FUNCTION_UNSPECIFIED
-    ):
-        return _evaluate_global_function(expr.global_function, args, kwargs)
-
-    raise ReplayError(f"cannot replay non-global function call: {expr.name}")
 
 
 def _evaluate_global_function(
