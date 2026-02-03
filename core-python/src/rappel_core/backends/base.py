@@ -4,11 +4,34 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Sequence, TYPE_CHECKING
+from typing import Any, Iterable, Mapping, Sequence, TYPE_CHECKING
 from uuid import UUID
 
 if TYPE_CHECKING:  # pragma: no cover - type checkers only
-    from ..runner.state import RunnerState
+    from ..dag import DAG
+    from ..runner.state import ExecutionEdge, ExecutionNode, RunnerState
+
+
+@dataclass(frozen=True)
+class QueuedInstance:
+    """Queued instance payload for the run loop."""
+
+    dag: "DAG"
+    entry_node: UUID
+    state: "RunnerState | None" = None
+    nodes: "Mapping[UUID, ExecutionNode] | None" = None
+    edges: "Iterable[ExecutionEdge] | None" = None
+    action_results: "Mapping[UUID, Any] | None" = None
+
+
+@dataclass(frozen=True)
+class InstanceDone:
+    """Completed instance payload with result or exception."""
+
+    executor_id: UUID
+    entry_node: UUID
+    result: Any | None
+    error: Any | None
 
 
 @dataclass(frozen=True)
@@ -38,3 +61,11 @@ class BaseBackend(ABC):
     @abstractmethod
     def save_actions_done(self, actions: Sequence[ActionDone]) -> None:
         """Persist completed action executions."""
+
+    @abstractmethod
+    async def get_queued_instances(self, size: int) -> list["QueuedInstance"]:
+        """Return up to size queued instances without blocking."""
+
+    @abstractmethod
+    def save_instances_done(self, instances: Sequence[InstanceDone]) -> None:
+        """Persist completed workflow instances."""

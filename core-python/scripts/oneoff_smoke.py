@@ -1,26 +1,21 @@
-"""CLI smoke check for core-python components."""
+"""One-off smoke script to exercise DAG execution with the runloop."""
 
 from __future__ import annotations
 
-import argparse
 import asyncio
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 from proto import ast_pb2 as ir
 
-from .dag import DAG, convert_to_dag
-from .dag_viz import render_dag_image
-from .ir_examples import EXAMPLES
-from .ir_executor import ExecutionError, StatementExecutor
-from .ir_format import format_program
-from .backends import MemoryBackend, QueuedInstance
-from .runloop import RunLoop
-from .runner import RunnerState, replay_variables
-from .runner.state import LiteralValue
-from .workers import InlineWorkerPool
+from rappel_core import convert_to_dag, format_program, render_dag_image
+from rappel_core.backends import MemoryBackend, QueuedInstance
+from rappel_core.ir_executor import ExecutionError, StatementExecutor
+from rappel_core.runloop import RunLoop
+from rappel_core.runner import RunnerState, replay_variables
+from rappel_core.runner.state import LiteralValue
+from rappel_core.workers import InlineWorkerPool
 
 
 def _literal_int(value: int) -> ir.Expr:
@@ -55,13 +50,7 @@ def _literal_from_value(value: Any) -> ir.Expr:
 
 def _build_program() -> ir.Program:
     values_expr = ir.Expr(
-        list=ir.ListExpr(
-            elements=[
-                _literal_int(1),
-                _literal_int(2),
-                _literal_int(3),
-            ]
-        )
+        list=ir.ListExpr(elements=[_literal_int(1), _literal_int(2), _literal_int(3)])
     )
     doubles_expr = ir.Expr(
         spread_expr=ir.SpreadExpr(
@@ -156,10 +145,7 @@ async def _action_sum(values: list[int]) -> int:
     return sum(values)
 
 
-ACTION_REGISTRY = {
-    "double": _action_double,
-    "sum": _action_sum,
-}
+ACTION_REGISTRY = {"double": _action_double, "sum": _action_sum}
 
 
 async def _action_handler(action: ir.ActionCall, kwargs: dict[str, Any]) -> Any:
@@ -195,10 +181,27 @@ def _build_runner_demo_state() -> tuple[RunnerState, dict[UUID, int]]:
     return state, action_results
 
 
-async def _run_executor_demo(dag: DAG, inputs: dict[str, Any]) -> None:
+async def main() -> int:
+    program = _build_program()
+    inputs = {"base": 5}
+
+    print("IR program")
+    print(format_program(program))
+    print(f"IR inputs: {inputs}")
+
+    dag = convert_to_dag(program)
+    output_path = render_dag_image(dag, Path.cwd() / "dag_smoke.png")
+    print(f"DAG image written to {output_path}")
+
+    executor = StatementExecutor(program, _action_handler)
+    result = await executor.execute_program(inputs=inputs)
+    print(f"Execution result: {result}")
+
+    demo_state, action_results = _build_runner_demo_state()
+    replayed = replay_variables(demo_state, action_results)
+    print(f"Runner replay variables: {replayed.variables}")
+
     state = RunnerState(dag=dag, link_queued_nodes=False)
-    instance_queue: asyncio.Queue[QueuedInstance] = asyncio.Queue()
-    backend = MemoryBackend(instance_queue)
     for name, value in inputs.items():
         state.record_assignment(
             targets=[name],
@@ -210,9 +213,11 @@ async def _run_executor_demo(dag: DAG, inputs: dict[str, Any]) -> None:
         raise RuntimeError("DAG entry node not found")
 
     entry_exec = state.queue_template_node(dag.entry_node)
-    action_results: dict[UUID, Any] = {}
+    instance_queue: asyncio.Queue[QueuedInstance] = asyncio.Queue()
+    backend = MemoryBackend(instance_queue)
     worker_pool = InlineWorkerPool(ACTION_REGISTRY)
-    runloop = RunLoop(worker_pool, backend)
+    runloop = RunLoop(worker_pool, backend, poll_interval=0)
+
     await instance_queue.put(
         QueuedInstance(
             dag=dag,
@@ -221,87 +226,14 @@ async def _run_executor_demo(dag: DAG, inputs: dict[str, Any]) -> None:
             action_results=action_results,
         )
     )
-    result = await runloop.run()
-    executed = next(iter(result.completed_actions.values()), [])
-    print("Runner executor actions: %s" % [node.label for node in executed])
+    runloop_result = await runloop.run()
+    executed = next(iter(runloop_result.completed_actions.values()), [])
+    print(f"Runner executor actions: {[node.label for node in executed]}")
+    print(f"Runloop action results: {action_results}")
+    final_replay = replay_variables(state, action_results)
+    print(f"Runloop replay variables: {final_replay.variables}")
+    return 0
 
 
-@dataclass(frozen=True)
-class SmokeCase:
-    name: str
-    program: ir.Program
-    inputs: dict[str, Any]
-    run_runner_demo: bool = False
-
-
-def _slugify(name: str) -> str:
-    return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in name)
-
-
-async def _run_program_smoke(case: SmokeCase) -> None:
-    print("\nIR program (%s)" % case.name)
-    print(format_program(case.program))
-    print("IR inputs (%s): %s" % (case.name, case.inputs))
-    dag = convert_to_dag(case.program)
-    slug = _slugify(case.name)
-    output_path = render_dag_image(dag, Path.cwd() / f"dag_smoke_{slug}.png")
-    print("DAG image (%s) written to %s" % (case.name, output_path))
-
-    executor = StatementExecutor(case.program, _action_handler)
-    result = await executor.execute_program(inputs=case.inputs)
-    print("Execution result (%s): %s" % (case.name, result))
-
-    if case.run_runner_demo:
-        demo_state, action_results = _build_runner_demo_state()
-        replayed = replay_variables(demo_state, action_results)
-        print("Runner replay variables: %s" % replayed.variables)
-        await _run_executor_demo(dag, case.inputs)
-
-
-async def _run_smoke(base: int) -> int:
-    cases = [
-        SmokeCase(
-            name="smoke",
-            program=_build_program(),
-            inputs={"base": base},
-            run_runner_demo=True,
-        ),
-        SmokeCase(
-            name="control_flow",
-            program=EXAMPLES["control_flow"](),
-            inputs={"base": 2},
-        ),
-        SmokeCase(
-            name="parallel_spread",
-            program=EXAMPLES["parallel_spread"](),
-            inputs={"base": 3},
-        ),
-        SmokeCase(
-            name="try_except",
-            program=EXAMPLES["try_except"](),
-            inputs={"values": [1, 2, 3]},
-        ),
-        SmokeCase(
-            name="while_loop",
-            program=EXAMPLES["while_loop"](),
-            inputs={"limit": 6},
-        ),
-    ]
-
-    failures = 0
-    for case in cases:
-        try:
-            await _run_program_smoke(case)
-        except Exception as exc:
-            failures += 1
-            print("Smoke case '%s' failed: %s" % (case.name, exc))
-
-    return 1 if failures else 0
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Smoke check core-python components.")
-    parser.add_argument("--base", type=int, default=5, help="Base input for the demo program.")
-    args = parser.parse_args()
-
-    raise SystemExit(asyncio.run(_run_smoke(args.base)))
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(main()))

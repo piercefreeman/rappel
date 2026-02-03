@@ -35,13 +35,20 @@ def build_dag_graph(dag: DAG) -> graphviz.Digraph:
         color="#4B4B4B",
     )
 
-    for node_id in sorted(dag.nodes):
+    node_ids = sorted(dag.nodes)
+    node_id_map = {node_id: f"node_{idx}" for idx, node_id in enumerate(node_ids)}
+
+    for node_id in node_ids:
         node = dag.nodes[node_id]
-        graph.node(node.id, label=_node_label(node), **_node_attrs(node))
+        graph.node(node_id_map[node_id], label=_node_label(node), **_node_attrs(node))
 
     for edge in dag.edges:
         attrs = _edge_attrs(edge)
-        graph.edge(edge.source, edge.target, **attrs)
+        source = node_id_map.get(edge.source)
+        target = node_id_map.get(edge.target)
+        if source is None or target is None:
+            continue
+        graph.edge(source, target, **attrs)
 
     return graph
 

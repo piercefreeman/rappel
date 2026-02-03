@@ -2,9 +2,9 @@ import asyncio
 
 from proto import ast_pb2 as ir
 
+from rappel_core.backends import MemoryBackend, QueuedInstance
 from rappel_core.dag import DAG, ActionCallNode, DAGEdge, InputNode, OutputNode
 from rappel_core.runloop import RunLoop
-from rappel_core.runner.executor import RunnerExecutor
 from rappel_core.runner.state import RunnerState
 from rappel_core.workers import InlineWorkerPool
 
@@ -34,15 +34,24 @@ def test_runloop_executes_actions() -> None:
         label="input x = 4",
     )
     entry_exec = state.queue_template_node(input_node.id)
-    executor = RunnerExecutor(dag, state=state, action_results={})
+    action_results: dict = {}
 
     async def double(value: int) -> int:
         return value * 2
 
+    instance_queue: asyncio.Queue[QueuedInstance] = asyncio.Queue()
+    backend = MemoryBackend(instance_queue)
     worker_pool = InlineWorkerPool({"double": double})
-    runloop = RunLoop(worker_pool)
-    runloop.register_executor(executor, entry_exec.node_id)
+    runloop = RunLoop(worker_pool, backend, poll_interval=0)
+    instance_queue.put_nowait(
+        QueuedInstance(
+            dag=dag,
+            entry_node=entry_exec.node_id,
+            state=state,
+            action_results=action_results,
+        )
+    )
     asyncio.run(runloop.run())
 
-    results = list(executor.action_results.values())
+    results = list(action_results.values())
     assert results == [8]

@@ -35,6 +35,7 @@ from .ir_executor import (
 from .ir_format import format_program
 from .runner import RunnerState
 from .runloop import RunLoop, RunLoopResult
+from .backends import InstanceDone, QueuedInstance
 from .workers import ActionCompletion, ActionRequest, BaseWorkerPool, InlineWorkerPool
 
 __all__ = [
@@ -75,4 +76,6 @@ __all__ = [
     "RunnerState",
     "RunLoop",
     "RunLoopResult",
+    "InstanceDone",
+    "QueuedInstance",
 ]

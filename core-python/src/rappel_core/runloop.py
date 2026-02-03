@@ -8,6 +8,9 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 from uuid import UUID, uuid4
 
+from .backends.base import BaseBackend, InstanceDone, QueuedInstance
+from .dag import DAG, OutputNode, ReturnNode
+from .runner import replay_variables
 from .runner.executor import RunnerExecutor
 from .runner.state import ExecutionNode
 from .workers.base import ActionCompletion, ActionRequest, BaseWorkerPool
@@ -33,13 +36,26 @@ class RunLoop:
     owning executor, and continues until no actions remain in flight.
     """
 
-    def __init__(self, worker_pool: BaseWorkerPool) -> None:
+    def __init__(
+        self,
+        worker_pool: BaseWorkerPool,
+        backend: BaseBackend,
+        *,
+        instance_batch_size: int = 25,
+        poll_interval: float = 0.05,
+    ) -> None:
         self._worker_pool = worker_pool
+        self._backend = backend
+        self._instance_batch_size = max(1, instance_batch_size)
+        self._poll_interval = max(0.0, poll_interval)
         self._executors: dict[UUID, RunnerExecutor] = {}
         self._entry_nodes: dict[UUID, UUID] = {}
         self._inflight: set[tuple[UUID, UUID]] = set()
         self._completion_queue: "asyncio.Queue[list[ActionCompletion]]" = asyncio.Queue()
+        self._instance_queue: "asyncio.Queue[list[QueuedInstance]]" = asyncio.Queue()
         self._stop = asyncio.Event()
+        self._instances_idle = asyncio.Event()
+        self._completed_executors: set[UUID] = set()
 
     def register_executor(self, executor: RunnerExecutor, entry_node: UUID) -> UUID:
         """Register an executor and its entry node, returning an executor id."""
@@ -50,9 +66,6 @@ class RunLoop:
 
     async def run(self) -> RunLoopResult:
         """Run all registered executors until no actions remain in flight."""
-        if not self._executors:
-            return RunLoopResult()
-
         result = RunLoopResult(
             completed_actions={executor_id: [] for executor_id in self._executors}
         )
@@ -64,15 +77,23 @@ class RunLoop:
             step = executor.increment(entry_node)
             self._queue_actions(executor_id, executor, step.actions)
 
+        poll_instances_task = asyncio.create_task(self._poll_instances())
+        process_instances_task = asyncio.create_task(self._process_instances(result))
         poll_task = asyncio.create_task(self._poll_completions())
         process_task = asyncio.create_task(self._process_completions(result))
 
-        if not self._inflight:
+        if not self._inflight and self._executors:
             self._stop.set()
 
         await self._stop.wait()
+        poll_instances_task.cancel()
+        process_instances_task.cancel()
         poll_task.cancel()
         process_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await poll_instances_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await process_instances_task
         with contextlib.suppress(asyncio.CancelledError):
             await poll_task
         with contextlib.suppress(asyncio.CancelledError):
@@ -113,9 +134,116 @@ class RunLoop:
                 if finished_nodes:
                     step = executor.increment_batch(finished_nodes)
                     self._queue_actions(executor_id, executor, step.actions)
+                self._finalize_executor_if_done(executor_id, executor)
 
-            if not self._inflight:
-                self._stop.set()
+            self._maybe_stop()
+
+    async def _poll_instances(self) -> None:
+        while not self._stop.is_set():
+            instances = await self._backend.get_queued_instances(self._instance_batch_size)
+            if instances:
+                self._instances_idle.clear()
+                await self._instance_queue.put(instances)
+            else:
+                self._instances_idle.set()
+                self._maybe_stop()
+            if self._poll_interval > 0:
+                await asyncio.sleep(self._poll_interval)
+            else:
+                await asyncio.sleep(0)
+
+    async def _process_instances(self, result: RunLoopResult) -> None:
+        while not self._stop.is_set():
+            instances = await self._instance_queue.get()
+            for instance in instances:
+                executor_id = self._register_instance(instance, result)
+                executor = self._executors[executor_id]
+                step = executor.increment(instance.entry_node)
+                self._queue_actions(executor_id, executor, step.actions)
+                self._finalize_executor_if_done(executor_id, executor)
+            self._maybe_stop()
+
+    def _register_instance(self, instance: QueuedInstance, result: RunLoopResult) -> UUID:
+        if instance.state is not None:
+            executor = RunnerExecutor(
+                instance.dag,
+                state=instance.state,
+                action_results=instance.action_results,
+                backend=self._backend,
+            )
+        else:
+            executor = RunnerExecutor(
+                instance.dag,
+                nodes=instance.nodes,
+                edges=instance.edges,
+                action_results=instance.action_results,
+                backend=self._backend,
+            )
+        executor_id = uuid4()
+        self._executors[executor_id] = executor
+        self._entry_nodes[executor_id] = instance.entry_node
+        result.completed_actions.setdefault(executor_id, [])
+        return executor_id
+
+    def _finalize_executor_if_done(self, executor_id: UUID, executor: RunnerExecutor) -> None:
+        if executor_id in self._completed_executors:
+            return
+        if self._has_inflight(executor_id):
+            return
+        result_payload, error_payload = self._compute_instance_payload(executor)
+        self._backend.save_instances_done(
+            [
+                InstanceDone(
+                    executor_id=executor_id,
+                    entry_node=self._entry_nodes[executor_id],
+                    result=result_payload,
+                    error=error_payload,
+                )
+            ]
+        )
+        self._completed_executors.add(executor_id)
+
+    def _has_inflight(self, executor_id: UUID) -> bool:
+        return any(exec_id == executor_id for exec_id, _ in self._inflight)
+
+    def _compute_instance_payload(self, executor: RunnerExecutor) -> tuple[Any | None, Any | None]:
+        try:
+            outputs = self._output_vars(executor.dag)
+            replayed = replay_variables(executor.state, executor.action_results)
+            if outputs:
+                result = {name: replayed.variables.get(name) for name in outputs}
+            else:
+                result = replayed.variables
+            return result, None
+        except Exception as exc:  # noqa: BLE001 - surface payload error
+            return None, exc
+
+    @staticmethod
+    def _output_vars(dag: "DAG") -> list[str]:
+        names: list[str] = []
+        seen: set[str] = set()
+        for node in dag.nodes.values():
+            if isinstance(node, OutputNode):
+                for name in node.io_vars:
+                    if name in seen:
+                        continue
+                    seen.add(name)
+                    names.append(name)
+            elif isinstance(node, ReturnNode):
+                if node.targets:
+                    for name in node.targets:
+                        if name in seen:
+                            continue
+                        seen.add(name)
+                        names.append(name)
+                elif node.target and node.target not in seen:
+                    seen.add(node.target)
+                    names.append(node.target)
+        return names
+
+    def _maybe_stop(self) -> None:
+        if not self._inflight and self._instances_idle.is_set() and self._instance_queue.empty():
+            self._stop.set()
 
     def _queue_actions(
         self,

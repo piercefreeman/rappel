@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Optional, Sequence
 from uuid import UUID
@@ -36,6 +37,10 @@ from .state import (
     VariableValue,
 )
 from .value_visitor import ValueExpr, ValueExprEvaluator
+
+LOGGER = logging.getLogger(__name__)
+
+LOGGER = logging.getLogger(__name__)
 
 
 class RunnerExecutorError(Exception):
@@ -94,6 +99,10 @@ class RunnerExecutor:
         return self._state
 
     @property
+    def dag(self) -> DAG:
+        return self._dag
+
+    @property
     def action_results(self) -> Mapping[UUID, Any]:
         return self._action_results
 
@@ -142,6 +151,8 @@ class RunnerExecutor:
         Use this when multiple actions complete in the same tick so the graph
         update and action inserts are persisted together.
         """
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug("increment_batch finished_nodes=%s", [str(node) for node in finished_nodes])
         self._eval_cache.clear()
         actions_done: list[ActionDone] = []
         pending_starts: list[tuple[ExecutionNode, Optional[Any]]] = []
@@ -198,6 +209,13 @@ class RunnerExecutor:
                         continue
                     if not self._inline_ready(successor):
                         continue
+                    if LOGGER.isEnabledFor(logging.DEBUG):
+                        LOGGER.debug(
+                            "execute_inline node=%s template=%s type=%s",
+                            successor.node_id,
+                            successor.template_id,
+                            successor.node_type,
+                        )
                     self._execute_inline_node(successor)
                     pending.append((successor, None))
         return actions
@@ -274,6 +292,9 @@ class RunnerExecutor:
             return self._expand_spread_action(source, template)
 
         if isinstance(template, AggregatorNode):
+            existing = self._find_connected_aggregator(source.node_id, template.id)
+            if existing is not None:
+                return [existing]
             agg_node = self._get_or_create_aggregator(template.id)
             self._add_exec_edge(source.node_id, agg_node.node_id)
             return [agg_node]
@@ -304,6 +325,14 @@ class RunnerExecutor:
             raise RunnerExecutorError("spread action missing aggregator link")
 
         agg_node = self._state.queue_template_node(template.aggregates_to)
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
+                "spread_expand template=%s loop_var=%s elements=%d agg_node=%s",
+                template.id,
+                template.spread_loop_var,
+                len(elements),
+                agg_node.node_id,
+            )
         if not elements:
             return [agg_node]
 
@@ -317,6 +346,20 @@ class RunnerExecutor:
             self._add_exec_edge(source.node_id, exec_node.node_id)
             self._add_exec_edge(exec_node.node_id, agg_node.node_id)
             created_actions.append(exec_node)
+            if LOGGER.isEnabledFor(logging.DEBUG):
+                LOGGER.debug(
+                    "spread_action node=%s iter=%s agg_node=%s",
+                    exec_node.node_id,
+                    idx,
+                    agg_node.node_id,
+                )
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            incoming = self._incoming_exec_edges.get(agg_node.node_id, [])
+            LOGGER.debug(
+                "spread_agg_edges agg_node=%s incoming=%d",
+                agg_node.node_id,
+                len(incoming),
+            )
         return created_actions
 
     def _queue_action_from_template(
@@ -349,6 +392,15 @@ class RunnerExecutor:
             targets=targets,
             action=spec,
         )
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
+                "queue_action node=%s template=%s action=%s iter=%s targets=%s",
+                node.node_id,
+                template.id,
+                spec.action_name,
+                iteration_index,
+                targets,
+            )
         for value in spec.kwargs.values():
             self._state._record_data_flow_from_value(node.node_id, value)
         result = self._state._assign_action_results(node, template.action_name, targets, iteration_index)
@@ -386,6 +438,20 @@ class RunnerExecutor:
                 source = self._state.nodes.get(edge.source)
                 if source is None or source.status != NodeStatus.COMPLETED:
                     return False
+            if LOGGER.isEnabledFor(logging.DEBUG):
+                statuses = [
+                    f"{edge.source}:{self._state.nodes[edge.source].status.value}"
+                    for edge in incoming
+                    if edge.source in self._state.nodes
+                ]
+                LOGGER.debug(
+                    "aggregator_ready node=%s incoming=%d required=%s connected=%s statuses=%s",
+                    node.node_id,
+                    len(incoming),
+                    list(required),
+                    list(connected),
+                    statuses,
+                )
             return True
 
         for edge in incoming:
@@ -411,11 +477,25 @@ class RunnerExecutor:
             for edge in self._incoming_exec_edges.get(node.node_id, [])
             if edge.edge_type == EdgeType.STATE_MACHINE
         ]
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
+                "aggregator_assign node=%s incoming_nodes=%d",
+                node.node_id,
+                len(incoming_nodes),
+            )
         values: list[ValueExpr] = []
         for source in incoming_nodes:
             if source.value_expr is None:
                 raise RunnerExecutorError("aggregator missing source value")
             values.append(source.value_expr)
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            labels: list[str] = []
+            for value in values:
+                if isinstance(value, ActionResultValue):
+                    labels.append(value.label())
+                else:
+                    labels.append(type(value).__name__)
+            LOGGER.debug("aggregator_values node=%s values=%s", node.node_id, labels)
 
         ordered = self._order_aggregated_values(incoming_nodes, values)
         list_value = ListValue(elements=tuple(ordered))
@@ -788,6 +868,13 @@ class RunnerExecutor:
             return
         self._state.edges.add(edge)
         self._incoming_exec_edges.setdefault(target, []).append(edge)
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
+                "exec_edge_add source=%s target=%s type=%s",
+                source,
+                target,
+                edge.edge_type.value,
+            )
 
     def _connected_template_sources(self, exec_node_id: UUID) -> set[str]:
         connected: set[str] = set()
@@ -797,6 +884,29 @@ class RunnerExecutor:
                 continue
             connected.add(source.template_id)
         return connected
+
+    def _find_connected_aggregator(
+        self, source_id: UUID, template_id: str
+    ) -> Optional[ExecutionNode]:
+        for edge in self._state.edges:
+            if edge.edge_type != EdgeType.STATE_MACHINE:
+                continue
+            if edge.source != source_id:
+                continue
+            target = self._state.nodes.get(edge.target)
+            if target is None:
+                continue
+            if target.template_id == template_id:
+                if LOGGER.isEnabledFor(logging.DEBUG):
+                    LOGGER.debug(
+                        "aggregator_reuse source=%s template=%s node=%s status=%s",
+                        source_id,
+                        template_id,
+                        target.node_id,
+                        target.status.value,
+                    )
+                return target
+        return None
 
     def _get_or_create_aggregator(self, template_id: str) -> ExecutionNode:
         candidates = [
