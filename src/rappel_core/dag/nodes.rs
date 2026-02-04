@@ -7,6 +7,9 @@ use uuid::Uuid;
 
 use crate::messages::ast as ir;
 
+/// Function entry node that declares input variables.
+///
+/// Visualization example: label="input: [base, limit]"
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InputNode {
     pub id: String,
@@ -34,6 +37,9 @@ impl InputNode {
     }
 }
 
+/// Function output node that exposes return values.
+///
+/// Visualization example: label="output: [result]"
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OutputNode {
     pub id: String,
@@ -57,6 +63,9 @@ impl OutputNode {
     }
 }
 
+/// Represents assignment statements in the DAG.
+///
+/// Visualization example: label="total = ..."
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AssignmentNode {
     pub id: String,
@@ -106,6 +115,11 @@ impl AssignmentNode {
     }
 }
 
+/// Invokes an action via @action() with optional parallel/spread context.
+///
+/// Visualization examples:
+/// - label="@double() -> value"
+/// - label="@fetch() [spread over item]"
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ActionCallNode {
     pub id: String,
@@ -207,6 +221,9 @@ impl ActionCallNode {
     }
 }
 
+/// Invokes a user-defined function inside the DAG.
+///
+/// Visualization example: label="helper() -> output"
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FnCallNode {
     pub id: String,
@@ -286,6 +303,9 @@ impl FnCallNode {
     }
 }
 
+/// Parallel fan-out control node.
+///
+/// Visualization example: label="parallel"
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParallelNode {
     pub id: String,
@@ -307,6 +327,11 @@ impl ParallelNode {
     }
 }
 
+/// Collects outputs from parallel or spread branches.
+///
+/// Visualization examples:
+/// - label="aggregate -> result"
+/// - label="parallel_aggregate -> outputs"
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AggregatorNode {
     pub id: String,
@@ -360,6 +385,9 @@ impl AggregatorNode {
     }
 }
 
+/// Conditional branch dispatch node.
+///
+/// Visualization example: label="if guard"
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BranchNode {
     pub id: String,
@@ -387,6 +415,9 @@ impl BranchNode {
     }
 }
 
+/// Converges multiple control-flow branches.
+///
+/// Visualization example: label="join"
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JoinNode {
     pub id: String,
@@ -421,6 +452,9 @@ impl JoinNode {
     }
 }
 
+/// Return node used when expanding nested functions.
+///
+/// Visualization example: label="return"
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReturnNode {
     pub id: String,
@@ -455,6 +489,7 @@ impl ReturnNode {
     }
 }
 
+/// Loop break node.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BreakNode {
     pub id: String,
@@ -476,6 +511,7 @@ impl BreakNode {
     }
 }
 
+/// Loop continue node.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ContinueNode {
     pub id: String,
@@ -497,6 +533,7 @@ impl ContinueNode {
     }
 }
 
+/// Bare expression statement node.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExpressionNode {
     pub id: String,
@@ -518,6 +555,15 @@ impl ExpressionNode {
     }
 }
 
+/// Base class for DAG nodes with computed labels and shared metadata.
+///
+/// We keep rich node detail here so scheduling, validation, and visualization
+/// can share the same source of truth without re-deriving labels or intent.
+///
+/// Visualization examples:
+/// - id="main_input_1", label="input: [x]"
+/// - id="action_4", label="@fetch() -> data"
+/// - id="join_7", label="join"
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "node_type", content = "data")]
 pub enum DAGNode {

@@ -3,6 +3,7 @@
 use crate::messages::ast as ir;
 const DEFAULT_INDENT: &str = "    ";
 
+/// Render IR AST nodes into a source-like representation.
 pub struct IRFormatter {
     indent: String,
 }
@@ -552,6 +553,7 @@ impl IRFormatter {
     }
 }
 
+/// Convenience wrapper to format a program.
 pub fn format_program(program: &ir::Program) -> String {
     IRFormatter::new(DEFAULT_INDENT).format_program(program)
 }

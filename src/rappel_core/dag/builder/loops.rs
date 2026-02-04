@@ -6,7 +6,13 @@ use super::super::models::{ConvertedSubgraph, DAGEdge, DagConversionError};
 use super::super::nodes::{AssignmentNode, BranchNode, BreakNode, ContinueNode, JoinNode};
 use super::converter::DAGConverter;
 
+/// Convert loop constructs into explicit DAG nodes.
 impl DAGConverter {
+    /// Build a guard expression for loop continuation based on collection length.
+    ///
+    /// Example:
+    /// - loop_i_var="__loop_1_i", collection=items
+    ///   guard becomes "__loop_1_i < len(items)"
     pub fn build_loop_guard(loop_i_var: &str, collection: Option<&ir::Expr>) -> Option<ir::Expr> {
         let collection = collection?.clone();
         let len_call = ir::FunctionCall {
@@ -36,6 +42,11 @@ impl DAGConverter {
         })
     }
 
+    /// Convert a for-loop into explicit loop init/cond/body/incr/exit nodes.
+    ///
+    /// Example IR:
+    /// - for item in items: @work(item)
+    ///   Expands into init (i = 0), cond, extract, body, incr, and loop join.
     pub fn convert_for_loop(
         &mut self,
         for_loop: &ir::ForLoop,
@@ -236,6 +247,7 @@ impl DAGConverter {
         })
     }
 
+    /// Convert a while-loop into explicit condition/body/continue/exit nodes.
     pub fn convert_while_loop(
         &mut self,
         while_loop: &ir::WhileLoop,
@@ -348,6 +360,7 @@ impl DAGConverter {
         })
     }
 
+    /// Convert a break statement by wiring to the loop exit node.
     pub fn convert_break(&mut self) -> Result<ConvertedSubgraph, DagConversionError> {
         let loop_exit = self
             .loop_exit_stack
@@ -370,6 +383,7 @@ impl DAGConverter {
         })
     }
 
+    /// Convert a continue statement by wiring to the loop increment node.
     pub fn convert_continue(&mut self) -> Result<ConvertedSubgraph, DagConversionError> {
         let loop_incr =
             self.loop_incr_stack.last().cloned().ok_or_else(|| {

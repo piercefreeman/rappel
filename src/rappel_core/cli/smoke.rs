@@ -10,35 +10,21 @@ use uuid::Uuid;
 
 use crate::messages::ast as ir;
 use crate::rappel_core::backends::{MemoryBackend, QueuedInstance};
-use crate::rappel_core::dag::{DAG, convert_to_dag};
+use crate::rappel_core::dag::convert_to_dag;
 use crate::rappel_core::dag_viz::render_dag_image;
-use crate::rappel_core::ir_examples::{binary, list_expr, variable};
-use crate::rappel_core::ir_examples::{
-    build_control_flow_program, build_parallel_spread_program, build_try_except_program,
-    build_while_loop_program, list_examples,
-};
-use crate::rappel_core::ir_executor::{ExecutionError, StatementExecutor};
+use crate::rappel_core::ir_executor::ExecutionError;
 use crate::rappel_core::ir_format::format_program;
+use crate::rappel_core::ir_parser::parse_program;
 use crate::rappel_core::runloop::RunLoop;
-use crate::rappel_core::runner::state::LiteralValue;
-use crate::rappel_core::runner::value_visitor::ValueExpr;
-use crate::rappel_core::runner::{RunnerState, replay_variables};
-use crate::rappel_core::workers::{ActionCallable, InlineWorkerPool, WorkerPoolError};
+use crate::rappel_core::runner::RunnerState;
+use crate::server_worker::WorkerBridgeServer;
+use crate::workers::{PythonWorkerConfig, PythonWorkerPool, RemoteWorkerPool};
 
 #[derive(Parser, Debug)]
 #[command(name = "rappel-smoke", about = "Smoke check core-python components.")]
 struct SmokeArgs {
     #[arg(long, default_value_t = 5)]
     base: i64,
-}
-
-fn literal_int(value: i64) -> ir::Expr {
-    ir::Expr {
-        kind: Some(ir::expr::Kind::Literal(ir::Literal {
-            value: Some(ir::literal::Value::IntValue(value)),
-        })),
-        span: None,
-    }
 }
 
 pub(crate) fn literal_from_value(value: &Value) -> ir::Expr {
@@ -102,272 +88,162 @@ pub(crate) fn literal_from_value(value: &Value) -> ir::Expr {
     }
 }
 
+fn parse_program_source(source: &str) -> Result<ir::Program, String> {
+    parse_program(source.trim()).map_err(|err| err.to_string())
+}
+
+const SMOKE_SOURCE: &str = r#"
+fn main(input: [base], output: [final]):
+    values = [1, 2, 3]
+    doubles = spread values:item -> @tests.fixtures.test_actions.double(value=item)
+    a, b = parallel:
+        @tests.fixtures.test_actions.double(value=base)
+        @tests.fixtures.test_actions.double(value=base + 1)
+    pair_sum = a + b
+    total = @tests.fixtures.test_actions.sum(values=doubles)
+    final = pair_sum + total
+    return final
+"#;
+
+const CONTROL_FLOW_SOURCE: &str = r#"
+fn main(input: [base], output: [summary]):
+    payload = {"items": [1, 2, 3, 4], "limit": base}
+    items = payload.items
+    first_item = items[0]
+    limit = payload.limit
+    results = []
+    for idx, item in enumerate(items):
+        if item % 2 == 0:
+            doubled = @tests.fixtures.test_actions.double(value=item)
+            results = results + [doubled]
+            continue
+        elif item > limit:
+            break
+        else:
+            results = results + [item]
+    count = len(results)
+    summary = {"count": count, "first": first_item, "results": results}
+    return summary
+"#;
+
+const PARALLEL_SPREAD_SOURCE: &str = r#"
+fn main(input: [base], output: [final]):
+    values = range(1, base + 1)
+    doubles = spread values:item -> @tests.fixtures.test_actions.double(value=item)
+    a, b = parallel:
+        @tests.fixtures.test_actions.double(value=base)
+        @tests.fixtures.test_actions.double(value=base + 1)
+    pair_sum = a + b
+    total = @tests.fixtures.test_actions.sum(values=doubles)
+    final = pair_sum + total
+    return final
+"#;
+
+const TRY_EXCEPT_SOURCE: &str = r#"
+fn risky(input: [numerator, denominator], output: [result]):
+    try:
+        result = numerator / denominator
+    except ZeroDivisionError as err:
+        result = 0
+    return result
+
+fn main(input: [values], output: [total]):
+    total = 0
+    for item in values:
+        denom = item - 2
+        part = risky(numerator=item, denominator=denom)
+        total = total + part
+    return total
+"#;
+
+const WHILE_LOOP_SOURCE: &str = r#"
+fn main(input: [limit], output: [accum]):
+    index = 0
+    accum = []
+    while index < limit:
+        accum = accum + [index]
+        if index == 2:
+            index = index + 1
+            continue
+        if index == 4:
+            break
+        index = index + 1
+    return accum
+"#;
+
 pub(crate) fn build_program() -> ir::Program {
-    let values_expr = list_expr(vec![literal_int(1), literal_int(2), literal_int(3)]);
-    let doubles_expr = ir::Expr {
-        kind: Some(ir::expr::Kind::SpreadExpr(Box::new(ir::SpreadExpr {
-            collection: Some(Box::new(variable("values"))),
-            loop_var: "item".to_string(),
-            action: Some(ir::ActionCall {
-                action_name: "double".to_string(),
-                kwargs: vec![ir::Kwarg {
-                    name: "value".to_string(),
-                    value: Some(variable("item")),
-                }],
-                policies: Vec::new(),
-                module_name: None,
-            }),
-        }))),
-        span: None,
-    };
-    let parallel_expr = ir::Expr {
-        kind: Some(ir::expr::Kind::ParallelExpr(ir::ParallelExpr {
-            calls: vec![
-                ir::Call {
-                    kind: Some(ir::call::Kind::Action(ir::ActionCall {
-                        action_name: "double".to_string(),
-                        kwargs: vec![ir::Kwarg {
-                            name: "value".to_string(),
-                            value: Some(variable("base")),
-                        }],
-                        policies: Vec::new(),
-                        module_name: None,
-                    })),
-                },
-                ir::Call {
-                    kind: Some(ir::call::Kind::Action(ir::ActionCall {
-                        action_name: "double".to_string(),
-                        kwargs: vec![ir::Kwarg {
-                            name: "value".to_string(),
-                            value: Some(binary(
-                                variable("base"),
-                                ir::BinaryOperator::BinaryOpAdd,
-                                literal_int(1),
-                            )),
-                        }],
-                        policies: Vec::new(),
-                        module_name: None,
-                    })),
-                },
-            ],
-        })),
-        span: None,
-    };
+    parse_program_source(SMOKE_SOURCE).expect("smoke program")
+}
 
-    let statements = vec![
-        ir::Statement {
-            kind: Some(ir::statement::Kind::Assignment(ir::Assignment {
-                targets: vec!["values".to_string()],
-                value: Some(values_expr),
-            })),
-            span: None,
-        },
-        ir::Statement {
-            kind: Some(ir::statement::Kind::Assignment(ir::Assignment {
-                targets: vec!["doubles".to_string()],
-                value: Some(doubles_expr),
-            })),
-            span: None,
-        },
-        ir::Statement {
-            kind: Some(ir::statement::Kind::Assignment(ir::Assignment {
-                targets: vec!["a".to_string(), "b".to_string()],
-                value: Some(parallel_expr),
-            })),
-            span: None,
-        },
-        ir::Statement {
-            kind: Some(ir::statement::Kind::Assignment(ir::Assignment {
-                targets: vec!["pair_sum".to_string()],
-                value: Some(binary(
-                    variable("a"),
-                    ir::BinaryOperator::BinaryOpAdd,
-                    variable("b"),
-                )),
-            })),
-            span: None,
-        },
-        ir::Statement {
-            kind: Some(ir::statement::Kind::Assignment(ir::Assignment {
-                targets: vec!["total".to_string()],
-                value: Some(ir::Expr {
-                    kind: Some(ir::expr::Kind::ActionCall(ir::ActionCall {
-                        action_name: "sum".to_string(),
-                        kwargs: vec![ir::Kwarg {
-                            name: "values".to_string(),
-                            value: Some(variable("doubles")),
-                        }],
-                        policies: Vec::new(),
-                        module_name: None,
-                    })),
-                    span: None,
-                }),
-            })),
-            span: None,
-        },
-        ir::Statement {
-            kind: Some(ir::statement::Kind::Assignment(ir::Assignment {
-                targets: vec!["final".to_string()],
-                value: Some(binary(
-                    variable("pair_sum"),
-                    ir::BinaryOperator::BinaryOpAdd,
-                    variable("total"),
-                )),
-            })),
-            span: None,
-        },
-        ir::Statement {
-            kind: Some(ir::statement::Kind::ReturnStmt(ir::ReturnStmt {
-                value: Some(variable("final")),
-            })),
-            span: None,
-        },
+pub(crate) fn build_control_flow_program() -> Result<ir::Program, String> {
+    parse_program_source(CONTROL_FLOW_SOURCE)
+}
+
+pub(crate) fn build_parallel_spread_program() -> Result<ir::Program, String> {
+    parse_program_source(PARALLEL_SPREAD_SOURCE)
+}
+
+pub(crate) fn build_try_except_program() -> Result<ir::Program, String> {
+    parse_program_source(TRY_EXCEPT_SOURCE)
+}
+
+pub(crate) fn build_while_loop_program() -> Result<ir::Program, String> {
+    parse_program_source(WHILE_LOOP_SOURCE)
+}
+
+pub(crate) fn list_examples() -> Vec<&'static str> {
+    let mut names = vec![
+        "control_flow",
+        "parallel_spread",
+        "try_except",
+        "while_loop",
     ];
-
-    let main_block = ir::Block {
-        statements,
-        span: None,
-    };
-    let main_fn = ir::FunctionDef {
-        name: "main".to_string(),
-        io: Some(ir::IoDecl {
-            inputs: vec!["base".to_string()],
-            outputs: vec!["final".to_string()],
-            span: None,
-        }),
-        body: Some(main_block),
-        span: None,
-    };
-    ir::Program {
-        functions: vec![main_fn],
-    }
+    names.sort();
+    names
 }
 
-async fn action_double(kwargs: HashMap<String, Value>) -> Result<Value, WorkerPoolError> {
-    let value = kwargs
-        .get("value")
-        .and_then(|value| value.as_i64())
-        .ok_or_else(|| WorkerPoolError::new("ActionError", "double expects integer value"))?;
-    Ok(Value::Number((value * 2).into()))
+#[derive(Clone)]
+struct SmokeCase {
+    name: String,
+    program: ir::Program,
+    inputs: HashMap<String, Value>,
 }
 
-async fn action_sum(kwargs: HashMap<String, Value>) -> Result<Value, WorkerPoolError> {
-    let values = kwargs
-        .get("values")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| WorkerPoolError::new("ActionError", "sum expects list of integers"))?;
-    let mut total = 0i64;
-    for item in values {
-        total += item.as_i64().unwrap_or(0);
-    }
-    Ok(Value::Number(total.into()))
-}
-
-fn action_registry() -> HashMap<String, ActionCallable> {
-    let mut actions: HashMap<String, ActionCallable> = HashMap::new();
-    actions.insert(
-        "double".to_string(),
-        Arc::new(|kwargs| Box::pin(action_double(kwargs))),
-    );
-    actions.insert(
-        "sum".to_string(),
-        Arc::new(|kwargs| Box::pin(action_sum(kwargs))),
-    );
-    actions
-}
-
-async fn action_handler(
-    action: ir::ActionCall,
-    kwargs: HashMap<String, Value>,
-) -> Result<Value, ExecutionError> {
-    match action.action_name.as_str() {
-        "double" => {
-            let value = kwargs
-                .get("value")
-                .and_then(|value| value.as_i64())
-                .ok_or_else(|| {
-                    ExecutionError::new("ExecutionError", "double expects integer value")
-                })?;
-            Ok(Value::Number((value * 2).into()))
-        }
-        "sum" => {
-            let values = kwargs
-                .get("values")
-                .and_then(|value| value.as_array())
-                .ok_or_else(|| {
-                    ExecutionError::new("ExecutionError", "sum expects list of integers")
-                })?;
-            let mut total = 0i64;
-            for item in values {
-                total += item.as_i64().unwrap_or(0);
+fn slugify(name: &str) -> String {
+    name.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
             }
-            Ok(Value::Number(total.into()))
-        }
-        _ => Err(ExecutionError::new(
-            "ExecutionError",
-            format!("unknown action: {}", action.action_name),
-        )),
-    }
+        })
+        .collect()
 }
 
-fn build_runner_demo_state() -> (RunnerState, HashMap<Uuid, Value>) {
-    let mut state = RunnerState::new(None, None, None, true);
-    let empty_list_expr = list_expr(Vec::new());
-    let _ = state
-        .record_assignment(
-            vec!["results".to_string()],
-            &empty_list_expr,
-            None,
-            Some("results = []".to_string()),
-        )
-        .expect("record assignment");
-
-    let mut action_results = HashMap::new();
-    for (idx, item) in [1i64, 2i64].iter().enumerate() {
-        let mut kwargs = HashMap::new();
-        kwargs.insert(
-            "item".to_string(),
-            ValueExpr::Literal(LiteralValue {
-                value: Value::Number((*item).into()),
-            }),
-        );
-        let action_ref = state
-            .queue_action(
-                "action",
-                Some(vec!["action_result".to_string()]),
-                Some(kwargs),
-                None,
-                Some(idx as i32),
-            )
-            .expect("queue action");
-        action_results.insert(action_ref.node_id, Value::Number((*item).into()));
-
-        let action_plus = binary(
-            variable("action_result"),
-            ir::BinaryOperator::BinaryOpAdd,
-            literal_int(2),
-        );
-        let concat_expr = binary(
-            variable("results"),
-            ir::BinaryOperator::BinaryOpAdd,
-            list_expr(vec![action_plus]),
-        );
-        let _ = state
-            .record_assignment(vec!["results".to_string()], &concat_expr, None, None)
-            .expect("record assignment");
-    }
-
-    (state, action_results)
-}
-
-async fn run_executor_demo(
-    dag: &DAG,
-    inputs: &HashMap<String, Value>,
+async fn run_program_smoke(
+    case: &SmokeCase,
+    worker_pool: RemoteWorkerPool,
 ) -> Result<(), ExecutionError> {
+    println!("\nIR program ({})", case.name);
+    println!("{}", format_program(&case.program));
+    println!("IR inputs ({}): {:?}", case.name, case.inputs);
+    let dag = convert_to_dag(&case.program)
+        .map_err(|err| ExecutionError::new("ExecutionError", err.to_string()))?;
+    let slug = slugify(&case.name);
+    let output_path = PathBuf::from(format!("dag_smoke_{slug}.png"));
+    let output_path = render_dag_image(&dag, &output_path)
+        .map_err(|err| ExecutionError::new("ExecutionError", err.to_string()))?;
+    println!(
+        "DAG image ({}) written to {}",
+        case.name,
+        output_path.display()
+    );
+
     let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
     let queue = Arc::new(Mutex::new(VecDeque::new()));
     let backend = MemoryBackend::with_queue(queue.clone());
-    for (name, value) in inputs {
+    for (name, value) in &case.inputs {
         let expr = literal_from_value(value);
         let label = format!("input {name} = {value}");
         let _ = state
@@ -383,7 +259,6 @@ async fn run_executor_demo(
         .queue_template_node(&entry_node, None)
         .map_err(|err| ExecutionError::new("ExecutionError", err.0))?;
 
-    let worker_pool = InlineWorkerPool::new(action_registry());
     let mut runloop = RunLoop::new(worker_pool, backend, 25, None, 0.05, 0.1);
     queue.lock().expect("queue lock").push_back(QueuedInstance {
         dag: dag.clone(),
@@ -409,69 +284,31 @@ async fn run_executor_demo(
     Ok(())
 }
 
-#[derive(Clone)]
-struct SmokeCase {
-    name: String,
-    program: ir::Program,
-    inputs: HashMap<String, Value>,
-    run_runner_demo: bool,
-}
-
-fn slugify(name: &str) -> String {
-    name.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-async fn run_program_smoke(case: &SmokeCase) -> Result<(), ExecutionError> {
-    println!("\nIR program ({})", case.name);
-    println!("{}", format_program(&case.program));
-    println!("IR inputs ({}): {:?}", case.name, case.inputs);
-    let dag = convert_to_dag(&case.program)
-        .map_err(|err| ExecutionError::new("ExecutionError", err.to_string()))?;
-    let slug = slugify(&case.name);
-    let output_path = PathBuf::from(format!("dag_smoke_{slug}.png"));
-    let output_path = render_dag_image(&dag, &output_path)
-        .map_err(|err| ExecutionError::new("ExecutionError", err.to_string()))?;
-    println!(
-        "DAG image ({}) written to {}",
-        case.name,
-        output_path.display()
-    );
-
-    let executor = StatementExecutor::new(
-        case.program.clone(),
-        Arc::new(|action, kwargs| Box::pin(action_handler(action, kwargs))),
-        None,
-    );
-    let result = executor
-        .execute_program(None, Some(case.inputs.clone()))
-        .await?;
-    println!("Execution result ({}): {}", case.name, result);
-
-    if case.run_runner_demo {
-        let (demo_state, action_results) = build_runner_demo_state();
-        let replayed = replay_variables(&demo_state, &action_results)
-            .map_err(|err| ExecutionError::new("ExecutionError", err.to_string()))?;
-        println!("Runner replay variables: {:?}", replayed.variables);
-        run_executor_demo(&dag, &case.inputs).await?;
-    }
-    Ok(())
-}
-
 async fn run_smoke(base: i64) -> i32 {
+    let bridge = match WorkerBridgeServer::start(None).await {
+        Ok(server) => server,
+        Err(err) => {
+            println!("Failed to start worker bridge server: {err}");
+            return 1;
+        }
+    };
+    let config = PythonWorkerConfig::new().with_user_module("tests.fixtures.test_actions");
+    let pool = match PythonWorkerPool::new(config, 2, Arc::clone(&bridge), None).await {
+        Ok(pool) => pool,
+        Err(err) => {
+            println!("Failed to start python worker pool: {err}");
+            bridge.shutdown().await;
+            return 1;
+        }
+    };
+    let pool = Arc::new(pool);
+    let worker_pool = RemoteWorkerPool::new(Arc::clone(&pool));
+
     let mut cases = Vec::new();
     cases.push(SmokeCase {
         name: "smoke".to_string(),
         program: build_program(),
         inputs: HashMap::from([("base".to_string(), Value::Number(base.into()))]),
-        run_runner_demo: true,
     });
     let examples = vec![
         ("control_flow", build_control_flow_program()),
@@ -501,17 +338,31 @@ async fn run_smoke(base: i64) -> i32 {
             name: name.to_string(),
             program,
             inputs,
-            run_runner_demo: false,
         });
     }
 
     let mut failures = 0;
     for case in &cases {
-        if let Err(err) = run_program_smoke(case).await {
+        if let Err(err) = run_program_smoke(case, worker_pool.clone()).await {
             failures += 1;
             println!("Smoke case '{}' failed: {}", case.name, err);
         }
     }
+
+    drop(worker_pool);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    match Arc::try_unwrap(pool) {
+        Ok(pool) => {
+            if let Err(err) = pool.shutdown().await {
+                println!("Failed to shut down worker pool: {err}");
+            }
+        }
+        Err(pool) => {
+            println!("Worker pool still in use; skipping shutdown");
+            drop(pool);
+        }
+    }
+    bridge.shutdown().await;
 
     println!("Examples available: {:?}", list_examples());
     if failures > 0 { 1 } else { 0 }

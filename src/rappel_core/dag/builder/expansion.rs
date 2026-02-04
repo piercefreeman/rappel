@@ -8,7 +8,13 @@ use super::super::models::{DAG, DAGEdge, DagConversionError, EdgeType};
 use super::super::nodes::{AssignmentNode, DAGNode};
 use super::converter::DAGConverter;
 
+/// Inline function calls and remap expansion edges.
 impl DAGConverter {
+    /// Redirect exception edges to expanded call entries and dedupe edges.
+    ///
+    /// After function expansion, exception edges may still point at a call
+    /// prefix (the "virtual" target). We map those prefixes to the first
+    /// node id in the expanded call subtree, then remove duplicate edges.
     pub fn remap_exception_targets(&self, dag: &mut DAG) {
         let call_entry_map = Self::build_call_entry_map(dag);
         for edge in dag
@@ -47,6 +53,11 @@ impl DAGConverter {
         dag.edges = deduped;
     }
 
+    /// Return a mapping from call prefixes to their first expanded node id.
+    ///
+    /// Example:
+    /// - Expanded nodes: "foo:call_1:action_3", "foo:call_1:return_4"
+    /// - Mapping entry: "foo:call_1" -> "foo:call_1:action_3"
     pub fn build_call_entry_map(dag: &DAG) -> HashMap<String, String> {
         let mut mapping: HashMap<String, String> = HashMap::new();
         for node_id in dag.nodes.keys() {
@@ -65,6 +76,7 @@ impl DAGConverter {
         mapping
     }
 
+    /// Inline the entry function and all reachable calls into a new DAG.
     pub fn expand_functions(
         &mut self,
         unexpanded: &DAG,
@@ -82,6 +94,16 @@ impl DAGConverter {
         Ok(expanded)
     }
 
+    /// Inline a function into the target DAG and return (first, last) node ids.
+    ///
+    /// The expansion clones nodes from the callee, prefixes their ids with the
+    /// call site, wires argument binding nodes before the callee entry, and
+    /// rewrites edges and aggregation pointers.
+    ///
+    /// Example:
+    /// - Caller node "call_2" invokes function "foo".
+    /// - Expanded ids become "call_2:foo_input_1", "call_2:action_3", etc.
+    /// - The return node's targets are rewritten to match the call assignment.
     pub fn expand_function_recursive(
         &mut self,
         unexpanded: &DAG,
@@ -345,6 +367,9 @@ impl DAGConverter {
         }
     }
 
+    /// Return a topological order for the given node subset.
+    ///
+    /// This only considers state-machine edges and ignores loop backs.
     pub fn get_topo_order(&self, dag: &DAG, node_ids: &HashSet<String>) -> Vec<String> {
         let mut in_degree: HashMap<String, i32> =
             node_ids.iter().map(|id| (id.clone(), 0)).collect();

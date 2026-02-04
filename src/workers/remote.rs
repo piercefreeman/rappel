@@ -1,4 +1,4 @@
-//! Python worker process management.
+//! Remote worker process management.
 //!
 //! This module provides the core infrastructure for spawning and managing
 //! Python worker processes that execute workflow actions.
@@ -44,11 +44,12 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
+use serde_json::Value;
 use tokio::sync::RwLock;
 
 use anyhow::{Context, Result as AnyResult, anyhow};
@@ -63,6 +64,9 @@ use tokio::{
 use tracing::{error, info, trace, warn};
 use uuid::Uuid;
 
+use super::base::{
+    ActionCompletion, ActionRequest, BaseWorkerPool, WorkerPoolError, error_to_value,
+};
 use crate::{
     messages::{self, MessageError, proto},
     server_worker::{WorkerBridgeChannels, WorkerBridgeServer},
@@ -1113,6 +1117,215 @@ impl PythonWorkerPool {
 
         info!("worker pool shutdown complete");
         Ok(())
+    }
+}
+
+fn kwargs_to_workflow_arguments(kwargs: &HashMap<String, Value>) -> proto::WorkflowArguments {
+    let mut arguments = Vec::with_capacity(kwargs.len());
+    for (key, value) in kwargs {
+        let arg_value = messages::json_to_workflow_argument_value(value);
+        arguments.push(proto::WorkflowArgument {
+            key: key.clone(),
+            value: Some(arg_value),
+        });
+    }
+    proto::WorkflowArguments { arguments }
+}
+
+fn normalize_error_value(error: Value) -> Value {
+    if let Value::Object(map) = error {
+        let error_type = map
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("RemoteWorkerError");
+        let error_message = map
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("remote worker error");
+        return error_to_value(&WorkerPoolError::new(error_type, error_message));
+    }
+    error
+}
+
+fn decode_action_result(metrics: &RoundTripMetrics) -> Value {
+    let payload =
+        messages::workflow_arguments_to_json(&metrics.response_payload).unwrap_or(Value::Null);
+    if metrics.success {
+        if let Value::Object(mut map) = payload {
+            if let Some(result) = map.remove("result") {
+                return result;
+            }
+            return Value::Object(map);
+        }
+        return payload;
+    }
+
+    if let Value::Object(mut map) = payload {
+        if let Some(error) = map.remove("error") {
+            return normalize_error_value(error);
+        }
+        return Value::Object(map);
+    }
+
+    let error_type = metrics.error_type.as_deref().unwrap_or("RemoteWorkerError");
+    let error_message = metrics
+        .error_message
+        .as_deref()
+        .unwrap_or("remote worker error");
+    error_to_value(&WorkerPoolError::new(error_type, error_message))
+}
+
+async fn execute_remote_request(
+    pool: Arc<PythonWorkerPool>,
+    request: ActionRequest,
+) -> ActionCompletion {
+    let executor_id = request.executor_id;
+    let node_id = request.node_id;
+    let Some(module_name) = request.module_name.clone() else {
+        return ActionCompletion {
+            executor_id,
+            node_id,
+            result: error_to_value(&WorkerPoolError::new(
+                "RemoteWorkerPoolError",
+                "missing module name for action request",
+            )),
+        };
+    };
+
+    let worker_idx = loop {
+        if let Some(idx) = pool.try_acquire_slot() {
+            break idx;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+
+    let worker = pool.get_worker(worker_idx).await;
+    let dispatch = ActionDispatchPayload {
+        action_id: node_id.to_string(),
+        instance_id: executor_id.to_string(),
+        sequence: 0,
+        action_name: request.action_name,
+        module_name,
+        kwargs: kwargs_to_workflow_arguments(&request.kwargs),
+        timeout_seconds: 0,
+        max_retries: 0,
+        attempt_number: 0,
+        dispatch_token: Uuid::new_v4(),
+    };
+
+    match worker.send_action(dispatch).await {
+        Ok(metrics) => {
+            pool.record_completion(worker_idx, Arc::clone(&pool));
+            ActionCompletion {
+                executor_id,
+                node_id,
+                result: decode_action_result(&metrics),
+            }
+        }
+        Err(err) => {
+            pool.release_slot(worker_idx);
+            ActionCompletion {
+                executor_id,
+                node_id,
+                result: error_to_value(&WorkerPoolError::new(
+                    "RemoteWorkerPoolError",
+                    err.to_string(),
+                )),
+            }
+        }
+    }
+}
+
+struct RemoteWorkerPoolInner {
+    pool: Arc<PythonWorkerPool>,
+    request_tx: mpsc::Sender<ActionRequest>,
+    request_rx: StdMutex<Option<mpsc::Receiver<ActionRequest>>>,
+    completion_tx: mpsc::Sender<ActionCompletion>,
+    completion_rx: Mutex<mpsc::Receiver<ActionCompletion>>,
+    launched: AtomicBool,
+}
+
+/// BaseWorkerPool implementation backed by a Python worker cluster.
+#[derive(Clone)]
+pub struct RemoteWorkerPool {
+    inner: Arc<RemoteWorkerPoolInner>,
+}
+
+impl RemoteWorkerPool {
+    pub fn new(pool: Arc<PythonWorkerPool>) -> Self {
+        let (request_tx, request_rx) = mpsc::channel(256);
+        let (completion_tx, completion_rx) = mpsc::channel(256);
+        Self {
+            inner: Arc::new(RemoteWorkerPoolInner {
+                pool,
+                request_tx,
+                request_rx: StdMutex::new(Some(request_rx)),
+                completion_tx,
+                completion_rx: Mutex::new(completion_rx),
+                launched: AtomicBool::new(false),
+            }),
+        }
+    }
+}
+
+impl BaseWorkerPool for RemoteWorkerPool {
+    fn launch<'a>(&'a self) -> futures::future::BoxFuture<'a, Result<(), WorkerPoolError>> {
+        Box::pin(async move {
+            if self.inner.launched.swap(true, Ordering::SeqCst) {
+                return Ok(());
+            }
+
+            let request_rx = {
+                let mut guard = self.inner.request_rx.lock().map_err(|_| {
+                    WorkerPoolError::new("RemoteWorkerPoolError", "failed to lock request receiver")
+                })?;
+                guard.take()
+            };
+
+            let Some(mut request_rx) = request_rx else {
+                return Ok(());
+            };
+
+            let pool = Arc::clone(&self.inner.pool);
+            let completion_tx = self.inner.completion_tx.clone();
+
+            tokio::spawn(async move {
+                while let Some(request) = request_rx.recv().await {
+                    let completion_tx = completion_tx.clone();
+                    let pool = Arc::clone(&pool);
+                    tokio::spawn(async move {
+                        let completion = execute_remote_request(pool, request).await;
+                        let _ = completion_tx.send(completion).await;
+                    });
+                }
+            });
+
+            Ok(())
+        })
+    }
+
+    fn queue(&self, request: ActionRequest) -> Result<(), WorkerPoolError> {
+        self.inner.request_tx.try_send(request).map_err(|err| {
+            WorkerPoolError::new(
+                "RemoteWorkerPoolError",
+                format!("failed to enqueue action request: {err}"),
+            )
+        })
+    }
+
+    fn get_complete<'a>(&'a self) -> futures::future::BoxFuture<'a, Vec<ActionCompletion>> {
+        Box::pin(async move {
+            let mut receiver = self.inner.completion_rx.lock().await;
+            let mut completions = Vec::new();
+            match receiver.recv().await {
+                Some(first) => completions.push(first),
+                None => return completions,
+            }
+            while let Ok(value) = receiver.try_recv() {
+                completions.push(value);
+            }
+            completions
+        })
     }
 }
 

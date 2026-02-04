@@ -1,10 +1,9 @@
-//! Core Rappel runtime modules (ported from core-python).
+//! Rappel core asyncio components.
 
 pub mod backends;
 pub mod cli;
 pub mod dag;
 pub mod dag_viz;
-pub mod ir_examples;
 pub mod ir_executor;
 pub mod ir_format;
 pub mod ir_parser;

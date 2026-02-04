@@ -6,7 +6,9 @@ use super::super::models::{ConvertedSubgraph, DAGEdge, DagConversionError, EXCEP
 use super::super::nodes::{AssignmentNode, JoinNode};
 use super::converter::DAGConverter;
 
+/// Convert try/except blocks into exception-aware DAG edges.
 impl DAGConverter {
+    /// Convert try/except blocks into exception-aware edges and optional join.
     pub fn convert_try_except(
         &mut self,
         try_except: &ir::TryExcept,
@@ -118,6 +120,11 @@ impl DAGConverter {
         result
     }
 
+    /// Insert an exception binding node before a handler graph.
+    ///
+    /// Example:
+    /// - except Exception as err: ...
+    ///   Inserts "err = __exception__" before the handler body.
     pub fn prepend_exception_binding(
         &mut self,
         exception_var: &str,

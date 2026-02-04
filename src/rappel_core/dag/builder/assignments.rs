@@ -9,7 +9,13 @@ use super::super::nodes::{
 };
 use super::converter::DAGConverter;
 
+/// Convert assignments and expression statements into DAG nodes.
 impl DAGConverter {
+    /// Convert an assignment into one or more DAG nodes.
+    ///
+    /// Example IR:
+    /// - x = @action()
+    ///   Produces a call node with target x and tracks x as defined at that node.
     pub fn convert_assignment(&mut self, assign: &ir::Assignment) -> Vec<String> {
         let value = assign.value.as_ref();
         if value.is_none() {
@@ -58,6 +64,7 @@ impl DAGConverter {
         }
     }
 
+    /// Convert a function call assignment into a FnCallNode.
     pub fn convert_fn_call_assignment(
         &mut self,
         target: &str,
@@ -101,6 +108,7 @@ impl DAGConverter {
         vec![node_id]
     }
 
+    /// Convert an action call into an ActionCallNode and track target bindings.
     pub fn convert_action_call_with_targets(
         &mut self,
         action: &ir::ActionCall,
@@ -140,6 +148,7 @@ impl DAGConverter {
         vec![node_id]
     }
 
+    /// Convert kwarg expressions into their string forms for labels/guards.
     pub fn extract_kwargs(&self, kwargs: &[ir::Kwarg]) -> HashMap<String, String> {
         let mut result = HashMap::new();
         for kwarg in kwargs {
@@ -150,6 +159,7 @@ impl DAGConverter {
         result
     }
 
+    /// Copy kwarg expressions so nodes can inspect or rewrite them later.
     pub fn extract_kwarg_exprs(&self, kwargs: &[ir::Kwarg]) -> HashMap<String, ir::Expr> {
         let mut result = HashMap::new();
         for kwarg in kwargs {
@@ -160,6 +170,7 @@ impl DAGConverter {
         result
     }
 
+    /// Build kwargs/kwarg_exprs by merging positional args with known inputs.
     pub fn extract_fn_call_args(
         &self,
         call: &ir::FunctionCall,
@@ -194,6 +205,7 @@ impl DAGConverter {
         (kwargs, kwarg_exprs)
     }
 
+    /// Render a best-effort string for UI labels and quick debugging.
     pub fn expr_to_string(&self, expr: &ir::Expr) -> String {
         match expr.kind.as_ref() {
             Some(ir::expr::Kind::Variable(var)) => format!("${}", var.name),
@@ -252,6 +264,7 @@ impl DAGConverter {
         }
     }
 
+    /// Render a literal to a stable string for labels.
     pub fn literal_to_string(&self, lit: &ir::Literal) -> String {
         match lit.value.as_ref() {
             Some(ir::literal::Value::IntValue(value)) => value.to_string(),
@@ -263,6 +276,7 @@ impl DAGConverter {
         }
     }
 
+    /// Convert an expression statement into a node (or a no-op).
     pub fn convert_expr_statement(&mut self, expr_stmt: &ir::ExprStmt) -> Vec<String> {
         let expr = match expr_stmt.expr.as_ref() {
             Some(expr) => expr,

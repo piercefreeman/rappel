@@ -18,6 +18,7 @@ pub type ActionCallable = Arc<
         + Sync,
 >;
 
+/// Execute action requests by calling async functions in the same loop.
 #[derive(Clone)]
 pub struct InlineWorkerPool {
     actions: HashMap<String, ActionCallable>,

@@ -443,7 +443,9 @@ impl RunnerExecutor {
         };
 
         match kind {
-            TemplateKind::SpreadAction(action) => self.expand_spread_action(source, action.as_ref()),
+            TemplateKind::SpreadAction(action) => {
+                self.expand_spread_action(source, action.as_ref())
+            }
             TemplateKind::Aggregator(template_id) => {
                 if let Some(existing) = self.find_connected_aggregator(source.node_id, &template_id)
                 {

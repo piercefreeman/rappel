@@ -8,11 +8,19 @@ use super::super::nodes::{
 };
 use super::converter::DAGConverter;
 
+/// Convert spread and parallel constructs into DAG nodes.
 impl DAGConverter {
+    /// Convert a spread action without explicit targets.
     pub fn convert_spread_action(&mut self, spread: &ir::SpreadAction) -> Vec<String> {
         self.convert_spread_action_with_targets(spread, &[])
     }
 
+    /// Convert a spread expression into an action + aggregator pair.
+    ///
+    /// Example IR:
+    /// - results = spread items: @do(item)
+    ///   Produces a spread action node (one per item at runtime) and an
+    ///   aggregator node that collects the spread results into results.
     pub fn convert_spread_expr(
         &mut self,
         spread: &ir::SpreadExpr,
@@ -78,6 +86,7 @@ impl DAGConverter {
         vec![action_id, agg_id]
     }
 
+    /// Convert a spread action statement into action + aggregator nodes.
     pub fn convert_spread_action_with_targets(
         &mut self,
         spread: &ir::SpreadAction,
@@ -143,10 +152,12 @@ impl DAGConverter {
         vec![action_id, agg_id]
     }
 
+    /// Convert a parallel block statement without assignment targets.
     pub fn convert_parallel_block(&mut self, parallel: &ir::ParallelBlock) -> Vec<String> {
         self.convert_parallel_block_with_targets(&parallel.calls, &[])
     }
 
+    /// Convert a parallel expression with assignment targets.
     pub fn convert_parallel_expr(
         &mut self,
         parallel: &ir::ParallelExpr,
@@ -155,6 +166,11 @@ impl DAGConverter {
         self.convert_parallel_block_with_targets(&parallel.calls, targets)
     }
 
+    /// Convert a parallel block/expression into a parallel node + calls + join.
+    ///
+    /// Example IR:
+    /// - a, b = parallel: @x() @y()
+    ///   Produces a parallel node, two call nodes, and an aggregator/join node.
     pub fn convert_parallel_block_with_targets(
         &mut self,
         calls: &[ir::Call],

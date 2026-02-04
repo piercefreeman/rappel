@@ -18,6 +18,7 @@ pub type ActionHandler = Arc<
         + Sync,
 >;
 
+/// Base error raised during IR execution.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct ExecutionError {
@@ -44,6 +45,7 @@ impl ExecutionError {
     }
 }
 
+/// Raised when a function call references an unknown function.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct FunctionNotFoundError(pub String);
@@ -54,6 +56,7 @@ impl From<FunctionNotFoundError> for ExecutionError {
     }
 }
 
+/// Raised when a variable lookup fails.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct VariableNotFoundError(pub String);
@@ -64,6 +67,7 @@ impl From<VariableNotFoundError> for ExecutionError {
     }
 }
 
+/// Raised when parallel execution yields exceptions.
 #[derive(Debug, thiserror::Error)]
 #[error("parallel execution failed")]
 pub struct ParallelExecutionError {
@@ -171,6 +175,7 @@ impl Default for ExecutionFrame {
     }
 }
 
+/// Executes IR statements and expressions with async action support.
 pub struct StatementExecutor {
     action_handler: ActionHandler,
     limits: ExecutionLimits,

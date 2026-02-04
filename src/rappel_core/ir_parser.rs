@@ -4,6 +4,7 @@ use std::fmt;
 
 use crate::messages::ast as ir;
 
+/// Raised when parsing the IR source representation fails.
 #[derive(Debug, Clone)]
 pub struct IRParseError(pub String);
 

@@ -1,4 +1,4 @@
-//! Backend implementations for run loop persistence.
+//! Backend implementations for runner persistence.
 
 mod base;
 mod memory;

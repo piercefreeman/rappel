@@ -11,12 +11,11 @@ use uuid::Uuid;
 use crate::messages::ast as ir;
 use crate::observability::obs;
 use crate::rappel_core::backends::{DEFAULT_DSN, PostgresBackend, QueuedInstance};
-use crate::rappel_core::cli::smoke::{build_program, literal_from_value};
-use crate::rappel_core::dag::{DAG, convert_to_dag};
-use crate::rappel_core::ir_examples::{
-    build_control_flow_program, build_parallel_spread_program, build_try_except_program,
-    build_while_loop_program,
+use crate::rappel_core::cli::smoke::{
+    build_control_flow_program, build_parallel_spread_program, build_program,
+    build_try_except_program, build_while_loop_program, literal_from_value,
 };
+use crate::rappel_core::dag::{DAG, convert_to_dag};
 use crate::rappel_core::runloop::RunLoop;
 use crate::rappel_core::runner::RunnerState;
 use crate::rappel_core::workers::{ActionCallable, InlineWorkerPool, WorkerPoolError};

@@ -7,7 +7,9 @@ use super::super::nodes::{
 };
 use super::converter::DAGConverter;
 
+/// Utility helpers shared across conversion helpers.
 impl DAGConverter {
+    /// Record that a variable is defined at the given node.
     pub fn track_var_definition(&mut self, var_name: &str, node_id: &str) {
         self.current_scope_vars
             .insert(var_name.to_string(), node_id.to_string());
@@ -17,12 +19,14 @@ impl DAGConverter {
             .push(node_id.to_string());
     }
 
+    /// Append a target if it is not already present.
     pub fn push_unique_target(targets: &mut Vec<String>, target: &str) {
         if !targets.iter().any(|existing| existing == target) {
             targets.push(target.to_string());
         }
     }
 
+    /// Return assignment targets for nodes that bind variables.
     pub fn targets_for_node(node: &DAGNode) -> Vec<String> {
         match node {
             DAGNode::Assignment(AssignmentNode {
@@ -87,6 +91,10 @@ impl DAGConverter {
         }
     }
 
+    /// Collect assignment targets from a statement list, recursively.
+    ///
+    /// This is used to determine loop join node targets so data-flow edges
+    /// can carry loop-carried variables out of the loop body.
     pub fn collect_assigned_targets(statements: &[ir::Statement], targets: &mut Vec<String>) {
         for stmt in statements {
             let kind = stmt.kind.as_ref();

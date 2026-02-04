@@ -291,16 +291,15 @@ async fn get_run_data(
     let include_nodes = query.include_nodes.unwrap_or(true);
 
     let mut nodes = Vec::new();
-    if include_nodes {
-        if let Some(graph) = state
+    if include_nodes
+        && let Some(graph) = state
             .database
             .get_execution_graph(instance_id)
             .await
             .ok()
             .flatten()
-        {
-            nodes = graph.nodes;
-        }
+    {
+        nodes = graph.nodes;
     }
 
     let timeline = state

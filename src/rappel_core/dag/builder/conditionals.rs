@@ -6,7 +6,9 @@ use super::super::models::{ConvertedSubgraph, DAGEdge, DagConversionError};
 use super::super::nodes::{BranchNode, JoinNode};
 use super::converter::DAGConverter;
 
+/// Convert conditional blocks into branch/join nodes.
 impl DAGConverter {
+    /// Convert an if/elif/else tree into a branch + optional join graph.
     pub fn convert_conditional(
         &mut self,
         cond: &ir::Conditional,
@@ -159,6 +161,7 @@ impl DAGConverter {
         })
     }
 
+    /// Build a guard for elif branches: not prior_guards and current_condition.
     pub fn build_compound_guard(
         &self,
         prior_guards: &[ir::Expr],

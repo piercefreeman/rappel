@@ -10,7 +10,18 @@ use super::super::nodes::{
 };
 use super::converter::DAGConverter;
 
+/// Rebuild data-flow edges from variable definition/use analysis.
 impl DAGConverter {
+    /// Recompute and add data-flow edges for the full expanded DAG.
+    ///
+    /// This rebuilds data-flow edges at the global level so variable uses in
+    /// guards, loop bodies, and expanded functions all point to the correct
+    /// definition nodes.
+    ///
+    /// Example:
+    /// - x = 1
+    /// - if x > 0: @action(x)
+    ///   The guard and action both receive data-flow edges from the assignment.
     pub fn add_global_data_flow_edges(&self, dag: &mut DAG) {
         let existing_data_flow: Vec<DAGEdge> = dag
             .edges
@@ -425,6 +436,7 @@ impl DAGConverter {
         dag.edges.extend(existing_data_flow);
     }
 
+    /// Add per-function data-flow edges after a function conversion.
     pub fn add_data_flow_edges_for_function(&mut self, function_name: &str) {
         let fn_node_ids: HashSet<String> = self
             .dag
@@ -436,6 +448,7 @@ impl DAGConverter {
         self.add_data_flow_from_definitions(function_name, &order);
     }
 
+    /// Add data-flow edges using the current variable definition history.
     pub fn add_data_flow_from_definitions(&mut self, function_name: &str, order: &[String]) {
         let fn_node_ids: HashSet<String> = self
             .dag
@@ -486,6 +499,7 @@ impl DAGConverter {
         }
     }
 
+    /// Return True if a node's arguments reference the variable.
     pub fn node_uses_variable(&self, node: &DAGNode, var_name: &str) -> bool {
         match node {
             DAGNode::ActionCall(ActionCallNode {
@@ -512,6 +526,7 @@ impl DAGConverter {
         }
     }
 
+    /// Return True if an expression tree references the variable name.
     pub fn expr_uses_var(expr: &ir::Expr, var_name: &str) -> bool {
         match expr.kind.as_ref() {
             Some(ir::expr::Kind::Literal(_)) => false,
@@ -641,6 +656,7 @@ impl DAGConverter {
         }
     }
 
+    /// Topologically order nodes using state-machine edges (ignoring loop backs).
     pub fn get_execution_order_for_nodes(&self, node_ids: &HashSet<String>) -> Vec<String> {
         let mut in_degree: HashMap<String, i32> =
             node_ids.iter().map(|id| (id.clone(), 0)).collect();

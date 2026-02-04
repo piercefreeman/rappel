@@ -10,6 +10,7 @@ use super::nodes::DAGNode;
 
 pub const EXCEPTION_SCOPE_VAR: &str = "__rappel_exception__";
 
+/// Raised when IR -> DAG conversion fails.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct DagConversionError(pub String);
@@ -18,6 +19,11 @@ pub fn assert_never<T: std::fmt::Debug>(value: T) -> ! {
     panic!("Unhandled value: {value:?}");
 }
 
+/// Classifies edges as control-flow (state machine) or data-flow.
+///
+/// We keep the distinction so visualization and scheduling can render them
+/// differently (solid vs dashed) and so data dependencies can be computed
+/// independently of execution ordering.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeType {
@@ -25,6 +31,16 @@ pub enum EdgeType {
     DataFlow,
 }
 
+/// Directed edge between DAG nodes with execution or data semantics.
+///
+/// We store rich metadata because both the runtime and the visualizer need to
+/// interpret the same graph: control-flow edges carry conditions/guards, while
+/// data-flow edges track which variable definition feeds which consumer.
+///
+/// Visualization examples:
+/// - control: action_1 -> join_2 (condition="success")
+/// - control: branch_3 -> then_4 (condition="guarded")
+/// - data: assign_5 -> action_6 (variable="payload")
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DAGEdge {
     pub source: String,
@@ -134,6 +150,15 @@ impl DAGEdge {
     }
 }
 
+/// Container for DAG nodes/edges with helper queries.
+///
+/// The DAG object is the common currency between conversion, scheduling, and
+/// visualization. We keep both node metadata and edge metadata so downstream
+/// tools can render a faithful control/data graph.
+///
+/// Visualization example (pseudo):
+/// - nodes: input -> action -> output
+/// - edges: input -control-> action, action -data(var=x)-> output
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DAG {
     pub nodes: HashMap<String, DAGNode>,
@@ -219,6 +244,16 @@ impl DAG {
     }
 }
 
+/// Intermediate representation for stitching statement subgraphs.
+///
+/// Every IR statement can expand into multiple DAG nodes. ConvertedSubgraph
+/// captures the "entry" and "exits" so the converter can wire the next
+/// statement without knowing the internal structure of the previous one.
+///
+/// Examples:
+/// - Simple assignment: entry=assign_1, exits=[assign_1]
+/// - If/else: entry=branch_2, exits=[join_5]
+/// - Empty block: is_noop=True (frontier stays unchanged)
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConvertedSubgraph {
     pub entry: Option<String>,

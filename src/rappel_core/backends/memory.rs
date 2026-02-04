@@ -9,6 +9,7 @@ use super::base::{
     ActionDone, BackendResult, BaseBackend, GraphUpdate, InstanceDone, QueuedInstance,
 };
 
+/// Backend that prints updates instead of persisting them.
 #[derive(Clone, Default)]
 pub struct MemoryBackend {
     instance_queue: Option<Arc<Mutex<VecDeque<QueuedInstance>>>>,

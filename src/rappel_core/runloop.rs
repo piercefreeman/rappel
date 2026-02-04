@@ -117,6 +117,8 @@ impl RunLoop {
             completed_actions: self.executors.keys().map(|id| (*id, Vec::new())).collect(),
         };
 
+        self.worker_pool.launch().await?;
+
         let mut initial_steps: Vec<(Uuid, ExecutorStep)> = Vec::new();
         for (executor_id, executor) in self.executors.iter_mut() {
             let entry_node = self.entry_nodes.get(executor_id).copied().ok_or_else(|| {
@@ -455,6 +457,7 @@ impl RunLoop {
                     executor_id,
                     node_id: action.node_id,
                     action_name: action_spec.action_name,
+                    module_name: action_spec.module_name.clone(),
                     kwargs,
                 };
                 worker_pool.queue(request)?;

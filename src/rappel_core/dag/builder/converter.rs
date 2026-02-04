@@ -8,6 +8,20 @@ use super::super::models::{ConvertedSubgraph, DAG, DAGEdge, DagConversionError};
 use super::super::nodes::{InputNode, OutputNode, ReturnNode};
 use super::super::validate::validate_dag;
 
+/// Convert IR programs into a DAG with control + data-flow edges.
+///
+/// Design overview:
+/// - Each IR statement becomes one or more DAG nodes (assignments, calls, joins, etc).
+/// - State-machine edges encode control flow, including branches, loops, and exceptions.
+/// - Data-flow edges link variable definitions to later uses so scheduling and replay
+///   can trace dependencies.
+/// - Function calls are expanded by cloning callee nodes with a stable prefix, then
+///   wiring caller -> callee arguments via synthetic assignments.
+///
+/// Example IR:
+/// - results = parallel: @a() @b()
+///   Yields a parallel node, two call nodes, and a join/aggregator node connected by
+///   control edges, plus data-flow edges from each call's result into the aggregator.
 pub struct DAGConverter {
     pub dag: DAG,
     pub node_counter: usize,
@@ -41,6 +55,15 @@ impl DAGConverter {
         }
     }
 
+    /// Convert a full IR program into a flattened, executable DAG.
+    ///
+    /// This chooses an entry function, expands all reachable function calls,
+    /// remaps exception edges to expanded call entries, adds global data-flow
+    /// edges, and validates the resulting graph.
+    ///
+    /// Example entry selection:
+    /// - If a function named "main" exists, it is used as the entry point.
+    /// - Otherwise, the first non-dunder function becomes the entry.
     pub fn convert(&mut self, program: &ir::Program) -> Result<DAG, DagConversionError> {
         let unexpanded = self.convert_with_pointers(program)?;
 
@@ -71,6 +94,11 @@ impl DAGConverter {
         Ok(dag)
     }
 
+    /// Convert each function into its own DAG fragment without inlining calls.
+    ///
+    /// The resulting graph preserves per-function node ids and keeps function
+    /// calls as call nodes. This is primarily used as the input to
+    /// expand_functions, which will inline and prefix the callee graphs.
     pub fn convert_with_pointers(
         &mut self,
         program: &ir::Program,
@@ -92,6 +120,14 @@ impl DAGConverter {
         Ok(dag)
     }
 
+    /// Convert a single function body into a DAG fragment.
+    ///
+    /// This creates input/output nodes, converts each statement in order, and
+    /// adds per-function data-flow edges based on variable definitions.
+    ///
+    /// Example IR:
+    /// - def main(x): y = x + 1; return y
+    ///   Produces input -> assignment -> return -> output with x/y data edges.
     pub fn convert_function(&mut self, fn_def: &ir::FunctionDef) -> Result<(), DagConversionError> {
         self.current_function = Some(fn_def.name.clone());
         self.current_scope_vars.clear();
@@ -165,11 +201,16 @@ impl DAGConverter {
         Ok(())
     }
 
+    /// Generate a stable node id for the current conversion session.
     pub fn next_id(&mut self, prefix: &str) -> String {
         self.node_counter += 1;
         format!("{prefix}_{}", self.node_counter)
     }
 
+    /// Convert a block into a connected subgraph.
+    ///
+    /// This stitches statement graphs together with state-machine edges and
+    /// returns entry/exits for the caller to connect.
     pub fn convert_block(
         &mut self,
         block: &ir::Block,
@@ -211,6 +252,7 @@ impl DAGConverter {
         })
     }
 
+    /// Convert a single statement into a subgraph with entry/exit nodes.
     pub fn convert_statement(
         &mut self,
         stmt: &ir::Statement,
@@ -274,6 +316,7 @@ impl DAGConverter {
         })
     }
 
+    /// Convert a return statement into a ReturnNode.
     pub fn convert_return(&mut self, ret: &ir::ReturnStmt) -> Vec<String> {
         let node_id = self.next_id("return");
         let mut node = ReturnNode::new(

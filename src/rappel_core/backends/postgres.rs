@@ -15,6 +15,7 @@ use super::base::{
 
 pub const DEFAULT_DSN: &str = "postgresql://rappel:rappel@localhost:5432/rappel_core";
 
+/// Persist runner state and action results in Postgres.
 #[derive(Clone)]
 pub struct PostgresBackend {
     pool: PgPool,
@@ -39,6 +40,7 @@ impl PostgresBackend {
         &self.pool
     }
 
+    /// Insert queued instances for run-loop consumption.
     #[obs]
     pub async fn queue_instances(&self, instances: &[QueuedInstance]) -> BackendResult<()> {
         if instances.is_empty() {
@@ -93,6 +95,7 @@ impl PostgresBackend {
         Ok(())
     }
 
+    /// Delete all queued instances from the backing table.
     #[obs]
     pub async fn clear_queue(&self) -> BackendResult<()> {
         Self::count_query(&self.query_counts, "delete:queued_instances_all");
@@ -102,6 +105,7 @@ impl PostgresBackend {
         Ok(())
     }
 
+    /// Delete all persisted runner data for a clean benchmark run.
     #[obs]
     pub async fn clear_all(&self) -> BackendResult<()> {
         Self::count_query(&self.query_counts, "truncate:runner_tables");

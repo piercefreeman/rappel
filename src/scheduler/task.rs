@@ -195,7 +195,7 @@ pub fn spawn_scheduler(
     scheduler_db: SchedulerDatabase,
     backend: PostgresBackend,
     config: SchedulerConfig,
-    dag_resolver: Arc<dyn Fn(&str) -> Option<DAG> + Send + Sync>,
+    dag_resolver: DagResolver,
 ) -> (tokio::task::JoinHandle<()>, watch::Sender<bool>) {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let task = SchedulerTask::new(scheduler_db, backend, config, shutdown_rx, dag_resolver);

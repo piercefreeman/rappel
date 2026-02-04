@@ -27,6 +27,7 @@ fn default_instance_id() -> Uuid {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// Queued instance payload for the run loop.
 pub struct QueuedInstance {
     pub dag: DAG,
     pub entry_node: Uuid,
@@ -39,6 +40,7 @@ pub struct QueuedInstance {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// Completed instance payload with result or exception.
 pub struct InstanceDone {
     pub executor_id: Uuid,
     pub entry_node: Uuid,
@@ -47,6 +49,10 @@ pub struct InstanceDone {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// Batch payload representing an updated execution graph snapshot.
+///
+/// This intentionally stores only runtime nodes and edges (no DAG template or
+/// derived caches) so persistence stays lightweight.
 pub struct GraphUpdate {
     pub instance_id: Uuid,
     pub nodes: HashMap<Uuid, ExecutionNode>,
@@ -54,6 +60,7 @@ pub struct GraphUpdate {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// Batch payload representing a completed action execution.
 pub struct ActionDone {
     pub node_id: Uuid,
     pub action_name: String,
@@ -61,21 +68,26 @@ pub struct ActionDone {
     pub result: Value,
 }
 
+/// Abstract persistence backend for runner state.
 pub trait BaseBackend: Send + Sync {
     fn clone_box(&self) -> Box<dyn BaseBackend>;
 
+    /// Persist updated execution graphs.
     fn save_graphs<'a>(&'a self, graphs: &'a [GraphUpdate]) -> BoxFuture<'a, BackendResult<()>>;
 
+    /// Persist completed action executions.
     fn save_actions_done<'a>(
         &'a self,
         actions: &'a [ActionDone],
     ) -> BoxFuture<'a, BackendResult<()>>;
 
+    /// Return up to size queued instances without blocking.
     fn get_queued_instances<'a>(
         &'a self,
         size: usize,
     ) -> BoxFuture<'a, BackendResult<Vec<QueuedInstance>>>;
 
+    /// Persist completed workflow instances.
     fn save_instances_done<'a>(
         &'a self,
         instances: &'a [InstanceDone],
