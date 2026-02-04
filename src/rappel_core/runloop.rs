@@ -23,6 +23,7 @@ use crate::rappel_core::workers::{
     ActionCompletion, ActionRequest, BaseWorkerPool, WorkerPoolError,
 };
 
+/// Raised when the run loop cannot coordinate execution.
 #[derive(Debug, thiserror::Error)]
 pub enum RunLoopError {
     #[error("{0}")]
@@ -35,6 +36,7 @@ pub enum RunLoopError {
     RunnerExecutor(#[from] RunnerExecutorError),
 }
 
+/// Aggregated action completions from the run loop.
 #[derive(Clone, Debug, Default)]
 pub struct RunLoopResult {
     pub completed_actions: HashMap<Uuid, Vec<crate::rappel_core::runner::ExecutionNode>>,
@@ -50,6 +52,12 @@ enum LoopEvent {
     Instance(InstanceMessage),
 }
 
+/// Coordinate RunnerExecutors with a shared worker pool.
+///
+/// RunLoop manages multiple executors concurrently. Each executor advances its
+/// DAG template until it hits action calls, which are queued on a worker pool.
+/// The run loop then polls for completions, delegates results back to the
+/// owning executor, and continues until no actions remain in flight.
 pub struct RunLoop {
     worker_pool: Arc<dyn BaseWorkerPool>,
     backend: Arc<dyn BaseBackend>,
@@ -93,6 +101,7 @@ impl RunLoop {
         }
     }
 
+    /// Register an executor and its entry node, returning an executor id.
     pub fn register_executor(&mut self, mut executor: RunnerExecutor, entry_node: Uuid) -> Uuid {
         let executor_id = Uuid::new_v4();
         executor.set_instance_id(executor_id);
@@ -101,6 +110,7 @@ impl RunLoop {
         executor_id
     }
 
+    /// Run all registered executors until no actions remain in flight.
     #[obs]
     pub async fn run(&mut self) -> Result<RunLoopResult, RunLoopError> {
         let mut result = RunLoopResult {
@@ -259,7 +269,8 @@ impl RunLoop {
             // 1. Compute all steps
             // 2. Single persist
             // 3. Then queue new actions
-            self.process_batch(all_completions, all_instances, &mut result).await?;
+            self.process_batch(all_completions, all_instances, &mut result)
+                .await?;
         }
 
         stop.store(true, Ordering::SeqCst);

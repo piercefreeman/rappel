@@ -360,7 +360,6 @@ impl BaseBackend for PostgresBackend {
         Box::new(self.clone())
     }
 
-
     fn save_graphs<'a>(&'a self, graphs: &'a [GraphUpdate]) -> BoxFuture<'a, BackendResult<()>> {
         Box::pin(self.save_graphs_impl(graphs))
     }

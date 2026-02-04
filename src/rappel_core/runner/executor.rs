@@ -20,17 +20,20 @@ use crate::rappel_core::runner::state::{
 };
 use crate::rappel_core::runner::value_visitor::{ValueExpr, ValueExprEvaluator};
 
+/// Raised when the runner executor cannot advance safely.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct RunnerExecutorError(pub String);
 
 #[derive(Clone, Debug)]
+/// Persistence payloads required before dispatching new actions.
 pub struct DurableUpdates {
     pub actions_done: Vec<ActionDone>,
     pub graph_updates: Vec<GraphUpdate>,
 }
 
 #[derive(Clone, Debug)]
+/// Return value for executor steps with newly queued action nodes.
 pub struct ExecutorStep {
     pub actions: Vec<ExecutionNode>,
     pub updates: Option<DurableUpdates>,
@@ -43,6 +46,16 @@ type FinishedNodeResult = (
     Option<ExecutionNode>,
 );
 
+/// Advance a DAG template using the current runner state and action results.
+///
+/// The executor treats the DAG as a control-flow template. It queues runtime
+/// execution nodes into RunnerState, unrolling loops/spreads into explicit
+/// iterations, and stops when it encounters action calls that must be executed
+/// by an external worker.
+///
+/// Each call to increment() starts from a finished execution node, walks
+/// downstream through inline nodes (assignments, branches, joins, etc.), and
+/// returns any newly queued action nodes that are now unblocked.
 pub struct RunnerExecutor {
     dag: DAG,
     state: RunnerState,
@@ -114,14 +127,21 @@ impl RunnerExecutor {
         self.instance_id = Some(instance_id);
     }
 
+    /// Store an action result value for a specific execution node.
     pub fn set_action_result(&mut self, node_id: Uuid, result: Value) {
         self.action_results.insert(node_id, result);
     }
 
+    /// Remove any cached action result for a specific execution node.
     pub fn clear_action_result(&mut self, node_id: Uuid) {
         self.action_results.remove(&node_id);
     }
 
+    /// Fail inflight actions and return any that should be retried.
+    ///
+    /// Use this after recovering from a crash: running actions are treated as
+    /// failed, their attempt counter is incremented if retry policies allow,
+    /// and retryable nodes are re-queued for execution.
     pub fn resume(&mut self) -> Result<ExecutorStep, RunnerExecutorError> {
         let mut retry_nodes = Vec::new();
         let retry_candidates: Vec<Uuid> = self
@@ -163,10 +183,19 @@ impl RunnerExecutor {
         })
     }
 
+    /// Advance execution from a finished node and return newly queued actions.
+    ///
+    /// Example:
+    /// - Action A finishes -> assignment -> branch -> action B
+    ///   increment(A) queues the assignment and branch inline, then returns action B.
     pub fn increment(&mut self, finished_node: Uuid) -> Result<ExecutorStep, RunnerExecutorError> {
         self.increment_batch(&[finished_node])
     }
 
+    /// Advance execution for multiple finished nodes in a single batch.
+    ///
+    /// Use this when multiple actions complete in the same tick so the graph
+    /// update and action inserts are persisted together.
     #[obs]
     pub fn increment_batch(
         &mut self,
@@ -206,6 +235,7 @@ impl RunnerExecutor {
         Ok(ExecutorStep { actions, updates })
     }
 
+    /// Walk downstream from a node, executing inline nodes until blocked.
     #[obs]
     fn walk_from(
         &mut self,
@@ -223,7 +253,7 @@ impl RunnerExecutor {
             let edges = if let Some(template_edges) = self.template_outgoing.get(template_id) {
                 self.select_edges(template_edges, &current, current_exception)?
             } else {
-                continue
+                continue;
             };
             for edge in edges {
                 let successors = self.queue_successor(&current, &edge)?;
@@ -246,6 +276,7 @@ impl RunnerExecutor {
         Ok(actions)
     }
 
+    /// Update state for a finished node and return replay metadata.
     #[obs]
     fn apply_finished_node(
         &mut self,
@@ -322,6 +353,7 @@ impl RunnerExecutor {
         Ok((Some(node), exception_value, action_done, retry_action))
     }
 
+    /// Select outgoing edges based on guards and exception state.
     fn select_edges(
         &self,
         edges: &[DAGEdge],
@@ -332,7 +364,8 @@ impl RunnerExecutor {
         if let Some(exception_value) = exception_value {
             let mut result = Vec::new();
             for edge in edges {
-                if edge.exception_types.is_some() && self.exception_matches(edge, &exception_value) {
+                if edge.exception_types.is_some() && self.exception_matches(edge, &exception_value)
+                {
                     result.push(edge.clone());
                 }
             }
@@ -374,6 +407,7 @@ impl RunnerExecutor {
         Ok(result)
     }
 
+    /// Queue successor nodes for a template edge, handling spreads/aggregators.
     fn queue_successor(
         &mut self,
         source: &ExecutionNode,
@@ -385,23 +419,21 @@ impl RunnerExecutor {
 
         // Extract info from template without holding borrow across mutable calls
         enum TemplateKind {
-            SpreadAction(ActionCallNode),
+            SpreadAction(Box<ActionCallNode>),
             Aggregator(String),
             Regular(String),
         }
 
         let kind = {
-            let template = self
-                .dag
-                .nodes
-                .get(&edge.target)
-                .ok_or_else(|| {
-                    RunnerExecutorError(format!("template node not found: {}", edge.target))
-                })?;
+            let template = self.dag.nodes.get(&edge.target).ok_or_else(|| {
+                RunnerExecutorError(format!("template node not found: {}", edge.target))
+            })?;
 
             match template {
-                crate::rappel_core::dag::DAGNode::ActionCall(action) if action.spread_loop_var.is_some() => {
-                    TemplateKind::SpreadAction(action.clone())
+                crate::rappel_core::dag::DAGNode::ActionCall(action)
+                    if action.spread_loop_var.is_some() =>
+                {
+                    TemplateKind::SpreadAction(Box::new(action.clone()))
                 }
                 crate::rappel_core::dag::DAGNode::Aggregator(_) => {
                     TemplateKind::Aggregator(template.id().to_string())
@@ -411,11 +443,10 @@ impl RunnerExecutor {
         };
 
         match kind {
-            TemplateKind::SpreadAction(action) => {
-                self.expand_spread_action(source, &action)
-            }
+            TemplateKind::SpreadAction(action) => self.expand_spread_action(source, action.as_ref()),
             TemplateKind::Aggregator(template_id) => {
-                if let Some(existing) = self.find_connected_aggregator(source.node_id, &template_id) {
+                if let Some(existing) = self.find_connected_aggregator(source.node_id, &template_id)
+                {
                     return Ok(vec![existing]);
                 }
                 let agg_node = self.get_or_create_aggregator(&template_id)?;
@@ -430,6 +461,12 @@ impl RunnerExecutor {
         }
     }
 
+    /// Unroll a spread action into per-item action nodes and a shared aggregator.
+    ///
+    /// Example IR:
+    /// - results = spread items:item -> @work(item=item)
+    ///   Produces one action execution node per element in items and connects
+    ///   them to a single aggregator node for results.
     fn expand_spread_action(
         &mut self,
         source: &ExecutionNode,
@@ -468,6 +505,11 @@ impl RunnerExecutor {
         Ok(created)
     }
 
+    /// Create an action execution node from a template with optional bindings.
+    ///
+    /// Example IR:
+    /// - @work(value=item) with local_scope{"item": LiteralValue(3)}
+    ///   Produces an action node whose kwargs include the literal 3.
     fn queue_action_from_template(
         &mut self,
         template: &ActionCallNode,
@@ -527,6 +569,7 @@ impl RunnerExecutor {
         Ok(node)
     }
 
+    /// Execute a non-action node inline and update assignments/edges.
     fn execute_inline_node(&mut self, node: &ExecutionNode) -> Result<(), RunnerExecutorError> {
         let template_id = node
             .template_id
@@ -549,6 +592,7 @@ impl RunnerExecutor {
             .map_err(|err| RunnerExecutorError(err.0))
     }
 
+    /// Check if an inline node is ready to run based on incoming edges.
     fn inline_ready(&self, node: &ExecutionNode) -> bool {
         if node.status == NodeStatus::Completed {
             return false;
@@ -598,6 +642,12 @@ impl RunnerExecutor {
         true
     }
 
+    /// Populate aggregated list assignments for a ready aggregator node.
+    ///
+    /// Example:
+    /// - results = spread items: @work(item)
+    ///   When all action nodes complete, the aggregator assigns
+    ///   results = [ActionResultValue(...), ...].
     fn apply_aggregator_assignments(
         &mut self,
         node: &ExecutionNode,
@@ -643,6 +693,7 @@ impl RunnerExecutor {
         Ok(())
     }
 
+    /// Order aggregator values by spread iteration or parallel index.
     fn order_aggregated_values(
         &self,
         sources: &[ExecutionNode],
@@ -683,6 +734,11 @@ impl RunnerExecutor {
         Ok(pairs.into_iter().map(|(_, value)| value).collect())
     }
 
+    /// Expand a collection expression into element ValueExprs.
+    ///
+    /// Example IR:
+    /// - spread range(3):i -> @work(i)
+    ///   Produces [LiteralValue(0), LiteralValue(1), LiteralValue(2)].
     fn expand_collection(
         &mut self,
         expr: &ir::Expr,
@@ -727,6 +783,7 @@ impl RunnerExecutor {
         ))
     }
 
+    /// Convert a pure IR expression into a ValueExpr without side effects.
     fn expr_to_value(expr: &ir::Expr) -> Result<ValueExpr, RunnerExecutorError> {
         match expr.kind.as_ref() {
             Some(ir::expr::Kind::Literal(lit)) => Ok(ValueExpr::Literal(LiteralValue {
@@ -841,6 +898,7 @@ impl RunnerExecutor {
         }
     }
 
+    /// Evaluate a guard expression using current symbolic assignments.
     fn evaluate_guard(&self, expr: Option<&ir::Expr>) -> Result<bool, RunnerExecutorError> {
         let expr = match expr {
             Some(expr) => expr,
@@ -851,6 +909,11 @@ impl RunnerExecutor {
         Ok(is_truthy(&result))
     }
 
+    /// Resolve an action's symbolic kwargs to concrete Python values.
+    ///
+    /// Example:
+    /// - spec.kwargs={"value": VariableValue("x")}
+    /// - with x assigned to LiteralValue(10), returns {"value": 10}.
     #[obs]
     pub fn resolve_action_kwargs(
         &self,
@@ -864,6 +927,7 @@ impl RunnerExecutor {
         Ok(resolved)
     }
 
+    /// Evaluate a ValueExpr into a concrete Python value.
     #[obs]
     fn evaluate_value_expr(&self, expr: &ValueExpr) -> Result<Value, RunnerExecutorError> {
         let stack = Rc::new(RefCell::new(HashSet::new()));
@@ -1329,30 +1393,34 @@ impl RunnerExecutor {
             let mut best_timeline_pos: Option<usize> = None;
 
             for &node_id in node_ids {
-                if let Some(node) = self.state.nodes.get(&node_id) {
-                    if node.status != NodeStatus::Completed {
-                        let timeline_pos = self.state.timeline.iter().position(|&id| id == node_id);
-                        if let Some(pos) = timeline_pos {
-                            if best_timeline_pos.is_none() || pos > best_timeline_pos.unwrap() {
-                                best_timeline_pos = Some(pos);
-                                best_node_id = Some(node_id);
-                            }
-                        } else if best_node_id.is_none() {
+                if let Some(node) = self.state.nodes.get(&node_id)
+                    && node.status != NodeStatus::Completed
+                {
+                    let timeline_pos = self.state.timeline.iter().position(|&id| id == node_id);
+                    if let Some(pos) = timeline_pos {
+                        if best_timeline_pos.is_none() || pos > best_timeline_pos.unwrap() {
+                            best_timeline_pos = Some(pos);
                             best_node_id = Some(node_id);
                         }
+                    } else if best_node_id.is_none() {
+                        best_node_id = Some(node_id);
                     }
                 }
             }
 
             if let Some(node_id) = best_node_id {
-                return self.state.nodes.get(&node_id).cloned().ok_or_else(|| {
-                    RunnerExecutorError(format!("node disappeared: {node_id}"))
-                });
+                return self
+                    .state
+                    .nodes
+                    .get(&node_id)
+                    .cloned()
+                    .ok_or_else(|| RunnerExecutorError(format!("node disappeared: {node_id}")));
             }
         }
 
         // Create new node and register it in the index
-        let node = self.state
+        let node = self
+            .state
             .queue_template_node(template_id, None)
             .map_err(|err| RunnerExecutorError(err.0))?;
         self.register_exec_node(template_id, node.node_id);

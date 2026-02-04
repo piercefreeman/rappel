@@ -15,6 +15,7 @@ use crate::rappel_core::runner::value_visitor::{
     ValueExpr, collect_value_sources, resolve_value_tree,
 };
 
+/// Raised when the runner state cannot be updated safely.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct RunnerStateError(pub String);
@@ -152,6 +153,53 @@ pub struct ExecutionEdge {
     pub edge_type: EdgeType,
 }
 
+/// Track queued/executed DAG nodes with an unrolled, symbolic state.
+///
+/// Design overview:
+/// - The runner state is not a variable heap; it is the runtime graph itself,
+///   unrolled to the exact nodes that have been queued or executed.
+/// - Each execution node stores assignments as symbolic expressions so action
+///   results can be replayed later without having the concrete payloads.
+/// - Data-flow edges encode which execution node supplies a value to another,
+///   while state-machine edges encode execution ordering and control flow. This
+///   mirrors how the ground truth IR->DAG functions.
+///
+/// Expected usage:
+/// - Callers queue nodes as the program executes (ie. the DAG template is
+///   walked) so loops and spreads expand into explicit iterations.
+/// - Callers never mutate variables directly; they record assignments on nodes
+///   and let replay walk the graph to reconstruct values.
+/// - Persisted state can be rehydrated only with nodes/edges. The constructor will
+///   rebuild in-memory cache (like timeline ordering and latest assignment tracking).
+///
+/// In short, RunnerState is the ground-truth runtime DAG: symbolic assignments
+/// plus control/data edges, suitable for replay and visualization.
+///
+/// Cycle walkthrough (mid-loop example):
+/// Suppose we are partway through:
+/// - results = []
+/// - for item in items:
+///     - action_result = @action(item)
+///     - results = results + [action_result + 1]
+///
+/// On a single iteration update:
+/// 1) The runner queues an action node for @action(item).
+///    - A new execution node is created with a UUID id.
+///    - Its assignments map action_result -> ActionResultValue(node_id).
+///    - Data-flow edges are added from the node that last defined `item`.
+/// 2) The runner queues the assignment node for results update.
+///    - The RHS expression is materialized:
+///      results + [action_result + 1] becomes a BinaryOpValue whose tree
+///      contains the ActionResultValue from step (1), plus a LiteralValue(1).
+///    - Data-flow edges are added from the prior results definition node and
+///      from the action node created in step (1).
+///    - Latest assignment tracking is updated so `results` now points to this
+///      new execution node.
+///
+/// After this iteration, the state graph has explicit nodes for the current
+/// action and the results update. Subsequent iterations repeat the same
+/// sequence, producing a chain of assignments where replay can reconstruct the
+/// incremental `results` value by following data-flow edges.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunnerState {
     pub dag: Option<DAG>,
@@ -195,6 +243,15 @@ impl RunnerState {
         self.latest_assignments.get(name).copied()
     }
 
+    /// Queue a runtime node based on the DAG template and apply its effects.
+    ///
+    /// Use this when stepping through a compiled DAG so the runtime state mirrors
+    /// the template node (assignments, action results, and data-flow edges).
+    ///
+    /// Example IR:
+    /// - total = a + b
+    ///   When the AssignmentNode template is queued, the execution node records
+    ///   the symbolic BinaryOpValue and updates data-flow edges from a/b.
     pub fn queue_template_node(
         &mut self,
         template_id: &str,
@@ -237,6 +294,13 @@ impl RunnerState {
         Ok(node)
     }
 
+    /// Create a runtime node directly without a DAG template.
+    ///
+    /// Use this for ad-hoc nodes (tests, synthetic steps) and as a common
+    /// builder for higher-level queue helpers like queue_action.
+    ///
+    /// Example:
+    /// - queue_node(node_type="assignment", label="results = []")
     pub fn queue_node(
         &mut self,
         node_type: &str,
@@ -268,6 +332,15 @@ impl RunnerState {
         Ok(node)
     }
 
+    /// Queue an action call from IR, respecting a local scope for loop vars.
+    ///
+    /// Use this during IR -> runner-state conversion (including spreads) so
+    /// action arguments are converted to symbolic expressions.
+    ///
+    /// Example IR:
+    /// - @double(value=item)
+    ///   With local_scope={"item": LiteralValue(2)}, the queued action uses a
+    ///   literal argument and links data-flow to the literal's source nodes.
     pub fn queue_action_call(
         &mut self,
         action: &ir::ActionCall,
@@ -332,6 +405,7 @@ impl RunnerState {
         Ok(())
     }
 
+    /// Return and clear the graph dirty bit for durable execution.
     pub fn consume_graph_dirty_for_durable_execution(&mut self) -> bool {
         let dirty = self.graph_dirty;
         self.graph_dirty = false;
@@ -346,6 +420,7 @@ impl RunnerState {
         });
     }
 
+    /// Insert a node into the runtime bookkeeping and optional control flow.
     fn register_node(&mut self, node: ExecutionNode) -> Result<(), RunnerStateError> {
         if self.nodes.contains_key(&node.node_id) {
             return Err(RunnerStateError(format!(
@@ -379,6 +454,7 @@ impl RunnerState {
         self.graph_dirty = true;
     }
 
+    /// Rebuild derived structures from persisted nodes and edges.
     fn rehydrate_state(&mut self) {
         self.timeline = self.build_timeline();
         self.latest_assignments.clear();
@@ -531,6 +607,7 @@ impl RunnerState {
         }
     }
 
+    /// Apply DAG template semantics to a queued execution node.
     fn apply_template_node(
         &mut self,
         exec_node: &ExecutionNode,
@@ -624,6 +701,7 @@ impl RunnerState {
         Ok(())
     }
 
+    /// Create symbolic action results and map them to targets.
     pub(crate) fn assign_action_results(
         &mut self,
         node: &ExecutionNode,
@@ -649,6 +727,7 @@ impl RunnerState {
         Ok(result_ref)
     }
 
+    /// Expand an assignment into per-target symbolic values.
     fn build_assignments(
         &self,
         targets: &[String],
@@ -724,6 +803,15 @@ impl RunnerState {
         }
     }
 
+    /// Inline variable references and apply light constant folding.
+    ///
+    /// Use this before storing assignments so values are self-contained and
+    /// list concatenations are simplified.
+    ///
+    /// Example IR:
+    /// - xs = [1]
+    /// - ys = xs + [2]
+    ///   Materialization turns ys into ListValue([1, 2]) rather than keeping xs.
     pub(crate) fn materialize_value(&self, value: ValueExpr) -> ValueExpr {
         let resolved = resolve_value_tree(&value, &|name, seen| {
             self.resolve_variable_value(name, seen)
@@ -739,6 +827,18 @@ impl RunnerState {
         resolved
     }
 
+    /// Resolve a variable name to its latest symbolic definition.
+    ///
+    /// Use this when materializing expressions so variables become their
+    /// defining expression while guarding against cycles.
+    ///
+    /// Example IR:
+    /// - x = 1
+    /// - y = x + 2
+    ///   When materializing y, the VariableValue("x") is replaced with the
+    ///   LiteralValue(1), yielding a BinaryOpValue(1 + 2) instead of a reference
+    ///   to x. This makes downstream replay use the symbolic expression rather
+    ///   than requiring a separate variable lookup.
     fn resolve_variable_value(&self, name: &str, seen: &mut HashSet<String>) -> ValueExpr {
         if seen.contains(name) {
             return ValueExpr::Variable(VariableValue {
@@ -786,12 +886,24 @@ impl RunnerState {
         }
     }
 
+    /// Add data-flow edges implied by a value expression.
+    ///
+    /// Use this when a node consumes an expression so upstream dependencies are
+    /// encoded in the runtime graph.
+    ///
+    /// Example IR:
+    /// - total = @sum(values)
+    ///   A data-flow edge is added from the values assignment node to the action.
     pub(crate) fn record_data_flow_from_value(&mut self, node_id: Uuid, value: &ValueExpr) {
         let source_ids =
             collect_value_sources(value, &|name| self.latest_assignments.get(name).copied());
         self.record_data_flow_edges(node_id, &source_ids);
     }
 
+    /// Register data-flow edges from sources to the given node.
+    ///
+    /// Example:
+    /// - sources {A, B} and node C produce edges A -> C and B -> C.
     fn record_data_flow_edges(&mut self, node_id: Uuid, source_ids: &HashSet<Uuid>) {
         for source_id in source_ids {
             if *source_id == node_id {
@@ -805,6 +917,14 @@ impl RunnerState {
         }
     }
 
+    /// Convert an IR expression into a symbolic ValueExpr tree.
+    ///
+    /// Use this when interpreting IR statements or DAG templates into the
+    /// runtime state; it queues actions and spreads as needed.
+    ///
+    /// Example IR:
+    /// - total = base + 1
+    ///   Produces BinaryOpValue(VariableValue("base"), LiteralValue(1)).
     pub fn expr_to_value(
         &mut self,
         expr: &ir::Expr,
@@ -936,6 +1056,7 @@ impl RunnerState {
         }
     }
 
+    /// Convert an IR call (action/function) into a ValueExpr.
     fn call_to_value(
         &mut self,
         call: &ir::Call,
@@ -958,6 +1079,7 @@ impl RunnerState {
         }
     }
 
+    /// Materialize a spread expression into concrete calls or a symbolic spread.
     fn spread_expr_value(
         &mut self,
         spread: &ir::SpreadExpr,
@@ -1003,6 +1125,14 @@ impl RunnerState {
         }))
     }
 
+    /// Build a binary-op value with simple constant folding.
+    ///
+    /// Use this when converting IR so literals and list concatenations are
+    /// simplified early.
+    ///
+    /// Example IR:
+    /// - total = 1 + 2
+    ///   Produces LiteralValue(3) instead of a BinaryOpValue.
     fn binary_op_value(&self, op: i32, left: ValueExpr, right: ValueExpr) -> ValueExpr {
         if ir::BinaryOperator::try_from(op).ok() == Some(ir::BinaryOperator::BinaryOpAdd)
             && let (ValueExpr::List(left_list), ValueExpr::List(right_list)) = (&left, &right)
@@ -1023,6 +1153,11 @@ impl RunnerState {
         })
     }
 
+    /// Build a unary-op value with constant folding for literals.
+    ///
+    /// Example IR:
+    /// - neg = -1
+    ///   Produces LiteralValue(-1) instead of UnaryOpValue.
     fn unary_op_value(&self, op: i32, operand: ValueExpr) -> ValueExpr {
         if let ValueExpr::Literal(lit) = &operand
             && let Some(folded) = fold_literal_unary(op, &lit.value)
@@ -1035,6 +1170,11 @@ impl RunnerState {
         })
     }
 
+    /// Build an index value, folding list literals when possible.
+    ///
+    /// Example IR:
+    /// - first = [10, 20][0]
+    ///   Produces LiteralValue(10) when the list is fully literal.
     fn index_value(&self, object: ValueExpr, index: ValueExpr) -> ValueExpr {
         if let (ValueExpr::List(list), ValueExpr::Literal(idx)) = (&object, &index)
             && let Some(idx) = idx.value.as_i64()
@@ -1049,6 +1189,13 @@ impl RunnerState {
         })
     }
 
+    /// Extract an action call spec from a DAG node.
+    ///
+    /// Use this when queueing nodes from the DAG template.
+    ///
+    /// Example:
+    /// - ActionCallNode(action_name="double", kwargs={"value": "$x"})
+    ///   Produces ActionCallSpec(action_name="double", kwargs={"value": VariableValue("x")}).
     fn action_spec_from_node(&mut self, node: &ActionCallNode) -> ActionCallSpec {
         let kwargs = node
             .kwarg_exprs
@@ -1062,6 +1209,11 @@ impl RunnerState {
         }
     }
 
+    /// Extract an action call spec from IR, applying local scope bindings.
+    ///
+    /// Example IR:
+    /// - @double(value=item) with local_scope["item"]=LiteralValue(2)
+    ///   Produces kwargs {"value": LiteralValue(2)}.
     fn action_spec_from_ir(
         &mut self,
         action: &ir::ActionCall,
@@ -1080,6 +1232,14 @@ impl RunnerState {
         }
     }
 
+    /// Queue an action call from raw parameters and return a symbolic result.
+    ///
+    /// Use this when constructing runner state programmatically without IR
+    /// objects, while still wiring data-flow edges and assignments.
+    ///
+    /// Example:
+    /// - queue_action("double", targets=["out"], kwargs={"value": LiteralValue(2)})
+    ///   Defines out via an ActionResultValue and records data-flow from the literal.
     pub fn queue_action(
         &mut self,
         action_name: &str,
@@ -1117,6 +1277,13 @@ impl RunnerState {
         Ok(result)
     }
 
+    /// Record an IR assignment as a runtime node with symbolic values.
+    ///
+    /// Use this when interpreting IR statements into the unrolled runtime graph.
+    ///
+    /// Example IR:
+    /// - results = []
+    ///   Produces an assignment node with targets ["results"] and a ListValue([]).
     pub fn record_assignment(
         &mut self,
         targets: Vec<String>,
@@ -1128,6 +1295,14 @@ impl RunnerState {
         self.record_assignment_value(targets, value_expr, node_id, label)
     }
 
+    /// Record a symbolic assignment node and update data-flow/definitions.
+    ///
+    /// Use this for assignments created programmatically after ValueExpr
+    /// construction (tests or state rewrites).
+    ///
+    /// Example:
+    /// - record_assignment_value(targets=["x"], value_expr=LiteralValue(1))
+    ///   Creates an assignment node with x bound to LiteralValue(1).
     pub fn record_assignment_value(
         &mut self,
         targets: Vec<String>,
@@ -1156,10 +1331,18 @@ impl RunnerState {
     }
 }
 
+/// Render a ValueExpr to a python-like string for debugging/visualization.
+///
+/// Example:
+/// - BinaryOpValue(VariableValue("a"), +, LiteralValue(1)) -> "a + 1"
 pub fn format_value(expr: &ValueExpr) -> String {
     format_value_inner(expr, 0)
 }
 
+/// Recursive ValueExpr formatter with operator precedence handling.
+///
+/// Example:
+/// - (a + b) * c renders with parentheses when needed.
 fn format_value_inner(expr: &ValueExpr, parent_prec: i32) -> String {
     match expr {
         ValueExpr::Literal(lit) => format_literal(&lit.value),
@@ -1252,6 +1435,7 @@ fn format_value_inner(expr: &ValueExpr, parent_prec: i32) -> String {
     }
 }
 
+/// Map binary operator enums to (symbol, precedence) for formatting.
 fn binary_operator(op: i32) -> (&'static str, i32) {
     match ir::BinaryOperator::try_from(op).ok() {
         Some(ir::BinaryOperator::BinaryOpOr) => ("or", 10),
@@ -1274,6 +1458,7 @@ fn binary_operator(op: i32) -> (&'static str, i32) {
     }
 }
 
+/// Map unary operator enums to (symbol, precedence) for formatting.
 fn unary_operator(op: i32) -> (&'static str, i32) {
     match ir::UnaryOperator::try_from(op).ok() {
         Some(ir::UnaryOperator::UnaryOpNeg) => ("-", 60),
@@ -1282,6 +1467,7 @@ fn unary_operator(op: i32) -> (&'static str, i32) {
     }
 }
 
+/// Return precedence for non-operator constructs like index/dot.
 fn precedence(kind: &str) -> i32 {
     match kind {
         "index" | "dot" => 80,
@@ -1289,6 +1475,7 @@ fn precedence(kind: &str) -> i32 {
     }
 }
 
+/// Format Python literals as source-like text.
 fn format_literal(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Null => "None".to_string(),
@@ -1306,6 +1493,10 @@ fn format_literal(value: &serde_json::Value) -> String {
     }
 }
 
+/// Convert an IR literal into a Python value.
+///
+/// Example IR:
+/// - Literal(int_value=3) -> 3
 pub(crate) fn literal_value(lit: &ir::Literal) -> serde_json::Value {
     match lit.value.as_ref() {
         Some(ir::literal::Value::IntValue(value)) => serde_json::Value::Number((*value).into()),
@@ -1319,6 +1510,10 @@ pub(crate) fn literal_value(lit: &ir::Literal) -> serde_json::Value {
     }
 }
 
+/// Try to fold a literal binary operation to a concrete value.
+///
+/// Example:
+/// - (1, 2, BINARY_OP_ADD) -> 3
 fn fold_literal_binary(
     op: i32,
     left: &serde_json::Value,
@@ -1375,6 +1570,10 @@ fn fold_literal_binary(
     }
 }
 
+/// Try to fold a literal unary operation to a concrete value.
+///
+/// Example:
+/// - (UNARY_OP_NEG, 4) -> -4
 fn fold_literal_unary(op: i32, operand: &serde_json::Value) -> Option<serde_json::Value> {
     match ir::UnaryOperator::try_from(op).ok() {
         Some(ir::UnaryOperator::UnaryOpNeg) => operand

@@ -12,6 +12,7 @@ use crate::rappel_core::dag::EdgeType;
 use crate::rappel_core::runner::state::{ActionResultValue, FunctionCallValue, RunnerState};
 use crate::rappel_core::runner::value_visitor::ValueExprEvaluator;
 
+/// Raised when replay cannot reconstruct variable values.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct ReplayError(pub String);
@@ -21,6 +22,7 @@ pub struct ReplayResult {
     pub variables: HashMap<String, Value>,
 }
 
+/// Replay variable values from a runner state snapshot.
 pub struct ReplayEngine<'a> {
     state: &'a RunnerState,
     action_results: &'a HashMap<Uuid, Value>,
@@ -31,6 +33,14 @@ pub struct ReplayEngine<'a> {
 }
 
 impl<'a> ReplayEngine<'a> {
+    /// Prepare replay state derived from a runner snapshot.
+    ///
+    /// We precompute a timeline index and incoming data-flow map so lookups are
+    /// O(1) during evaluation.
+    ///
+    /// Example:
+    /// - timeline = [node_a, node_b]
+    /// - index[node_b] == 1 and incoming data edges are pre-sorted.
     pub fn new(state: &'a RunnerState, action_results: &'a HashMap<Uuid, Value>) -> Self {
         let timeline = if state.timeline.is_empty() {
             state.nodes.keys().cloned().collect()
@@ -53,6 +63,16 @@ impl<'a> ReplayEngine<'a> {
         }
     }
 
+    /// Replay variable values by scanning assignments from newest to oldest.
+    ///
+    /// We walk the timeline in reverse to capture the latest assignment for each
+    /// variable and skip older definitions once a value is known. This mirrors
+    /// "last write wins" semantics while avoiding redundant evaluation work.
+    ///
+    /// Example:
+    /// - x = 1
+    /// - x = 2
+    ///   Reverse traversal yields x=2 without evaluating the older assignment.
     pub fn replay_variables(&self) -> Result<ReplayResult, ReplayError> {
         let mut variables: HashMap<String, Value> = HashMap::new();
         for node_id in self.timeline.iter().rev() {
@@ -78,6 +98,15 @@ impl<'a> ReplayEngine<'a> {
         Ok(ReplayResult { variables })
     }
 
+    /// Evaluate a single assignment expression with cycle detection.
+    ///
+    /// We memoize evaluated (node, target) pairs and guard against recursive
+    /// references by tracking a stack of active evaluations.
+    ///
+    /// Example:
+    /// - x = y + 1
+    /// - y = 2
+    ///   Evaluating x resolves y first, then computes x.
     fn evaluate_assignment(
         &self,
         node_id: Uuid,
@@ -136,6 +165,15 @@ impl<'a> ReplayEngine<'a> {
         Ok(value)
     }
 
+    /// Resolve a variable reference via data-flow edges.
+    ///
+    /// This walks to the closest upstream definition and replays that
+    /// assignment for the requested variable.
+    ///
+    /// Example:
+    /// - action_1 defines x
+    /// - assign_2 uses x
+    ///   Resolving x from assign_2 evaluates action_1's assignment.
     fn resolve_variable(
         &self,
         current_node_id: Uuid,
@@ -150,6 +188,13 @@ impl<'a> ReplayEngine<'a> {
         self.evaluate_assignment(source_node_id, name, stack)
     }
 
+    /// Find the nearest upstream node that defines the variable.
+    ///
+    /// We consult pre-sorted incoming data edges and ignore sources that are
+    /// later in the timeline than the current node.
+    ///
+    /// Example:
+    /// - if node_b comes after node_a, node_b cannot be a source for node_a.
     fn find_variable_source_node(&self, current_node_id: Uuid, name: &str) -> Option<Uuid> {
         let sources = self.incoming_data.get(&current_node_id)?;
         let current_idx = self
@@ -170,6 +215,12 @@ impl<'a> ReplayEngine<'a> {
         None
     }
 
+    /// Fetch an action result by node id, handling indexed results.
+    ///
+    /// Example:
+    /// - result = @fetch()
+    /// - result[0]
+    ///   The evaluator looks up the action result and returns index 0.
     fn resolve_action_result(&self, expr: &ActionResultValue) -> Result<Value, ReplayError> {
         let value = self
             .action_results
@@ -194,6 +245,13 @@ impl<'a> ReplayEngine<'a> {
         Ok(value)
     }
 
+    /// Evaluate a function call during replay.
+    ///
+    /// Only global functions are supported because user-defined functions are
+    /// not available in this replay context.
+    ///
+    /// Example:
+    /// - len(items=[1, 2]) -> 2
     fn evaluate_function_call(
         &self,
         expr: &FunctionCallValue,
@@ -212,6 +270,10 @@ impl<'a> ReplayEngine<'a> {
     }
 }
 
+/// Apply a binary operator to replayed operands.
+///
+/// Example:
+/// - left=1, right=2, op=ADD -> 3
 fn apply_binary(op: i32, left: Value, right: Value) -> Result<Value, ReplayError> {
     match ir::BinaryOperator::try_from(op).ok() {
         Some(ir::BinaryOperator::BinaryOpOr) => {
@@ -250,6 +312,10 @@ fn apply_binary(op: i32, left: Value, right: Value) -> Result<Value, ReplayError
     }
 }
 
+/// Apply a unary operator to a replayed operand.
+///
+/// Example:
+/// - op=NOT, operand=True -> False
 fn apply_unary(op: i32, operand: Value) -> Result<Value, ReplayError> {
     match ir::UnaryOperator::try_from(op).ok() {
         Some(ir::UnaryOperator::UnaryOpNeg) => {
@@ -271,6 +337,11 @@ fn apply_unary(op: i32, operand: Value) -> Result<Value, ReplayError> {
     }
 }
 
+/// Evaluate supported global helper functions.
+///
+/// Example:
+/// - range(0, 3) -> [0, 1, 2]
+/// - isexception(value={"type": "...", "message": "..."}) -> True
 fn evaluate_global_function(
     global_function: i32,
     args: Vec<Value>,
@@ -321,6 +392,10 @@ fn evaluate_global_function(
     }
 }
 
+/// Build a reverse index of incoming data-flow edges.
+///
+/// Sources are sorted from most-recent to oldest by timeline index so
+/// lookups can short-circuit on the first viable definition.
 fn build_incoming_data_map(
     state: &RunnerState,
     index: &HashMap<Uuid, usize>,
@@ -429,6 +504,10 @@ fn is_truthy(value: &Value) -> bool {
     }
 }
 
+/// Return True if the value looks like an exception payload.
+///
+/// We treat native exceptions or dict payloads with type/message keys as
+/// exception-shaped values.
 fn is_exception_value(value: &Value) -> bool {
     if let Value::Object(map) = value {
         return map.contains_key("type") && map.contains_key("message");
@@ -483,6 +562,10 @@ fn range_from_args(args: &[Value]) -> Vec<Value> {
     values
 }
 
+/// Replay variable values from a runner state snapshot.
+///
+/// This is a convenience wrapper around ReplayEngine that prefers the latest
+/// assignment for each variable and returns a fully materialized mapping.
 pub fn replay_variables(
     state: &RunnerState,
     action_results: &HashMap<Uuid, Value>,

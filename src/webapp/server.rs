@@ -1,0 +1,926 @@
+//! Web application server for the Rappel workflow dashboard.
+
+use std::{net::SocketAddr, sync::Arc};
+
+use anyhow::{Context, Result};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    response::{Html, IntoResponse, Response},
+    routing::get,
+};
+use chrono::Utc;
+use serde::Serialize;
+use tera::{Context as TeraContext, Tera};
+use tokio::net::TcpListener;
+use tracing::{error, info};
+use uuid::Uuid;
+
+use super::db::WebappDatabase;
+use super::types::{
+    ActionLogsResponse, FilterValuesResponse, HealthResponse, InstanceExportInfo, TimelineEntry,
+    WebappConfig, WorkflowInstanceExport, WorkflowRunDataResponse,
+};
+
+// Embed templates at compile time
+const TEMPLATE_BASE: &str = include_str!("../../templates/base.html");
+const TEMPLATE_MACROS: &str = include_str!("../../templates/macros.html");
+const TEMPLATE_HOME: &str = include_str!("../../templates/home.html");
+const TEMPLATE_ERROR: &str = include_str!("../../templates/error.html");
+const TEMPLATE_WORKFLOW: &str = include_str!("../../templates/workflow.html");
+const TEMPLATE_WORKFLOW_RUN: &str = include_str!("../../templates/workflow_run.html");
+const TEMPLATE_INVOCATIONS: &str = include_str!("../../templates/invocations.html");
+const TEMPLATE_SCHEDULED: &str = include_str!("../../templates/scheduled.html");
+const TEMPLATE_SCHEDULE_DETAIL: &str = include_str!("../../templates/schedule_detail.html");
+
+/// Webapp server handle.
+pub struct WebappServer {
+    addr: SocketAddr,
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+}
+
+impl WebappServer {
+    /// Start the webapp server.
+    ///
+    /// Returns None if the webapp is disabled via configuration.
+    pub async fn start(config: WebappConfig, database: WebappDatabase) -> Result<Option<Self>> {
+        if !config.enabled {
+            info!("webapp disabled (set RAPPEL_WEBAPP_ENABLED=true to enable)");
+            return Ok(None);
+        }
+
+        let bind_addr = config.bind_addr();
+        let listener = TcpListener::bind(&bind_addr)
+            .await
+            .with_context(|| format!("failed to bind webapp listener on {bind_addr}"))?;
+
+        let actual_addr = listener.local_addr()?;
+
+        // Initialize templates
+        let templates = init_templates()?;
+
+        let state = WebappState {
+            database: Arc::new(database),
+            templates: Arc::new(templates),
+        };
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        // Spawn the server task
+        tokio::spawn(run_server(listener, state, shutdown_rx));
+
+        info!(addr = %actual_addr, "webapp server started");
+
+        Ok(Some(Self {
+            addr: actual_addr,
+            shutdown_tx,
+        }))
+    }
+
+    /// Get the address the server is bound to.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Shutdown the server.
+    pub async fn shutdown(self) {
+        let _ = self.shutdown_tx.send(());
+    }
+}
+
+/// Initialize Tera templates from embedded strings.
+fn init_templates() -> Result<Tera> {
+    let mut tera = Tera::default();
+
+    tera.add_raw_template("base.html", TEMPLATE_BASE)
+        .context("failed to add base.html template")?;
+    tera.add_raw_template("macros.html", TEMPLATE_MACROS)
+        .context("failed to add macros.html template")?;
+    tera.add_raw_template("home.html", TEMPLATE_HOME)
+        .context("failed to add home.html template")?;
+    tera.add_raw_template("error.html", TEMPLATE_ERROR)
+        .context("failed to add error.html template")?;
+    tera.add_raw_template("workflow.html", TEMPLATE_WORKFLOW)
+        .context("failed to add workflow.html template")?;
+    tera.add_raw_template("workflow_run.html", TEMPLATE_WORKFLOW_RUN)
+        .context("failed to add workflow_run.html template")?;
+    tera.add_raw_template("invocations.html", TEMPLATE_INVOCATIONS)
+        .context("failed to add invocations.html template")?;
+    tera.add_raw_template("scheduled.html", TEMPLATE_SCHEDULED)
+        .context("failed to add scheduled.html template")?;
+    tera.add_raw_template("schedule_detail.html", TEMPLATE_SCHEDULE_DETAIL)
+        .context("failed to add schedule_detail.html template")?;
+
+    tera.autoescape_on(vec![".html", ".tera"]);
+    Ok(tera)
+}
+
+// ============================================================================
+// Internal Server State
+// ============================================================================
+
+#[derive(Clone)]
+struct WebappState {
+    database: Arc<WebappDatabase>,
+    templates: Arc<Tera>,
+}
+
+async fn run_server(
+    listener: TcpListener,
+    state: WebappState,
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    use axum::routing::post;
+
+    let app = Router::new()
+        .route("/", get(list_invocations))
+        .route("/invocations", get(list_invocations))
+        .route("/instance/:instance_id", get(instance_detail))
+        .route("/api/instance/:instance_id/run-data", get(get_run_data))
+        .route(
+            "/api/instance/:instance_id/action-logs/:action_id",
+            get(get_action_logs),
+        )
+        .route("/api/instance/:instance_id/export", get(export_instance))
+        .route(
+            "/api/invocations/filter-values/:column",
+            get(get_filter_values),
+        )
+        // Schedule routes
+        .route("/scheduled", get(list_schedules))
+        .route("/scheduled/:schedule_id", get(schedule_detail))
+        .route("/scheduled/:schedule_id/pause", post(pause_schedule))
+        .route("/scheduled/:schedule_id/resume", post(resume_schedule))
+        .route("/scheduled/:schedule_id/delete", post(delete_schedule))
+        .route(
+            "/api/scheduled/filter-values/:column",
+            get(get_schedule_filter_values),
+        )
+        .route("/healthz", get(healthz))
+        .with_state(state);
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .ok();
+}
+
+// ============================================================================
+// Handlers
+// ============================================================================
+
+async fn healthz() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok",
+        service: "rappel-webapp",
+    })
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct InvocationListQuery {
+    page: Option<i64>,
+    q: Option<String>,
+}
+
+async fn list_invocations(
+    State(state): State<WebappState>,
+    axum::extract::Query(query): axum::extract::Query<InvocationListQuery>,
+) -> impl IntoResponse {
+    let per_page = 50i64;
+    let search = query.q.as_deref().filter(|v| !v.trim().is_empty());
+
+    let total_count = match state.database.count_instances(search).await {
+        Ok(count) => count,
+        Err(err) => {
+            error!(?err, "failed to count instances");
+            return Html(render_error_page(
+                &state.templates,
+                "Unable to load invocations",
+                "We couldn't fetch workflow instances. Please check the database connection.",
+            ));
+        }
+    };
+
+    let total_pages = (total_count as f64 / per_page as f64).ceil() as i64;
+    let current_page = query.page.unwrap_or(1).max(1).min(total_pages.max(1));
+    let offset = (current_page - 1) * per_page;
+
+    match state
+        .database
+        .list_instances(search, per_page, offset)
+        .await
+    {
+        Ok(instances) => Html(render_invocations_page(
+            &state.templates,
+            &instances,
+            current_page,
+            total_pages,
+            search.map(|s| s.to_string()),
+            total_count,
+        )),
+        Err(err) => {
+            error!(?err, "failed to load instances");
+            Html(render_error_page(
+                &state.templates,
+                "Unable to load invocations",
+                "We couldn't fetch workflow instances. Please check the database connection.",
+            ))
+        }
+    }
+}
+
+async fn instance_detail(
+    State(state): State<WebappState>,
+    Path(instance_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let instance = match state.database.get_instance(instance_id).await {
+        Ok(i) => i,
+        Err(err) => {
+            error!(?err, %instance_id, "failed to load instance");
+            return Html(render_error_page(
+                &state.templates,
+                "Instance not found",
+                "The requested workflow instance could not be located.",
+            ));
+        }
+    };
+
+    // Get execution graph
+    let graph = state
+        .database
+        .get_execution_graph(instance_id)
+        .await
+        .unwrap_or(None);
+
+    Html(render_instance_detail_page(
+        &state.templates,
+        &instance,
+        graph,
+    ))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RunDataQuery {
+    page: Option<i64>,
+    per_page: Option<i64>,
+    include_nodes: Option<bool>,
+}
+
+async fn get_run_data(
+    State(state): State<WebappState>,
+    Path(instance_id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<RunDataQuery>,
+) -> Result<Json<WorkflowRunDataResponse>, HttpError> {
+    state
+        .database
+        .get_instance(instance_id)
+        .await
+        .map_err(|err| {
+            error!(?err, %instance_id, "failed to load instance");
+            HttpError {
+                status: StatusCode::NOT_FOUND,
+                message: "workflow instance not found".to_string(),
+            }
+        })?;
+
+    let per_page = query.per_page.unwrap_or(200).clamp(1, 1000);
+    let page = query.page.unwrap_or(1).max(1);
+    let include_nodes = query.include_nodes.unwrap_or(true);
+
+    let mut nodes = Vec::new();
+    if include_nodes {
+        if let Some(graph) = state
+            .database
+            .get_execution_graph(instance_id)
+            .await
+            .ok()
+            .flatten()
+        {
+            nodes = graph.nodes;
+        }
+    }
+
+    let timeline = state
+        .database
+        .get_action_results(instance_id)
+        .await
+        .unwrap_or_default();
+
+    let total = timeline.len() as i64;
+    let start = ((page - 1) * per_page) as usize;
+    let end = (start + per_page as usize).min(timeline.len());
+    let paginated: Vec<TimelineEntry> = if start < timeline.len() {
+        timeline[start..end].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    let has_more = (page * per_page) < total;
+
+    Ok(Json(WorkflowRunDataResponse {
+        nodes,
+        timeline: paginated,
+        page,
+        per_page,
+        total,
+        has_more,
+    }))
+}
+
+async fn get_action_logs(
+    State(state): State<WebappState>,
+    Path((instance_id, action_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<ActionLogsResponse>, HttpError> {
+    state
+        .database
+        .get_instance(instance_id)
+        .await
+        .map_err(|err| {
+            error!(?err, %instance_id, "failed to load instance");
+            HttpError {
+                status: StatusCode::NOT_FOUND,
+                message: "workflow instance not found".to_string(),
+            }
+        })?;
+
+    let timeline = state
+        .database
+        .get_action_results(instance_id)
+        .await
+        .unwrap_or_default();
+
+    let action_id_str = action_id.to_string();
+    let logs: Vec<_> = timeline
+        .into_iter()
+        .filter(|e| e.action_id == action_id_str)
+        .map(|e| super::types::ActionLogEntry {
+            action_id: e.action_id,
+            action_name: e.action_name,
+            module_name: e.module_name,
+            status: e.status,
+            attempt_number: e.attempt_number,
+            dispatched_at: e.dispatched_at,
+            completed_at: e.completed_at,
+            duration_ms: e.duration_ms,
+            request: e.request_preview,
+            response: e.response_preview,
+            error: e.error,
+        })
+        .collect();
+
+    Ok(Json(ActionLogsResponse { logs }))
+}
+
+async fn export_instance(
+    State(state): State<WebappState>,
+    Path(instance_id): Path<Uuid>,
+) -> Result<Json<WorkflowInstanceExport>, HttpError> {
+    let instance = state
+        .database
+        .get_instance(instance_id)
+        .await
+        .map_err(|err| {
+            error!(?err, %instance_id, "failed to load instance");
+            HttpError {
+                status: StatusCode::NOT_FOUND,
+                message: "workflow instance not found".to_string(),
+            }
+        })?;
+
+    let nodes = state
+        .database
+        .get_execution_graph(instance_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|g| g.nodes)
+        .unwrap_or_default();
+
+    let timeline = state
+        .database
+        .get_action_results(instance_id)
+        .await
+        .unwrap_or_default();
+
+    let export = WorkflowInstanceExport {
+        export_version: "1.0",
+        exported_at: Utc::now().to_rfc3339(),
+        instance: InstanceExportInfo {
+            id: instance.id.to_string(),
+            status: instance.status.to_string(),
+            created_at: instance.created_at.to_rfc3339(),
+            input_payload: instance.input_payload,
+            result_payload: instance.result_payload,
+        },
+        nodes,
+        timeline,
+    };
+
+    Ok(Json(export))
+}
+
+async fn get_filter_values(
+    State(state): State<WebappState>,
+    Path(column): Path<String>,
+) -> impl IntoResponse {
+    let result = match column.as_str() {
+        "workflow" => state.database.get_distinct_workflows().await,
+        "status" => state.database.get_distinct_statuses().await,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(FilterValuesResponse { values: vec![] }),
+            );
+        }
+    };
+
+    match result {
+        Ok(values) => (StatusCode::OK, Json(FilterValuesResponse { values })),
+        Err(err) => {
+            error!(?err, %column, "failed to fetch filter values");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(FilterValuesResponse { values: vec![] }),
+            )
+        }
+    }
+}
+
+// ============================================================================
+// Schedule Handlers
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+struct ScheduleListQuery {
+    page: Option<i64>,
+}
+
+async fn list_schedules(
+    State(state): State<WebappState>,
+    axum::extract::Query(query): axum::extract::Query<ScheduleListQuery>,
+) -> impl IntoResponse {
+    let per_page = 20i64;
+
+    let total_count = match state.database.count_schedules().await {
+        Ok(count) => count,
+        Err(err) => {
+            error!(?err, "failed to count schedules");
+            return Html(render_error_page(
+                &state.templates,
+                "Unable to load schedules",
+                "We couldn't fetch scheduled workflows. Please check the database connection.",
+            ));
+        }
+    };
+
+    let total_pages = (total_count as f64 / per_page as f64).ceil() as i64;
+    let current_page = query.page.unwrap_or(1).max(1).min(total_pages.max(1));
+    let offset = (current_page - 1) * per_page;
+
+    match state.database.list_schedules(per_page, offset).await {
+        Ok(schedules) => Html(render_schedules_page(
+            &state.templates,
+            &schedules,
+            current_page,
+            total_pages,
+            total_count,
+        )),
+        Err(err) => {
+            error!(?err, "failed to load schedules");
+            Html(render_error_page(
+                &state.templates,
+                "Unable to load schedules",
+                "We couldn't fetch scheduled workflows. Please check the database connection.",
+            ))
+        }
+    }
+}
+
+async fn schedule_detail(
+    State(state): State<WebappState>,
+    Path(schedule_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let schedule = match state.database.get_schedule(schedule_id).await {
+        Ok(s) => s,
+        Err(err) => {
+            error!(?err, %schedule_id, "failed to load schedule");
+            return Html(render_error_page(
+                &state.templates,
+                "Schedule not found",
+                "The requested schedule could not be located.",
+            ));
+        }
+    };
+
+    Html(render_schedule_detail_page(&state.templates, &schedule))
+}
+
+async fn pause_schedule(
+    State(state): State<WebappState>,
+    Path(schedule_id): Path<Uuid>,
+) -> impl IntoResponse {
+    match state
+        .database
+        .update_schedule_status(schedule_id, "paused")
+        .await
+    {
+        Ok(_) => axum::response::Redirect::to(&format!("/scheduled/{}", schedule_id)),
+        Err(err) => {
+            error!(?err, %schedule_id, "failed to pause schedule");
+            axum::response::Redirect::to(&format!("/scheduled/{}", schedule_id))
+        }
+    }
+}
+
+async fn resume_schedule(
+    State(state): State<WebappState>,
+    Path(schedule_id): Path<Uuid>,
+) -> impl IntoResponse {
+    match state
+        .database
+        .update_schedule_status(schedule_id, "active")
+        .await
+    {
+        Ok(_) => axum::response::Redirect::to(&format!("/scheduled/{}", schedule_id)),
+        Err(err) => {
+            error!(?err, %schedule_id, "failed to resume schedule");
+            axum::response::Redirect::to(&format!("/scheduled/{}", schedule_id))
+        }
+    }
+}
+
+async fn delete_schedule(
+    State(state): State<WebappState>,
+    Path(schedule_id): Path<Uuid>,
+) -> impl IntoResponse {
+    match state
+        .database
+        .update_schedule_status(schedule_id, "deleted")
+        .await
+    {
+        Ok(true) => axum::response::Redirect::to("/scheduled"),
+        Ok(false) => axum::response::Redirect::to(&format!("/scheduled/{}", schedule_id)),
+        Err(err) => {
+            error!(?err, %schedule_id, "failed to delete schedule");
+            axum::response::Redirect::to(&format!("/scheduled/{}", schedule_id))
+        }
+    }
+}
+
+async fn get_schedule_filter_values(
+    State(state): State<WebappState>,
+    Path(column): Path<String>,
+) -> impl IntoResponse {
+    let result = match column.as_str() {
+        "status" => state.database.get_distinct_schedule_statuses().await,
+        "schedule_type" => state.database.get_distinct_schedule_types().await,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(FilterValuesResponse { values: vec![] }),
+            );
+        }
+    };
+
+    match result {
+        Ok(values) => (StatusCode::OK, Json(FilterValuesResponse { values })),
+        Err(err) => {
+            error!(?err, %column, "failed to fetch schedule filter values");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(FilterValuesResponse { values: vec![] }),
+            )
+        }
+    }
+}
+
+// ============================================================================
+// Error Handling
+// ============================================================================
+
+#[derive(Debug)]
+struct HttpError {
+    status: StatusCode,
+    message: String,
+}
+
+impl IntoResponse for HttpError {
+    fn into_response(self) -> Response {
+        let body = Json(serde_json::json!({ "message": self.message }));
+        (self.status, body).into_response()
+    }
+}
+
+// ============================================================================
+// Template Rendering
+// ============================================================================
+
+#[derive(Serialize)]
+struct InvocationsPageContext {
+    title: String,
+    active_tab: String,
+    invocations: Vec<InvocationRow>,
+    current_page: i64,
+    total_pages: i64,
+    has_pagination: bool,
+    search_query: Option<String>,
+    total_count: i64,
+}
+
+#[derive(Serialize)]
+struct InvocationRow {
+    id: String,
+    workflow_name: String,
+    created_at: String,
+    status: String,
+    input_preview: String,
+}
+
+fn render_invocations_page(
+    templates: &Tera,
+    instances: &[super::types::InstanceSummary],
+    current_page: i64,
+    total_pages: i64,
+    search_query: Option<String>,
+    total_count: i64,
+) -> String {
+    let invocations: Vec<InvocationRow> = instances
+        .iter()
+        .map(|i| InvocationRow {
+            id: i.id.to_string(),
+            workflow_name: i
+                .workflow_name
+                .clone()
+                .unwrap_or_else(|| "workflow".to_string()),
+            created_at: i.created_at.to_rfc3339(),
+            status: i.status.to_string(),
+            input_preview: i.input_preview.clone(),
+        })
+        .collect();
+
+    let context = InvocationsPageContext {
+        title: "Invocations".to_string(),
+        active_tab: "invocations".to_string(),
+        invocations,
+        current_page,
+        total_pages,
+        has_pagination: total_pages > 1,
+        search_query,
+        total_count,
+    };
+
+    render_template(templates, "invocations.html", &context)
+}
+
+#[derive(Serialize)]
+struct InstanceDetailPageContext {
+    title: String,
+    active_tab: String,
+    workflow: WorkflowInfo,
+    instance: InstanceInfo,
+    graph_data: GraphData,
+}
+
+#[derive(Serialize)]
+struct WorkflowInfo {
+    id: String,
+    name: String,
+}
+
+#[derive(Serialize)]
+struct InstanceInfo {
+    id: String,
+    created_at: String,
+    status: String,
+    input_payload: String,
+    result_payload: String,
+}
+
+#[derive(Serialize)]
+struct GraphData {
+    nodes: Vec<GraphNode>,
+}
+
+#[derive(Serialize)]
+struct GraphNode {
+    id: String,
+    action: String,
+    module: String,
+    depends_on: Vec<String>,
+}
+
+fn render_instance_detail_page(
+    templates: &Tera,
+    instance: &super::types::InstanceDetail,
+    graph: Option<super::types::ExecutionGraphView>,
+) -> String {
+    let graph_data = if let Some(g) = graph {
+        // Build depends_on from edges
+        let edges_by_target: std::collections::HashMap<String, Vec<String>> =
+            g.edges
+                .iter()
+                .fold(std::collections::HashMap::new(), |mut acc, e| {
+                    acc.entry(e.target.clone())
+                        .or_default()
+                        .push(e.source.clone());
+                    acc
+                });
+
+        let nodes: Vec<GraphNode> = g
+            .nodes
+            .iter()
+            .filter(|n| n.action_name.is_some()) // Only show action nodes
+            .map(|n| GraphNode {
+                id: n.id.clone(),
+                action: n.action_name.clone().unwrap_or_default(),
+                module: n
+                    .module_name
+                    .clone()
+                    .unwrap_or_else(|| "workflow".to_string()),
+                depends_on: edges_by_target.get(&n.id).cloned().unwrap_or_default(),
+            })
+            .collect();
+
+        GraphData { nodes }
+    } else {
+        GraphData { nodes: Vec::new() }
+    };
+
+    let context = InstanceDetailPageContext {
+        title: format!("Instance {}", instance.id),
+        active_tab: "invocations".to_string(),
+        workflow: WorkflowInfo {
+            id: instance.id.to_string(),
+            name: instance
+                .workflow_name
+                .clone()
+                .unwrap_or_else(|| "workflow".to_string()),
+        },
+        instance: InstanceInfo {
+            id: instance.id.to_string(),
+            created_at: instance.created_at.to_rfc3339(),
+            status: instance.status.to_string(),
+            input_payload: instance.input_payload.clone(),
+            result_payload: instance.result_payload.clone(),
+        },
+        graph_data,
+    };
+
+    render_template(templates, "workflow_run.html", &context)
+}
+
+fn render_error_page(templates: &Tera, title: &str, message: &str) -> String {
+    let mut ctx = TeraContext::new();
+    ctx.insert("title", title);
+    ctx.insert("active_tab", "");
+    ctx.insert("error_title", title);
+    ctx.insert("error_message", message);
+    templates.render("error.html", &ctx).unwrap_or_else(|e| {
+        error!(?e, "failed to render error template");
+        format!("<h1>{}</h1><p>{}</p>", title, message)
+    })
+}
+
+fn render_template<T: Serialize>(templates: &Tera, name: &str, context: &T) -> String {
+    let ctx = TeraContext::from_serialize(context).unwrap_or_default();
+    templates.render(name, &ctx).unwrap_or_else(|e| {
+        error!(?e, template = name, "failed to render template");
+        format!("Template error: {}", e)
+    })
+}
+
+// ============================================================================
+// Schedule Template Rendering
+// ============================================================================
+
+#[derive(Serialize)]
+struct SchedulesPageContext {
+    title: String,
+    active_tab: String,
+    schedules: Vec<ScheduleRow>,
+    current_page: i64,
+    total_pages: i64,
+    has_pagination: bool,
+    total_count: i64,
+}
+
+#[derive(Serialize)]
+struct ScheduleRow {
+    id: String,
+    workflow_name: String,
+    schedule_name: String,
+    schedule_type: String,
+    expression: String,
+    status: String,
+    next_run_at: Option<String>,
+    last_run_at: Option<String>,
+}
+
+fn render_schedules_page(
+    templates: &Tera,
+    schedules: &[super::types::ScheduleSummary],
+    current_page: i64,
+    total_pages: i64,
+    total_count: i64,
+) -> String {
+    let schedule_rows: Vec<ScheduleRow> = schedules
+        .iter()
+        .map(|s| {
+            let expression = if s.schedule_type == "cron" {
+                s.cron_expression.clone().unwrap_or_default()
+            } else {
+                format!("every {} seconds", s.interval_seconds.unwrap_or(0))
+            };
+            ScheduleRow {
+                id: s.id.clone(),
+                workflow_name: s.workflow_name.clone(),
+                schedule_name: s.schedule_name.clone(),
+                schedule_type: s.schedule_type.clone(),
+                expression,
+                status: s.status.clone(),
+                next_run_at: s.next_run_at.clone(),
+                last_run_at: s.last_run_at.clone(),
+            }
+        })
+        .collect();
+
+    let context = SchedulesPageContext {
+        title: "Scheduled Workflows".to_string(),
+        active_tab: "scheduled".to_string(),
+        schedules: schedule_rows,
+        current_page,
+        total_pages,
+        has_pagination: total_pages > 1,
+        total_count,
+    };
+
+    render_template(templates, "scheduled.html", &context)
+}
+
+#[derive(Serialize)]
+struct ScheduleDetailPageContext {
+    title: String,
+    active_tab: String,
+    schedule: ScheduleDetailView,
+}
+
+#[derive(Serialize)]
+struct ScheduleDetailView {
+    id: String,
+    workflow_name: String,
+    schedule_name: String,
+    schedule_type: String,
+    cron_expression: Option<String>,
+    interval_seconds: Option<i64>,
+    schedule_expression: String,
+    jitter_seconds: i64,
+    status: String,
+    next_run_at: Option<String>,
+    last_run_at: Option<String>,
+    last_instance_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+    priority: i32,
+    allow_duplicate: bool,
+    input_payload: Option<String>,
+}
+
+fn render_schedule_detail_page(
+    templates: &Tera,
+    schedule: &super::types::ScheduleDetail,
+) -> String {
+    let schedule_expression = if schedule.schedule_type == "cron" {
+        schedule.cron_expression.clone().unwrap_or_default()
+    } else {
+        format!("every {} seconds", schedule.interval_seconds.unwrap_or(0))
+    };
+
+    let context = ScheduleDetailPageContext {
+        title: format!("Schedule: {}", schedule.schedule_name),
+        active_tab: "scheduled".to_string(),
+        schedule: ScheduleDetailView {
+            id: schedule.id.clone(),
+            workflow_name: schedule.workflow_name.clone(),
+            schedule_name: schedule.schedule_name.clone(),
+            schedule_type: schedule.schedule_type.clone(),
+            cron_expression: schedule.cron_expression.clone(),
+            interval_seconds: schedule.interval_seconds,
+            schedule_expression,
+            jitter_seconds: schedule.jitter_seconds,
+            status: schedule.status.clone(),
+            next_run_at: schedule.next_run_at.clone(),
+            last_run_at: schedule.last_run_at.clone(),
+            last_instance_id: schedule.last_instance_id.clone(),
+            created_at: schedule.created_at.clone(),
+            updated_at: schedule.updated_at.clone(),
+            priority: schedule.priority,
+            allow_duplicate: schedule.allow_duplicate,
+            input_payload: schedule.input_payload.clone(),
+        },
+    };
+
+    render_template(templates, "schedule_detail.html", &context)
+}

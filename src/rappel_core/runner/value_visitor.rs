@@ -27,6 +27,11 @@ pub enum ValueExpr {
     Spread(SpreadValue),
 }
 
+/// Resolve variables inside a ValueExpr tree without executing actions.
+///
+/// Example IR:
+/// - y = x + 1 (where x -> LiteralValue(2))
+///   Produces BinaryOpValue(LiteralValue(2), +, LiteralValue(1)).
 pub struct ValueExprResolver<'a> {
     resolve_variable: &'a dyn Fn(&str, &mut HashSet<String>) -> ValueExpr,
     seen: &'a mut HashSet<String>,
@@ -110,6 +115,11 @@ impl<'a> ValueExprResolver<'a> {
     }
 }
 
+/// Collect execution node ids that supply data to a ValueExpr tree.
+///
+/// Example IR:
+/// - total = a + @sum(values)
+///   Returns the node ids that last defined `a` and the action node for sum().
 pub struct ValueExprSourceCollector<'a> {
     resolve_variable: &'a dyn Fn(&str) -> Option<Uuid>,
 }
@@ -174,6 +184,11 @@ impl<'a> ValueExprSourceCollector<'a> {
     }
 }
 
+/// Evaluate ValueExpr nodes into concrete Python values.
+///
+/// Example:
+/// - BinaryOpValue(VariableValue("a"), +, LiteralValue(1)) becomes the
+///   current value of a plus 1.
 pub struct ValueExprEvaluator<'a, E> {
     resolve_variable: &'a dyn Fn(&str) -> Result<serde_json::Value, E>,
     resolve_action_result: &'a dyn Fn(&ActionResultValue) -> Result<serde_json::Value, E>,
@@ -294,6 +309,14 @@ impl<'a, E> ValueExprEvaluator<'a, E> {
     }
 }
 
+/// Recursively resolve variable references throughout a value tree.
+///
+/// Use this as the core materialization step before assignment storage.
+///
+/// Example IR:
+/// - z = (x + y) * 2
+///   The tree walk replaces VariableValue("x")/("y") with their latest
+///   symbolic definitions before storing z.
 pub fn resolve_value_tree(
     value: &ValueExpr,
     resolve_variable: &dyn Fn(&str, &mut HashSet<String>) -> ValueExpr,
@@ -303,6 +326,11 @@ pub fn resolve_value_tree(
     resolver.visit(value)
 }
 
+/// Find execution node ids that supply data to the given value.
+///
+/// Example IR:
+/// - total = a + @sum(values)
+///   Returns the latest assignment node for a and the action node for sum().
 pub fn collect_value_sources(
     value: &ValueExpr,
     resolve_variable: &dyn Fn(&str) -> Option<Uuid>,
