@@ -26,6 +26,15 @@ class ReplayEngine:
     """Replay variable values from a runner state snapshot."""
 
     def __init__(self, state: RunnerState, action_results: Mapping[UUID, Any]) -> None:
+        """Prepare replay state derived from a runner snapshot.
+
+        We precompute a timeline index and incoming data-flow map so lookups are
+        O(1) during evaluation.
+
+        Example:
+        - timeline = [node_a, node_b]
+        - index[node_b] == 1 and incoming data edges are pre-sorted.
+        """
         self._state = state
         self._action_results = action_results
         self._cache: dict[tuple[UUID, str], Any] = {}
@@ -34,12 +43,25 @@ class ReplayEngine:
         self._incoming_data = self._build_incoming_data_map()
 
     def replay_variables(self) -> ReplayResult:
+        """Replay variable values by scanning assignments from newest to oldest.
+
+        We walk the timeline in reverse to capture the latest assignment for each
+        variable and skip older definitions once a value is known. This mirrors
+        "last write wins" semantics while avoiding redundant evaluation work.
+
+        Example:
+        - x = 1
+        - x = 2
+        Reverse traversal yields x=2 without evaluating the older assignment.
+        """
         variables: dict[str, Any] = {}
-        for node_id in self._timeline:
+        for node_id in reversed(self._timeline):
             node = self._state.nodes.get(node_id)
             if node is None or not node.assignments:
                 continue
             for target in node.assignments:
+                if target in variables:
+                    continue
                 variables[target] = self._evaluate_assignment(node_id, target, set())
         return ReplayResult(variables=variables)
 
@@ -49,6 +71,16 @@ class ReplayEngine:
         target: str,
         stack: set[tuple[UUID, str]],
     ) -> Any:
+        """Evaluate a single assignment expression with cycle detection.
+
+        We memoize evaluated (node, target) pairs and guard against recursive
+        references by tracking a stack of active evaluations.
+
+        Example:
+        - x = y + 1
+        - y = 2
+        Evaluating x resolves y first, then computes x.
+        """
         key = (node_id, target)
         if key in self._cache:
             return self._cache[key]
@@ -79,6 +111,16 @@ class ReplayEngine:
         name: str,
         stack: set[tuple[UUID, str]],
     ) -> Any:
+        """Resolve a variable reference via data-flow edges.
+
+        This walks to the closest upstream definition and replays that
+        assignment for the requested variable.
+
+        Example:
+        - action_1 defines x
+        - assign_2 uses x
+        Resolving x from assign_2 evaluates action_1's assignment.
+        """
         source_node_id = self._find_variable_source_node(current_node_id, name)
         if source_node_id is None:
             raise ReplayError(f"variable not found via data-flow edges: {name}")
@@ -89,6 +131,14 @@ class ReplayEngine:
         current_node_id: UUID,
         name: str,
     ) -> Optional[UUID]:
+        """Find the nearest upstream node that defines the variable.
+
+        We consult pre-sorted incoming data edges and ignore sources that are
+        later in the timeline than the current node.
+
+        Example:
+        - if node_b comes after node_a, node_b cannot be a source for node_a.
+        """
         sources = self._incoming_data.get(current_node_id, ())
         current_idx = self._index.get(current_node_id, len(self._index))
         for source_id in sources:
@@ -100,6 +150,13 @@ class ReplayEngine:
         return None
 
     def _resolve_action_result(self, expr: ActionResultValue) -> Any:
+        """Fetch an action result by node id, handling indexed results.
+
+        Example:
+        - result = @fetch()
+        - result[0]
+        The evaluator looks up the action result and returns index 0.
+        """
         if expr.node_id not in self._action_results:
             raise ReplayError(f"missing action result for {expr.node_id}")
         value = self._action_results[expr.node_id]
@@ -118,6 +175,14 @@ class ReplayEngine:
         args: Sequence[Any],
         kwargs: Mapping[str, Any],
     ) -> Any:
+        """Evaluate a function call during replay.
+
+        Only global functions are supported because user-defined functions are
+        not available in this replay context.
+
+        Example:
+        - len(items=[1, 2]) -> 2
+        """
         if (
             expr.global_function
             and expr.global_function != ir.GlobalFunction.GLOBAL_FUNCTION_UNSPECIFIED
@@ -132,6 +197,12 @@ class ReplayEngine:
         args: Sequence[Any],
         kwargs: Mapping[str, Any],
     ) -> Any:
+        """Evaluate supported global helper functions.
+
+        Example:
+        - range(0, 3) -> [0, 1, 2]
+        - isexception(value={"type": "...", "message": "..."}) -> True
+        """
         match global_function:
             case ir.GlobalFunction.GLOBAL_FUNCTION_RANGE:
                 return list(range(*args))
@@ -160,6 +231,11 @@ class ReplayEngine:
 
     @staticmethod
     def _apply_binary(op: ir.BinaryOperator, left: Any, right: Any) -> Any:
+        """Apply a binary operator to replayed operands.
+
+        Example:
+        - left=1, right=2, op=ADD -> 3
+        """
         match op:
             case ir.BinaryOperator.BINARY_OP_OR:
                 return left or right
@@ -200,6 +276,11 @@ class ReplayEngine:
 
     @staticmethod
     def _apply_unary(op: ir.UnaryOperator, operand: Any) -> Any:
+        """Apply a unary operator to a replayed operand.
+
+        Example:
+        - op=NOT, operand=True -> False
+        """
         match op:
             case ir.UnaryOperator.UNARY_OP_NEG:
                 return -operand
@@ -212,6 +293,11 @@ class ReplayEngine:
 
     @staticmethod
     def _is_exception_value(value: Any) -> bool:
+        """Return True if the value looks like an exception payload.
+
+        We treat native exceptions or dict payloads with type/message keys as
+        exception-shaped values.
+        """
         if isinstance(value, BaseException):
             return True
         if isinstance(value, dict) and "type" in value and "message" in value:
@@ -219,6 +305,11 @@ class ReplayEngine:
         return False
 
     def _build_incoming_data_map(self) -> dict[UUID, list[UUID]]:
+        """Build a reverse index of incoming data-flow edges.
+
+        Sources are sorted from most-recent to oldest by timeline index so
+        lookups can short-circuit on the first viable definition.
+        """
         incoming: dict[UUID, list[UUID]] = {}
         for edge in self._state.edges:
             if edge.edge_type != EdgeType.DATA_FLOW:
@@ -236,4 +327,9 @@ def replay_variables(
     state: RunnerState,
     action_results: Mapping[UUID, Any],
 ) -> ReplayResult:
+    """Replay variable values from a runner state snapshot.
+
+    This is a convenience wrapper around ReplayEngine that prefers the latest
+    assignment for each variable and returns a fully materialized mapping.
+    """
     return ReplayEngine(state, action_results).replay_variables()
