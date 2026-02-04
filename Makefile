@@ -1,7 +1,7 @@
 PY_PROTO_OUT := python/proto
 PY_CORE_PROTO_OUT := core-python/proto
 
-.PHONY: all build-proto clean lint lint-verify python-lint python-lint-verify rust-lint rust-lint-verify coverage python-coverage rust-coverage
+.PHONY: all build-proto clean lint lint-verify python-lint python-lint-verify rust-lint rust-lint-verify coverage python-coverage rust-coverage benchmark
 
 all: build-proto
 
@@ -70,3 +70,12 @@ python-coverage:
 rust-coverage:
 	cargo llvm-cov --lcov --output-path target/rust-coverage.lcov
 	cargo llvm-cov --html --output-dir target/rust-htmlcov
+
+BENCH_ARGS ?= --count 1000
+BENCH_PROFILE ?= target/benchmark-profile.json
+BENCH_TOP ?= 20
+benchmark:
+	@mkdir -p $(dir $(BENCH_PROFILE))
+	cargo build --bin benchmark
+	samply record --unstable-presymbolicate --save-only -o $(BENCH_PROFILE) -- target/debug/benchmark $(BENCH_ARGS)
+	uv run python scripts/parse_samply_profile.py $(BENCH_PROFILE) --top $(BENCH_TOP)
