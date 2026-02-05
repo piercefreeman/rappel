@@ -136,25 +136,25 @@ async fn run_server(
     let app = Router::new()
         .route("/", get(list_invocations))
         .route("/invocations", get(list_invocations))
-        .route("/instance/:instance_id", get(instance_detail))
-        .route("/api/instance/:instance_id/run-data", get(get_run_data))
+        .route("/instance/{instance_id}", get(instance_detail))
+        .route("/api/instance/{instance_id}/run-data", get(get_run_data))
         .route(
-            "/api/instance/:instance_id/action-logs/:action_id",
+            "/api/instance/{instance_id}/action-logs/{action_id}",
             get(get_action_logs),
         )
-        .route("/api/instance/:instance_id/export", get(export_instance))
+        .route("/api/instance/{instance_id}/export", get(export_instance))
         .route(
-            "/api/invocations/filter-values/:column",
+            "/api/invocations/filter-values/{column}",
             get(get_filter_values),
         )
         // Schedule routes
         .route("/scheduled", get(list_schedules))
-        .route("/scheduled/:schedule_id", get(schedule_detail))
-        .route("/scheduled/:schedule_id/pause", post(pause_schedule))
-        .route("/scheduled/:schedule_id/resume", post(resume_schedule))
-        .route("/scheduled/:schedule_id/delete", post(delete_schedule))
+        .route("/scheduled/{schedule_id}", get(schedule_detail))
+        .route("/scheduled/{schedule_id}/pause", post(pause_schedule))
+        .route("/scheduled/{schedule_id}/resume", post(resume_schedule))
+        .route("/scheduled/{schedule_id}/delete", post(delete_schedule))
         .route(
-            "/api/scheduled/filter-values/:column",
+            "/api/scheduled/filter-values/{column}",
             get(get_schedule_filter_values),
         )
         .route("/healthz", get(healthz))
