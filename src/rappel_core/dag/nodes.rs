@@ -582,8 +582,11 @@ pub enum DAGNode {
     Expression(ExpressionNode),
 }
 
+// TODO: Refactor this model into models.rs and then just import the specific nodes from this
+// separate nodes file... Cleaner to keep the high level DAGNodes generic like this
 impl DAGNode {
     pub fn id(&self) -> &str {
+        // TODO: This is pretty messy right now.. add an “as_*” helper macro for the match ladders
         match self {
             DAGNode::Input(node) => &node.id,
             DAGNode::Output(node) => &node.id,

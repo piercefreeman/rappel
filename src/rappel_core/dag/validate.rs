@@ -13,6 +13,8 @@ pub fn validate_dag(dag: &DAG) -> Result<(), DagConversionError> {
     Ok(())
 }
 
+// TODO: Add comments to each of these functions that will explain the case in which these
+// validations should fail
 pub fn validate_edges_reference_existing_nodes(dag: &DAG) -> Result<(), DagConversionError> {
     for edge in &dag.edges {
         if !dag.nodes.contains_key(&edge.source) {

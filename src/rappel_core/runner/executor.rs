@@ -29,6 +29,8 @@ pub struct RunnerExecutorError(pub String);
 
 #[derive(Clone, Debug)]
 /// Persistence payloads required before dispatching new actions.
+/// These need to be written to the backends in order to ensure that we can mark any
+/// inflight actions as failed before queuing them up again
 pub struct DurableUpdates {
     pub actions_done: Vec<ActionDone>,
     pub graph_updates: Vec<GraphUpdate>,
@@ -76,16 +78,20 @@ impl RunnerExecutor {
     pub fn new(
         dag: DAG,
         state: RunnerState,
+        // TODO: Technically should these be execution results? Because they're mapping
+        // an execution node id to a value?
         action_results: HashMap<Uuid, Value>,
         backend: Option<Arc<dyn CoreBackend>>,
     ) -> Self {
         let mut state = state;
         state.dag = Some(dag.clone());
         state.set_link_queued_nodes(false);
+
         let template_outgoing = Self::build_template_outgoing(&dag);
         let template_incoming = Self::build_template_incoming(&dag);
         let incoming_exec_edges = Self::build_incoming_exec_edges(&state);
         let template_to_exec_nodes = Self::build_template_to_exec_nodes(&state);
+
         Self {
             dag,
             state,
