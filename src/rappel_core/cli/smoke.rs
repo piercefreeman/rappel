@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use serde_json::Value;
 use uuid::Uuid;
@@ -12,7 +13,6 @@ use crate::messages::ast as ir;
 use crate::rappel_core::backends::{MemoryBackend, QueuedInstance};
 use crate::rappel_core::dag::convert_to_dag;
 use crate::rappel_core::dag_viz::render_dag_image;
-use crate::rappel_core::ir_executor::ExecutionError;
 use crate::rappel_core::ir_format::format_program;
 use crate::rappel_core::ir_parser::parse_program;
 use crate::rappel_core::runloop::RunLoop;
@@ -221,19 +221,15 @@ fn slugify(name: &str) -> String {
         .collect()
 }
 
-async fn run_program_smoke(
-    case: &SmokeCase,
-    worker_pool: RemoteWorkerPool,
-) -> Result<(), ExecutionError> {
+async fn run_program_smoke(case: &SmokeCase, worker_pool: RemoteWorkerPool) -> Result<()> {
     println!("\nIR program ({})", case.name);
     println!("{}", format_program(&case.program));
     println!("IR inputs ({}): {:?}", case.name, case.inputs);
-    let dag = convert_to_dag(&case.program)
-        .map_err(|err| ExecutionError::new("ExecutionError", err.to_string()))?;
+    let dag = convert_to_dag(&case.program).map_err(|err| anyhow!(err.to_string()))?;
     let slug = slugify(&case.name);
     let output_path = PathBuf::from(format!("dag_smoke_{slug}.png"));
-    let output_path = render_dag_image(&dag, &output_path)
-        .map_err(|err| ExecutionError::new("ExecutionError", err.to_string()))?;
+    let output_path =
+        render_dag_image(&dag, &output_path).map_err(|err| anyhow!(err.to_string()))?;
     println!(
         "DAG image ({}) written to {}",
         case.name,
@@ -254,10 +250,10 @@ async fn run_program_smoke(
     let entry_node = dag
         .entry_node
         .clone()
-        .ok_or_else(|| ExecutionError::new("ExecutionError", "DAG entry node not found"))?;
+        .ok_or_else(|| anyhow!("DAG entry node not found"))?;
     let entry_exec = state
         .queue_template_node(&entry_node, None)
-        .map_err(|err| ExecutionError::new("ExecutionError", err.0))?;
+        .map_err(|err| anyhow!(err.0))?;
 
     let mut runloop = RunLoop::new(worker_pool, backend, 25, None, 0.05, 0.1);
     queue.lock().expect("queue lock").push_back(QueuedInstance {
@@ -272,7 +268,7 @@ async fn run_program_smoke(
     let result = runloop
         .run()
         .await
-        .map_err(|err| ExecutionError::new("ExecutionError", err.to_string()))?;
+        .map_err(|err| anyhow!(err.to_string()))?;
     let executed = result
         .completed_actions
         .values()
