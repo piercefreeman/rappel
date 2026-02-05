@@ -2,6 +2,7 @@
 
 pub mod messages;
 pub mod observability;
+pub mod pool_status;
 pub mod rappel_core;
 pub mod scheduler;
 pub mod server_worker;
@@ -11,6 +12,7 @@ pub mod workers;
 // Worker infrastructure (preserved from the legacy Rust core).
 pub use messages::{MessageError, ast as ir_ast, proto, workflow_argument_value_to_json};
 pub use observability::obs;
+pub use pool_status::{PoolTimeSeries, TimeSeriesEntry, TimeSeriesJsonEntry};
 pub use scheduler::{
     CreateScheduleParams, ScheduleId, ScheduleType, SchedulerConfig, SchedulerDatabase,
     SchedulerTask, WorkflowSchedule, spawn_scheduler,

@@ -32,6 +32,7 @@ services:
       RAPPEL_DATABASE_URL: postgresql://rappel:rappel@postgres:5432/rappel_example
       RAPPEL_USER_MODULE: example_app.workflows
       RAPPEL_CONCURRENT_PER_WORKER: 500
+      RAPPEL_MAX_CONCURRENT_INSTANCES: 5000
       RUST_LOG: rappel=info,start_workers=info
       RAPPEL_WEBAPP_ENABLED: "true"
       RAPPEL_WEBAPP_ADDR: "0.0.0.0:24119"

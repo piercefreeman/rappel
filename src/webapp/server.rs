@@ -33,6 +33,7 @@ const TEMPLATE_WORKFLOW_RUN: &str = include_str!("../../templates/workflow_run.h
 const TEMPLATE_INVOCATIONS: &str = include_str!("../../templates/invocations.html");
 const TEMPLATE_SCHEDULED: &str = include_str!("../../templates/scheduled.html");
 const TEMPLATE_SCHEDULE_DETAIL: &str = include_str!("../../templates/schedule_detail.html");
+const TEMPLATE_WORKERS: &str = include_str!("../../templates/workers.html");
 
 /// Webapp server handle.
 pub struct WebappServer {
@@ -111,6 +112,8 @@ fn init_templates() -> Result<Tera> {
         .context("failed to add scheduled.html template")?;
     tera.add_raw_template("schedule_detail.html", TEMPLATE_SCHEDULE_DETAIL)
         .context("failed to add schedule_detail.html template")?;
+    tera.add_raw_template("workers.html", TEMPLATE_WORKERS)
+        .context("failed to add workers.html template")?;
 
     tera.autoescape_on(vec![".html", ".tera"]);
     Ok(tera)
@@ -147,6 +150,8 @@ async fn run_server(
             "/api/invocations/filter-values/{column}",
             get(get_filter_values),
         )
+        // Worker routes
+        .route("/workers", get(list_workers))
         // Schedule routes
         .route("/scheduled", get(list_schedules))
         .route("/scheduled/{schedule_id}", get(schedule_detail))
@@ -449,6 +454,39 @@ async fn get_filter_values(
 }
 
 // ============================================================================
+// Worker Handlers
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+struct WorkersQuery {
+    minutes: Option<i64>,
+}
+
+async fn list_workers(
+    State(state): State<WebappState>,
+    axum::extract::Query(query): axum::extract::Query<WorkersQuery>,
+) -> impl IntoResponse {
+    let window_minutes = query.minutes.unwrap_or(5).clamp(1, 1440);
+
+    // Check if worker_status table exists
+    if !state.database.worker_status_table_exists().await {
+        return Html(render_workers_page(&state.templates, &[], window_minutes));
+    }
+
+    let statuses = state
+        .database
+        .get_worker_statuses(window_minutes)
+        .await
+        .unwrap_or_default();
+
+    Html(render_workers_page(
+        &state.templates,
+        &statuses,
+        window_minutes,
+    ))
+}
+
+// ============================================================================
 // Schedule Handlers
 // ============================================================================
 
@@ -461,6 +499,11 @@ async fn list_schedules(
     State(state): State<WebappState>,
     axum::extract::Query(query): axum::extract::Query<ScheduleListQuery>,
 ) -> impl IntoResponse {
+    // Check if schedules table exists
+    if !state.database.schedules_table_exists().await {
+        return Html(render_schedules_page(&state.templates, &[], 1, 1, 0));
+    }
+
     let per_page = 20i64;
 
     let total_count = match state.database.count_schedules().await {
@@ -922,4 +965,176 @@ fn render_schedule_detail_page(
     };
 
     render_template(templates, "schedule_detail.html", &context)
+}
+
+// ============================================================================
+// Workers Template Rendering
+// ============================================================================
+
+#[derive(Serialize)]
+struct WorkersPageContext {
+    title: String,
+    active_tab: String,
+    window_minutes: i64,
+    active_worker_count: i64,
+    actions_per_sec: String,
+    median_instance_duration: String,
+    active_instance_count: i64,
+    total_in_flight: i64,
+    total_queue_depth: i64,
+    has_time_series: bool,
+    time_series_json: String,
+    action_rows: Vec<WorkerActionRowView>,
+    instance_rows: Vec<WorkerInstanceRowView>,
+}
+
+#[derive(Serialize)]
+struct WorkerActionRowView {
+    pool_id: String,
+    active_workers: i64,
+    actions_per_sec: String,
+    throughput_per_min: i64,
+    total_completed: i64,
+    median_dequeue_ms: Option<i64>,
+    median_handling_ms: Option<i64>,
+    last_action_at: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Serialize)]
+struct WorkerInstanceRowView {
+    pool_id: String,
+    active_instances: i64,
+    instances_per_sec: String,
+    instances_per_min: i64,
+    total_completed: i64,
+    median_duration: String,
+    median_dequeue_ms: Option<i64>,
+    updated_at: String,
+}
+
+fn render_workers_page(
+    templates: &Tera,
+    statuses: &[super::db::WorkerStatus],
+    window_minutes: i64,
+) -> String {
+    use crate::pool_status::PoolTimeSeries;
+
+    // Build action rows
+    let action_rows: Vec<WorkerActionRowView> = statuses
+        .iter()
+        .map(|s| WorkerActionRowView {
+            pool_id: s.pool_id.to_string(),
+            active_workers: s.active_workers as i64,
+            actions_per_sec: format!("{:.2}", s.actions_per_sec),
+            throughput_per_min: s.throughput_per_min as i64,
+            total_completed: s.total_completed,
+            median_dequeue_ms: s.median_dequeue_ms,
+            median_handling_ms: s.median_handling_ms,
+            last_action_at: s.last_action_at.map(|dt| dt.to_rfc3339()),
+            updated_at: s.updated_at.to_rfc3339(),
+        })
+        .collect();
+
+    // Build instance rows
+    let instance_rows: Vec<WorkerInstanceRowView> = statuses
+        .iter()
+        .map(|s| {
+            let median_duration = match s.median_instance_duration_secs {
+                Some(secs) => format_duration_secs(secs),
+                None => "\u{2014}".to_string(),
+            };
+            WorkerInstanceRowView {
+                pool_id: s.pool_id.to_string(),
+                active_instances: s.active_instance_count as i64,
+                instances_per_sec: format!("{:.2}", s.instances_per_sec),
+                instances_per_min: s.instances_per_min as i64,
+                total_completed: s.total_instances_completed,
+                median_duration,
+                median_dequeue_ms: s.median_dequeue_ms,
+                updated_at: s.updated_at.to_rfc3339(),
+            }
+        })
+        .collect();
+
+    // Aggregate across pools
+    let active_worker_count: i64 = statuses.iter().map(|s| s.active_workers as i64).sum();
+    let total_actions_per_sec: f64 = statuses.iter().map(|s| s.actions_per_sec).sum();
+    let actions_per_sec = format!("{:.2}", total_actions_per_sec);
+    let active_instance_count: i64 = statuses
+        .iter()
+        .map(|s| s.active_instance_count as i64)
+        .sum();
+    let total_queue_depth: i64 = statuses.iter().filter_map(|s| s.dispatch_queue_size).sum();
+    let total_in_flight: i64 = statuses.iter().filter_map(|s| s.total_in_flight).sum();
+
+    // Average of median instance duration across pools
+    let median_instance_duration = {
+        let durations: Vec<f64> = statuses
+            .iter()
+            .filter_map(|s| s.median_instance_duration_secs)
+            .collect();
+        if durations.is_empty() {
+            "\u{2014}".to_string()
+        } else {
+            let avg = durations.iter().sum::<f64>() / durations.len() as f64;
+            format_duration_secs(avg)
+        }
+    };
+
+    // Decode time-series from all pools and merge into a single JSON array.
+    // For a single-pool setup this is just the one blob; for multi-pool we
+    // pick the pool with the most data points (typically there's only one).
+    let mut best_ts: Option<PoolTimeSeries> = None;
+    for status in statuses {
+        if let Some(ref bytes) = status.time_series
+            && let Some(ts) = PoolTimeSeries::decode(bytes)
+        {
+            let is_better = best_ts.as_ref().is_none_or(|b| ts.len() > b.len());
+            if is_better {
+                best_ts = Some(ts);
+            }
+        }
+    }
+
+    let (time_series_json, has_time_series) = match best_ts {
+        Some(ts) if !ts.is_empty() => {
+            let json = serde_json::to_string(&ts.to_json_entries()).unwrap_or_default();
+            (json, true)
+        }
+        _ => ("[]".to_string(), false),
+    };
+
+    let context = WorkersPageContext {
+        title: "Workers".to_string(),
+        active_tab: "workers".to_string(),
+        window_minutes,
+        active_worker_count,
+        actions_per_sec,
+        median_instance_duration,
+        active_instance_count,
+        total_in_flight,
+        total_queue_depth,
+        has_time_series,
+        time_series_json,
+        action_rows,
+        instance_rows,
+    };
+
+    render_template(templates, "workers.html", &context)
+}
+
+/// Format duration in seconds as a human-readable string.
+fn format_duration_secs(secs: f64) -> String {
+    if secs < 0.001 {
+        format!("{:.0}µs", secs * 1_000_000.0)
+    } else if secs < 1.0 {
+        format!("{:.0}ms", secs * 1000.0)
+    } else if secs < 60.0 {
+        format!("{:.1}s", secs)
+    } else if secs < 3600.0 {
+        format!("{:.1}m", secs / 60.0)
+    } else {
+        format!("{:.1}h", secs / 3600.0)
+    }
 }

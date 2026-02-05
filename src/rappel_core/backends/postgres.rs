@@ -10,7 +10,8 @@ use uuid::Uuid;
 use crate::observability::obs;
 
 use super::base::{
-    ActionDone, BackendError, BackendResult, BaseBackend, GraphUpdate, InstanceDone, QueuedInstance,
+    ActionDone, BackendError, BackendResult, BaseBackend, GraphUpdate, InstanceDone,
+    QueuedInstance, WorkerStatusUpdate,
 };
 
 pub const DEFAULT_DSN: &str = "postgresql://rappel:rappel@localhost:5432/rappel_core";
@@ -218,6 +219,75 @@ impl PostgresBackend {
 
     fn deserialize<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, BackendError> {
         rmp_serde::from_slice(payload).map_err(|e| BackendError::Message(e.to_string()))
+    }
+
+    /// Upsert worker status for monitoring and activity graphs.
+    #[obs]
+    pub async fn upsert_worker_status(&self, status: &WorkerStatusUpdate) -> BackendResult<()> {
+        Self::count_query(&self.query_counts, "upsert:worker_status");
+        sqlx::query(
+            r#"
+            INSERT INTO worker_status (
+                pool_id,
+                worker_id,
+                throughput_per_min,
+                total_completed,
+                last_action_at,
+                updated_at,
+                median_dequeue_ms,
+                median_handling_ms,
+                dispatch_queue_size,
+                total_in_flight,
+                active_workers,
+                actions_per_sec,
+                median_instance_duration_secs,
+                active_instance_count,
+                total_instances_completed,
+                instances_per_sec,
+                instances_per_min,
+                time_series
+            )
+            VALUES ($1, 0, $2, $3, $4, NOW(), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            ON CONFLICT (pool_id, worker_id)
+            DO UPDATE SET
+                throughput_per_min = EXCLUDED.throughput_per_min,
+                total_completed = EXCLUDED.total_completed,
+                last_action_at = EXCLUDED.last_action_at,
+                updated_at = EXCLUDED.updated_at,
+                median_dequeue_ms = EXCLUDED.median_dequeue_ms,
+                median_handling_ms = EXCLUDED.median_handling_ms,
+                dispatch_queue_size = EXCLUDED.dispatch_queue_size,
+                total_in_flight = EXCLUDED.total_in_flight,
+                active_workers = EXCLUDED.active_workers,
+                actions_per_sec = EXCLUDED.actions_per_sec,
+                median_instance_duration_secs = EXCLUDED.median_instance_duration_secs,
+                active_instance_count = EXCLUDED.active_instance_count,
+                total_instances_completed = EXCLUDED.total_instances_completed,
+                instances_per_sec = EXCLUDED.instances_per_sec,
+                instances_per_min = EXCLUDED.instances_per_min,
+                time_series = EXCLUDED.time_series
+            "#,
+        )
+        .bind(status.pool_id)
+        .bind(status.throughput_per_min)
+        .bind(status.total_completed)
+        .bind(status.last_action_at)
+        .bind(status.median_dequeue_ms)
+        .bind(status.median_handling_ms)
+        .bind(status.dispatch_queue_size)
+        .bind(status.total_in_flight)
+        .bind(status.active_workers)
+        .bind(status.actions_per_sec)
+        .bind(status.median_instance_duration_secs)
+        .bind(status.active_instance_count)
+        .bind(status.total_instances_completed)
+        .bind(status.instances_per_sec)
+        .bind(status.instances_per_min)
+        .bind(&status.time_series)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
     }
 
     #[obs]

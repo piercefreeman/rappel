@@ -978,6 +978,18 @@ impl PythonWorkerPool {
         }
     }
 
+    /// Get queue statistics: (dispatch_queue_size, total_in_flight).
+    pub fn queue_stats(&self) -> (usize, usize) {
+        let total_in_flight: usize = self
+            .in_flight_counts
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum();
+        // dispatch_queue_size would require access to the bridge's queue
+        // For now, return 0 as placeholder
+        (0, total_in_flight)
+    }
+
     /// Record an action completion for a worker and trigger recycling if needed.
     ///
     /// This decrements the in-flight count and increments the action count for
@@ -1133,18 +1145,35 @@ fn kwargs_to_workflow_arguments(kwargs: &HashMap<String, Value>) -> proto::Workf
 }
 
 fn normalize_error_value(error: Value) -> Value {
-    if let Value::Object(map) = error {
-        let error_type = map
-            .get("type")
-            .and_then(|value| value.as_str())
-            .unwrap_or("RemoteWorkerError");
-        let error_message = map
-            .get("message")
-            .and_then(|value| value.as_str())
-            .unwrap_or("remote worker error");
-        return error_to_value(&WorkerPoolError::new(error_type, error_message));
+    let Value::Object(mut map) = error else {
+        return error;
+    };
+
+    if let Some(Value::Object(exception)) = map.remove("__exception__") {
+        return ensure_error_fields(exception);
     }
-    error
+
+    ensure_error_fields(map)
+}
+
+fn ensure_error_fields(mut map: serde_json::Map<String, Value>) -> Value {
+    let error_type = map
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("RemoteWorkerError")
+        .to_string();
+    let error_message = map
+        .get("message")
+        .and_then(|value| value.as_str())
+        .unwrap_or("remote worker error")
+        .to_string();
+    if !map.contains_key("type") {
+        map.insert("type".to_string(), Value::String(error_type));
+    }
+    if !map.contains_key("message") {
+        map.insert("message".to_string(), Value::String(error_message));
+    }
+    Value::Object(map)
 }
 
 fn decode_action_result(metrics: &RoundTripMetrics) -> Value {

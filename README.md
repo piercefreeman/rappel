@@ -198,8 +198,7 @@ These are the primary environment parameters that you'll likely want to customiz
 | `RAPPEL_USER_MODULE` | Python module preloaded into each worker | none | `my_app.actions` |
 | `RAPPEL_POLL_INTERVAL_MS` | Poll interval for the dispatch loop (ms) | `100` | `50` |
 | `RAPPEL_MAX_ACTION_LIFECYCLE` | Max actions per worker before recycling (see below) | none (no limit) | `1000` |
-| `RAPPEL_INSTANCE_CLAIM_BATCH_SIZE` | Max workflow instances to claim per DB query | `50` | `25` |
-| `RAPPEL_MAX_CONCURRENT_INSTANCES` | Max workflow instances a runner can hold concurrently | `100` | `200` |
+| `RAPPEL_MAX_CONCURRENT_INSTANCES` | Max workflow instances held concurrently (claim size is min(available slots, max)) | `50` | `200` |
 | `RAPPEL_WEBAPP_ENABLED` | Enable the web dashboard | `false` | `true` |
 | `RAPPEL_WEBAPP_ADDR` | Web dashboard bind address | `0.0.0.0:24119` | `0.0.0.0:8080` |
 | `RAPPEL_WEBAPP_DB_MAX_CONNECTIONS` | Max DB connections for the webapp pool | `2` | `4` |

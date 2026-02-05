@@ -277,6 +277,7 @@ impl<'a, E> ValueExprEvaluator<'a, E> {
                     (serde_json::Value::Object(map), serde_json::Value::String(key)) => map
                         .get(&key)
                         .cloned()
+                        .or_else(|| lookup_exception_value(&map, &key))
                         .ok_or_else(|| (self.error_factory)("dict has no key")),
                     _ => Err((self.error_factory)("unsupported index operation")),
                 }
@@ -287,6 +288,7 @@ impl<'a, E> ValueExprEvaluator<'a, E> {
                     return map
                         .get(&value.attribute)
                         .cloned()
+                        .or_else(|| lookup_exception_value(&map, &value.attribute))
                         .ok_or_else(|| (self.error_factory)("dict has no key"));
                 }
                 Err((self.error_factory)("attribute not found"))
@@ -307,6 +309,19 @@ impl<'a, E> ValueExprEvaluator<'a, E> {
             )),
         }
     }
+}
+
+fn lookup_exception_value(
+    map: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<serde_json::Value> {
+    if !(map.contains_key("type") && map.contains_key("message")) {
+        return None;
+    }
+    map.get("values")
+        .and_then(|value| value.as_object())
+        .and_then(|values| values.get(key))
+        .cloned()
 }
 
 /// Recursively resolve variable references throughout a value tree.

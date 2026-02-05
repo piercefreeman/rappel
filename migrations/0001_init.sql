@@ -126,5 +126,15 @@ CREATE TABLE worker_status (
     -- Pool-level metrics (same for all workers in pool)
     dispatch_queue_size BIGINT,
     total_in_flight BIGINT,
+    -- Additional metrics for activity graph
+    active_workers INT NOT NULL DEFAULT 0,
+    actions_per_sec DOUBLE PRECISION NOT NULL DEFAULT 0,
+    median_instance_duration_secs DOUBLE PRECISION,
+    active_instance_count INT NOT NULL DEFAULT 0,
+    total_instances_completed BIGINT NOT NULL DEFAULT 0,
+    instances_per_sec DOUBLE PRECISION NOT NULL DEFAULT 0,
+    instances_per_min DOUBLE PRECISION NOT NULL DEFAULT 0,
+    -- Encoded time-series ring buffer for activity graphs
+    time_series BYTEA,
     PRIMARY KEY (pool_id, worker_id)
 );

@@ -8,7 +8,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::messages::ast as ir;
-use crate::rappel_core::dag::EdgeType;
+use crate::rappel_core::dag::{EXCEPTION_SCOPE_VAR, EdgeType};
 use crate::rappel_core::runner::state::{ActionResultValue, FunctionCallValue, RunnerState};
 use crate::rappel_core::runner::value_visitor::ValueExprEvaluator;
 
@@ -180,11 +180,13 @@ impl<'a> ReplayEngine<'a> {
         name: &str,
         stack: Rc<RefCell<HashSet<(Uuid, String)>>>,
     ) -> Result<Value, ReplayError> {
-        let source_node_id = self
-            .find_variable_source_node(current_node_id, name)
-            .ok_or_else(|| {
-                ReplayError(format!("variable not found via data-flow edges: {name}"))
-            })?;
+        let mut source_node_id = self.find_variable_source_node(current_node_id, name);
+        if source_node_id.is_none() && name == EXCEPTION_SCOPE_VAR {
+            source_node_id = self.state.latest_assignment(name);
+        }
+        let source_node_id = source_node_id.ok_or_else(|| {
+            ReplayError(format!("variable not found via data-flow edges: {name}"))
+        })?;
         self.evaluate_assignment(source_node_id, name, stack)
     }
 

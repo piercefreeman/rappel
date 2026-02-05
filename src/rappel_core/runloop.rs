@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -61,7 +61,7 @@ enum LoopEvent {
 pub struct RunLoop {
     worker_pool: Arc<dyn BaseWorkerPool>,
     backend: Arc<dyn BaseBackend>,
-    instance_batch_size: usize,
+    max_concurrent_instances: usize,
     instance_done_batch_size: usize,
     poll_interval: Duration,
     persistence_interval: Duration,
@@ -77,18 +77,19 @@ impl RunLoop {
     pub fn new(
         worker_pool: impl BaseWorkerPool + 'static,
         backend: impl BaseBackend + 'static,
-        instance_batch_size: usize,
+        max_concurrent_instances: usize,
         instance_done_batch_size: Option<usize>,
         poll_interval: f64,
         persistence_interval: f64,
     ) -> Self {
+        let max_concurrent_instances = std::cmp::max(1, max_concurrent_instances);
         Self {
             worker_pool: Arc::new(worker_pool),
             backend: Arc::new(backend),
-            instance_batch_size: std::cmp::max(1, instance_batch_size),
+            max_concurrent_instances,
             instance_done_batch_size: std::cmp::max(
                 1,
-                instance_done_batch_size.unwrap_or(instance_batch_size),
+                instance_done_batch_size.unwrap_or(max_concurrent_instances),
             ),
             poll_interval: Duration::from_secs_f64(poll_interval.max(0.0)),
             persistence_interval: Duration::from_secs_f64(persistence_interval.max(0.0)),
@@ -132,6 +133,8 @@ impl RunLoop {
             self.handle_step(executor_id, step).await?;
         }
 
+        let available_instance_slots = Arc::new(AtomicUsize::new(self.available_instance_slots()));
+
         let (completion_tx, mut completion_rx) = mpsc::channel::<Vec<ActionCompletion>>(32);
         let (instance_tx, mut instance_rx) = mpsc::channel::<InstanceMessage>(16);
         let stop = Arc::new(AtomicBool::new(false));
@@ -163,7 +166,8 @@ impl RunLoop {
 
         let backend = self.backend.clone();
         let poll_interval = self.poll_interval;
-        let instance_batch_size = self.instance_batch_size;
+        let max_concurrent_instances = self.max_concurrent_instances;
+        let instance_available_slots = Arc::clone(&available_instance_slots);
         let instance_stop = stop.clone();
         let instance_notify = stop_notify.clone();
         let instance_handle = tokio::spawn(async move {
@@ -171,7 +175,17 @@ impl RunLoop {
                 if instance_stop.load(Ordering::SeqCst) {
                     break;
                 }
-                let batch = backend.get_queued_instances(instance_batch_size).await;
+                let available_slots = instance_available_slots.load(Ordering::SeqCst);
+                let batch_size = std::cmp::min(available_slots, max_concurrent_instances);
+                if batch_size == 0 {
+                    if poll_interval > Duration::ZERO {
+                        tokio::time::sleep(poll_interval).await;
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(0)).await;
+                    }
+                    continue;
+                }
+                let batch = backend.get_queued_instances(batch_size).await;
                 let message = match batch {
                     Ok(instances) => InstanceMessage::Batch(instances),
                     Err(err) => InstanceMessage::Error(err),
@@ -273,6 +287,7 @@ impl RunLoop {
             // 3. Then queue new actions
             self.process_batch(all_completions, all_instances, &mut result)
                 .await?;
+            self.store_available_instance_slots(&available_instance_slots);
         }
 
         stop.store(true, Ordering::SeqCst);
@@ -546,6 +561,21 @@ impl RunLoop {
                 (None, Some(error_value))
             }
         }
+    }
+
+    fn active_instances(&self) -> usize {
+        self.executors
+            .len()
+            .saturating_sub(self.completed_executors.len())
+    }
+
+    fn available_instance_slots(&self) -> usize {
+        self.max_concurrent_instances
+            .saturating_sub(self.active_instances())
+    }
+
+    fn store_available_instance_slots(&self, slots: &Arc<AtomicUsize>) {
+        slots.store(self.available_instance_slots(), Ordering::SeqCst);
     }
 
     #[obs]

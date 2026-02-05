@@ -366,6 +366,7 @@ impl RunnerState {
             &spec.action_name,
             targets.as_deref(),
             iteration_index,
+            false,
         )?;
         if let Some(node_mut) = self.nodes.get_mut(&node.node_id) {
             node_mut.value_expr = Some(ValueExpr::ActionResult(result.clone()));
@@ -680,6 +681,7 @@ impl RunnerState {
                     action_name,
                     targets.as_deref(),
                     iteration_index,
+                    false,
                 )?;
                 if let Some(node_mut) = self.nodes.get_mut(&exec_node.node_id) {
                     node_mut.value_expr = Some(ValueExpr::ActionResult(result));
@@ -740,6 +742,7 @@ impl RunnerState {
         action_name: &str,
         targets: Option<&[String]>,
         iteration_index: Option<i32>,
+        update_latest: bool,
     ) -> Result<ActionResultValue, RunnerStateError> {
         let result_ref = ActionResultValue {
             node_id: node.node_id,
@@ -754,7 +757,9 @@ impl RunnerState {
             if let Some(node) = self.nodes.get_mut(&node.node_id) {
                 node.assignments.extend(assignments.clone());
             }
-            self.mark_latest_assignments(node.node_id, &assignments);
+            if update_latest {
+                self.mark_latest_assignments(node.node_id, &assignments);
+            }
         }
         Ok(result_ref)
     }
@@ -1323,6 +1328,7 @@ impl RunnerState {
             &spec.action_name,
             targets.as_deref(),
             iteration_index,
+            false,
         )?;
         if let Some(node) = self.nodes.get_mut(&node.node_id) {
             node.value_expr = Some(ValueExpr::ActionResult(result.clone()));

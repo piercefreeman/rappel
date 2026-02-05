@@ -67,7 +67,7 @@ impl WebappDatabase {
             r#"
             SELECT instance_id, entry_node, created_at, state, result, error
             FROM runner_instances
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, instance_id DESC
             LIMIT $1 OFFSET $2
             "#,
         )
@@ -202,14 +202,31 @@ impl WebappDatabase {
             .map(|g| g.nodes.iter().map(|n| (n.id.clone(), n)).collect())
             .unwrap_or_default();
 
-        // Get action results from runner_actions_done
+        // Extract node IDs from the graph to filter action results
+        let node_ids: Vec<Uuid> = graph
+            .as_ref()
+            .map(|g| {
+                g.nodes
+                    .iter()
+                    .filter_map(|n| Uuid::parse_str(&n.id).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Get action results only for nodes belonging to this instance
         let rows = sqlx::query(
             r#"
             SELECT id, created_at, node_id, action_name, attempt, result
             FROM runner_actions_done
-            ORDER BY created_at DESC
+            WHERE node_id = ANY($1)
+            ORDER BY created_at ASC
             "#,
         )
+        .bind(&node_ids)
         .fetch_all(&self.pool)
         .await?;
 
@@ -427,6 +444,241 @@ impl WebappDatabase {
     pub async fn get_distinct_schedule_types(&self) -> BackendResult<Vec<String>> {
         Ok(vec!["cron".to_string(), "interval".to_string()])
     }
+
+    // ========================================================================
+    // Worker Stats Queries
+    // ========================================================================
+
+    /// Get worker action stats aggregated by pool.
+    pub async fn get_worker_action_stats(
+        &self,
+        window_minutes: i64,
+    ) -> BackendResult<Vec<WorkerActionRow>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                pool_id,
+                COUNT(DISTINCT worker_id) as active_workers,
+                SUM(throughput_per_min) / 60.0 as actions_per_sec,
+                SUM(throughput_per_min) as throughput_per_min,
+                SUM(total_completed) as total_completed,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY median_dequeue_ms) as median_dequeue_ms,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY median_handling_ms) as median_handling_ms,
+                MAX(last_action_at) as last_action_at,
+                MAX(updated_at) as updated_at
+            FROM worker_status
+            WHERE updated_at > NOW() - INTERVAL '1 minute' * $1
+            GROUP BY pool_id
+            ORDER BY actions_per_sec DESC
+            "#,
+        )
+        .bind(window_minutes)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut stats = Vec::new();
+        for row in rows {
+            stats.push(WorkerActionRow {
+                pool_id: row.get::<Uuid, _>("pool_id").to_string(),
+                active_workers: row.get::<i64, _>("active_workers"),
+                actions_per_sec: format!("{:.1}", row.get::<f64, _>("actions_per_sec")),
+                throughput_per_min: row.get::<f64, _>("throughput_per_min") as i64,
+                total_completed: row.get::<i64, _>("total_completed"),
+                median_dequeue_ms: row
+                    .get::<Option<f64>, _>("median_dequeue_ms")
+                    .map(|v| v as i64),
+                median_handling_ms: row
+                    .get::<Option<f64>, _>("median_handling_ms")
+                    .map(|v| v as i64),
+                last_action_at: row
+                    .get::<Option<DateTime<Utc>>, _>("last_action_at")
+                    .map(|dt| dt.to_rfc3339()),
+                updated_at: row.get::<DateTime<Utc>, _>("updated_at").to_rfc3339(),
+            });
+        }
+
+        Ok(stats)
+    }
+
+    /// Get aggregate worker stats for the overview cards.
+    pub async fn get_worker_aggregate_stats(
+        &self,
+        window_minutes: i64,
+    ) -> BackendResult<WorkerAggregateStats> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(DISTINCT worker_id) as active_worker_count,
+                COALESCE(SUM(throughput_per_min) / 60.0, 0) as actions_per_sec,
+                COALESCE(SUM(total_in_flight), 0) as total_in_flight,
+                COALESCE(SUM(dispatch_queue_size), 0) as total_queue_depth
+            FROM worker_status
+            WHERE updated_at > NOW() - INTERVAL '1 minute' * $1
+            "#,
+        )
+        .bind(window_minutes)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(WorkerAggregateStats {
+            active_worker_count: row.get::<i64, _>("active_worker_count"),
+            actions_per_sec: format!("{:.1}", row.get::<f64, _>("actions_per_sec")),
+            total_in_flight: row.get::<i64, _>("total_in_flight"),
+            total_queue_depth: row.get::<i64, _>("total_queue_depth"),
+        })
+    }
+
+    /// Check if worker_status table exists.
+    pub async fn worker_status_table_exists(&self) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables
+                WHERE table_name = 'worker_status'
+            )
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Check if workflow_schedules table exists.
+    pub async fn schedules_table_exists(&self) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables
+                WHERE table_name = 'workflow_schedules'
+            )
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Get full worker status including time series data.
+    pub async fn get_worker_statuses(
+        &self,
+        window_minutes: i64,
+    ) -> BackendResult<Vec<WorkerStatus>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                pool_id,
+                MAX(active_workers) as active_workers,
+                SUM(throughput_per_min) as throughput_per_min,
+                SUM(throughput_per_min) / 60.0 as actions_per_sec,
+                SUM(total_completed) as total_completed,
+                MAX(last_action_at) as last_action_at,
+                MAX(updated_at) as updated_at,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY median_dequeue_ms) as median_dequeue_ms,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY median_handling_ms) as median_handling_ms,
+                MAX(dispatch_queue_size) as dispatch_queue_size,
+                MAX(total_in_flight) as total_in_flight,
+                MAX(median_instance_duration_secs) as median_instance_duration_secs,
+                MAX(active_instance_count) as active_instance_count,
+                SUM(total_instances_completed) as total_instances_completed,
+                MAX(instances_per_sec) as instances_per_sec,
+                MAX(instances_per_min) as instances_per_min,
+                (SELECT time_series FROM worker_status ws2
+                 WHERE ws2.pool_id = worker_status.pool_id
+                 AND ws2.time_series IS NOT NULL
+                 ORDER BY ws2.updated_at DESC LIMIT 1) as time_series
+            FROM worker_status
+            WHERE updated_at > NOW() - INTERVAL '1 minute' * $1
+            GROUP BY pool_id
+            ORDER BY actions_per_sec DESC
+            "#,
+        )
+        .bind(window_minutes)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut statuses = Vec::new();
+        for row in rows {
+            statuses.push(WorkerStatus {
+                pool_id: row.get::<Uuid, _>("pool_id"),
+                active_workers: row.get::<Option<i32>, _>("active_workers").unwrap_or(0),
+                throughput_per_min: row.get::<f64, _>("throughput_per_min"),
+                actions_per_sec: row.get::<f64, _>("actions_per_sec"),
+                total_completed: row.get::<i64, _>("total_completed"),
+                last_action_at: row.get::<Option<DateTime<Utc>>, _>("last_action_at"),
+                updated_at: row.get::<DateTime<Utc>, _>("updated_at"),
+                median_dequeue_ms: row
+                    .get::<Option<f64>, _>("median_dequeue_ms")
+                    .map(|v| v as i64),
+                median_handling_ms: row
+                    .get::<Option<f64>, _>("median_handling_ms")
+                    .map(|v| v as i64),
+                dispatch_queue_size: row.get::<Option<i64>, _>("dispatch_queue_size"),
+                total_in_flight: row.get::<Option<i64>, _>("total_in_flight"),
+                median_instance_duration_secs: row
+                    .get::<Option<f64>, _>("median_instance_duration_secs"),
+                active_instance_count: row
+                    .get::<Option<i32>, _>("active_instance_count")
+                    .unwrap_or(0),
+                total_instances_completed: row
+                    .get::<Option<i64>, _>("total_instances_completed")
+                    .unwrap_or(0),
+                instances_per_sec: row
+                    .get::<Option<f64>, _>("instances_per_sec")
+                    .unwrap_or(0.0),
+                instances_per_min: row
+                    .get::<Option<f64>, _>("instances_per_min")
+                    .unwrap_or(0.0),
+                time_series: row.get::<Option<Vec<u8>>, _>("time_series"),
+            });
+        }
+
+        Ok(statuses)
+    }
+}
+
+/// Full worker status for webapp display.
+#[derive(Debug, Clone)]
+pub struct WorkerStatus {
+    pub pool_id: Uuid,
+    pub active_workers: i32,
+    pub throughput_per_min: f64,
+    pub actions_per_sec: f64,
+    pub total_completed: i64,
+    pub last_action_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+    pub median_dequeue_ms: Option<i64>,
+    pub median_handling_ms: Option<i64>,
+    pub dispatch_queue_size: Option<i64>,
+    pub total_in_flight: Option<i64>,
+    pub median_instance_duration_secs: Option<f64>,
+    pub active_instance_count: i32,
+    pub total_instances_completed: i64,
+    pub instances_per_sec: f64,
+    pub instances_per_min: f64,
+    pub time_series: Option<Vec<u8>>,
+}
+
+/// Worker action stats row for display.
+#[derive(Debug, Clone)]
+pub struct WorkerActionRow {
+    pub pool_id: String,
+    pub active_workers: i64,
+    pub actions_per_sec: String,
+    pub throughput_per_min: i64,
+    pub total_completed: i64,
+    pub median_dequeue_ms: Option<i64>,
+    pub median_handling_ms: Option<i64>,
+    pub last_action_at: Option<String>,
+    pub updated_at: String,
+}
+
+/// Aggregate worker stats for overview cards.
+#[derive(Debug, Clone)]
+pub struct WorkerAggregateStats {
+    pub active_worker_count: i64,
+    pub actions_per_sec: String,
+    pub total_in_flight: i64,
+    pub total_queue_depth: i64,
 }
 
 // ============================================================================

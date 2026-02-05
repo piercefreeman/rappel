@@ -12,7 +12,9 @@ use uuid::Uuid;
 use crate::messages::ast as ir;
 use crate::observability::obs;
 use crate::rappel_core::backends::{ActionDone, BaseBackend, GraphUpdate};
-use crate::rappel_core::dag::{ActionCallNode, AggregatorNode, DAG, DAGEdge, EdgeType};
+use crate::rappel_core::dag::{
+    ActionCallNode, AggregatorNode, DAG, DAGEdge, EXCEPTION_SCOPE_VAR, EdgeType,
+};
 use crate::rappel_core::runner::state::{
     ActionCallSpec, ActionResultValue, BinaryOpValue, DictEntryValue, DictValue, DotValue,
     ExecutionEdge, ExecutionNode, FunctionCallValue, IndexValue, ListValue, LiteralValue,
@@ -323,10 +325,32 @@ impl RunnerExecutor {
                 self.state
                     .mark_failed(node_id)
                     .map_err(|err| RunnerExecutorError(err.0))?;
+                let exception_value = exception_value.clone().unwrap_or(Value::Null);
+                let exception_expr = ValueExpr::Literal(LiteralValue {
+                    value: exception_value.clone(),
+                });
+                let mut exception_assignment = HashMap::new();
+                exception_assignment
+                    .insert(EXCEPTION_SCOPE_VAR.to_string(), exception_expr.clone());
+                if let Some(node) = self.state.nodes.get_mut(&node_id) {
+                    node.assignments
+                        .insert(EXCEPTION_SCOPE_VAR.to_string(), exception_expr);
+                }
+                self.state
+                    .mark_latest_assignments(node_id, &exception_assignment);
             } else {
                 self.state
                     .mark_completed(node_id)
                     .map_err(|err| RunnerExecutorError(err.0))?;
+                let assignments = self
+                    .state
+                    .nodes
+                    .get(&node_id)
+                    .map(|node| node.assignments.clone())
+                    .unwrap_or_default();
+                if !assignments.is_empty() {
+                    self.state.mark_latest_assignments(node_id, &assignments);
+                }
                 let (action_name, attempt) = {
                     let node = self.state.nodes.get(&node_id).ok_or_else(|| {
                         RunnerExecutorError(format!("execution node not found: {node_id}"))
@@ -563,6 +587,7 @@ impl RunnerExecutor {
                 &template.action_name,
                 Some(&targets),
                 iteration_index,
+                false,
             )
             .map_err(|err| RunnerExecutorError(err.0))?;
         if let Some(node_mut) = self.state.nodes.get_mut(&node.node_id) {
@@ -622,7 +647,7 @@ impl RunnerExecutor {
             }
             for edge in incoming {
                 if let Some(source) = self.state.nodes.get(&edge.source) {
-                    if source.status != NodeStatus::Completed {
+                    if !matches!(source.status, NodeStatus::Completed | NodeStatus::Failed) {
                         return false;
                     }
                 } else {
@@ -634,7 +659,7 @@ impl RunnerExecutor {
 
         for edge in incoming {
             if let Some(source) = self.state.nodes.get(&edge.source) {
-                if source.status != NodeStatus::Completed {
+                if !matches!(source.status, NodeStatus::Completed | NodeStatus::Failed) {
                     return false;
                 }
             } else {
@@ -1396,7 +1421,7 @@ impl RunnerExecutor {
 
             for &node_id in node_ids {
                 if let Some(node) = self.state.nodes.get(&node_id)
-                    && node.status != NodeStatus::Completed
+                    && !matches!(node.status, NodeStatus::Completed | NodeStatus::Failed)
                 {
                     let timeline_pos = self.state.timeline.iter().position(|&id| id == node_id);
                     if let Some(pos) = timeline_pos {

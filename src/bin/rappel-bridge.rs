@@ -877,9 +877,10 @@ fn action_result_to_completion(
             payload
         }
     } else if let Value::Object(mut map) = payload {
-        map.remove("error").unwrap_or(Value::Object(map))
+        let error = map.remove("error").unwrap_or(Value::Object(map));
+        normalize_error_value(error)
     } else {
-        payload
+        normalize_error_value(payload)
     };
 
     Some(ActionCompletion {
@@ -887,6 +888,38 @@ fn action_result_to_completion(
         node_id,
         result: value,
     })
+}
+
+fn normalize_error_value(error: Value) -> Value {
+    let Value::Object(mut map) = error else {
+        return error;
+    };
+
+    if let Some(Value::Object(exception)) = map.remove("__exception__") {
+        return ensure_error_fields(exception);
+    }
+
+    ensure_error_fields(map)
+}
+
+fn ensure_error_fields(mut map: serde_json::Map<String, Value>) -> Value {
+    let error_type = map
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("RemoteWorkerError")
+        .to_string();
+    let error_message = map
+        .get("message")
+        .and_then(|value| value.as_str())
+        .unwrap_or("remote worker error")
+        .to_string();
+    if !map.contains_key("type") {
+        map.insert("type".to_string(), Value::String(error_type));
+    }
+    if !map.contains_key("message") {
+        map.insert("message".to_string(), Value::String(error_message));
+    }
+    Value::Object(map)
 }
 
 fn build_queued_instance(
