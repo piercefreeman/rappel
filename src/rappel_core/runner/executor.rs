@@ -57,6 +57,9 @@ type FinishedNodeResult = (
 /// iterations, and stops when it encounters action calls that must be executed
 /// by an external worker.
 ///
+/// This serves as a runner supervisor for a single instance that's owned
+/// in memory by our logic.
+///
 /// Each call to increment() starts from a finished execution node, walks
 /// downstream through inline nodes (assignments, branches, joins, etc.), and
 /// returns any newly queued action nodes that are now unblocked.
@@ -65,11 +68,14 @@ pub struct RunnerExecutor {
     state: RunnerState,
     action_results: HashMap<Uuid, Value>,
     backend: Option<Arc<dyn CoreBackend>>,
+    // TODO: Delegate these into the DAG to be dynamicly calculated when we need them. This will
+    // allow us to share multiple DAG representations across the same underlying DAG.
     template_outgoing: FxHashMap<String, Vec<DAGEdge>>,
     template_incoming: FxHashMap<String, HashSet<String>>,
     incoming_exec_edges: FxHashMap<Uuid, Vec<ExecutionEdge>>,
     /// Index: template_id -> list of execution node IDs with that template
     template_to_exec_nodes: FxHashMap<String, Vec<Uuid>>,
+    // TODO: Describe what eval cache does and how long it lives for...
     eval_cache: RefCell<FxHashMap<(Uuid, String), Value>>,
     instance_id: Option<Uuid>,
 }
@@ -131,11 +137,14 @@ impl RunnerExecutor {
     }
 
     /// Store an action result value for a specific execution node.
+    // TODO: I believe this again should be "execution_result"
     pub fn set_action_result(&mut self, node_id: Uuid, result: Value) {
         self.action_results.insert(node_id, result);
     }
 
     /// Remove any cached action result for a specific execution node.
+    // TODO: When would this happen in practice? Feels like we would never want
+    // to allow this? Once an execution node is done it should be done, no?
     pub fn clear_action_result(&mut self, node_id: Uuid) {
         self.action_results.remove(&node_id);
     }
@@ -152,6 +161,8 @@ impl RunnerExecutor {
             .nodes
             .iter()
             .filter(|(_, node)| {
+                // TODO: We should not support string-only types, they should either be enums
+                // or probably better yet using something like matches!
                 node.node_type == "action_call" && node.status == NodeStatus::Running
             })
             .map(|(node_id, _)| *node_id)
@@ -191,6 +202,8 @@ impl RunnerExecutor {
     /// Example:
     /// - Action A finishes -> assignment -> branch -> action B
     ///   increment(A) queues the assignment and branch inline, then returns action B.
+    /// TODO: No need for this wrapper fn, just change increment_batch to be .increment and force
+    /// client callers to provide a list value
     pub fn increment(&mut self, finished_node: Uuid) -> Result<ExecutorStep, RunnerExecutorError> {
         self.increment_batch(&[finished_node])
     }
@@ -228,6 +241,7 @@ impl RunnerExecutor {
 
         while let Some((start, exception_value)) = pending_starts.pop() {
             for action in self.walk_from(start, exception_value.clone())? {
+                // TODO: Explain why this is necessary
                 if seen_actions.insert(action.node_id) {
                     actions.push(action);
                 }
@@ -235,10 +249,17 @@ impl RunnerExecutor {
         }
 
         let updates = self.collect_updates(actions_done)?;
+
+        // TODO: We should fail any executions that have passed their timeout by this point and queue
+        // them for retry if possible
+
+        // TODO: We should also compute when the next wake_up time is for this task (assuming no action result
+        // values have been received) - this should be the min(all execution timeouts)
+
         Ok(ExecutorStep { actions, updates })
     }
 
-    /// Walk downstream from a node, executing inline nodes until blocked.
+    /// Walk downstream from a node, executing inline nodes until blocked by an action node.
     #[obs]
     fn walk_from(
         &mut self,
@@ -249,6 +270,8 @@ impl RunnerExecutor {
         let mut actions = Vec::new();
 
         while let Some((current, current_exception)) = pending.pop() {
+            // TODO: is the template_id the same thing as a action_id? Should we switch to
+            // that language to be consistent...
             let template_id = match &current.template_id {
                 Some(id) => id,
                 None => continue,
@@ -303,6 +326,11 @@ impl RunnerExecutor {
             })?;
             if Self::is_exception_value(&action_value) {
                 exception_value = Some(action_value);
+                // TODO: Consolidate this retry logic (which has a similar representation in
+                // the initial fail+retry logic) into its own function for .fail_execution(exception, reason) that handles
+                // the retry validation and queue addition for us...
+                // The other resume function should create a synthetic error that indicates it failed because
+                // it had to be retried
                 let can_retry = {
                     let node = self.state.nodes.get(&node_id).ok_or_else(|| {
                         RunnerExecutorError(format!("execution node not found: {node_id}"))
@@ -442,6 +470,8 @@ impl RunnerExecutor {
         }
 
         // Extract info from template without holding borrow across mutable calls
+        // TODO: Is there a benefit to placing this here versus globally? We should probably move it
+        // global for consistency
         enum TemplateKind {
             SpreadAction(Box<ActionCallNode>),
             Aggregator(String),
@@ -726,6 +756,8 @@ impl RunnerExecutor {
         sources: &[ExecutionNode],
         values: &[ValueExpr],
     ) -> Result<Vec<ValueExpr>, RunnerExecutorError> {
+        // TODO: This feels horribly complicated? Doesn't the execution node in state that we create
+        // keep track of its own ordering? How does the timeline fit in here? Do we even need a timeline?
         if sources.len() != values.len() {
             return Err(RunnerExecutorError(
                 "aggregator sources/value mismatch".to_string(),
@@ -809,6 +841,9 @@ impl RunnerExecutor {
             "spread collection is not iterable".to_string(),
         ))
     }
+
+    // TODO: Migrate expr_to_value and our various evaluators (evaluate_value_expr) into a
+    // separate runner/expression_evaluator.rs file that we can just call and test discretely
 
     /// Convert a pure IR expression into a ValueExpr without side effects.
     fn expr_to_value(expr: &ir::Expr) -> Result<ValueExpr, RunnerExecutorError> {
@@ -1246,6 +1281,13 @@ impl RunnerExecutor {
         false
     }
 
+    // TODO: Can retry should be refactored into a separate class, because we want to add more complexities
+    // for this policy that determines when we're actually allowed to retry. The output should be a boolean
+    // of whether to retry and also a timestamp of the scheduled_at date at which we're allowed
+    // to retry
+    // TODO: add a new function that determines if a workflow is blocked because all of the frontier
+    // action nodes have a future scheduled date. In these cases we should evict the instance from our executor
+    // and queue it for resumption at min(scheduled at dates)
     fn can_retry(&self, node: &ExecutionNode) -> Result<bool, RunnerExecutorError> {
         let template_id = match &node.template_id {
             Some(id) => id.clone(),

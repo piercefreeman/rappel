@@ -175,6 +175,10 @@ pub struct ExecutionEdge {
 /// In short, RunnerState is the ground-truth runtime DAG: symbolic assignments
 /// plus control/data edges, suitable for replay and visualization.
 ///
+/// Action nodes represent our "frontier" nodes. Because of how we construct the graph and always
+/// greedily walk the state until we hit the next actions that are possible to run, we guarantee that
+/// leaf nodes are only ever actions.
+///
 /// Cycle walkthrough (mid-loop example):
 /// Suppose we are partway through:
 /// - results = []
