@@ -6,7 +6,7 @@ mod postgres;
 
 pub use base::{
     ActionDone, BackendError, BackendResult, BaseBackend, GraphUpdate, InstanceDone,
-    QueuedInstance, WorkerStatusUpdate,
+    QueuedInstance, WorkerStatusBackend, WorkerStatusUpdate,
 };
 pub use memory::MemoryBackend;
 pub use postgres::{DEFAULT_DSN, PostgresBackend};

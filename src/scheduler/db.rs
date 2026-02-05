@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::db;
 use crate::rappel_core::backends::{BackendError, BackendResult};
 
 use super::types::{CreateScheduleParams, ScheduleId, ScheduleType, WorkflowSchedule};
@@ -15,6 +16,10 @@ pub struct SchedulerDatabase {
     pool: PgPool,
 }
 
+// TODO: Consolidate objects into the regular db manager. Consolidate the functional logic
+// of the work we do on an individual "tick" into the backends/postgres.rs implementation. Come
+// up with a very simple in-memory representation of the same basic logic in backends/memory.
+
 impl SchedulerDatabase {
     /// Create a new scheduler database handle from an existing pool.
     pub fn new(pool: PgPool) -> Self {
@@ -24,9 +29,8 @@ impl SchedulerDatabase {
     /// Connect to the database.
     pub async fn connect(dsn: &str) -> BackendResult<Self> {
         let pool = PgPool::connect(dsn).await?;
-        let db = Self { pool };
-        db.ensure_schema().await?;
-        Ok(db)
+        db::run_migrations(&pool).await?;
+        Ok(Self { pool })
     }
 
     /// Get the underlying pool.
@@ -36,42 +40,7 @@ impl SchedulerDatabase {
 
     /// Ensure the schedule schema exists.
     pub async fn ensure_schema(&self) -> BackendResult<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS workflow_schedules (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                workflow_name TEXT NOT NULL,
-                schedule_name TEXT NOT NULL,
-                schedule_type TEXT NOT NULL,
-                cron_expression TEXT,
-                interval_seconds BIGINT,
-                jitter_seconds BIGINT NOT NULL DEFAULT 0,
-                input_payload BYTEA,
-                status TEXT NOT NULL DEFAULT 'active',
-                next_run_at TIMESTAMPTZ,
-                last_run_at TIMESTAMPTZ,
-                last_instance_id UUID,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                priority INT NOT NULL DEFAULT 0,
-                allow_duplicate BOOLEAN NOT NULL DEFAULT false,
-                UNIQUE(workflow_name, schedule_name)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_schedules_due ON workflow_schedules(next_run_at)
-                WHERE status = 'active' AND next_run_at IS NOT NULL
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
+        db::run_migrations(&self.pool).await
     }
 
     // ========================================================================

@@ -17,8 +17,7 @@ use crate::rappel_core::ir_format::format_program;
 use crate::rappel_core::ir_parser::parse_program;
 use crate::rappel_core::runloop::RunLoop;
 use crate::rappel_core::runner::RunnerState;
-use crate::server_worker::WorkerBridgeServer;
-use crate::workers::{PythonWorkerConfig, PythonWorkerPool, RemoteWorkerPool};
+use crate::workers::{PythonWorkerConfig, RemoteWorkerPool};
 
 #[derive(Parser, Debug)]
 #[command(name = "rappel-smoke", about = "Smoke check core-python components.")]
@@ -281,24 +280,14 @@ async fn run_program_smoke(case: &SmokeCase, worker_pool: RemoteWorkerPool) -> R
 }
 
 async fn run_smoke(base: i64) -> i32 {
-    let bridge = match WorkerBridgeServer::start(None).await {
-        Ok(server) => server,
-        Err(err) => {
-            println!("Failed to start worker bridge server: {err}");
-            return 1;
-        }
-    };
     let config = PythonWorkerConfig::new().with_user_module("tests.fixtures.test_actions");
-    let pool = match PythonWorkerPool::new(config, 2, Arc::clone(&bridge), None).await {
+    let worker_pool = match RemoteWorkerPool::new_with_config(config, 2, None, None, 10).await {
         Ok(pool) => pool,
         Err(err) => {
             println!("Failed to start python worker pool: {err}");
-            bridge.shutdown().await;
             return 1;
         }
     };
-    let pool = Arc::new(pool);
-    let worker_pool = RemoteWorkerPool::new(Arc::clone(&pool));
 
     let mut cases = Vec::new();
     cases.push(SmokeCase {
@@ -345,20 +334,9 @@ async fn run_smoke(base: i64) -> i32 {
         }
     }
 
-    drop(worker_pool);
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    match Arc::try_unwrap(pool) {
-        Ok(pool) => {
-            if let Err(err) = pool.shutdown().await {
-                println!("Failed to shut down worker pool: {err}");
-            }
-        }
-        Err(pool) => {
-            println!("Worker pool still in use; skipping shutdown");
-            drop(pool);
-        }
+    if let Err(err) = worker_pool.shutdown().await {
+        println!("Failed to shut down worker pool: {err}");
     }
-    bridge.shutdown().await;
 
     println!("Examples available: {:?}", list_examples());
     if failures > 0 { 1 } else { 0 }

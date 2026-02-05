@@ -8,7 +8,8 @@ use std::sync::{
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
+use tracing::error;
 use uuid::Uuid;
 
 use crate::observability::obs;
@@ -605,6 +606,60 @@ impl RunLoop {
             self.backend.save_graphs(&graph_updates).await?;
         }
         Ok(())
+    }
+}
+
+/// Supervise a run loop, restarting on errors until shutdown.
+pub async fn runloop_supervisor<B, W>(
+    backend: B,
+    worker_pool: W,
+    max_concurrent_instances: usize,
+    instance_done_batch_size: Option<usize>,
+    poll_interval: Duration,
+    persistence_interval: Duration,
+    shutdown_rx: watch::Receiver<bool>,
+) where
+    B: BaseBackend + Clone + Send + Sync + 'static,
+    W: BaseWorkerPool + Clone + Send + Sync + 'static,
+{
+    let mut backoff = Duration::from_millis(200);
+    let max_backoff = Duration::from_secs(5);
+
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        let mut runloop = RunLoop::new(
+            worker_pool.clone(),
+            backend.clone(),
+            max_concurrent_instances,
+            instance_done_batch_size,
+            poll_interval.as_secs_f64(),
+            persistence_interval.as_secs_f64(),
+        );
+
+        let result = runloop.run().await;
+
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        match result {
+            Ok(_) => {
+                backoff = Duration::from_millis(200);
+                if poll_interval > Duration::ZERO {
+                    tokio::time::sleep(poll_interval).await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+            Err(err) => {
+                error!(error = %err, "runloop exited with error; restarting");
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, max_backoff);
+            }
+        }
     }
 }
 

@@ -40,6 +40,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     env,
+    net::SocketAddr,
     path::PathBuf,
     process::Stdio,
     sync::{
@@ -67,10 +68,13 @@ use uuid::Uuid;
 use super::base::{
     ActionCompletion, ActionRequest, BaseWorkerPool, WorkerPoolError, error_to_value,
 };
+use super::status::{WorkerPoolStats, WorkerPoolStatsSnapshot};
 use crate::{
     messages::{self, MessageError, proto},
     server_worker::{WorkerBridgeChannels, WorkerBridgeServer},
 };
+
+const LATENCY_SAMPLE_SIZE: usize = 256;
 
 /// Configuration for spawning Python workers.
 #[derive(Clone, Debug)]
@@ -282,6 +286,53 @@ impl WorkerThroughputTracker {
                 }
             })
             .collect()
+    }
+}
+
+#[derive(Debug)]
+struct LatencyTracker {
+    max_samples: usize,
+    dequeue_ms: VecDeque<i64>,
+    handling_ms: VecDeque<i64>,
+}
+
+impl LatencyTracker {
+    fn new(max_samples: usize) -> Self {
+        Self {
+            max_samples: max_samples.max(1),
+            dequeue_ms: VecDeque::new(),
+            handling_ms: VecDeque::new(),
+        }
+    }
+
+    fn record(&mut self, ack_latency: Duration, worker_duration: Duration) {
+        let dequeue = ack_latency.as_millis() as i64;
+        let handling = worker_duration.as_millis() as i64;
+        self.dequeue_ms.push_back(dequeue);
+        self.handling_ms.push_back(handling);
+
+        while self.dequeue_ms.len() > self.max_samples {
+            self.dequeue_ms.pop_front();
+        }
+        while self.handling_ms.len() > self.max_samples {
+            self.handling_ms.pop_front();
+        }
+    }
+
+    fn median(values: &VecDeque<i64>) -> Option<i64> {
+        if values.is_empty() {
+            return None;
+        }
+        let mut ordered: Vec<i64> = values.iter().copied().collect();
+        ordered.sort_unstable();
+        Some(ordered[ordered.len() / 2])
+    }
+
+    fn snapshot_medians(&self) -> (Option<i64>, Option<i64>) {
+        (
+            Self::median(&self.dequeue_ms),
+            Self::median(&self.handling_ms),
+        )
     }
 }
 
@@ -718,10 +769,9 @@ impl Drop for PythonWorker {
 /// # Example
 ///
 /// ```ignore
-/// let bridge = WorkerBridgeServer::start(None).await?;
 /// let config = PythonWorkerConfig::new()
 ///     .with_user_module("my_app.actions");
-/// let pool = PythonWorkerPool::new(config, 4, bridge, None).await?;
+/// let pool = PythonWorkerPool::new_with_bridge_addr(config, 4, None, None, 10).await?;
 ///
 /// let metrics = pool.get_worker(0).await.send_action(dispatch).await?;
 /// ```
@@ -732,6 +782,8 @@ pub struct PythonWorkerPool {
     cursor: AtomicUsize,
     /// Throughput tracker for workers in the pool
     throughput: StdMutex<WorkerThroughputTracker>,
+    /// Rolling latency tracker for dequeue/handling metrics
+    latency: StdMutex<LatencyTracker>,
     /// Action counts per worker slot (for lifecycle tracking)
     action_counts: Vec<AtomicU64>,
     /// In-flight action counts per worker slot (for concurrency control)
@@ -835,6 +887,7 @@ impl PythonWorkerPool {
                 worker_ids,
                 Duration::from_secs(60),
             )),
+            latency: StdMutex::new(LatencyTracker::new(LATENCY_SAMPLE_SIZE)),
             action_counts,
             in_flight_counts,
             max_concurrent_per_worker: max_concurrent_per_worker.max(1),
@@ -842,6 +895,37 @@ impl PythonWorkerPool {
             bridge,
             config,
         })
+    }
+
+    /// Create a new worker pool and spawn its own bridge server.
+    pub async fn new_with_bridge_addr(
+        config: PythonWorkerConfig,
+        count: usize,
+        bind_addr: Option<SocketAddr>,
+        max_action_lifecycle: Option<u64>,
+        max_concurrent_per_worker: usize,
+    ) -> AnyResult<Self> {
+        let bridge = WorkerBridgeServer::start(bind_addr).await?;
+        match Self::new_with_concurrency(
+            config,
+            count,
+            Arc::clone(&bridge),
+            max_action_lifecycle,
+            max_concurrent_per_worker,
+        )
+        .await
+        {
+            Ok(pool) => Ok(pool),
+            Err(err) => {
+                bridge.shutdown().await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Return the bridge address for worker connections.
+    pub fn bridge_addr(&self) -> SocketAddr {
+        self.bridge.addr()
     }
 
     /// Get a worker by index.
@@ -975,6 +1059,22 @@ impl PythonWorkerPool {
             tracker.snapshot_at(Instant::now())
         } else {
             Vec::new()
+        }
+    }
+
+    /// Record the latest latency measurements for median reporting.
+    pub fn record_latency(&self, ack_latency: Duration, worker_duration: Duration) {
+        if let Ok(mut tracker) = self.latency.lock() {
+            tracker.record(ack_latency, worker_duration);
+        }
+    }
+
+    /// Return the current median dequeue/handling latencies in milliseconds.
+    pub fn median_latencies_ms(&self) -> (Option<i64>, Option<i64>) {
+        if let Ok(tracker) = self.latency.lock() {
+            tracker.snapshot_medians()
+        } else {
+            (None, None)
         }
     }
 
@@ -1127,6 +1227,7 @@ impl PythonWorkerPool {
             }
         }
 
+        self.bridge.shutdown().await;
         info!("worker pool shutdown complete");
         Ok(())
     }
@@ -1244,6 +1345,7 @@ async fn execute_remote_request(
 
     match worker.send_action(dispatch).await {
         Ok(metrics) => {
+            pool.record_latency(metrics.ack_latency, metrics.worker_duration);
             pool.record_completion(worker_idx, Arc::clone(&pool));
             ActionCompletion {
                 executor_id,
@@ -1293,6 +1395,44 @@ impl RemoteWorkerPool {
                 completion_rx: Mutex::new(completion_rx),
                 launched: AtomicBool::new(false),
             }),
+        }
+    }
+
+    pub async fn new_with_config(
+        config: PythonWorkerConfig,
+        count: usize,
+        bind_addr: Option<SocketAddr>,
+        max_action_lifecycle: Option<u64>,
+        max_concurrent_per_worker: usize,
+    ) -> AnyResult<Self> {
+        let pool = PythonWorkerPool::new_with_bridge_addr(
+            config,
+            count,
+            bind_addr,
+            max_action_lifecycle,
+            max_concurrent_per_worker,
+        )
+        .await?;
+        Ok(Self::new(Arc::new(pool)))
+    }
+
+    pub fn bridge_addr(&self) -> SocketAddr {
+        self.inner.pool.bridge_addr()
+    }
+
+    pub async fn shutdown(self) -> AnyResult<()> {
+        match Arc::try_unwrap(self.inner) {
+            Ok(inner) => match Arc::try_unwrap(inner.pool) {
+                Ok(pool) => pool.shutdown().await,
+                Err(_) => {
+                    warn!("worker pool still referenced during shutdown; skipping shutdown");
+                    Ok(())
+                }
+            },
+            Err(_) => {
+                warn!("remote worker pool still referenced during shutdown; skipping shutdown");
+                Ok(())
+            }
         }
     }
 }
@@ -1358,6 +1498,35 @@ impl BaseWorkerPool for RemoteWorkerPool {
     }
 }
 
+impl WorkerPoolStats for PythonWorkerPool {
+    fn stats_snapshot(&self) -> WorkerPoolStatsSnapshot {
+        let snapshots = self.throughput_snapshots();
+        let active_workers = snapshots.len() as u16;
+        let throughput_per_min: f64 = snapshots.iter().map(|s| s.throughput_per_min).sum();
+        let total_completed: i64 = snapshots.iter().map(|s| s.total_completed as i64).sum();
+        let last_action_at = snapshots.iter().filter_map(|s| s.last_action_at).max();
+        let (dispatch_queue_size, total_in_flight) = self.queue_stats();
+        let (median_dequeue_ms, median_handling_ms) = self.median_latencies_ms();
+
+        WorkerPoolStatsSnapshot {
+            active_workers,
+            throughput_per_min,
+            total_completed,
+            last_action_at,
+            dispatch_queue_size,
+            total_in_flight,
+            median_dequeue_ms,
+            median_handling_ms,
+        }
+    }
+}
+
+impl WorkerPoolStats for RemoteWorkerPool {
+    fn stats_snapshot(&self) -> WorkerPoolStatsSnapshot {
+        self.inner.pool.stats_snapshot()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1419,10 +1588,9 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires Python environment
     async fn test_pool_spawn_and_shutdown() {
-        let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
         let config = PythonWorkerConfig::new();
 
-        let pool = PythonWorkerPool::new(config, 2, Arc::clone(&bridge), None)
+        let pool = PythonWorkerPool::new_with_bridge_addr(config, 2, None, None, 10)
             .await
             .expect("create pool");
 
@@ -1435,16 +1603,14 @@ mod tests {
         assert_eq!(workers[1].worker_id(), 1);
 
         pool.shutdown().await.expect("shutdown pool");
-        bridge.shutdown().await;
     }
 
     #[tokio::test]
     #[ignore] // Requires Python environment
     async fn test_pool_round_robin_selection() {
-        let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
         let config = PythonWorkerConfig::new();
 
-        let pool = PythonWorkerPool::new(config, 3, Arc::clone(&bridge), None)
+        let pool = PythonWorkerPool::new_with_bridge_addr(config, 3, None, None, 10)
             .await
             .expect("create pool");
 
@@ -1465,16 +1631,14 @@ mod tests {
         assert_eq!(w4.worker_id(), 0); // Wrapped
 
         pool.shutdown().await.expect("shutdown pool");
-        bridge.shutdown().await;
     }
 
     #[tokio::test]
     #[ignore] // Requires Python environment with test actions
     async fn test_send_action_roundtrip() {
-        let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
         let config = PythonWorkerConfig::new().with_user_module("tests.fixtures.test_actions");
 
-        let pool = PythonWorkerPool::new(config, 1, Arc::clone(&bridge), None)
+        let pool = PythonWorkerPool::new_with_bridge_addr(config, 1, None, None, 10)
             .await
             .expect("create pool");
 
@@ -1502,17 +1666,15 @@ mod tests {
         assert!(metrics.worker_duration.as_nanos() > 0);
 
         pool.shutdown().await.expect("shutdown pool");
-        bridge.shutdown().await;
     }
 
     #[tokio::test]
     #[ignore] // Requires Python environment
     async fn test_multiple_concurrent_actions() {
-        let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
         let config = PythonWorkerConfig::new().with_user_module("tests.fixtures.test_actions");
 
         let pool = Arc::new(
-            PythonWorkerPool::new(config, 2, Arc::clone(&bridge), None)
+            PythonWorkerPool::new_with_bridge_addr(config, 2, None, None, 10)
                 .await
                 .expect("create pool"),
         );
@@ -1550,9 +1712,14 @@ mod tests {
             assert!(metrics.success);
         }
 
-        // Need to get the pool out of the Arc for shutdown
-        // In real code, you'd structure this differently
-        bridge.shutdown().await;
+        match Arc::try_unwrap(pool) {
+            Ok(pool) => {
+                pool.shutdown().await.expect("shutdown pool");
+            }
+            Err(_) => {
+                warn!("worker pool still referenced during shutdown; skipping shutdown");
+            }
+        }
     }
 
     #[test]
@@ -1588,11 +1755,10 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires Python environment
     async fn test_worker_concurrency_control() {
-        let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
         let config = PythonWorkerConfig::new();
 
         // Create pool with 2 workers, max 3 concurrent per worker
-        let pool = PythonWorkerPool::new_with_concurrency(config, 2, Arc::clone(&bridge), None, 3)
+        let pool = PythonWorkerPool::new_with_bridge_addr(config, 2, None, None, 3)
             .await
             .expect("create pool");
 
@@ -1638,7 +1804,6 @@ mod tests {
         assert_eq!(pool.available_capacity(), 0);
 
         pool.shutdown().await.expect("shutdown pool");
-        bridge.shutdown().await;
     }
 
     #[test]
@@ -1686,12 +1851,11 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires Python environment with test actions
     async fn test_worker_recycling_after_lifecycle_limit() {
-        let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
         let config = PythonWorkerConfig::new().with_user_module("tests.fixtures.test_actions");
 
         // Create pool with max_action_lifecycle = 2
         let pool = Arc::new(
-            PythonWorkerPool::new(config, 1, Arc::clone(&bridge), Some(2))
+            PythonWorkerPool::new_with_bridge_addr(config, 1, None, Some(2), 10)
                 .await
                 .expect("create pool"),
         );
@@ -1779,18 +1943,24 @@ mod tests {
         let metrics = worker.send_action(dispatch3).await.expect("send action 3");
         assert!(metrics.success);
 
-        bridge.shutdown().await;
+        match Arc::try_unwrap(pool) {
+            Ok(pool) => {
+                pool.shutdown().await.expect("shutdown pool");
+            }
+            Err(_) => {
+                warn!("worker pool still referenced during shutdown; skipping shutdown");
+            }
+        }
     }
 
     #[tokio::test]
     #[ignore] // Requires Python environment with test actions
     async fn test_worker_no_recycling_when_lifecycle_none() {
-        let bridge = WorkerBridgeServer::start(None).await.expect("start bridge");
         let config = PythonWorkerConfig::new().with_user_module("tests.fixtures.test_actions");
 
         // Create pool with no lifecycle limit
         let pool = Arc::new(
-            PythonWorkerPool::new(config, 1, Arc::clone(&bridge), None)
+            PythonWorkerPool::new_with_bridge_addr(config, 1, None, None, 10)
                 .await
                 .expect("create pool"),
         );
@@ -1827,7 +1997,14 @@ mod tests {
             "Worker should not have been recycled when lifecycle limit is None"
         );
 
-        bridge.shutdown().await;
+        match Arc::try_unwrap(pool) {
+            Ok(pool) => {
+                pool.shutdown().await.expect("shutdown pool");
+            }
+            Err(_) => {
+                warn!("worker pool still referenced during shutdown; skipping shutdown");
+            }
+        }
     }
 
     #[test]

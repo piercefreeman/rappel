@@ -50,10 +50,7 @@ struct WorkflowStore {
 
 impl WorkflowStore {
     async fn connect(dsn: &str) -> Result<Self> {
-        let backend = PostgresBackend::connect(dsn)
-            .await
-            .map_err(|err| anyhow::anyhow!(err))?;
-        ensure_workflow_schema(backend.pool()).await?;
+        let backend = PostgresBackend::connect(dsn).await?;
         Ok(Self { backend })
     }
 
@@ -1032,32 +1029,6 @@ fn literal_from_value(value: &Value) -> ir::Expr {
             span: None,
         },
     }
-}
-
-async fn ensure_workflow_schema(pool: &sqlx::PgPool) -> Result<()> {
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS workflow_versions (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            workflow_name TEXT NOT NULL,
-            dag_hash TEXT NOT NULL,
-            program_proto BYTEA NOT NULL,
-            concurrent BOOLEAN NOT NULL DEFAULT false,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            UNIQUE(workflow_name, dag_hash)
-        )
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_workflow_versions_name ON workflow_versions(workflow_name)",
-    )
-    .execute(pool)
-    .await?;
-
-    Ok(())
 }
 
 fn proto_schedule_type(value: i32) -> Option<ScheduleType> {

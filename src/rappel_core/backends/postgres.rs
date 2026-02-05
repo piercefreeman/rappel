@@ -7,13 +7,17 @@ use futures::future::BoxFuture;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use uuid::Uuid;
 
+use crate::db;
 use crate::observability::obs;
 
 use super::base::{
     ActionDone, BackendError, BackendResult, BaseBackend, GraphUpdate, InstanceDone,
-    QueuedInstance, WorkerStatusUpdate,
+    QueuedInstance, WorkerStatusBackend, WorkerStatusUpdate,
 };
 
+// TODO: Remove this... we should rely on one central pool for our app. You should
+// accept the pool as the constructor parameters since this is expected to come from the
+// parent and not internally
 pub const DEFAULT_DSN: &str = "postgresql://rappel:rappel@localhost:5432/rappel_core";
 
 /// Persist runner state and action results in Postgres.
@@ -28,13 +32,12 @@ impl PostgresBackend {
     #[obs]
     pub async fn connect(dsn: &str) -> BackendResult<Self> {
         let pool = PgPool::connect(dsn).await?;
-        let backend = Self {
+        db::run_migrations(&pool).await?;
+        Ok(Self {
             pool,
             query_counts: Arc::new(Mutex::new(HashMap::new())),
             batch_size_counts: Arc::new(Mutex::new(HashMap::new())),
-        };
-        backend.ensure_schema().await?;
-        Ok(backend)
+        })
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -137,62 +140,6 @@ impl PostgresBackend {
             .lock()
             .expect("batch size counts poisoned")
             .clone()
-    }
-
-    #[obs]
-    async fn ensure_schema(&self) -> BackendResult<()> {
-        let statements = [
-            r#"
-            CREATE TABLE IF NOT EXISTS runner_graph_updates (
-                id BIGSERIAL PRIMARY KEY,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                state BYTEA NOT NULL
-            )
-            "#,
-            r#"
-            CREATE TABLE IF NOT EXISTS runner_actions_done (
-                id BIGSERIAL PRIMARY KEY,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                node_id UUID NOT NULL,
-                action_name TEXT NOT NULL,
-                attempt INTEGER NOT NULL,
-                result BYTEA
-            )
-            "#,
-            r#"
-            CREATE TABLE IF NOT EXISTS runner_instances (
-                instance_id UUID PRIMARY KEY,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                entry_node UUID NOT NULL,
-                state BYTEA,
-                result BYTEA,
-                error BYTEA
-            )
-            "#,
-            r#"
-            CREATE TABLE IF NOT EXISTS runner_instances_done (
-                id BIGSERIAL PRIMARY KEY,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                executor_id UUID NOT NULL,
-                entry_node UUID NOT NULL,
-                result BYTEA,
-                error BYTEA
-            )
-            "#,
-            r#"
-            CREATE TABLE IF NOT EXISTS queued_instances (
-                instance_id UUID PRIMARY KEY,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                payload BYTEA NOT NULL
-            )
-            "#,
-        ];
-        let mut tx = self.pool.begin().await?;
-        for statement in statements {
-            sqlx::query(statement).execute(&mut *tx).await?;
-        }
-        tx.commit().await?;
-        Ok(())
     }
 
     fn count_query(counts: &Arc<Mutex<HashMap<String, usize>>>, label: &str) {
@@ -457,6 +404,15 @@ impl BaseBackend for PostgresBackend {
         instances: &'a [InstanceDone],
     ) -> BoxFuture<'a, BackendResult<()>> {
         Box::pin(self.save_instances_done_impl(instances))
+    }
+}
+
+impl WorkerStatusBackend for PostgresBackend {
+    fn upsert_worker_status<'a>(
+        &'a self,
+        status: &'a WorkerStatusUpdate,
+    ) -> BoxFuture<'a, BackendResult<()>> {
+        Box::pin(async move { PostgresBackend::upsert_worker_status(self, status).await })
     }
 }
 

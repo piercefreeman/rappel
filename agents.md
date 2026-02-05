@@ -1,8 +1,13 @@
 # Rappel
 
+## Terminology
+
+- A "node_id" is only true for the ground truth DAG node that come from the workflow definition in the run() workflow. This is converted from Python->IR->DAG. These are the `nodes` that are referenced.
+- An "execution_id" comes from the state graph of the program that is currently running. Loops are unrolled in this state, for example. They also maintain the state of the actions that are actually pushed into the cluster like the current attempt number of the actions.
+
 ## Code Review
 
-When there are TODOs in the code that indicate issues with the code written (versus areas that we want to implement in the future), you should fix them one by one. You should also generalize the feedback that you receive into advice that applies to our code style guides. For every piece of this feedback, consult the CLAUDE.md file. Is the feedback still within the document? If not, add it as a new bullet or nuance a bullet that is already there to be more specific it it overlaps significantly in scope. Feel free to include code examples inline of the good/bad way of how to handle it.
+When there are TODOs in the code that indicate issues with the code written (versus areas that we want to implement in the future), you should fix them one by one. You should also generalize the feedback that you receive into advice that applies to our code style guides. For every piece of this feedback, consult the AGENTS.md file. Is the feedback still within the document? If not, add it as a new bullet or nuance a bullet that is already there to be more specific it it overlaps significantly in scope. Feel free to include code examples inline of the good/bad way of how to handle it.
 
 Once you are done fixing the TODO, double check your work. Have we really taken care of the TODO? Remove the comment if so.
 
@@ -106,13 +111,6 @@ Follow a modern, developer-focused design language. The design prioritizes clari
 - Distinct visual treatment from hover
 - Consider using filled backgrounds instead of just borders
 
-## AI Controlled
-
-This section is used for the scratch updates, driven by our Agents.
-
-<code_feedback>
-</code_feedback>
-
 ## Coding Conventions
 
 - Never add optional-import fallbacks for core dependencies (e.g., wrapping `pydantic` imports in `try/except`). Import them directly and let the program fail fast if they're missing.
@@ -132,3 +130,15 @@ This section is used for the scratch updates, driven by our Agents.
 
 - Run python tests with `uv run pytest`
 - To run the rust integration tests you'll have to do something like: source .env && cargo test ...
+
+## AI Controlled
+
+This section is used for the scratch updates, driven by our Agents.
+
+<code_feedback>
+<rule>Centralize environment parsing in shared config modules and build sub-configs inside `from_env`. Good: `let cfg = WorkerConfig::from_env()?; let webapp = cfg.webapp.clone();` Bad: `let cfg = WorkerConfig::from_env()?; let webapp = WebappConfig::from_env();`</rule>
+<rule>Prefer `?` (with `context` when needed) over wrapping simple errors with `map_err(|err| anyhow!(err))`. Good: `PostgresBackend::connect(dsn).await?;` Bad: `PostgresBackend::connect(dsn).await.map_err(|err| anyhow!(err))?;`</rule>
+<rule>Use SQLx migrations for schema creation instead of ad-hoc `CREATE TABLE` blocks in binaries. Good: `db::run_migrations(&pool).await?;` Bad: `sqlx::query("CREATE TABLE...").execute(&pool).await?;`</rule>
+<rule>Own and shut down exclusive dependencies in the component that uses them (e.g., worker pools own their bridge servers). Good: `PythonWorkerPool::new_with_bridge_addr(...)` Bad: `let bridge = WorkerBridgeServer::start(...); PythonWorkerPool::new(..., bridge, ...)`</rule>
+<rule>Promote shared runtime helpers into their owning modules rather than duplicating them in binaries. Good: `runloop::runloop_supervisor(...)` Bad: `async fn runloop_supervisor(...) { ... }` in a bin.</rule>
+</code_feedback>

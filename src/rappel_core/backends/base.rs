@@ -26,14 +26,21 @@ fn default_instance_id() -> Uuid {
     Uuid::new_v4()
 }
 
+// The models that we use for our backends are similar to the ones that we
+// have specified in our database/Postgres backend, but not 1:1. It's better for
+// us to internally convert within the given backend
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Queued instance payload for the run loop.
 pub struct QueuedInstance {
     pub dag: DAG,
     pub entry_node: Uuid,
     pub state: Option<RunnerState>,
+
+    // TODO: Isn't nodes & edges here just repetitive from the DAG+RunnerState?
     pub nodes: Option<HashMap<Uuid, ExecutionNode>>,
     pub edges: Option<HashSet<ExecutionEdge>>,
+
     pub action_results: Option<HashMap<Uuid, Value>>,
     #[serde(default = "default_instance_id")]
     pub instance_id: Uuid,
@@ -55,6 +62,8 @@ pub struct InstanceDone {
 /// derived caches) so persistence stays lightweight.
 pub struct GraphUpdate {
     pub instance_id: Uuid,
+    // TODO: Should we just be passed the RunnerState here so it's already
+    // nice and typehinted for us?
     pub nodes: HashMap<Uuid, ExecutionNode>,
     pub edges: HashSet<ExecutionEdge>,
 }
@@ -62,16 +71,24 @@ pub struct GraphUpdate {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Batch payload representing a completed action execution.
 pub struct ActionDone {
+    // TODO: I don't think we need the action_name... Additionally, done
+    // actions should NOT be parameterized based on the node_id since the node
+    // is only the ground truth DAG representation. Instead we should have execution_id.
     pub node_id: Uuid,
     pub action_name: String,
     pub attempt: i32,
     pub result: Value,
 }
 
+// TODO: Refactor backends to be in src/backends... The active backend should be passed
+// into the rappel_core entrypoint & the scheduled entrypoint & the workers entrypoint
+
 /// Abstract persistence backend for runner state.
 pub trait BaseBackend: Send + Sync {
     fn clone_box(&self) -> Box<dyn BaseBackend>;
 
+    // TODO: Switch all of these calls to just use async as their public definition... this avoids
+    // the need to capture these box futures and leads to a much cleaner signature
     /// Persist updated execution graphs.
     fn save_graphs<'a>(&'a self, graphs: &'a [GraphUpdate]) -> BoxFuture<'a, BackendResult<()>>;
 
@@ -92,6 +109,12 @@ pub trait BaseBackend: Send + Sync {
         &'a self,
         instances: &'a [InstanceDone],
     ) -> BoxFuture<'a, BackendResult<()>>;
+
+    // TODO: Add endpoint for registering workflow DAGs
+    // TODO: Add endpoint for registering new instances
+    // TODO: Add endpoint for saving worker status updates
+    // TODO: Add endpoint for adding a new schedule
+    // TODO: Add endpoint for getting ready schedules
 }
 
 impl Clone for Box<dyn BaseBackend> {
@@ -100,6 +123,8 @@ impl Clone for Box<dyn BaseBackend> {
     }
 }
 
+// TODO: Move to top of file... Add a new public API on the backend that lets us
+// save the current worker states...
 /// Worker status update for persistence.
 #[derive(Clone, Debug)]
 pub struct WorkerStatusUpdate {
@@ -119,4 +144,12 @@ pub struct WorkerStatusUpdate {
     pub instances_per_sec: f64,
     pub instances_per_min: f64,
     pub time_series: Option<Vec<u8>>,
+}
+
+/// Backend capability for recording worker status metrics.
+pub trait WorkerStatusBackend: Send + Sync {
+    fn upsert_worker_status<'a>(
+        &'a self,
+        status: &'a WorkerStatusUpdate,
+    ) -> BoxFuture<'a, BackendResult<()>>;
 }

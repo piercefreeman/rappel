@@ -1,5 +1,7 @@
 //! Rappel - worker pool infrastructure plus the core IR/runtime port.
 
+pub mod config;
+pub mod db;
 pub mod messages;
 pub mod observability;
 pub mod pool_status;
@@ -21,5 +23,5 @@ pub use server_worker::{WorkerBridgeChannels, WorkerBridgeServer};
 pub use webapp::{WebappConfig, WebappDatabase, WebappServer};
 pub use workers::{
     ActionDispatchPayload, PythonWorker, PythonWorkerConfig, PythonWorkerPool, RemoteWorkerPool,
-    RoundTripMetrics,
+    RoundTripMetrics, spawn_status_reporter,
 };

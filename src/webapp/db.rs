@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::db;
 use crate::rappel_core::backends::{BackendError, BackendResult, GraphUpdate};
 use crate::rappel_core::runner::state::NodeStatus;
 
@@ -29,6 +30,7 @@ impl WebappDatabase {
     /// Connect to the database.
     pub async fn connect(dsn: &str) -> BackendResult<Self> {
         let pool = PgPool::connect(dsn).await?;
+        db::run_migrations(&pool).await?;
         Ok(Self { pool })
     }
 

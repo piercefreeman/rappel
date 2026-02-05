@@ -7,6 +7,7 @@ use futures::future::BoxFuture;
 
 use super::base::{
     ActionDone, BackendResult, BaseBackend, GraphUpdate, InstanceDone, QueuedInstance,
+    WorkerStatusBackend, WorkerStatusUpdate,
 };
 
 /// Backend that prints updates instead of persisting them.
@@ -33,6 +34,9 @@ impl MemoryBackend {
     }
 }
 
+// TODO: To make this more complete, we should store some representation of these objects in-memory
+// attached to the object so we could actually theoretically use this as a storage medium
+// in tests or something separate from postgres...
 impl BaseBackend for MemoryBackend {
     fn clone_box(&self) -> Box<dyn BaseBackend> {
         Box::new(self.clone())
@@ -94,5 +98,14 @@ impl BaseBackend for MemoryBackend {
             }
             Ok(instances)
         })
+    }
+}
+
+impl WorkerStatusBackend for MemoryBackend {
+    fn upsert_worker_status<'a>(
+        &'a self,
+        _status: &'a WorkerStatusUpdate,
+    ) -> BoxFuture<'a, BackendResult<()>> {
+        Box::pin(async { Ok(()) })
     }
 }
