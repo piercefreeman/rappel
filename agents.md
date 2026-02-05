@@ -152,4 +152,10 @@ This section is used for the scratch updates, driven by our Agents.
 <rule>Name the core persistence trait by domain (e.g., `CoreBackend`) rather than a generic `BaseBackend` to make scope explicit. Good: `trait CoreBackend { ... }` Bad: `trait BaseBackend { ... }`.</rule>
 <rule>Prefer exhaustive `match` handling in Rust over exporting a generic `assert_never` helper. Good: `match status { NodeStatus::Queued => ..., NodeStatus::Running => ..., NodeStatus::Completed => ..., NodeStatus::Failed => ... }` Bad: `assert_never(status)`.</rule>
 <rule>Keep DAG edges stored as a flat list for compact serialization; build adjacency views in helper methods when needed. Good: `pub edges: Vec<DAGEdge>` with `get_incoming_edges()` helpers. Bad: adding multiple adjacency maps to `DAG` without a serialization plan.</rule>
+<rule>Avoid stringly-typed execution node checks; use `ExecutionNodeType` or `ExecutionNode::is_action_call()` helpers. Good: `if node.is_action_call() { ... }` Bad: `if node.node_type == "action_call" { ... }`.</rule>
+<rule>Centralize action failure/retry handling to keep resume and completion paths consistent. Good: `self.handle_action_failure(node_id, exception)?;` Bad: duplicated retry/queue logic in multiple methods.</rule>
+<rule>Keep `DAGNode` in `models.rs` and centralize per-variant logic with shared helpers/macros to avoid repeated match ladders. Good: `for_each_dag_node_variant!(impl_dag_node_view);` Bad: hand-written match blocks copied across methods.</rule>
+<rule>Add a happy-path unit test for each DAG builder conversion helper. Good: a literal assignment conversion test in `dag/builder/assignments.rs`; Bad: no coverage for new conversion branches.</rule>
+<rule>Centralize worker pool metrics in shared helpers so pools don't duplicate tracking logic. Good: `WorkerPoolMetrics::new(worker_ids, window, samples); metrics.record_completion(idx);` Bad: per-pool `WorkerThroughputTracker`/`LatencyTracker` structs.</rule>
+<rule>Add a minimal happy-path test for formatting/serialization helpers. Good: parse IR then `assert_eq!(format_program(&program), source);` Bad: leaving formatting logic untested.</rule>
 </code_feedback>

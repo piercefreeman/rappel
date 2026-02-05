@@ -124,7 +124,7 @@ impl RunLoop {
             let entry_node = self.entry_nodes.get(executor_id).copied().ok_or_else(|| {
                 RunLoopError::Message(format!("missing entry node for executor {executor_id}"))
             })?;
-            let step = executor.increment(entry_node)?;
+            let step = executor.increment(&[entry_node])?;
             initial_steps.push((*executor_id, step));
         }
         self.persist_steps(&initial_steps).await?;
@@ -380,7 +380,7 @@ impl RunLoop {
                 finished_nodes.push(completion.execution_id);
             }
             if !finished_nodes.is_empty() {
-                let step = executor.increment_batch(&finished_nodes)?;
+                let step = executor.increment(&finished_nodes)?;
                 steps.push((executor_id, step));
             }
         }
@@ -403,7 +403,7 @@ impl RunLoop {
             let entry_node = self.entry_nodes.get(&executor_id).copied().ok_or_else(|| {
                 RunLoopError::Message(format!("missing entry node for executor {executor_id}"))
             })?;
-            let step = executor.increment(entry_node)?;
+            let step = executor.increment(&[entry_node])?;
             steps.push((executor_id, step));
         }
         Ok(steps)

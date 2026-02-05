@@ -2,11 +2,16 @@
 
 use std::collections::{HashMap, HashSet};
 
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::messages::ast as ir;
 
-use super::nodes::DAGNode;
+use super::nodes::{
+    ActionCallNode, AggregatorNode, AssignmentNode, BranchNode, BreakNode, ContinueNode,
+    ExpressionNode, FnCallNode, InputNode, JoinNode, OutputNode, ParallelNode, ReturnNode,
+};
 
 pub const EXCEPTION_SCOPE_VAR: &str = "__rappel_exception__";
 
@@ -146,6 +151,247 @@ impl DAGEdge {
     }
 }
 
+/// Base class for DAG nodes with computed labels and shared metadata.
+///
+/// We keep rich node detail here so scheduling, validation, and visualization
+/// can share the same source of truth without re-deriving labels or intent.
+///
+/// Visualization examples:
+/// - id="main_input_1", label="input: [x]"
+/// - id="action_4", label="@fetch() -> data"
+/// - id="join_7", label="join"
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "node_type", content = "data")]
+pub enum DAGNode {
+    Input(InputNode),
+    Output(OutputNode),
+    Assignment(AssignmentNode),
+    ActionCall(ActionCallNode),
+    FnCall(FnCallNode),
+    Parallel(ParallelNode),
+    Aggregator(AggregatorNode),
+    Branch(BranchNode),
+    Join(JoinNode),
+    Return(ReturnNode),
+    Break(BreakNode),
+    Continue(ContinueNode),
+    Expression(ExpressionNode),
+}
+
+trait DagNodeView {
+    fn id(&self) -> &str;
+    fn function_name(&self) -> Option<&str>;
+    fn node_uuid(&self) -> &Uuid;
+    fn label(&self) -> String;
+}
+
+macro_rules! for_each_dag_node_variant {
+    ($macro:ident) => {
+        $macro!(Input, as_input, InputNode, "input");
+        $macro!(Output, as_output, OutputNode, "output");
+        $macro!(Assignment, as_assignment, AssignmentNode, "assignment");
+        $macro!(ActionCall, as_action_call, ActionCallNode, "action_call");
+        $macro!(FnCall, as_fn_call, FnCallNode, "fn_call");
+        $macro!(Parallel, as_parallel, ParallelNode, "parallel");
+        $macro!(Aggregator, as_aggregator, AggregatorNode, "aggregator");
+        $macro!(Branch, as_branch, BranchNode, "branch");
+        $macro!(Join, as_join, JoinNode, "join");
+        $macro!(Return, as_return, ReturnNode, "return");
+        $macro!(Break, as_break, BreakNode, "break");
+        $macro!(Continue, as_continue, ContinueNode, "continue");
+        $macro!(Expression, as_expression, ExpressionNode, "expression");
+    };
+}
+
+macro_rules! impl_dag_node_view {
+    ($variant:ident, $method:ident, $ty:ty, $kind:expr) => {
+        impl DagNodeView for $ty {
+            fn id(&self) -> &str {
+                &self.id
+            }
+
+            fn function_name(&self) -> Option<&str> {
+                self.function_name.as_deref()
+            }
+
+            fn node_uuid(&self) -> &Uuid {
+                &self.node_uuid
+            }
+
+            fn label(&self) -> String {
+                self.label()
+            }
+        }
+    };
+}
+
+for_each_dag_node_variant!(impl_dag_node_view);
+
+macro_rules! impl_dag_node_as {
+    ($variant:ident, $method:ident, $ty:ty, $kind:expr) => {
+        pub fn $method(&self) -> Option<&$ty> {
+            if let DAGNode::$variant(node) = self {
+                Some(node)
+            } else {
+                None
+            }
+        }
+    };
+}
+
+impl DAGNode {
+    fn view(&self) -> &dyn DagNodeView {
+        match self {
+            DAGNode::Input(node) => node,
+            DAGNode::Output(node) => node,
+            DAGNode::Assignment(node) => node,
+            DAGNode::ActionCall(node) => node,
+            DAGNode::FnCall(node) => node,
+            DAGNode::Parallel(node) => node,
+            DAGNode::Aggregator(node) => node,
+            DAGNode::Branch(node) => node,
+            DAGNode::Join(node) => node,
+            DAGNode::Return(node) => node,
+            DAGNode::Break(node) => node,
+            DAGNode::Continue(node) => node,
+            DAGNode::Expression(node) => node,
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        self.view().id()
+    }
+
+    pub fn function_name(&self) -> Option<&str> {
+        self.view().function_name()
+    }
+
+    pub fn node_uuid(&self) -> &Uuid {
+        self.view().node_uuid()
+    }
+
+    pub fn node_type(&self) -> &'static str {
+        match self {
+            DAGNode::Input(_) => "input",
+            DAGNode::Output(_) => "output",
+            DAGNode::Assignment(_) => "assignment",
+            DAGNode::ActionCall(_) => "action_call",
+            DAGNode::FnCall(_) => "fn_call",
+            DAGNode::Parallel(_) => "parallel",
+            DAGNode::Aggregator(_) => "aggregator",
+            DAGNode::Branch(_) => "branch",
+            DAGNode::Join(_) => "join",
+            DAGNode::Return(_) => "return",
+            DAGNode::Break(_) => "break",
+            DAGNode::Continue(_) => "continue",
+            DAGNode::Expression(_) => "expression",
+        }
+    }
+
+    pub fn label(&self) -> String {
+        self.view().label()
+    }
+
+    pub fn is_input(&self) -> bool {
+        matches!(self, DAGNode::Input(_))
+    }
+
+    pub fn is_output(&self) -> bool {
+        matches!(self, DAGNode::Output(_))
+    }
+
+    pub fn is_aggregator(&self) -> bool {
+        matches!(self, DAGNode::Aggregator(_))
+    }
+
+    pub fn is_fn_call(&self) -> bool {
+        matches!(self, DAGNode::FnCall(_))
+    }
+
+    pub fn is_spread(&self) -> bool {
+        matches!(self, DAGNode::ActionCall(node) if node.is_spread())
+    }
+
+    pub fn targets(&self) -> Vec<String> {
+        match self {
+            DAGNode::Assignment(node) => node.targets.clone(),
+            DAGNode::ActionCall(node) => node.targets.clone().unwrap_or_default(),
+            DAGNode::FnCall(node) => node.targets.clone().unwrap_or_default(),
+            DAGNode::Aggregator(node) => node.targets.clone().unwrap_or_default(),
+            DAGNode::Join(node) => node.targets.clone().unwrap_or_default(),
+            DAGNode::Return(node) => node.targets.clone().unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn target(&self) -> Option<String> {
+        match self {
+            DAGNode::Assignment(node) => node.target.clone(),
+            DAGNode::ActionCall(node) => node.target.clone(),
+            DAGNode::FnCall(node) => node.target.clone(),
+            DAGNode::Aggregator(node) => node.target.clone(),
+            DAGNode::Join(node) => node.target.clone(),
+            DAGNode::Return(node) => node.target.clone(),
+            _ => None,
+        }
+    }
+
+    for_each_dag_node_variant!(impl_dag_node_as);
+}
+
+macro_rules! impl_dag_node_from {
+    ($variant:ident, $method:ident, $ty:ty, $kind:expr) => {
+        impl From<$ty> for DAGNode {
+            fn from(node: $ty) -> Self {
+                DAGNode::$variant(node)
+            }
+        }
+    };
+}
+
+for_each_dag_node_variant!(impl_dag_node_from);
+
+/// Derived state-machine adjacency for quick DAG traversal.
+#[derive(Clone, Debug, Default)]
+pub struct DagEdgeIndex {
+    outgoing_state_machine: FxHashMap<String, Vec<DAGEdge>>,
+    incoming_state_machine: FxHashMap<String, HashSet<String>>,
+}
+
+impl DagEdgeIndex {
+    pub fn new(dag: &DAG) -> Self {
+        let mut outgoing_state_machine: FxHashMap<String, Vec<DAGEdge>> = FxHashMap::default();
+        let mut incoming_state_machine: FxHashMap<String, HashSet<String>> = FxHashMap::default();
+        for edge in &dag.edges {
+            if edge.edge_type != EdgeType::StateMachine {
+                continue;
+            }
+            outgoing_state_machine
+                .entry(edge.source.clone())
+                .or_default()
+                .push(edge.clone());
+            incoming_state_machine
+                .entry(edge.target.clone())
+                .or_default()
+                .insert(edge.source.clone());
+        }
+        Self {
+            outgoing_state_machine,
+            incoming_state_machine,
+        }
+    }
+
+    pub fn outgoing(&self, node_id: &str) -> Option<&[DAGEdge]> {
+        self.outgoing_state_machine
+            .get(node_id)
+            .map(|edges| edges.as_slice())
+    }
+
+    pub fn incoming(&self, node_id: &str) -> Option<&HashSet<String>> {
+        self.incoming_state_machine.get(node_id)
+    }
+}
+
 /// Container for DAG nodes/edges with helper queries.
 ///
 /// The DAG object is the common currency between conversion, scheduling, and
@@ -163,6 +409,10 @@ pub struct DAG {
 }
 
 impl DAG {
+    pub fn edge_index(&self) -> DagEdgeIndex {
+        DagEdgeIndex::new(self)
+    }
+
     pub fn add_node(&mut self, node: DAGNode) {
         if self.entry_node.is_none() {
             self.entry_node = Some(node.id().to_string());

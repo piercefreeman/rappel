@@ -4,10 +4,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::messages::ast as ir;
 
+use super::super::models::DAGNode;
 use super::super::models::{DAG, DAGEdge, EdgeType};
-use super::super::nodes::{
-    ActionCallNode, AssignmentNode, DAGNode, FnCallNode, InputNode, ReturnNode,
-};
+use super::super::nodes::{ActionCallNode, AssignmentNode, FnCallNode, InputNode, ReturnNode};
 use super::converter::DAGConverter;
 
 /// Rebuild data-flow edges from variable definition/use analysis.

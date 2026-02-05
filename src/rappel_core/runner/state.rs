@@ -123,6 +123,68 @@ pub enum NodeStatus {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionNodeType {
+    Input,
+    Output,
+    Assignment,
+    ActionCall,
+    FnCall,
+    Parallel,
+    Aggregator,
+    Branch,
+    Join,
+    Return,
+    Break,
+    Continue,
+    Expression,
+}
+
+impl ExecutionNodeType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExecutionNodeType::Input => "input",
+            ExecutionNodeType::Output => "output",
+            ExecutionNodeType::Assignment => "assignment",
+            ExecutionNodeType::ActionCall => "action_call",
+            ExecutionNodeType::FnCall => "fn_call",
+            ExecutionNodeType::Parallel => "parallel",
+            ExecutionNodeType::Aggregator => "aggregator",
+            ExecutionNodeType::Branch => "branch",
+            ExecutionNodeType::Join => "join",
+            ExecutionNodeType::Return => "return",
+            ExecutionNodeType::Break => "break",
+            ExecutionNodeType::Continue => "continue",
+            ExecutionNodeType::Expression => "expression",
+        }
+    }
+}
+
+impl TryFrom<&str> for ExecutionNodeType {
+    type Error = RunnerStateError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "input" => Ok(ExecutionNodeType::Input),
+            "output" => Ok(ExecutionNodeType::Output),
+            "assignment" => Ok(ExecutionNodeType::Assignment),
+            "action_call" => Ok(ExecutionNodeType::ActionCall),
+            "fn_call" => Ok(ExecutionNodeType::FnCall),
+            "parallel" => Ok(ExecutionNodeType::Parallel),
+            "aggregator" => Ok(ExecutionNodeType::Aggregator),
+            "branch" => Ok(ExecutionNodeType::Branch),
+            "join" => Ok(ExecutionNodeType::Join),
+            "return" => Ok(ExecutionNodeType::Return),
+            "break" => Ok(ExecutionNodeType::Break),
+            "continue" => Ok(ExecutionNodeType::Continue),
+            "expression" => Ok(ExecutionNodeType::Expression),
+            _ => Err(RunnerStateError(format!(
+                "unknown execution node type: {value}"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionNode {
     pub node_id: Uuid,
@@ -135,6 +197,19 @@ pub struct ExecutionNode {
     pub value_expr: Option<ValueExpr>,
     pub assignments: HashMap<String, ValueExpr>,
     pub action_attempt: i32,
+}
+
+impl ExecutionNode {
+    pub fn node_type_enum(&self) -> Result<ExecutionNodeType, RunnerStateError> {
+        ExecutionNodeType::try_from(self.node_type.as_str())
+    }
+
+    pub fn is_action_call(&self) -> bool {
+        matches!(
+            ExecutionNodeType::try_from(self.node_type.as_str()),
+            Ok(ExecutionNodeType::ActionCall)
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -286,7 +361,7 @@ impl RunnerState {
             },
             value_expr: None,
             assignments: HashMap::new(),
-            action_attempt: if template.node_type() == "action_call" {
+            action_attempt: if matches!(template, DAGNode::ActionCall(_)) {
                 1
             } else {
                 0
@@ -311,6 +386,7 @@ impl RunnerState {
         label: &str,
         params: QueueNodeParams,
     ) -> Result<ExecutionNode, RunnerStateError> {
+        let node_type_enum = ExecutionNodeType::try_from(node_type)?;
         let QueueNodeParams {
             node_id,
             template_id,
@@ -319,7 +395,11 @@ impl RunnerState {
             value_expr,
         } = params;
         let node_id = node_id.unwrap_or_else(Uuid::new_v4);
-        let action_attempt = if node_type == "action_call" { 1 } else { 0 };
+        let action_attempt = if matches!(node_type_enum, ExecutionNodeType::ActionCall) {
+            1
+        } else {
+            0
+        };
         let node = ExecutionNode {
             node_id,
             node_type: node_type.to_string(),
@@ -354,7 +434,7 @@ impl RunnerState {
     ) -> Result<ActionResultValue, RunnerStateError> {
         let spec = self.action_spec_from_ir(action, local_scope);
         let node = self.queue_node(
-            "action_call",
+            ExecutionNodeType::ActionCall.as_str(),
             &format!("@{}()", spec.action_name),
             QueueNodeParams {
                 targets: targets.clone(),
@@ -400,7 +480,7 @@ impl RunnerState {
 
     pub fn increment_action_attempt(&mut self, node_id: Uuid) -> Result<(), RunnerStateError> {
         let node = self.get_node_mut(node_id)?;
-        if node.node_type != "action_call" {
+        if !node.is_action_call() {
             return Err(RunnerStateError(
                 "action attempt increment requires an action_call node".to_string(),
             ));
@@ -445,7 +525,7 @@ impl RunnerState {
         }
         self.nodes.insert(node.node_id, node.clone());
         self.ready_queue.push(node.node_id);
-        if node.node_type == "action_call" {
+        if node.is_action_call() {
             self.mark_graph_dirty();
         }
         if self.link_queued_nodes
@@ -1316,7 +1396,7 @@ impl RunnerState {
             kwargs: kwargs.unwrap_or_default(),
         };
         let node = self.queue_node(
-            "action_call",
+            ExecutionNodeType::ActionCall.as_str(),
             &format!("@{}()", spec.action_name),
             QueueNodeParams {
                 targets: targets.clone(),

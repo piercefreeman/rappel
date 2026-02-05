@@ -13,8 +13,7 @@ pub fn validate_dag(dag: &DAG) -> Result<(), DagConversionError> {
     Ok(())
 }
 
-// TODO: Add comments to each of these functions that will explain the case in which these
-// validations should fail
+/// Fail if any edge references a missing source or target node.
 pub fn validate_edges_reference_existing_nodes(dag: &DAG) -> Result<(), DagConversionError> {
     for edge in &dag.edges {
         if !dag.nodes.contains_key(&edge.source) {
@@ -33,6 +32,7 @@ pub fn validate_edges_reference_existing_nodes(dag: &DAG) -> Result<(), DagConve
     Ok(())
 }
 
+/// Fail if a main output node has non-exception control flow continuing past it.
 pub fn validate_output_nodes_have_no_outgoing_edges(dag: &DAG) -> Result<(), DagConversionError> {
     for (node_id, node) in &dag.nodes {
         if node.node_type() == "output" && !node_id.contains(':') {
@@ -52,6 +52,10 @@ pub fn validate_output_nodes_have_no_outgoing_edges(dag: &DAG) -> Result<(), Dag
     Ok(())
 }
 
+/// Fail if a loop increment node has unexpected control-flow edges.
+///
+/// Loop increment nodes should only connect to loop condition nodes via loop-back edges,
+/// or have exception edges. Any other state-machine edge indicates a conversion bug.
 pub fn validate_loop_incr_edges(dag: &DAG) -> Result<(), DagConversionError> {
     for node_id in dag.nodes.keys() {
         if !node_id.contains("loop_incr") {
@@ -76,6 +80,7 @@ pub fn validate_loop_incr_edges(dag: &DAG) -> Result<(), DagConversionError> {
     Ok(())
 }
 
+/// Fail if duplicate state-machine edges exist between the same nodes.
 pub fn validate_no_duplicate_state_machine_edges(dag: &DAG) -> Result<(), DagConversionError> {
     let mut seen: HashSet<String> = HashSet::new();
     for edge in &dag.edges {
@@ -103,6 +108,7 @@ pub fn validate_no_duplicate_state_machine_edges(dag: &DAG) -> Result<(), DagCon
     Ok(())
 }
 
+/// Fail if input nodes have incoming state-machine edges.
 pub fn validate_input_nodes_have_no_incoming_edges(dag: &DAG) -> Result<(), DagConversionError> {
     for (node_id, node) in &dag.nodes {
         if node.is_input() {

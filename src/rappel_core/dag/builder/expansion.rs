@@ -4,8 +4,9 @@ use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
+use super::super::models::DAGNode;
 use super::super::models::{DAG, DAGEdge, DagConversionError, EdgeType};
-use super::super::nodes::{AssignmentNode, DAGNode};
+use super::super::nodes::AssignmentNode;
 use super::converter::DAGConverter;
 
 /// Inline function calls and remap expansion edges.

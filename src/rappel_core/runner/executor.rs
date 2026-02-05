@@ -2,7 +2,6 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -13,14 +12,14 @@ use crate::backends::{ActionDone, CoreBackend, GraphUpdate};
 use crate::messages::ast as ir;
 use crate::observability::obs;
 use crate::rappel_core::dag::{
-    ActionCallNode, AggregatorNode, DAG, DAGEdge, EXCEPTION_SCOPE_VAR, EdgeType,
+    ActionCallNode, AggregatorNode, DAG, DAGEdge, DagEdgeIndex, EXCEPTION_SCOPE_VAR, EdgeType,
 };
+use crate::rappel_core::runner::expression_evaluator::is_exception_value;
 use crate::rappel_core::runner::state::{
-    ActionCallSpec, ActionResultValue, BinaryOpValue, DictEntryValue, DictValue, DotValue,
-    ExecutionEdge, ExecutionNode, FunctionCallValue, IndexValue, ListValue, LiteralValue,
-    NodeStatus, QueueNodeParams, RunnerState, UnaryOpValue, VariableValue,
+    ActionCallSpec, ExecutionEdge, ExecutionNode, ExecutionNodeType, IndexValue, ListValue,
+    LiteralValue, NodeStatus, QueueNodeParams, RunnerState,
 };
-use crate::rappel_core::runner::value_visitor::{ValueExpr, ValueExprEvaluator};
+use crate::rappel_core::runner::value_visitor::ValueExpr;
 
 /// Raised when the runner executor cannot advance safely.
 #[derive(Debug, thiserror::Error)]
@@ -43,12 +42,31 @@ pub struct ExecutorStep {
     pub updates: Option<DurableUpdates>,
 }
 
+/// Action result payloads keyed by execution node id.
+type ExecutionResultMap = HashMap<Uuid, Value>;
+
 type FinishedNodeResult = (
     Option<ExecutionNode>,
     Option<Value>,
     Option<ActionDone>,
     Option<ExecutionNode>,
 );
+
+enum TemplateKind {
+    SpreadAction(Box<ActionCallNode>),
+    Aggregator(String),
+    Regular(String),
+}
+
+#[derive(Clone, Debug)]
+struct RetryDecision {
+    should_retry: bool,
+}
+
+struct RetryPolicyEvaluator<'a> {
+    policies: &'a [ir::PolicyBracket],
+    exception_name: Option<&'a str>,
+}
 
 /// Advance a DAG template using the current runner state and action results.
 ///
@@ -60,22 +78,20 @@ type FinishedNodeResult = (
 /// This serves as a runner supervisor for a single instance that's owned
 /// in memory by our logic.
 ///
-/// Each call to increment() starts from a finished execution node, walks
+/// Each call to increment() starts from finished execution nodes, walks
 /// downstream through inline nodes (assignments, branches, joins, etc.), and
 /// returns any newly queued action nodes that are now unblocked.
 pub struct RunnerExecutor {
     dag: DAG,
     state: RunnerState,
-    action_results: HashMap<Uuid, Value>,
+    action_results: ExecutionResultMap,
     backend: Option<Arc<dyn CoreBackend>>,
-    // TODO: Delegate these into the DAG to be dynamicly calculated when we need them. This will
-    // allow us to share multiple DAG representations across the same underlying DAG.
-    template_outgoing: FxHashMap<String, Vec<DAGEdge>>,
-    template_incoming: FxHashMap<String, HashSet<String>>,
+    template_index: DagEdgeIndex,
     incoming_exec_edges: FxHashMap<Uuid, Vec<ExecutionEdge>>,
     /// Index: template_id -> list of execution node IDs with that template
     template_to_exec_nodes: FxHashMap<String, Vec<Uuid>>,
-    // TODO: Describe what eval cache does and how long it lives for...
+    /// Cached assignment evaluations for the current increment pass.
+    /// Cleared at the start of each increment call.
     eval_cache: RefCell<FxHashMap<(Uuid, String), Value>>,
     instance_id: Option<Uuid>,
 }
@@ -84,17 +100,15 @@ impl RunnerExecutor {
     pub fn new(
         dag: DAG,
         state: RunnerState,
-        // TODO: Technically should these be execution results? Because they're mapping
-        // an execution node id to a value?
-        action_results: HashMap<Uuid, Value>,
+        // Action results keyed by execution node id.
+        action_results: ExecutionResultMap,
         backend: Option<Arc<dyn CoreBackend>>,
     ) -> Self {
         let mut state = state;
         state.dag = Some(dag.clone());
         state.set_link_queued_nodes(false);
 
-        let template_outgoing = Self::build_template_outgoing(&dag);
-        let template_incoming = Self::build_template_incoming(&dag);
+        let template_index = dag.edge_index();
         let incoming_exec_edges = Self::build_incoming_exec_edges(&state);
         let template_to_exec_nodes = Self::build_template_to_exec_nodes(&state);
 
@@ -103,8 +117,7 @@ impl RunnerExecutor {
             state,
             action_results,
             backend,
-            template_outgoing,
-            template_incoming,
+            template_index,
             incoming_exec_edges,
             template_to_exec_nodes,
             eval_cache: RefCell::new(FxHashMap::default()),
@@ -124,7 +137,7 @@ impl RunnerExecutor {
         &self.dag
     }
 
-    pub fn action_results(&self) -> &HashMap<Uuid, Value> {
+    pub fn action_results(&self) -> &ExecutionResultMap {
         &self.action_results
     }
 
@@ -136,15 +149,21 @@ impl RunnerExecutor {
         self.instance_id = Some(instance_id);
     }
 
-    /// Store an action result value for a specific execution node.
-    // TODO: I believe this again should be "execution_result"
+    pub(super) fn eval_cache_get(&self, key: &(Uuid, String)) -> Option<Value> {
+        self.eval_cache.borrow().get(key).cloned()
+    }
+
+    pub(super) fn eval_cache_insert(&self, key: (Uuid, String), value: Value) {
+        self.eval_cache.borrow_mut().insert(key, value);
+    }
+
+    /// Store an action result value for a specific execution node id.
     pub fn set_action_result(&mut self, node_id: Uuid, result: Value) {
         self.action_results.insert(node_id, result);
     }
 
     /// Remove any cached action result for a specific execution node.
-    // TODO: When would this happen in practice? Feels like we would never want
-    // to allow this? Once an execution node is done it should be done, no?
+    /// Used when re-queuing an action so we don't replay stale results.
     pub fn clear_action_result(&mut self, node_id: Uuid) {
         self.action_results.remove(&node_id);
     }
@@ -155,65 +174,31 @@ impl RunnerExecutor {
     /// failed, their attempt counter is incremented if retry policies allow,
     /// and retryable nodes are re-queued for execution.
     pub fn resume(&mut self) -> Result<ExecutorStep, RunnerExecutorError> {
-        let mut retry_nodes = Vec::new();
-        let retry_candidates: Vec<Uuid> = self
-            .state
-            .nodes
-            .iter()
-            .filter(|(_, node)| {
-                // TODO: We should not support string-only types, they should either be enums
-                // or probably better yet using something like matches!
-                node.node_type == "action_call" && node.status == NodeStatus::Running
-            })
-            .map(|(node_id, _)| *node_id)
-            .collect();
-
-        for node_id in retry_candidates {
-            let can_retry = {
-                let node = self.state.nodes.get(&node_id).ok_or_else(|| {
-                    RunnerExecutorError(format!("execution node not found: {node_id}"))
-                })?;
-                self.can_retry(node)?
-            };
-            if can_retry {
-                self.state
-                    .increment_action_attempt(node_id)
-                    .map_err(|err| RunnerExecutorError(err.0))?;
-                if let Some(node) = self.state.nodes.get_mut(&node_id) {
-                    node.status = NodeStatus::Queued;
-                    retry_nodes.push(node.clone());
-                }
-                if !self.state.ready_queue.contains(&node_id) {
-                    self.state.ready_queue.push(node_id);
-                }
-            } else if let Some(node) = self.state.nodes.get_mut(&node_id) {
-                node.status = NodeStatus::Failed;
+        let mut finished_nodes = Vec::new();
+        for (node_id, node) in &self.state.nodes {
+            if node.is_action_call() && node.status == NodeStatus::Running {
+                finished_nodes.push(*node_id);
+                self.action_results
+                    .entry(*node_id)
+                    .or_insert_with(|| Self::resume_exception_value(*node_id));
             }
         }
-        let updates = self.collect_updates(Vec::new())?;
-        Ok(ExecutorStep {
-            actions: retry_nodes,
-            updates,
-        })
+        if finished_nodes.is_empty() {
+            let updates = self.collect_updates(Vec::new())?;
+            return Ok(ExecutorStep {
+                actions: Vec::new(),
+                updates,
+            });
+        }
+        self.increment(&finished_nodes)
     }
 
-    /// Advance execution from a finished node and return newly queued actions.
-    ///
-    /// Example:
-    /// - Action A finishes -> assignment -> branch -> action B
-    ///   increment(A) queues the assignment and branch inline, then returns action B.
-    /// TODO: No need for this wrapper fn, just change increment_batch to be .increment and force
-    /// client callers to provide a list value
-    pub fn increment(&mut self, finished_node: Uuid) -> Result<ExecutorStep, RunnerExecutorError> {
-        self.increment_batch(&[finished_node])
-    }
-
-    /// Advance execution for multiple finished nodes in a single batch.
+    /// Advance execution for finished nodes in a single batch.
     ///
     /// Use this when multiple actions complete in the same tick so the graph
     /// update and action inserts are persisted together.
     #[obs]
-    pub fn increment_batch(
+    pub fn increment(
         &mut self,
         finished_nodes: &[Uuid],
     ) -> Result<ExecutorStep, RunnerExecutorError> {
@@ -241,7 +226,7 @@ impl RunnerExecutor {
 
         while let Some((start, exception_value)) = pending_starts.pop() {
             for action in self.walk_from(start, exception_value.clone())? {
-                // TODO: Explain why this is necessary
+                // Multiple finished nodes can converge on the same action; avoid duplicates.
                 if seen_actions.insert(action.node_id) {
                     actions.push(action);
                 }
@@ -250,11 +235,8 @@ impl RunnerExecutor {
 
         let updates = self.collect_updates(actions_done)?;
 
-        // TODO: We should fail any executions that have passed their timeout by this point and queue
-        // them for retry if possible
-
-        // TODO: We should also compute when the next wake_up time is for this task (assuming no action result
-        // values have been received) - this should be the min(all execution timeouts)
+        // Note: Action timeouts and delayed retries require wall-clock tracking in the run loop.
+        // The executor only handles timeout failures once they surface as action results.
 
         Ok(ExecutorStep { actions, updates })
     }
@@ -270,13 +252,13 @@ impl RunnerExecutor {
         let mut actions = Vec::new();
 
         while let Some((current, current_exception)) = pending.pop() {
-            // TODO: is the template_id the same thing as a action_id? Should we switch to
-            // that language to be consistent...
-            let template_id = match &current.template_id {
+            // template_id is the DAG node id, not the execution id.
+            let template_node_id = match &current.template_id {
                 Some(id) => id,
                 None => continue,
             };
-            let edges = if let Some(template_edges) = self.template_outgoing.get(template_id) {
+            let edges = if let Some(template_edges) = self.template_index.outgoing(template_node_id)
+            {
                 self.select_edges(template_edges, &current, current_exception)?
             } else {
                 continue;
@@ -287,7 +269,7 @@ impl RunnerExecutor {
                     if successor.status == NodeStatus::Completed {
                         continue;
                     }
-                    if successor.node_type == "action_call" {
+                    if successor.is_action_call() {
                         actions.push(successor);
                         continue;
                     }
@@ -312,61 +294,23 @@ impl RunnerExecutor {
         let mut action_done: Option<ActionDone> = None;
         let mut retry_action: Option<ExecutionNode> = None;
 
-        let node_type = self
+        let node_is_action = self
             .state
             .nodes
             .get(&node_id)
             .ok_or_else(|| RunnerExecutorError(format!("execution node not found: {node_id}")))?
-            .node_type
-            .clone();
+            .is_action_call();
 
-        if node_type == "action_call" {
+        if node_is_action {
             let action_value = self.action_results.get(&node_id).cloned().ok_or_else(|| {
                 RunnerExecutorError(format!("missing action result for {}", node_id))
             })?;
-            if Self::is_exception_value(&action_value) {
+            if is_exception_value(&action_value) {
                 exception_value = Some(action_value);
-                // TODO: Consolidate this retry logic (which has a similar representation in
-                // the initial fail+retry logic) into its own function for .fail_execution(exception, reason) that handles
-                // the retry validation and queue addition for us...
-                // The other resume function should create a synthetic error that indicates it failed because
-                // it had to be retried
-                let can_retry = {
-                    let node = self.state.nodes.get(&node_id).ok_or_else(|| {
-                        RunnerExecutorError(format!("execution node not found: {node_id}"))
-                    })?;
-                    self.can_retry(node)?
-                };
-                if can_retry {
-                    self.state
-                        .increment_action_attempt(node_id)
-                        .map_err(|err| RunnerExecutorError(err.0))?;
-                    let should_queue = !self.state.ready_queue.contains(&node_id);
-                    if let Some(node) = self.state.nodes.get_mut(&node_id) {
-                        node.status = NodeStatus::Queued;
-                    }
-                    if should_queue {
-                        self.state.ready_queue.push(node_id);
-                    }
-                    retry_action = self.state.nodes.get(&node_id).cloned();
+                if let Some(node) = self.handle_action_failure(node_id, exception_value.as_ref())? {
+                    retry_action = Some(node);
                     return Ok((None, None, None, retry_action));
                 }
-                self.state
-                    .mark_failed(node_id)
-                    .map_err(|err| RunnerExecutorError(err.0))?;
-                let exception_value = exception_value.clone().unwrap_or(Value::Null);
-                let exception_expr = ValueExpr::Literal(LiteralValue {
-                    value: exception_value.clone(),
-                });
-                let mut exception_assignment = HashMap::new();
-                exception_assignment
-                    .insert(EXCEPTION_SCOPE_VAR.to_string(), exception_expr.clone());
-                if let Some(node) = self.state.nodes.get_mut(&node_id) {
-                    node.assignments
-                        .insert(EXCEPTION_SCOPE_VAR.to_string(), exception_expr);
-                }
-                self.state
-                    .mark_latest_assignments(node_id, &exception_assignment);
             } else {
                 self.state
                     .mark_completed(node_id)
@@ -403,6 +347,99 @@ impl RunnerExecutor {
                 RunnerExecutorError(format!("execution node not found: {node_id}"))
             })?;
         Ok((Some(node), exception_value, action_done, retry_action))
+    }
+
+    fn handle_action_failure(
+        &mut self,
+        node_id: Uuid,
+        exception_value: Option<&Value>,
+    ) -> Result<Option<ExecutionNode>, RunnerExecutorError> {
+        let node =
+            self.state.nodes.get(&node_id).ok_or_else(|| {
+                RunnerExecutorError(format!("execution node not found: {node_id}"))
+            })?;
+        let decision = self.retry_decision(node, exception_value)?;
+        if decision.should_retry {
+            self.state
+                .increment_action_attempt(node_id)
+                .map_err(|err| RunnerExecutorError(err.0))?;
+            let should_queue = !self.state.ready_queue.contains(&node_id);
+            if let Some(node) = self.state.nodes.get_mut(&node_id) {
+                node.status = NodeStatus::Queued;
+            }
+            if should_queue {
+                self.state.ready_queue.push(node_id);
+            }
+            let retry_node = self.state.nodes.get(&node_id).cloned().ok_or_else(|| {
+                RunnerExecutorError(format!("execution node not found: {node_id}"))
+            })?;
+            return Ok(Some(retry_node));
+        }
+
+        self.state
+            .mark_failed(node_id)
+            .map_err(|err| RunnerExecutorError(err.0))?;
+        if let Some(exception_value) = exception_value {
+            let exception_expr = ValueExpr::Literal(LiteralValue {
+                value: exception_value.clone(),
+            });
+            let mut exception_assignment = HashMap::new();
+            exception_assignment.insert(EXCEPTION_SCOPE_VAR.to_string(), exception_expr.clone());
+            if let Some(node) = self.state.nodes.get_mut(&node_id) {
+                node.assignments
+                    .insert(EXCEPTION_SCOPE_VAR.to_string(), exception_expr);
+            }
+            self.state
+                .mark_latest_assignments(node_id, &exception_assignment);
+        }
+        Ok(None)
+    }
+
+    fn retry_decision(
+        &self,
+        node: &ExecutionNode,
+        exception_value: Option<&Value>,
+    ) -> Result<RetryDecision, RunnerExecutorError> {
+        let template_id = match &node.template_id {
+            Some(id) => id.clone(),
+            None => {
+                return Ok(RetryDecision {
+                    should_retry: false,
+                });
+            }
+        };
+        let template = self.dag.nodes.get(&template_id).ok_or_else(|| {
+            RunnerExecutorError(format!("template node not found: {template_id}"))
+        })?;
+        let action = match template {
+            crate::rappel_core::dag::DAGNode::ActionCall(action) => action,
+            _ => {
+                return Ok(RetryDecision {
+                    should_retry: false,
+                });
+            }
+        };
+        let exception_name = exception_value.and_then(exception_type);
+        let evaluator = RetryPolicyEvaluator {
+            policies: &action.policies,
+            exception_name,
+        };
+        Ok(evaluator.decision(node.action_attempt))
+    }
+
+    fn resume_exception_value(node_id: Uuid) -> Value {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "type".to_string(),
+            Value::String("ExecutorResume".to_string()),
+        );
+        map.insert(
+            "message".to_string(),
+            Value::String(format!(
+                "action {node_id} was running during resume and is treated as failed"
+            )),
+        );
+        Value::Object(map)
     }
 
     /// Select outgoing edges based on guards and exception state.
@@ -470,14 +507,6 @@ impl RunnerExecutor {
         }
 
         // Extract info from template without holding borrow across mutable calls
-        // TODO: Is there a benefit to placing this here versus globally? We should probably move it
-        // global for consistency
-        enum TemplateKind {
-            SpreadAction(Box<ActionCallNode>),
-            Aggregator(String),
-            Regular(String),
-        }
-
         let kind = {
             let template = self.dag.nodes.get(&edge.target).ok_or_else(|| {
                 RunnerExecutorError(format!("template node not found: {}", edge.target))
@@ -597,7 +626,7 @@ impl RunnerExecutor {
         let node = self
             .state
             .queue_node(
-                "action_call",
+                ExecutionNodeType::ActionCall.as_str(),
                 &template.label(),
                 QueueNodeParams {
                     template_id: Some(template.id.clone()),
@@ -669,7 +698,7 @@ impl RunnerExecutor {
         };
 
         if let crate::rappel_core::dag::DAGNode::Aggregator(_) = template {
-            if let Some(required) = self.template_incoming.get(template.id()) {
+            if let Some(required) = self.template_index.incoming(template.id()) {
                 let connected = self.connected_template_sources(node.node_id);
                 if !required.is_subset(&connected) {
                     return false;
@@ -756,8 +785,7 @@ impl RunnerExecutor {
         sources: &[ExecutionNode],
         values: &[ValueExpr],
     ) -> Result<Vec<ValueExpr>, RunnerExecutorError> {
-        // TODO: This feels horribly complicated? Doesn't the execution node in state that we create
-        // keep track of its own ordering? How does the timeline fit in here? Do we even need a timeline?
+        // Order by explicit iteration/parallel indices when available, then fall back to timeline.
         if sources.len() != values.len() {
             return Err(RunnerExecutorError(
                 "aggregator sources/value mismatch".to_string(),
@@ -770,27 +798,37 @@ impl RunnerExecutor {
             .enumerate()
             .map(|(idx, node_id)| (*node_id, idx))
             .collect();
-        let mut pairs: Vec<((i32, i32), ValueExpr)> = Vec::new();
+        let mut pairs: Vec<((i32, i32), ValueExpr)> = Vec::with_capacity(values.len());
         for (source, value) in sources.iter().zip(values.iter()) {
-            let mut primary = 2;
-            let mut secondary = *timeline_index.get(&source.node_id).unwrap_or(&0) as i32;
-            if let ValueExpr::ActionResult(action) = value {
-                if let Some(iter_idx) = action.iteration_index {
-                    primary = 0;
-                    secondary = iter_idx;
-                }
-            } else if let Some(template_id) = &source.template_id
-                && let Some(crate::rappel_core::dag::DAGNode::ActionCall(action)) =
-                    self.dag.nodes.get(template_id)
-                && let Some(idx) = action.parallel_index
-            {
-                primary = 1;
-                secondary = idx;
-            }
-            pairs.push(((primary, secondary), value.clone()));
+            let key = self.aggregated_sort_key(source, value, &timeline_index);
+            pairs.push((key, value.clone()));
         }
         pairs.sort_by_key(|item| item.0);
         Ok(pairs.into_iter().map(|(_, value)| value).collect())
+    }
+
+    fn aggregated_sort_key(
+        &self,
+        source: &ExecutionNode,
+        value: &ValueExpr,
+        timeline_index: &HashMap<Uuid, usize>,
+    ) -> (i32, i32) {
+        let mut primary = 2;
+        let mut secondary = *timeline_index.get(&source.node_id).unwrap_or(&0) as i32;
+        if let ValueExpr::ActionResult(action) = value {
+            if let Some(iter_idx) = action.iteration_index {
+                primary = 0;
+                secondary = iter_idx;
+            }
+        } else if let Some(template_id) = &source.template_id
+            && let Some(crate::rappel_core::dag::DAGNode::ActionCall(action)) =
+                self.dag.nodes.get(template_id)
+            && let Some(idx) = action.parallel_index
+        {
+            primary = 1;
+            secondary = idx;
+        }
+        (primary, secondary)
     }
 
     /// Expand a collection expression into element ValueExprs.
@@ -840,504 +878,6 @@ impl RunnerExecutor {
         Err(RunnerExecutorError(
             "spread collection is not iterable".to_string(),
         ))
-    }
-
-    // TODO: Migrate expr_to_value and our various evaluators (evaluate_value_expr) into a
-    // separate runner/expression_evaluator.rs file that we can just call and test discretely
-
-    /// Convert a pure IR expression into a ValueExpr without side effects.
-    fn expr_to_value(expr: &ir::Expr) -> Result<ValueExpr, RunnerExecutorError> {
-        match expr.kind.as_ref() {
-            Some(ir::expr::Kind::Literal(lit)) => Ok(ValueExpr::Literal(LiteralValue {
-                value: super::state::literal_value(lit),
-            })),
-            Some(ir::expr::Kind::Variable(var)) => Ok(ValueExpr::Variable(VariableValue {
-                name: var.name.clone(),
-            })),
-            Some(ir::expr::Kind::BinaryOp(op)) => {
-                let left = op
-                    .left
-                    .as_ref()
-                    .ok_or_else(|| RunnerExecutorError("binary op missing left".to_string()))?;
-                let right = op
-                    .right
-                    .as_ref()
-                    .ok_or_else(|| RunnerExecutorError("binary op missing right".to_string()))?;
-                Ok(ValueExpr::BinaryOp(BinaryOpValue {
-                    left: Box::new(Self::expr_to_value(left)?),
-                    op: op.op,
-                    right: Box::new(Self::expr_to_value(right)?),
-                }))
-            }
-            Some(ir::expr::Kind::UnaryOp(op)) => {
-                let operand = op
-                    .operand
-                    .as_ref()
-                    .ok_or_else(|| RunnerExecutorError("unary op missing operand".to_string()))?;
-                Ok(ValueExpr::UnaryOp(UnaryOpValue {
-                    op: op.op,
-                    operand: Box::new(Self::expr_to_value(operand)?),
-                }))
-            }
-            Some(ir::expr::Kind::List(list)) => {
-                let mut elements = Vec::new();
-                for item in &list.elements {
-                    elements.push(Self::expr_to_value(item)?);
-                }
-                Ok(ValueExpr::List(ListValue { elements }))
-            }
-            Some(ir::expr::Kind::Dict(dict_expr)) => {
-                let mut entries = Vec::new();
-                for entry in &dict_expr.entries {
-                    let key = entry
-                        .key
-                        .as_ref()
-                        .ok_or_else(|| RunnerExecutorError("dict entry missing key".to_string()))?;
-                    let value = entry.value.as_ref().ok_or_else(|| {
-                        RunnerExecutorError("dict entry missing value".to_string())
-                    })?;
-                    entries.push(DictEntryValue {
-                        key: Self::expr_to_value(key)?,
-                        value: Self::expr_to_value(value)?,
-                    });
-                }
-                Ok(ValueExpr::Dict(DictValue { entries }))
-            }
-            Some(ir::expr::Kind::Index(index)) => {
-                let object = index.object.as_ref().ok_or_else(|| {
-                    RunnerExecutorError("index access missing object".to_string())
-                })?;
-                let index_expr = index
-                    .index
-                    .as_ref()
-                    .ok_or_else(|| RunnerExecutorError("index access missing index".to_string()))?;
-                Ok(ValueExpr::Index(IndexValue {
-                    object: Box::new(Self::expr_to_value(object)?),
-                    index: Box::new(Self::expr_to_value(index_expr)?),
-                }))
-            }
-            Some(ir::expr::Kind::Dot(dot)) => {
-                let object = dot
-                    .object
-                    .as_ref()
-                    .ok_or_else(|| RunnerExecutorError("dot access missing object".to_string()))?;
-                Ok(ValueExpr::Dot(DotValue {
-                    object: Box::new(Self::expr_to_value(object)?),
-                    attribute: dot.attribute.clone(),
-                }))
-            }
-            Some(ir::expr::Kind::FunctionCall(call)) => {
-                let mut args = Vec::new();
-                for arg in &call.args {
-                    args.push(Self::expr_to_value(arg)?);
-                }
-                let mut kwargs = HashMap::new();
-                for kw in &call.kwargs {
-                    if let Some(value) = &kw.value {
-                        kwargs.insert(kw.name.clone(), Self::expr_to_value(value)?);
-                    }
-                }
-                let global_fn = if call.global_function != 0 {
-                    Some(call.global_function)
-                } else {
-                    None
-                };
-                Ok(ValueExpr::FunctionCall(FunctionCallValue {
-                    name: call.name.clone(),
-                    args,
-                    kwargs,
-                    global_function: global_fn,
-                }))
-            }
-            Some(
-                ir::expr::Kind::ActionCall(_)
-                | ir::expr::Kind::ParallelExpr(_)
-                | ir::expr::Kind::SpreadExpr(_),
-            ) => Err(RunnerExecutorError(
-                "action/spread calls not allowed in guard expressions".to_string(),
-            )),
-            None => Ok(ValueExpr::Literal(LiteralValue { value: Value::Null })),
-        }
-    }
-
-    /// Evaluate a guard expression using current symbolic assignments.
-    fn evaluate_guard(&self, expr: Option<&ir::Expr>) -> Result<bool, RunnerExecutorError> {
-        let expr = match expr {
-            Some(expr) => expr,
-            None => return Ok(false),
-        };
-        let value_expr = self.state.materialize_value(Self::expr_to_value(expr)?);
-        let result = self.evaluate_value_expr(&value_expr)?;
-        Ok(is_truthy(&result))
-    }
-
-    /// Resolve an action's symbolic kwargs to concrete Python values.
-    ///
-    /// Example:
-    /// - spec.kwargs={"value": VariableValue("x")}
-    /// - with x assigned to LiteralValue(10), returns {"value": 10}.
-    #[obs]
-    pub fn resolve_action_kwargs(
-        &self,
-        action: &ActionCallSpec,
-    ) -> Result<HashMap<String, Value>, RunnerExecutorError> {
-        let mut resolved = HashMap::new();
-        for (name, expr) in &action.kwargs {
-            let materialized = self.state.materialize_value(expr.clone());
-            resolved.insert(name.clone(), self.evaluate_value_expr(&materialized)?);
-        }
-        Ok(resolved)
-    }
-
-    /// Evaluate a ValueExpr into a concrete Python value.
-    #[obs]
-    fn evaluate_value_expr(&self, expr: &ValueExpr) -> Result<Value, RunnerExecutorError> {
-        let stack = Rc::new(RefCell::new(HashSet::new()));
-        let resolve_variable = {
-            let stack = stack.clone();
-            let this = self;
-            move |name: &str| this.evaluate_variable(name, stack.clone())
-        };
-        let resolve_action_result = {
-            let this = self;
-            move |value: &ActionResultValue| this.resolve_action_result(value)
-        };
-        let resolve_function_call = {
-            let this = self;
-            move |value: &FunctionCallValue, args, kwargs| {
-                this.evaluate_function_call(value, args, kwargs)
-            }
-        };
-        let apply_binary = |op, left, right| Self::apply_binary(op, left, right);
-        let apply_unary = |op, operand| Self::apply_unary(op, operand);
-        let error_factory = |message: &str| RunnerExecutorError(message.to_string());
-        let evaluator = ValueExprEvaluator::new(
-            &resolve_variable,
-            &resolve_action_result,
-            &resolve_function_call,
-            &apply_binary,
-            &apply_unary,
-            &error_factory,
-        );
-        evaluator.visit(expr)
-    }
-
-    fn evaluate_variable(
-        &self,
-        name: &str,
-        stack: Rc<RefCell<HashSet<(Uuid, String)>>>,
-    ) -> Result<Value, RunnerExecutorError> {
-        let node_id = self
-            .state
-            .latest_assignment(name)
-            .ok_or_else(|| RunnerExecutorError(format!("variable not found: {name}")))?;
-        self.evaluate_assignment(node_id, name, stack)
-    }
-
-    fn evaluate_assignment(
-        &self,
-        node_id: Uuid,
-        target: &str,
-        stack: Rc<RefCell<HashSet<(Uuid, String)>>>,
-    ) -> Result<Value, RunnerExecutorError> {
-        let key = (node_id, target.to_string());
-        if let Some(value) = self.eval_cache.borrow().get(&key) {
-            return Ok(value.clone());
-        }
-        if stack.borrow().contains(&key) {
-            return Err(RunnerExecutorError(format!(
-                "recursive assignment detected for {target}"
-            )));
-        }
-
-        let node = self
-            .state
-            .nodes
-            .get(&node_id)
-            .ok_or_else(|| RunnerExecutorError(format!("missing assignment for {target}")))?;
-        let expr = node
-            .assignments
-            .get(target)
-            .ok_or_else(|| RunnerExecutorError(format!("missing assignment for {target}")))?;
-
-        stack.borrow_mut().insert(key.clone());
-        let resolve_variable = {
-            let stack = stack.clone();
-            let this = self;
-            move |name: &str| this.evaluate_variable(name, stack.clone())
-        };
-        let resolve_action_result = {
-            let this = self;
-            move |value: &ActionResultValue| this.resolve_action_result(value)
-        };
-        let resolve_function_call = {
-            let this = self;
-            move |value: &FunctionCallValue, args, kwargs| {
-                this.evaluate_function_call(value, args, kwargs)
-            }
-        };
-        let apply_binary = |op, left, right| Self::apply_binary(op, left, right);
-        let apply_unary = |op, operand| Self::apply_unary(op, operand);
-        let error_factory = |message: &str| RunnerExecutorError(message.to_string());
-        let evaluator = ValueExprEvaluator::new(
-            &resolve_variable,
-            &resolve_action_result,
-            &resolve_function_call,
-            &apply_binary,
-            &apply_unary,
-            &error_factory,
-        );
-        let value = evaluator.visit(expr)?;
-        stack.borrow_mut().remove(&key);
-        self.eval_cache.borrow_mut().insert(key, value.clone());
-        Ok(value)
-    }
-
-    fn resolve_action_result(
-        &self,
-        expr: &ActionResultValue,
-    ) -> Result<Value, RunnerExecutorError> {
-        let value = self
-            .action_results
-            .get(&expr.node_id)
-            .cloned()
-            .ok_or_else(|| {
-                RunnerExecutorError(format!("missing action result for {}", expr.node_id))
-            })?;
-        if let Some(idx) = expr.result_index {
-            if let Value::Array(items) = value {
-                let idx = idx as usize;
-                return items.get(idx).cloned().ok_or_else(|| {
-                    RunnerExecutorError(format!(
-                        "action result for {} has no index {}",
-                        expr.node_id, idx
-                    ))
-                });
-            }
-            return Err(RunnerExecutorError(format!(
-                "action result for {} has no index {}",
-                expr.node_id, idx
-            )));
-        }
-        Ok(value)
-    }
-
-    fn evaluate_function_call(
-        &self,
-        expr: &FunctionCallValue,
-        args: Vec<Value>,
-        kwargs: HashMap<String, Value>,
-    ) -> Result<Value, RunnerExecutorError> {
-        if let Some(global_fn) = expr.global_function
-            && global_fn != ir::GlobalFunction::Unspecified as i32
-        {
-            return self.evaluate_global_function(global_fn, args, kwargs);
-        }
-        Err(RunnerExecutorError(format!(
-            "cannot evaluate non-global function call: {}",
-            expr.name
-        )))
-    }
-
-    fn evaluate_global_function(
-        &self,
-        global_function: i32,
-        args: Vec<Value>,
-        kwargs: HashMap<String, Value>,
-    ) -> Result<Value, RunnerExecutorError> {
-        match ir::GlobalFunction::try_from(global_function).ok() {
-            Some(ir::GlobalFunction::Range) => Ok(range_from_args(&args).into()),
-            Some(ir::GlobalFunction::Len) => {
-                if let Some(first) = args.first() {
-                    return Ok(Value::Number(len_of_value(first)?));
-                }
-                if let Some(items) = kwargs.get("items") {
-                    return Ok(Value::Number(len_of_value(items)?));
-                }
-                Err(RunnerExecutorError("len() missing argument".to_string()))
-            }
-            Some(ir::GlobalFunction::Enumerate) => {
-                let items = if let Some(first) = args.first() {
-                    first.clone()
-                } else if let Some(items) = kwargs.get("items") {
-                    items.clone()
-                } else {
-                    return Err(RunnerExecutorError(
-                        "enumerate() missing argument".to_string(),
-                    ));
-                };
-                let list = match items {
-                    Value::Array(items) => items,
-                    _ => return Err(RunnerExecutorError("enumerate() expects list".to_string())),
-                };
-                let pairs: Vec<Value> = list
-                    .into_iter()
-                    .enumerate()
-                    .map(|(idx, item)| Value::Array(vec![Value::Number((idx as i64).into()), item]))
-                    .collect();
-                Ok(Value::Array(pairs))
-            }
-            Some(ir::GlobalFunction::Isexception) => {
-                if let Some(first) = args.first() {
-                    return Ok(Value::Bool(Self::is_exception_value(first)));
-                }
-                if let Some(value) = kwargs.get("value") {
-                    return Ok(Value::Bool(Self::is_exception_value(value)));
-                }
-                Err(RunnerExecutorError(
-                    "isexception() missing argument".to_string(),
-                ))
-            }
-            Some(ir::GlobalFunction::Unspecified) | None => Err(RunnerExecutorError(
-                "global function unspecified".to_string(),
-            )),
-        }
-    }
-
-    fn apply_binary(op: i32, left: Value, right: Value) -> Result<Value, RunnerExecutorError> {
-        match ir::BinaryOperator::try_from(op).ok() {
-            Some(ir::BinaryOperator::BinaryOpOr) => {
-                if is_truthy(&left) {
-                    Ok(left)
-                } else {
-                    Ok(right)
-                }
-            }
-            Some(ir::BinaryOperator::BinaryOpAnd) => {
-                if is_truthy(&left) {
-                    Ok(right)
-                } else {
-                    Ok(left)
-                }
-            }
-            Some(ir::BinaryOperator::BinaryOpEq) => Ok(Value::Bool(left == right)),
-            Some(ir::BinaryOperator::BinaryOpNe) => Ok(Value::Bool(left != right)),
-            Some(ir::BinaryOperator::BinaryOpLt) => compare_values(left, right, |a, b| a < b),
-            Some(ir::BinaryOperator::BinaryOpLe) => compare_values(left, right, |a, b| a <= b),
-            Some(ir::BinaryOperator::BinaryOpGt) => compare_values(left, right, |a, b| a > b),
-            Some(ir::BinaryOperator::BinaryOpGe) => compare_values(left, right, |a, b| a >= b),
-            Some(ir::BinaryOperator::BinaryOpIn) => Ok(Value::Bool(value_in(&left, &right))),
-            Some(ir::BinaryOperator::BinaryOpNotIn) => Ok(Value::Bool(!value_in(&left, &right))),
-            Some(ir::BinaryOperator::BinaryOpAdd) => add_values(left, right),
-            Some(ir::BinaryOperator::BinaryOpSub) => numeric_op(left, right, |a, b| a - b, true),
-            Some(ir::BinaryOperator::BinaryOpMul) => numeric_op(left, right, |a, b| a * b, true),
-            Some(ir::BinaryOperator::BinaryOpDiv) => numeric_op(left, right, |a, b| a / b, false),
-            Some(ir::BinaryOperator::BinaryOpFloorDiv) => {
-                numeric_op(left, right, |a, b| (a / b).floor(), true)
-            }
-            Some(ir::BinaryOperator::BinaryOpMod) => numeric_op(left, right, |a, b| a % b, true),
-            Some(ir::BinaryOperator::BinaryOpUnspecified) | None => Err(RunnerExecutorError(
-                "binary operator unspecified".to_string(),
-            )),
-        }
-    }
-
-    fn apply_unary(op: i32, operand: Value) -> Result<Value, RunnerExecutorError> {
-        match ir::UnaryOperator::try_from(op).ok() {
-            Some(ir::UnaryOperator::UnaryOpNeg) => {
-                if let Some(value) = int_value(&operand) {
-                    return Ok(Value::Number((-value).into()));
-                }
-                match operand.as_f64() {
-                    Some(value) => Ok(Value::Number(
-                        serde_json::Number::from_f64(-value)
-                            .unwrap_or_else(|| serde_json::Number::from(0)),
-                    )),
-                    None => Err(RunnerExecutorError("unary neg expects number".to_string())),
-                }
-            }
-            Some(ir::UnaryOperator::UnaryOpNot) => Ok(Value::Bool(!is_truthy(&operand))),
-            Some(ir::UnaryOperator::UnaryOpUnspecified) | None => Err(RunnerExecutorError(
-                "unary operator unspecified".to_string(),
-            )),
-        }
-    }
-
-    fn is_exception_value(value: &Value) -> bool {
-        if let Value::Object(map) = value {
-            return map.contains_key("type") && map.contains_key("message");
-        }
-        false
-    }
-
-    fn exception_matches(&self, edge: &DAGEdge, exception_value: &Value) -> bool {
-        let exception_types = match &edge.exception_types {
-            Some(types) => types,
-            None => return false,
-        };
-        if exception_types.is_empty() {
-            return true;
-        }
-        let exc_name = match exception_value {
-            Value::Object(map) => map
-                .get("type")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string()),
-            _ => None,
-        };
-        if let Some(name) = exc_name {
-            return exception_types.iter().any(|value| value == &name);
-        }
-        false
-    }
-
-    // TODO: Can retry should be refactored into a separate class, because we want to add more complexities
-    // for this policy that determines when we're actually allowed to retry. The output should be a boolean
-    // of whether to retry and also a timestamp of the scheduled_at date at which we're allowed
-    // to retry
-    // TODO: add a new function that determines if a workflow is blocked because all of the frontier
-    // action nodes have a future scheduled date. In these cases we should evict the instance from our executor
-    // and queue it for resumption at min(scheduled at dates)
-    fn can_retry(&self, node: &ExecutionNode) -> Result<bool, RunnerExecutorError> {
-        let template_id = match &node.template_id {
-            Some(id) => id.clone(),
-            None => return Ok(false),
-        };
-        let template = self.dag.nodes.get(&template_id).ok_or_else(|| {
-            RunnerExecutorError(format!("template node not found: {template_id}"))
-        })?;
-        let action = match template {
-            crate::rappel_core::dag::DAGNode::ActionCall(action) => action,
-            _ => return Ok(false),
-        };
-        let mut max_retries: i32 = 0;
-        for policy in &action.policies {
-            match policy.kind.as_ref() {
-                Some(ir::policy_bracket::Kind::Retry(retry)) => {
-                    max_retries = max_retries.max(retry.max_retries as i32);
-                }
-                Some(ir::policy_bracket::Kind::Timeout(_)) | None => continue,
-            }
-        }
-        Ok(node.action_attempt - 1 < max_retries)
-    }
-
-    fn build_template_outgoing(dag: &DAG) -> FxHashMap<String, Vec<DAGEdge>> {
-        let mut outgoing: FxHashMap<String, Vec<DAGEdge>> = FxHashMap::default();
-        for edge in &dag.edges {
-            if edge.edge_type != EdgeType::StateMachine {
-                continue;
-            }
-            outgoing
-                .entry(edge.source.clone())
-                .or_default()
-                .push(edge.clone());
-        }
-        outgoing
-    }
-
-    fn build_template_incoming(dag: &DAG) -> FxHashMap<String, HashSet<String>> {
-        let mut incoming: FxHashMap<String, HashSet<String>> = FxHashMap::default();
-        for edge in &dag.edges {
-            if edge.edge_type != EdgeType::StateMachine {
-                continue;
-            }
-            incoming
-                .entry(edge.target.clone())
-                .or_default()
-                .insert(edge.source.clone());
-        }
-        incoming
     }
 
     fn build_incoming_exec_edges(state: &RunnerState) -> FxHashMap<Uuid, Vec<ExecutionEdge>> {
@@ -1523,136 +1063,40 @@ impl RunnerExecutor {
     }
 }
 
-fn int_value(value: &Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
-}
+impl<'a> RetryPolicyEvaluator<'a> {
+    fn decision(&self, attempt: i32) -> RetryDecision {
+        let mut max_retries: i32 = 0;
+        let mut matched_policy = false;
 
-fn numeric_op(
-    left: Value,
-    right: Value,
-    op: impl Fn(f64, f64) -> f64,
-    prefer_int: bool,
-) -> Result<Value, RunnerExecutorError> {
-    let left_num = left
-        .as_f64()
-        .ok_or_else(|| RunnerExecutorError("numeric operation expects number".to_string()))?;
-    let right_num = right
-        .as_f64()
-        .ok_or_else(|| RunnerExecutorError("numeric operation expects number".to_string()))?;
-    let result = op(left_num, right_num);
-    if prefer_int && int_value(&left).is_some() && int_value(&right).is_some() && result.is_finite()
-    {
-        let rounded = result.round();
-        if (result - rounded).abs() < 1e-9
-            && rounded >= (i64::MIN as f64)
-            && rounded <= (i64::MAX as f64)
-        {
-            return Ok(Value::Number((rounded as i64).into()));
+        for policy in self.policies {
+            let Some(ir::policy_bracket::Kind::Retry(retry)) = policy.kind.as_ref() else {
+                continue;
+            };
+            let matches_exception = if retry.exception_types.is_empty() {
+                true
+            } else if let Some(name) = self.exception_name {
+                retry.exception_types.iter().any(|value| value == name)
+            } else {
+                false
+            };
+            if !matches_exception {
+                continue;
+            }
+            matched_policy = true;
+            max_retries = max_retries.max(retry.max_retries as i32);
         }
-    }
-    Ok(Value::Number(
-        serde_json::Number::from_f64(result).unwrap_or_else(|| serde_json::Number::from(0)),
-    ))
-}
 
-fn add_values(left: Value, right: Value) -> Result<Value, RunnerExecutorError> {
-    if let (Value::Array(mut left), Value::Array(right)) = (left.clone(), right.clone()) {
-        left.extend(right);
-        return Ok(Value::Array(left));
-    }
-    if let (Some(left), Some(right)) = (left.as_str(), right.as_str()) {
-        return Ok(Value::String(format!("{left}{right}")));
-    }
-    numeric_op(left, right, |a, b| a + b, true)
-}
+        let should_retry = matched_policy && attempt - 1 < max_retries;
 
-fn compare_values(
-    left: Value,
-    right: Value,
-    op: impl Fn(f64, f64) -> bool,
-) -> Result<Value, RunnerExecutorError> {
-    let left = left
-        .as_f64()
-        .ok_or_else(|| RunnerExecutorError("comparison expects number".to_string()))?;
-    let right = right
-        .as_f64()
-        .ok_or_else(|| RunnerExecutorError("comparison expects number".to_string()))?;
-    Ok(Value::Bool(op(left, right)))
-}
-
-fn value_in(value: &Value, container: &Value) -> bool {
-    match container {
-        Value::Array(items) => items.iter().any(|item| item == value),
-        Value::Object(map) => value
-            .as_str()
-            .map(|key| map.contains_key(key))
-            .unwrap_or(false),
-        Value::String(text) => value
-            .as_str()
-            .map(|needle| text.contains(needle))
-            .unwrap_or(false),
-        _ => false,
+        RetryDecision { should_retry }
     }
 }
 
-fn is_truthy(value: &Value) -> bool {
+fn exception_type(value: &Value) -> Option<&str> {
     match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(number) => number.as_f64().map(|value| value != 0.0).unwrap_or(false),
-        Value::String(value) => !value.is_empty(),
-        Value::Array(values) => !values.is_empty(),
-        Value::Object(map) => !map.is_empty(),
+        Value::Object(map) => map.get("type").and_then(|value| value.as_str()),
+        _ => None,
     }
-}
-
-fn len_of_value(value: &Value) -> Result<serde_json::Number, RunnerExecutorError> {
-    let len = match value {
-        Value::Array(items) => items.len() as i64,
-        Value::String(text) => text.len() as i64,
-        Value::Object(map) => map.len() as i64,
-        _ => {
-            return Err(RunnerExecutorError(
-                "len() expects list, string, or dict".to_string(),
-            ));
-        }
-    };
-    Ok(len.into())
-}
-
-fn range_from_args(args: &[Value]) -> Vec<Value> {
-    let mut start = 0i64;
-    let mut end = 0i64;
-    let mut step = 1i64;
-    if args.len() == 1 {
-        end = args[0].as_i64().unwrap_or(0);
-    } else if args.len() >= 2 {
-        start = args[0].as_i64().unwrap_or(0);
-        end = args[1].as_i64().unwrap_or(0);
-        if args.len() >= 3 {
-            step = args[2].as_i64().unwrap_or(1);
-        }
-    }
-    if step == 0 {
-        return Vec::new();
-    }
-    let mut values = Vec::new();
-    if step > 0 {
-        let mut current = start;
-        while current < end {
-            values.push(Value::Number(current.into()));
-            current += step;
-        }
-    } else {
-        let mut current = start;
-        while current > end {
-            values.push(Value::Number(current.into()));
-            current += step;
-        }
-    }
-    values
 }
 
 #[cfg(test)]
@@ -1866,7 +1310,9 @@ mod tests {
         action_results.insert(start_exec.node_id, Value::Number(10.into()));
         let mut executor = RunnerExecutor::new(dag.clone(), state, action_results, None);
 
-        let step = executor.increment(start_exec.node_id).expect("increment");
+        let step = executor
+            .increment(&[start_exec.node_id])
+            .expect("increment");
         assert_eq!(step.actions.len(), 1);
         assert_eq!(
             step.actions[0].template_id.as_deref(),
@@ -1952,7 +1398,7 @@ mod tests {
         action_results.insert(exec1.node_id, Value::Number(42.into()));
         let mut executor = RunnerExecutor::new(dag.clone(), state, action_results, None);
 
-        let step = executor.increment(exec1.node_id).expect("increment");
+        let step = executor.increment(&[exec1.node_id]).expect("increment");
         assert_eq!(step.actions.len(), 1);
         let exec2 = &step.actions[0];
         assert_eq!(exec2.template_id.as_deref(), Some(action2.id.as_str()));
@@ -2021,7 +1467,7 @@ mod tests {
         compare_executor_states(&executor, &rehydrated);
 
         executor.set_action_result(exec1.node_id, Value::Number(10.into()));
-        let step1 = executor.increment(exec1.node_id).expect("increment");
+        let step1 = executor.increment(&[exec1.node_id]).expect("increment");
         let exec2 = step1.actions[0].clone();
 
         let (nodes_snap, edges_snap, results_snap) =
@@ -2030,7 +1476,7 @@ mod tests {
         compare_executor_states(&executor, &rehydrated);
 
         executor.set_action_result(exec2.node_id, Value::Number(20.into()));
-        let step2 = executor.increment(exec2.node_id).expect("increment");
+        let step2 = executor.increment(&[exec2.node_id]).expect("increment");
         let exec3 = step2.actions[0].clone();
 
         let (nodes_snap, edges_snap, results_snap) =
@@ -2039,7 +1485,7 @@ mod tests {
         compare_executor_states(&executor, &rehydrated);
 
         executor.set_action_result(exec3.node_id, Value::Number(30.into()));
-        let step3 = executor.increment(exec3.node_id).expect("increment");
+        let step3 = executor.increment(&[exec3.node_id]).expect("increment");
         assert!(step3.actions.is_empty());
 
         let (nodes_snap, edges_snap, results_snap) =
@@ -2048,7 +1494,7 @@ mod tests {
         compare_executor_states(&executor, &rehydrated);
 
         for node in rehydrated.state().nodes.values() {
-            if node.node_type == "action_call" {
+            if node.is_action_call() {
                 assert_eq!(node.status, NodeStatus::Completed);
             }
         }
@@ -2104,7 +1550,7 @@ mod tests {
         action_results.insert(exec1.node_id, Value::Number(10.into()));
         let mut executor = RunnerExecutor::new(dag.clone(), state, action_results, None);
 
-        let step = executor.increment(exec1.node_id).expect("increment");
+        let step = executor.increment(&[exec1.node_id]).expect("increment");
         assert_eq!(step.actions.len(), 1);
         assert_eq!(
             step.actions[0].template_id.as_deref(),
@@ -2211,8 +1657,8 @@ mod tests {
             snapshot_state(executor.state(), executor.action_results());
         let mut rehydrated = create_rehydrated_executor(&dag, nodes_snap, edges_snap, results_snap);
 
-        let orig_step = executor.increment(exec1.node_id).expect("increment");
-        let rehy_step = rehydrated.increment(exec1.node_id).expect("increment");
+        let orig_step = executor.increment(&[exec1.node_id]).expect("increment");
+        let rehy_step = rehydrated.increment(&[exec1.node_id]).expect("increment");
         assert_eq!(orig_step.actions.len(), rehy_step.actions.len());
         assert_eq!(
             orig_step.actions[0].template_id,
@@ -2300,7 +1746,7 @@ mod tests {
         let mut action_results = HashMap::new();
         action_results.insert(exec1.node_id, Value::Number(21.into()));
         let mut executor = RunnerExecutor::new(dag.clone(), state, action_results, None);
-        executor.increment(exec1.node_id).expect("increment");
+        executor.increment(&[exec1.node_id]).expect("increment");
 
         let orig_replay = crate::rappel_core::runner::replay_variables(
             executor.state(),
@@ -2379,7 +1825,9 @@ mod tests {
         );
         let mut executor = RunnerExecutor::new(dag.clone(), state, action_results, None);
 
-        let step1 = executor.increment(initial_exec.node_id).expect("increment");
+        let step1 = executor
+            .increment(&[initial_exec.node_id])
+            .expect("increment");
         assert_eq!(step1.actions.len(), 3);
 
         let (nodes_snap, edges_snap, results_snap) =
@@ -2392,8 +1840,7 @@ mod tests {
             .nodes
             .values()
             .filter(|node| {
-                node.node_type == "action_call"
-                    && node.template_id.as_deref() == Some(&spread_action.id)
+                node.is_action_call() && node.template_id.as_deref() == Some(&spread_action.id)
             })
             .collect();
         assert_eq!(action_nodes.len(), 3);
@@ -2459,7 +1906,9 @@ mod tests {
         );
         let mut executor = RunnerExecutor::new(dag.clone(), state, action_results.clone(), None);
 
-        let step1 = executor.increment(initial_exec.node_id).expect("increment");
+        let step1 = executor
+            .increment(&[initial_exec.node_id])
+            .expect("increment");
         let spread_nodes = step1.actions;
         assert_eq!(spread_nodes.len(), 2);
 
@@ -2473,7 +1922,7 @@ mod tests {
         }
 
         let _step2 = executor
-            .increment_batch(&spread_nodes.iter().map(|n| n.node_id).collect::<Vec<_>>())
+            .increment(&spread_nodes.iter().map(|n| n.node_id).collect::<Vec<_>>())
             .expect("increment");
 
         let (nodes_snap, edges_snap, results_snap) =
@@ -2530,7 +1979,7 @@ mod tests {
                 Value::Number((i * 10).into()),
             );
             let step = executor
-                .increment(exec_nodes.last().unwrap().node_id)
+                .increment(&[exec_nodes.last().unwrap().node_id])
                 .expect("increment");
             if !step.actions.is_empty() {
                 exec_nodes.push(step.actions[0].clone());
@@ -2585,7 +2034,7 @@ mod tests {
         let mut action_results = HashMap::new();
         action_results.insert(exec1.node_id, Value::Number(50.into()));
         let mut executor = RunnerExecutor::new(dag.clone(), state, action_results, None);
-        let step = executor.increment(exec1.node_id).expect("increment");
+        let step = executor.increment(&[exec1.node_id]).expect("increment");
         let exec2 = step.actions[0].clone();
 
         let (nodes_snap, edges_snap, results_snap) =

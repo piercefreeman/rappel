@@ -1,6 +1,7 @@
 //! Runner utilities.
 
 pub mod executor;
+pub mod expression_evaluator;
 pub mod replay;
 pub mod state;
 pub mod value_visitor;

@@ -9,6 +9,10 @@ use uuid::Uuid;
 
 use crate::messages::ast as ir;
 use crate::rappel_core::dag::{EXCEPTION_SCOPE_VAR, EdgeType};
+use crate::rappel_core::runner::expression_evaluator::{
+    add_values, compare_values, int_value, is_exception_value, is_truthy, len_of_value, numeric_op,
+    range_from_args, value_in,
+};
 use crate::rappel_core::runner::state::{ActionResultValue, FunctionCallValue, RunnerState};
 use crate::rappel_core::runner::value_visitor::ValueExprEvaluator;
 
@@ -272,11 +276,16 @@ impl<'a> ReplayEngine<'a> {
     }
 }
 
+fn replay_error(message: &'static str) -> ReplayError {
+    ReplayError(message.to_string())
+}
+
 /// Apply a binary operator to replayed operands.
 ///
 /// Example:
 /// - left=1, right=2, op=ADD -> 3
 fn apply_binary(op: i32, left: Value, right: Value) -> Result<Value, ReplayError> {
+    let error = replay_error;
     match ir::BinaryOperator::try_from(op).ok() {
         Some(ir::BinaryOperator::BinaryOpOr) => {
             if is_truthy(&left) {
@@ -294,20 +303,22 @@ fn apply_binary(op: i32, left: Value, right: Value) -> Result<Value, ReplayError
         }
         Some(ir::BinaryOperator::BinaryOpEq) => Ok(Value::Bool(left == right)),
         Some(ir::BinaryOperator::BinaryOpNe) => Ok(Value::Bool(left != right)),
-        Some(ir::BinaryOperator::BinaryOpLt) => compare_values(left, right, |a, b| a < b),
-        Some(ir::BinaryOperator::BinaryOpLe) => compare_values(left, right, |a, b| a <= b),
-        Some(ir::BinaryOperator::BinaryOpGt) => compare_values(left, right, |a, b| a > b),
-        Some(ir::BinaryOperator::BinaryOpGe) => compare_values(left, right, |a, b| a >= b),
+        Some(ir::BinaryOperator::BinaryOpLt) => compare_values(left, right, |a, b| a < b, error),
+        Some(ir::BinaryOperator::BinaryOpLe) => compare_values(left, right, |a, b| a <= b, error),
+        Some(ir::BinaryOperator::BinaryOpGt) => compare_values(left, right, |a, b| a > b, error),
+        Some(ir::BinaryOperator::BinaryOpGe) => compare_values(left, right, |a, b| a >= b, error),
         Some(ir::BinaryOperator::BinaryOpIn) => Ok(Value::Bool(value_in(&left, &right))),
         Some(ir::BinaryOperator::BinaryOpNotIn) => Ok(Value::Bool(!value_in(&left, &right))),
-        Some(ir::BinaryOperator::BinaryOpAdd) => add_values(left, right),
-        Some(ir::BinaryOperator::BinaryOpSub) => numeric_op(left, right, |a, b| a - b, true),
-        Some(ir::BinaryOperator::BinaryOpMul) => numeric_op(left, right, |a, b| a * b, true),
-        Some(ir::BinaryOperator::BinaryOpDiv) => numeric_op(left, right, |a, b| a / b, false),
-        Some(ir::BinaryOperator::BinaryOpFloorDiv) => {
-            numeric_op(left, right, |a, b| (a / b).floor(), true)
+        Some(ir::BinaryOperator::BinaryOpAdd) => add_values(left, right, error),
+        Some(ir::BinaryOperator::BinaryOpSub) => numeric_op(left, right, |a, b| a - b, true, error),
+        Some(ir::BinaryOperator::BinaryOpMul) => numeric_op(left, right, |a, b| a * b, true, error),
+        Some(ir::BinaryOperator::BinaryOpDiv) => {
+            numeric_op(left, right, |a, b| a / b, false, error)
         }
-        Some(ir::BinaryOperator::BinaryOpMod) => numeric_op(left, right, |a, b| a % b, true),
+        Some(ir::BinaryOperator::BinaryOpFloorDiv) => {
+            numeric_op(left, right, |a, b| (a / b).floor(), true, error)
+        }
+        Some(ir::BinaryOperator::BinaryOpMod) => numeric_op(left, right, |a, b| a % b, true, error),
         Some(ir::BinaryOperator::BinaryOpUnspecified) | None => {
             Err(ReplayError("binary operator unspecified".to_string()))
         }
@@ -353,10 +364,10 @@ fn evaluate_global_function(
         Some(ir::GlobalFunction::Range) => Ok(range_from_args(&args).into()),
         Some(ir::GlobalFunction::Len) => {
             if let Some(first) = args.first() {
-                return Ok(Value::Number(len_of_value(first)?));
+                return Ok(Value::Number(len_of_value(first, replay_error)?));
             }
             if let Some(items) = kwargs.get("items") {
-                return Ok(Value::Number(len_of_value(items)?));
+                return Ok(Value::Number(len_of_value(items, replay_error)?));
             }
             Err(ReplayError("len() missing argument".to_string()))
         }
@@ -419,149 +430,6 @@ fn build_incoming_data_map(
         sources.reverse();
     }
     incoming
-}
-
-fn int_value(value: &Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
-}
-
-fn numeric_op(
-    left: Value,
-    right: Value,
-    op: impl Fn(f64, f64) -> f64,
-    prefer_int: bool,
-) -> Result<Value, ReplayError> {
-    let left_num = left
-        .as_f64()
-        .ok_or_else(|| ReplayError("numeric operation expects number".to_string()))?;
-    let right_num = right
-        .as_f64()
-        .ok_or_else(|| ReplayError("numeric operation expects number".to_string()))?;
-    let result = op(left_num, right_num);
-    if prefer_int && int_value(&left).is_some() && int_value(&right).is_some() && result.is_finite()
-    {
-        let rounded = result.round();
-        if (result - rounded).abs() < 1e-9
-            && rounded >= (i64::MIN as f64)
-            && rounded <= (i64::MAX as f64)
-        {
-            return Ok(Value::Number((rounded as i64).into()));
-        }
-    }
-    Ok(Value::Number(
-        serde_json::Number::from_f64(result).unwrap_or_else(|| serde_json::Number::from(0)),
-    ))
-}
-
-fn add_values(left: Value, right: Value) -> Result<Value, ReplayError> {
-    if let (Value::Array(mut left), Value::Array(right)) = (left.clone(), right.clone()) {
-        left.extend(right);
-        return Ok(Value::Array(left));
-    }
-    if let (Some(left), Some(right)) = (left.as_str(), right.as_str()) {
-        return Ok(Value::String(format!("{left}{right}")));
-    }
-    numeric_op(left, right, |a, b| a + b, true)
-}
-
-fn compare_values(
-    left: Value,
-    right: Value,
-    op: impl Fn(f64, f64) -> bool,
-) -> Result<Value, ReplayError> {
-    let left = left
-        .as_f64()
-        .ok_or_else(|| ReplayError("comparison expects number".to_string()))?;
-    let right = right
-        .as_f64()
-        .ok_or_else(|| ReplayError("comparison expects number".to_string()))?;
-    Ok(Value::Bool(op(left, right)))
-}
-
-fn value_in(value: &Value, container: &Value) -> bool {
-    match container {
-        Value::Array(items) => items.iter().any(|item| item == value),
-        Value::Object(map) => value
-            .as_str()
-            .map(|key| map.contains_key(key))
-            .unwrap_or(false),
-        Value::String(text) => value
-            .as_str()
-            .map(|needle| text.contains(needle))
-            .unwrap_or(false),
-        _ => false,
-    }
-}
-
-fn is_truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(number) => number.as_f64().map(|value| value != 0.0).unwrap_or(false),
-        Value::String(value) => !value.is_empty(),
-        Value::Array(values) => !values.is_empty(),
-        Value::Object(map) => !map.is_empty(),
-    }
-}
-
-/// Return True if the value looks like an exception payload.
-///
-/// We treat native exceptions or dict payloads with type/message keys as
-/// exception-shaped values.
-fn is_exception_value(value: &Value) -> bool {
-    if let Value::Object(map) = value {
-        return map.contains_key("type") && map.contains_key("message");
-    }
-    false
-}
-
-fn len_of_value(value: &Value) -> Result<serde_json::Number, ReplayError> {
-    let len = match value {
-        Value::Array(items) => items.len() as i64,
-        Value::String(text) => text.len() as i64,
-        Value::Object(map) => map.len() as i64,
-        _ => {
-            return Err(ReplayError(
-                "len() expects list, string, or dict".to_string(),
-            ));
-        }
-    };
-    Ok(len.into())
-}
-
-fn range_from_args(args: &[Value]) -> Vec<Value> {
-    let mut start = 0i64;
-    let mut end = 0i64;
-    let mut step = 1i64;
-    if args.len() == 1 {
-        end = args[0].as_i64().unwrap_or(0);
-    } else if args.len() >= 2 {
-        start = args[0].as_i64().unwrap_or(0);
-        end = args[1].as_i64().unwrap_or(0);
-        if args.len() >= 3 {
-            step = args[2].as_i64().unwrap_or(1);
-        }
-    }
-    if step == 0 {
-        return Vec::new();
-    }
-    let mut values = Vec::new();
-    if step > 0 {
-        let mut current = start;
-        while current < end {
-            values.push(Value::Number(current.into()));
-            current += step;
-        }
-    } else {
-        let mut current = start;
-        while current > end {
-            values.push(Value::Number(current.into()));
-            current += step;
-        }
-    }
-    values
 }
 
 /// Replay variable values from a runner state snapshot.

@@ -557,3 +557,25 @@ impl IRFormatter {
 pub fn format_program(program: &ir::Program) -> String {
     IRFormatter::new(DEFAULT_INDENT).format_program(program)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_INDENT, format_program};
+    use crate::rappel_core::ir_parser::IRParser;
+
+    #[test]
+    fn test_format_program_happy_path() {
+        let source = [
+            "fn main(input: [x], output: [y]):",
+            "    y = x + 1",
+            "    return y",
+        ]
+        .join("\n");
+
+        let mut parser = IRParser::new(DEFAULT_INDENT);
+        let program = parser.parse_program(&source).expect("parse program");
+        let formatted = format_program(&program);
+
+        assert_eq!(formatted, source);
+    }
+}

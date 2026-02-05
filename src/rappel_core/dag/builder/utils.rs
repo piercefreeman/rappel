@@ -2,8 +2,9 @@
 
 use crate::messages::ast as ir;
 
+use super::super::models::DAGNode;
 use super::super::nodes::{
-    ActionCallNode, AggregatorNode, AssignmentNode, DAGNode, FnCallNode, JoinNode, ReturnNode,
+    ActionCallNode, AggregatorNode, AssignmentNode, FnCallNode, JoinNode, ReturnNode,
 };
 use super::converter::DAGConverter;
 

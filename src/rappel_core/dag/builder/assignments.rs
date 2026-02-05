@@ -333,5 +333,52 @@ impl DAGConverter {
     }
 }
 
-// TODO: Add a simple happy path test for the conversion. So similarly for all
-// of these specific conversion plugins in the dag/builder
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rappel_core::dag::DAGNode;
+
+    fn literal_int(value: i64) -> ir::Expr {
+        ir::Expr {
+            kind: Some(ir::expr::Kind::Literal(ir::Literal {
+                value: Some(ir::literal::Value::IntValue(value)),
+            })),
+            span: None,
+        }
+    }
+
+    #[test]
+    fn test_convert_assignment_literal_happy_path() {
+        let mut converter = DAGConverter::new();
+        converter.current_function = Some("main".to_string());
+
+        let assign = ir::Assignment {
+            targets: vec!["x".to_string()],
+            value: Some(literal_int(42)),
+        };
+
+        let nodes = converter.convert_assignment(&assign);
+        assert_eq!(nodes.len(), 1);
+        let node_id = &nodes[0];
+
+        let node = converter
+            .dag
+            .nodes
+            .get(node_id)
+            .expect("assignment node missing");
+        match node {
+            DAGNode::Assignment(assignment) => {
+                assert_eq!(assignment.targets, vec!["x".to_string()]);
+                assert!(assignment.target.is_none());
+                assert!(assignment.assign_expr.is_some());
+            }
+            other => panic!("expected assignment node, got {}", other.node_type()),
+        }
+
+        assert_eq!(
+            converter.current_scope_vars.get("x"),
+            Some(node_id),
+            "assignment should track latest definition"
+        );
+    }
+}

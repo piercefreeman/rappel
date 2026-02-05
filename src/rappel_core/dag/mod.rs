@@ -7,12 +7,13 @@ pub mod validate;
 
 pub use builder::{DAGConverter, convert_to_dag};
 pub use models::{
-    ConvertedSubgraph, DAG, DAGEdge, DagConversionError, EXCEPTION_SCOPE_VAR, EdgeType,
+    ConvertedSubgraph, DAG, DAGEdge, DAGNode, DagConversionError, DagEdgeIndex,
+    EXCEPTION_SCOPE_VAR, EdgeType,
 };
 pub use nodes::{
     ActionCallNode, ActionCallParams, AggregatorNode, AssignmentNode, BranchNode, BreakNode,
-    ContinueNode, DAGNode, ExpressionNode, FnCallNode, FnCallParams, InputNode, JoinNode,
-    OutputNode, ParallelNode, ReturnNode,
+    ContinueNode, ExpressionNode, FnCallNode, FnCallParams, InputNode, JoinNode, OutputNode,
+    ParallelNode, ReturnNode,
 };
 pub use validate::{
     validate_dag, validate_edges_reference_existing_nodes,

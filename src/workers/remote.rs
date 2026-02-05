@@ -38,7 +38,7 @@
 //! - Round-robin selection ensures load distribution even with slow workers
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     env,
     net::SocketAddr,
     path::PathBuf,
@@ -54,7 +54,6 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 
 use anyhow::{Context, Result as AnyResult, anyhow};
-use chrono::{DateTime, Utc};
 use prost::Message;
 use tokio::{
     process::{Child, Command},
@@ -66,8 +65,10 @@ use tracing::{error, info, trace, warn};
 use uuid::Uuid;
 
 use super::base::{
-    ActionCompletion, ActionRequest, BaseWorkerPool, WorkerPoolError, error_to_value,
+    ActionCompletion, ActionRequest, BaseWorkerPool, WorkerPoolError, WorkerPoolMetrics,
+    error_to_value,
 };
+pub use super::base::{RoundTripMetrics, WorkerThroughputSnapshot};
 use super::status::{WorkerPoolStats, WorkerPoolStatsSnapshot};
 use crate::{
     messages::{self, MessageError, proto},
@@ -160,180 +161,6 @@ fn find_executable(bin: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// Metrics from a single action round-trip.
-#[derive(Debug, Clone)]
-pub struct RoundTripMetrics {
-    /// The action ID that was executed
-    pub action_id: String,
-    /// The workflow instance this action belongs to
-    pub instance_id: String,
-    /// Delivery ID used for correlation
-    pub delivery_id: u64,
-    /// Sequence number within the instance
-    pub sequence: u32,
-    /// Time from send to ACK receipt
-    pub ack_latency: Duration,
-    /// Time from send to result receipt
-    pub round_trip: Duration,
-    /// Time the worker spent executing (from worker's perspective)
-    pub worker_duration: Duration,
-    /// Serialized result payload
-    pub response_payload: Vec<u8>,
-    /// Whether the action succeeded
-    pub success: bool,
-    /// Dispatch token for correlation (echoed back)
-    pub dispatch_token: Option<Uuid>,
-    /// Error type if the action failed
-    pub error_type: Option<String>,
-    /// Error message if the action failed
-    pub error_message: Option<String>,
-}
-
-/// Throughput snapshot for a single worker.
-#[derive(Debug, Clone)]
-pub struct WorkerThroughputSnapshot {
-    /// Worker ID
-    pub worker_id: u64,
-    /// Throughput in actions per minute
-    pub throughput_per_min: f64,
-    /// Total actions completed since pool start
-    pub total_completed: u64,
-    /// Timestamp of last completed action
-    pub last_action_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug)]
-struct WorkerThroughputState {
-    worker_id: u64,
-    total_completed: u64,
-    recent_completions: VecDeque<Instant>,
-    last_action_at: Option<DateTime<Utc>>,
-}
-
-impl WorkerThroughputState {
-    fn new(worker_id: u64) -> Self {
-        Self {
-            worker_id,
-            total_completed: 0,
-            recent_completions: VecDeque::new(),
-            last_action_at: None,
-        }
-    }
-
-    fn prune_before(&mut self, cutoff: Instant) {
-        while self
-            .recent_completions
-            .front()
-            .is_some_and(|instant| *instant < cutoff)
-        {
-            self.recent_completions.pop_front();
-        }
-    }
-}
-
-#[derive(Debug)]
-struct WorkerThroughputTracker {
-    window: Duration,
-    workers: Vec<WorkerThroughputState>,
-}
-
-impl WorkerThroughputTracker {
-    fn new(worker_ids: Vec<u64>, window: Duration) -> Self {
-        let workers = worker_ids
-            .into_iter()
-            .map(WorkerThroughputState::new)
-            .collect();
-        Self { window, workers }
-    }
-
-    fn record_completion(&mut self, worker_idx: usize) {
-        let now = Instant::now();
-        let wall_time = Utc::now();
-        self.record_completion_at(worker_idx, now, wall_time);
-    }
-
-    fn record_completion_at(&mut self, worker_idx: usize, when: Instant, wall_time: DateTime<Utc>) {
-        let Some(worker) = self.workers.get_mut(worker_idx) else {
-            return;
-        };
-        let cutoff = when.checked_sub(self.window).unwrap_or(when);
-        worker.prune_before(cutoff);
-        worker.recent_completions.push_back(when);
-        worker.total_completed = worker.total_completed.saturating_add(1);
-        worker.last_action_at = Some(wall_time);
-    }
-
-    fn snapshot_at(&mut self, now: Instant) -> Vec<WorkerThroughputSnapshot> {
-        let window_secs = self.window.as_secs_f64();
-        let cutoff = now.checked_sub(self.window).unwrap_or(now);
-        self.workers
-            .iter_mut()
-            .map(|worker| {
-                worker.prune_before(cutoff);
-                let throughput_per_min = if window_secs > 0.0 {
-                    (worker.recent_completions.len() as f64 / window_secs) * 60.0
-                } else {
-                    0.0
-                };
-
-                WorkerThroughputSnapshot {
-                    worker_id: worker.worker_id,
-                    throughput_per_min,
-                    total_completed: worker.total_completed,
-                    last_action_at: worker.last_action_at,
-                }
-            })
-            .collect()
-    }
-}
-
-#[derive(Debug)]
-struct LatencyTracker {
-    max_samples: usize,
-    dequeue_ms: VecDeque<i64>,
-    handling_ms: VecDeque<i64>,
-}
-
-impl LatencyTracker {
-    fn new(max_samples: usize) -> Self {
-        Self {
-            max_samples: max_samples.max(1),
-            dequeue_ms: VecDeque::new(),
-            handling_ms: VecDeque::new(),
-        }
-    }
-
-    fn record(&mut self, ack_latency: Duration, worker_duration: Duration) {
-        let dequeue = ack_latency.as_millis() as i64;
-        let handling = worker_duration.as_millis() as i64;
-        self.dequeue_ms.push_back(dequeue);
-        self.handling_ms.push_back(handling);
-
-        while self.dequeue_ms.len() > self.max_samples {
-            self.dequeue_ms.pop_front();
-        }
-        while self.handling_ms.len() > self.max_samples {
-            self.handling_ms.pop_front();
-        }
-    }
-
-    fn median(values: &VecDeque<i64>) -> Option<i64> {
-        if values.is_empty() {
-            return None;
-        }
-        let mut ordered: Vec<i64> = values.iter().copied().collect();
-        ordered.sort_unstable();
-        Some(ordered[ordered.len() / 2])
-    }
-
-    fn snapshot_medians(&self) -> (Option<i64>, Option<i64>) {
-        (
-            Self::median(&self.dequeue_ms),
-            Self::median(&self.handling_ms),
-        )
-    }
 }
 
 /// Payload for dispatching an action to a worker.
@@ -780,10 +607,8 @@ pub struct PythonWorkerPool {
     workers: RwLock<Vec<Arc<PythonWorker>>>,
     /// Cursor for round-robin selection
     cursor: AtomicUsize,
-    /// Throughput tracker for workers in the pool
-    throughput: StdMutex<WorkerThroughputTracker>,
-    /// Rolling latency tracker for dequeue/handling metrics
-    latency: StdMutex<LatencyTracker>,
+    /// Shared metrics tracker for throughput + latency.
+    metrics: StdMutex<WorkerPoolMetrics>,
     /// Action counts per worker slot (for lifecycle tracking)
     action_counts: Vec<AtomicU64>,
     /// In-flight action counts per worker slot (for concurrency control)
@@ -883,11 +708,11 @@ impl PythonWorkerPool {
         Ok(Self {
             workers: RwLock::new(workers),
             cursor: AtomicUsize::new(0),
-            throughput: StdMutex::new(WorkerThroughputTracker::new(
+            metrics: StdMutex::new(WorkerPoolMetrics::new(
                 worker_ids,
                 Duration::from_secs(60),
+                LATENCY_SAMPLE_SIZE,
             )),
-            latency: StdMutex::new(LatencyTracker::new(LATENCY_SAMPLE_SIZE)),
             action_counts,
             in_flight_counts,
             max_concurrent_per_worker: max_concurrent_per_worker.max(1),
@@ -1055,8 +880,8 @@ impl PythonWorkerPool {
     ///
     /// Returns worker throughput metrics including completion counts and rates.
     pub fn throughput_snapshots(&self) -> Vec<WorkerThroughputSnapshot> {
-        if let Ok(mut tracker) = self.throughput.lock() {
-            tracker.snapshot_at(Instant::now())
+        if let Ok(mut metrics) = self.metrics.lock() {
+            metrics.throughput_snapshots(Instant::now())
         } else {
             Vec::new()
         }
@@ -1064,15 +889,15 @@ impl PythonWorkerPool {
 
     /// Record the latest latency measurements for median reporting.
     pub fn record_latency(&self, ack_latency: Duration, worker_duration: Duration) {
-        if let Ok(mut tracker) = self.latency.lock() {
-            tracker.record(ack_latency, worker_duration);
+        if let Ok(mut metrics) = self.metrics.lock() {
+            metrics.record_latency(ack_latency, worker_duration);
         }
     }
 
     /// Return the current median dequeue/handling latencies in milliseconds.
     pub fn median_latencies_ms(&self) -> (Option<i64>, Option<i64>) {
-        if let Ok(tracker) = self.latency.lock() {
-            tracker.snapshot_medians()
+        if let Ok(metrics) = self.metrics.lock() {
+            metrics.median_latencies_ms()
         } else {
             (None, None)
         }
@@ -1101,10 +926,10 @@ impl PythonWorkerPool {
         self.release_slot(worker_idx);
 
         // Update throughput tracking
-        if let Ok(mut tracker) = self.throughput.lock() {
-            tracker.record_completion(worker_idx);
+        if let Ok(mut metrics) = self.metrics.lock() {
+            metrics.record_completion(worker_idx);
             if tracing::enabled!(tracing::Level::TRACE) {
-                let snapshots = tracker.snapshot_at(Instant::now());
+                let snapshots = metrics.throughput_snapshots(Instant::now());
                 if let Some(snapshot) = snapshots.get(worker_idx) {
                     trace!(
                         worker_id = snapshot.worker_id,
@@ -1167,9 +992,8 @@ impl PythonWorkerPool {
         }
 
         // Update throughput tracker with new worker ID
-        if let Ok(mut tracker) = self.throughput.lock() {
-            let idx = worker_idx % tracker.workers.len();
-            tracker.workers[idx] = WorkerThroughputState::new(new_worker_id);
+        if let Ok(mut metrics) = self.metrics.lock() {
+            metrics.reset_worker(worker_idx, new_worker_id);
         }
 
         info!(
@@ -1720,36 +1544,6 @@ mod tests {
                 warn!("worker pool still referenced during shutdown; skipping shutdown");
             }
         }
-    }
-
-    #[test]
-    fn test_worker_throughput_tracker_window() {
-        let base_wall = Utc::now();
-        let mut tracker = WorkerThroughputTracker::new(vec![0, 1], Duration::from_secs(60));
-        let base = Instant::now();
-
-        tracker.record_completion_at(0, base, base_wall);
-        tracker.record_completion_at(0, base + Duration::from_secs(10), base_wall);
-        tracker.record_completion_at(0, base + Duration::from_secs(50), base_wall);
-        tracker.record_completion_at(0, base + Duration::from_secs(70), base_wall);
-
-        let snapshots = tracker.snapshot_at(base + Duration::from_secs(70));
-        let worker_one = snapshots
-            .iter()
-            .find(|snapshot| snapshot.worker_id == 0)
-            .expect("worker zero snapshot");
-        let worker_two = snapshots
-            .iter()
-            .find(|snapshot| snapshot.worker_id == 1)
-            .expect("worker one snapshot");
-
-        assert_eq!(worker_one.total_completed, 4);
-        assert!((worker_one.throughput_per_min - 3.0).abs() < 0.001);
-        assert!(worker_one.last_action_at.is_some());
-
-        assert_eq!(worker_two.total_completed, 0);
-        assert_eq!(worker_two.throughput_per_min, 0.0);
-        assert!(worker_two.last_action_at.is_none());
     }
 
     #[tokio::test]
