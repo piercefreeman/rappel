@@ -20,7 +20,10 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 )
 # @@protoc_insertion_point(imports)
 
+from google.protobuf import struct_pb2 as google_dot_protobuf_dot_struct__pb2
+
 _sym_db = _symbol_database.Default()
+_sym_db.RegisterFileDescriptor(google_dot_protobuf_dot_struct__pb2.DESCRIPTOR)
 
 
 

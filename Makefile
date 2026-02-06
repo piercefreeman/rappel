@@ -16,7 +16,7 @@ build-proto:
 		--mypy_out=../$(PY_PROTO_OUT) \
 		--mypy_grpc_out=../$(PY_PROTO_OUT) \
 		../proto/messages.proto ../proto/ast.proto
-	cd core-python && uv run python -m grpc_tools.protoc \
+	cd python && uv run python -m grpc_tools.protoc \
 		--proto_path=../proto \
 		--plugin=protoc-gen-mypy="$$(pwd)/.venv/bin/protoc-gen-mypy" \
 		--plugin=protoc-gen-mypy_grpc="$$(pwd)/.venv/bin/protoc-gen-mypy_grpc" \
