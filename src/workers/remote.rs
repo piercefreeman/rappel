@@ -1207,9 +1207,23 @@ pub struct RemoteWorkerPool {
 }
 
 impl RemoteWorkerPool {
+    const DEFAULT_QUEUE_CAPACITY: usize = 1024;
+
     pub fn new(pool: Arc<PythonWorkerPool>) -> Self {
-        let (request_tx, request_rx) = mpsc::channel(256);
-        let (completion_tx, completion_rx) = mpsc::channel(256);
+        Self::with_capacity(
+            pool,
+            Self::DEFAULT_QUEUE_CAPACITY,
+            Self::DEFAULT_QUEUE_CAPACITY,
+        )
+    }
+
+    pub fn with_capacity(
+        pool: Arc<PythonWorkerPool>,
+        request_capacity: usize,
+        completion_capacity: usize,
+    ) -> Self {
+        let (request_tx, request_rx) = mpsc::channel(request_capacity.max(1));
+        let (completion_tx, completion_rx) = mpsc::channel(completion_capacity.max(1));
         Self {
             inner: Arc::new(RemoteWorkerPoolInner {
                 pool,
@@ -1229,6 +1243,12 @@ impl RemoteWorkerPool {
         max_action_lifecycle: Option<u64>,
         max_concurrent_per_worker: usize,
     ) -> AnyResult<Self> {
+        let worker_count = count.max(1);
+        let per_worker = max_concurrent_per_worker.max(1);
+        let queue_capacity = worker_count
+            .saturating_mul(per_worker)
+            .saturating_mul(2)
+            .max(Self::DEFAULT_QUEUE_CAPACITY);
         let pool = PythonWorkerPool::new_with_bridge_addr(
             config,
             count,
@@ -1237,7 +1257,11 @@ impl RemoteWorkerPool {
             max_concurrent_per_worker,
         )
         .await?;
-        Ok(Self::new(Arc::new(pool)))
+        Ok(Self::with_capacity(
+            Arc::new(pool),
+            queue_capacity,
+            queue_capacity,
+        ))
     }
 
     pub fn bridge_addr(&self) -> SocketAddr {

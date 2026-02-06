@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use prost::Message;
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc, watch};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::backends::{
@@ -182,6 +182,14 @@ impl ShardExecutor {
             sleep_requests.push(sleep_request);
         }
 
+        debug!(
+            executor_id = %self.executor_id,
+            actions = actions.len(),
+            sleep_requests = sleep_requests.len(),
+            inflight = self.inflight.len(),
+            "executor step"
+        );
+
         let instance_done = if !self.completed && actions.is_empty() && self.inflight.is_empty() {
             self.completed = true;
             Some(build_instance_done(
@@ -218,6 +226,11 @@ fn run_executor_shard(
     while let Ok(command) = receiver.recv() {
         match command {
             ShardCommand::AssignInstances(instances) => {
+                debug!(
+                    shard_id,
+                    count = instances.len(),
+                    "assigning instances to shard"
+                );
                 for instance in instances {
                     let state = match instance.state {
                         Some(state) => state,
@@ -660,7 +673,11 @@ impl RunLoop {
                     )
                     .await;
                 let message = match batch {
-                    Ok(QueuedInstanceBatch { instances }) => InstanceMessage::Batch { instances },
+                    Ok(QueuedInstanceBatch { instances }) => {
+                        let count = instances.len();
+                        debug!(count, "polled queued instances");
+                        InstanceMessage::Batch { instances }
+                    }
                     Err(err) => InstanceMessage::Error(err),
                 };
                 if instance_tx.send(message).await.is_err() {
@@ -874,6 +891,7 @@ impl RunLoop {
                     run_result = Err(err);
                     break;
                 }
+                debug!(count = all_instances.len(), "hydrated queued instances");
                 let mut by_shard: HashMap<usize, Vec<QueuedInstance>> = HashMap::new();
                 let mut claimed_instance_ids = Vec::with_capacity(all_instances.len());
                 for instance in all_instances {
@@ -884,7 +902,13 @@ impl RunLoop {
                     claimed_instance_ids.push(instance.instance_id);
                     by_shard.entry(shard_idx).or_default().push(instance);
                 }
+                let claimed_count = claimed_instance_ids.len();
                 lock_tracker.insert_all(claimed_instance_ids);
+                debug!(
+                    count = claimed_count,
+                    lock_uuid = %lock_tracker.lock_uuid(),
+                    "tracked instance locks"
+                );
                 for (shard_idx, batch) in by_shard {
                     if let Some(sender) = shard_senders.get(shard_idx) {
                         let _ = sender.send(ShardCommand::AssignInstances(batch));

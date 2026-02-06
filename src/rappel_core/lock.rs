@@ -9,6 +9,8 @@ use chrono::{Duration as ChronoDuration, Utc};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
+use tracing::{debug, warn};
+
 use crate::backends::{CoreBackend, LockClaim};
 
 #[derive(Clone)]
@@ -79,12 +81,14 @@ pub fn spawn_lock_heartbeat(
                 _ = tokio::time::sleep(heartbeat_interval) => {}
             };
             let instance_ids = tracker.snapshot();
+            debug!(count = instance_ids.len(), "lock heartbeat tick");
             if instance_ids.is_empty() {
                 continue;
             }
             let lock_expires_at = Utc::now()
                 + ChronoDuration::from_std(lock_ttl).unwrap_or_else(|_| ChronoDuration::seconds(0));
-            let _ = backend
+            debug!(count = instance_ids.len(), "refreshing instance locks");
+            if let Err(err) = backend
                 .refresh_instance_locks(
                     LockClaim {
                         lock_uuid: tracker.lock_uuid(),
@@ -92,7 +96,10 @@ pub fn spawn_lock_heartbeat(
                     },
                     &instance_ids,
                 )
-                .await;
+                .await
+            {
+                warn!(error = %err, "failed to refresh instance locks");
+            }
         }
     })
 }
