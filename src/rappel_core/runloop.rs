@@ -765,10 +765,10 @@ impl RunLoop {
 
         loop {
             if instances_idle && executor_shards.is_empty() && sleeping_nodes.is_empty() {
-                info!(
+                warn!(
                     inflight = inflight_actions.len(),
                     blocked = blocked_until_by_instance.len(),
-                    "runloop idle with no active executors; exiting loop"
+                    "runloop exiting: idle with no active executors"
                 );
                 break;
             }
@@ -793,7 +793,7 @@ impl RunLoop {
                     None
                 }
                 else => {
-                    info!("runloop event channels closed");
+                    warn!("runloop exiting: event channels closed");
                     break;
                 },
             };
@@ -823,12 +823,14 @@ impl RunLoop {
                     }
                 }
                 CoordinatorEvent::Instance(InstanceMessage::Error(err)) => {
+                    warn!(error = %err, "runloop exiting: instance poller backend error");
                     run_result = Err(RunLoopError::Backend(err));
                     break;
                 }
                 CoordinatorEvent::Shard(event) => match event {
                     ShardEvent::Step(step) => all_steps.push(step),
                     ShardEvent::Error(err) => {
+                        warn!(error = %err, "runloop exiting: shard error");
                         run_result = Err(err);
                         break;
                     }
@@ -851,24 +853,28 @@ impl RunLoop {
                         }
                     }
                     InstanceMessage::Error(err) => {
+                        warn!(error = %err, "runloop exiting: instance poller backend error");
                         run_result = Err(RunLoopError::Backend(err));
                         break;
                     }
                 }
             }
             if run_result.is_err() {
+                warn!("runloop exiting: error after draining instance messages");
                 break;
             }
             while let Ok(event) = event_rx.try_recv() {
                 match event {
                     ShardEvent::Step(step) => all_steps.push(step),
                     ShardEvent::Error(err) => {
+                        warn!(error = %err, "runloop exiting: shard error");
                         run_result = Err(err);
                         break;
                     }
                 }
             }
             if run_result.is_err() {
+                warn!("runloop exiting: error after draining shard events");
                 break;
             }
             while let Ok(wake) = sleep_rx.try_recv() {
@@ -1231,7 +1237,7 @@ pub async fn runloop_supervisor<B, W>(
 
         match result {
             Ok(_) => {
-                info!("runloop exited cleanly");
+                warn!("runloop exited cleanly (unexpected); restarting");
                 backoff = Duration::from_millis(200);
                 if poll_interval > Duration::ZERO {
                     tokio::time::sleep(poll_interval).await;
