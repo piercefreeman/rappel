@@ -9,6 +9,8 @@ pub mod pool_status;
 pub mod rappel_core;
 pub mod scheduler;
 pub mod server_worker;
+#[cfg(test)]
+pub mod test_support;
 pub mod webapp;
 pub mod workers;
 

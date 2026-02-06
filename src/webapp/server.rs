@@ -1155,6 +1155,7 @@ mod tests {
         http::{Request, StatusCode},
     };
     use http_body_util::BodyExt;
+    use serial_test::serial;
     use sqlx::postgres::PgPoolOptions;
     use tower::util::ServiceExt;
     use uuid::Uuid;
@@ -1163,6 +1164,7 @@ mod tests {
     use crate::backends::{
         MemoryBackend, PostgresBackend, WebappBackend, WorkerStatusBackend, WorkerStatusUpdate,
     };
+    use crate::test_support::postgres_setup;
 
     async fn call_route(backend: Arc<dyn WebappBackend>, uri: &str) -> (StatusCode, String) {
         let templates = Arc::new(init_templates().expect("templates initialize"));
@@ -1285,5 +1287,77 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("\"status\":\"ok\""));
         assert!(body.contains("\"service\":\"rappel-webapp\""));
+    }
+
+    #[tokio::test]
+    #[serial(postgres)]
+    async fn high_level_pages_resolve_with_postgres_backend_live_db() {
+        let pool = postgres_setup().await;
+
+        let backend = Arc::new(PostgresBackend::new(pool.clone()));
+        let pool_id = Uuid::new_v4();
+        backend
+            .upsert_worker_status(&WorkerStatusUpdate {
+                pool_id,
+                throughput_per_min: 120.0,
+                total_completed: 42,
+                last_action_at: None,
+                median_dequeue_ms: Some(5),
+                median_handling_ms: Some(18),
+                dispatch_queue_size: 3,
+                total_in_flight: 1,
+                active_workers: 2,
+                actions_per_sec: 2.0,
+                median_instance_duration_secs: Some(0.25),
+                active_instance_count: 1,
+                total_instances_completed: 7,
+                instances_per_sec: 0.2,
+                instances_per_min: 12.0,
+                time_series: None,
+            })
+            .await
+            .expect("insert worker status");
+
+        let backend_dyn: Arc<dyn WebappBackend> = backend.clone();
+        let routes: Vec<(String, &str)> = vec![
+            ("/".to_string(), "Invocations"),
+            ("/invocations".to_string(), "Invocations"),
+            ("/scheduled".to_string(), "Scheduled Workflows"),
+            (
+                format!("/instance/{}", Uuid::new_v4()),
+                "Instance not found",
+            ),
+            (
+                format!("/scheduled/{}", Uuid::new_v4()),
+                "Schedule not found",
+            ),
+        ];
+
+        for (route, expected) in routes {
+            let (status, body) = call_route(backend_dyn.clone(), &route).await;
+            assert_eq!(status, StatusCode::OK, "route={route}");
+            assert!(!body.trim().is_empty(), "route={route}");
+            assert!(
+                body.contains(expected),
+                "route={route}, expected={expected}"
+            );
+        }
+
+        let (status, workers_body) = call_route(backend_dyn.clone(), "/workers").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!workers_body.trim().is_empty());
+        assert!(workers_body.contains("Workers"));
+        assert!(workers_body.contains(&pool_id.to_string()));
+
+        let (status, health_body) = call_route(backend_dyn, "/healthz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(health_body.contains("\"status\":\"ok\""));
+        assert!(health_body.contains("\"service\":\"rappel-webapp\""));
+
+        sqlx::query("DELETE FROM worker_status WHERE pool_id = $1")
+            .bind(pool_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup worker status row");
     }
 }
