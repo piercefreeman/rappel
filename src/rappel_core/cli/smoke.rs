@@ -7,10 +7,14 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
+use prost::Message;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::backends::{MemoryBackend, QueuedInstance};
+use crate::backends::{
+    MemoryBackend, QueuedInstance, WorkflowRegistration, WorkflowRegistryBackend,
+};
 use crate::messages::ast as ir;
 use crate::rappel_core::dag::convert_to_dag;
 use crate::rappel_core::dag_viz::render_dag_image;
@@ -225,7 +229,9 @@ async fn run_program_smoke(case: &SmokeCase, worker_pool: RemoteWorkerPool) -> R
     println!("\nIR program ({})", case.name);
     println!("{}", format_program(&case.program));
     println!("IR inputs ({}): {:?}", case.name, case.inputs);
-    let dag = convert_to_dag(&case.program).map_err(|err| anyhow!(err.to_string()))?;
+    let program_proto = case.program.encode_to_vec();
+    let ir_hash = format!("{:x}", Sha256::digest(&program_proto));
+    let dag = Arc::new(convert_to_dag(&case.program).map_err(|err| anyhow!(err.to_string()))?);
     let slug = slugify(&case.name);
     let output_path = PathBuf::from(format!("dag_smoke_{slug}.png"));
     let output_path =
@@ -236,9 +242,19 @@ async fn run_program_smoke(case: &SmokeCase, worker_pool: RemoteWorkerPool) -> R
         output_path.display()
     );
 
-    let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
+    let mut state = RunnerState::new(Some(Arc::clone(&dag)), None, None, false);
     let queue = Arc::new(Mutex::new(VecDeque::new()));
     let backend = MemoryBackend::with_queue(queue.clone());
+    let workflow_version_id = backend
+        .upsert_workflow_version(&WorkflowRegistration {
+            workflow_name: case.name.clone(),
+            workflow_version: ir_hash.clone(),
+            ir_hash,
+            program_proto,
+            concurrent: false,
+        })
+        .await
+        .map_err(|err| anyhow!(err.to_string()))?;
     for (name, value) in &case.inputs {
         let expr = literal_from_value(value);
         let label = format!("input {name} = {value}");
@@ -271,7 +287,8 @@ async fn run_program_smoke(case: &SmokeCase, worker_pool: RemoteWorkerPool) -> R
         },
     );
     queue.lock().expect("queue lock").push_back(QueuedInstance {
-        dag: dag.clone(),
+        workflow_version_id,
+        dag: None,
         entry_node: entry_exec.node_id,
         state: Some(state),
         action_results: HashMap::new(),

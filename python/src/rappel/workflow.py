@@ -64,6 +64,9 @@ class Workflow:
     name: ClassVar[Optional[str]] = None
     """Human-friendly identifier. Override to pin the registry key; defaults to lowercase class name."""
 
+    version: ClassVar[Optional[str]] = None
+    """Optional workflow version identifier. Defaults to IR hash when unset."""
+
     concurrent: ClassVar[bool] = False
     """When True, downstream engines may respect DAG-parallel execution; False preserves sequential semantics."""
 
@@ -151,10 +154,13 @@ class Workflow:
         ir_bytes = program.SerializeToString()
         ir_hash = hashlib.sha256(ir_bytes).hexdigest()
 
+        workflow_version = cls.version or ir_hash
+
         message = pb2.WorkflowRegistration(
             workflow_name=cls.short_name(),
             ir=ir_bytes,
             ir_hash=ir_hash,
+            workflow_version=workflow_version,
             concurrent=cls.concurrent,
         )
 

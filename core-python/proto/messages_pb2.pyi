@@ -519,6 +519,7 @@ class WorkflowRegistration(google.protobuf.message.Message):
     WORKFLOW_NAME_FIELD_NUMBER: builtins.int
     IR_FIELD_NUMBER: builtins.int
     IR_HASH_FIELD_NUMBER: builtins.int
+    WORKFLOW_VERSION_FIELD_NUMBER: builtins.int
     INITIAL_CONTEXT_FIELD_NUMBER: builtins.int
     CONCURRENT_FIELD_NUMBER: builtins.int
     PRIORITY_FIELD_NUMBER: builtins.int
@@ -526,7 +527,9 @@ class WorkflowRegistration(google.protobuf.message.Message):
     ir: builtins.bytes
     """Serialized IR program (from ast.proto)"""
     ir_hash: builtins.str
-    """Hash of the IR for versioning"""
+    """Hash of the IR for immutability checks"""
+    workflow_version: builtins.str
+    """User-defined version identifier"""
     concurrent: builtins.bool
     """Whether multiple instances can run"""
     priority: builtins.int
@@ -539,12 +542,13 @@ class WorkflowRegistration(google.protobuf.message.Message):
         workflow_name: builtins.str = ...,
         ir: builtins.bytes = ...,
         ir_hash: builtins.str = ...,
+        workflow_version: builtins.str = ...,
         initial_context: Global___WorkflowArguments | None = ...,
         concurrent: builtins.bool = ...,
         priority: builtins.int | None = ...,
     ) -> None: ...
     def HasField(self, field_name: typing.Literal["_priority", b"_priority", "initial_context", b"initial_context", "priority", b"priority"]) -> builtins.bool: ...
-    def ClearField(self, field_name: typing.Literal["_priority", b"_priority", "concurrent", b"concurrent", "initial_context", b"initial_context", "ir", b"ir", "ir_hash", b"ir_hash", "priority", b"priority", "workflow_name", b"workflow_name"]) -> None: ...
+    def ClearField(self, field_name: typing.Literal["_priority", b"_priority", "concurrent", b"concurrent", "initial_context", b"initial_context", "ir", b"ir", "ir_hash", b"ir_hash", "priority", b"priority", "workflow_name", b"workflow_name", "workflow_version", b"workflow_version"]) -> None: ...
     def WhichOneof(self, oneof_group: typing.Literal["_priority", b"_priority"]) -> typing.Literal["priority"] | None: ...
 
 Global___WorkflowRegistration: typing_extensions.TypeAlias = WorkflowRegistration

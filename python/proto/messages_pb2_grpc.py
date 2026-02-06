@@ -2,8 +2,7 @@
 """Client and server classes corresponding to protobuf-defined services."""
 
 import grpc
-
-from proto import messages_pb2 as messages__pb2
+import messages_pb2 as messages__pb2
 
 GRPC_GENERATED_VERSION = '1.71.2'
 GRPC_VERSION = grpc.__version__

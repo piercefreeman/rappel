@@ -32,7 +32,7 @@ use uuid::Uuid;
 use rappel::backends::{
     ActionDone, BackendError, BackendResult, CoreBackend, GraphUpdate, InstanceDone,
     InstanceLockStatus, LockClaim, PostgresBackend, QueuedInstance, QueuedInstanceBatch,
-    SchedulerBackend, WorkflowRegistration, WorkflowRegistryBackend,
+    SchedulerBackend, WorkflowRegistration, WorkflowRegistryBackend, WorkflowVersion,
 };
 use rappel::db;
 use rappel::messages::{self, ast as ir, proto};
@@ -65,9 +65,15 @@ impl WorkflowStore {
         &self,
         registration: &proto::WorkflowRegistration,
     ) -> Result<Uuid> {
+        let workflow_version = if registration.workflow_version.is_empty() {
+            registration.ir_hash.clone()
+        } else {
+            registration.workflow_version.clone()
+        };
         let backend_registration = WorkflowRegistration {
             workflow_name: registration.workflow_name.clone(),
-            dag_hash: registration.ir_hash.clone(),
+            workflow_version,
+            ir_hash: registration.ir_hash.clone(),
             program_proto: registration.ir.clone(),
             concurrent: registration.concurrent,
         };
@@ -128,14 +134,16 @@ impl WorkflowStore {
     }
 }
 
+type InstanceLockStore = HashMap<Uuid, (Option<Uuid>, Option<DateTime<Utc>>)>;
+type WorkflowVersionStore = HashMap<(String, String), (Uuid, WorkflowRegistration)>;
+
 #[derive(Clone)]
 struct InMemoryBackend {
     queue: Arc<Mutex<VecDeque<QueuedInstance>>>,
     instances_done: Arc<Mutex<HashMap<Uuid, InstanceDone>>>,
     instance_locks: Arc<Mutex<InstanceLockStore>>,
+    workflow_versions: Arc<Mutex<WorkflowVersionStore>>,
 }
-
-type InstanceLockStore = HashMap<Uuid, (Option<Uuid>, Option<DateTime<Utc>>)>;
 
 impl InMemoryBackend {
     fn new(
@@ -146,6 +154,7 @@ impl InMemoryBackend {
             queue,
             instances_done,
             instance_locks: Arc::new(Mutex::new(HashMap::new())),
+            workflow_versions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -304,6 +313,57 @@ impl CoreBackend for InMemoryBackend {
     }
 }
 
+#[async_trait]
+impl WorkflowRegistryBackend for InMemoryBackend {
+    async fn upsert_workflow_version(
+        &self,
+        registration: &WorkflowRegistration,
+    ) -> BackendResult<Uuid> {
+        let mut guard = self.workflow_versions.lock().map_err(|_| {
+            BackendError::Message("in-memory workflow versions poisoned".to_string())
+        })?;
+        let key = (
+            registration.workflow_name.clone(),
+            registration.workflow_version.clone(),
+        );
+        if let Some((id, existing)) = guard.get(&key) {
+            if existing.ir_hash != registration.ir_hash {
+                return Err(BackendError::Message(format!(
+                    "workflow version already exists with different IR hash: {}@{}",
+                    registration.workflow_name, registration.workflow_version
+                )));
+            }
+            return Ok(*id);
+        }
+        let id = Uuid::new_v4();
+        guard.insert(key, (id, registration.clone()));
+        Ok(id)
+    }
+
+    async fn get_workflow_versions(&self, ids: &[Uuid]) -> BackendResult<Vec<WorkflowVersion>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let guard = self.workflow_versions.lock().map_err(|_| {
+            BackendError::Message("in-memory workflow versions poisoned".to_string())
+        })?;
+        let mut versions = Vec::new();
+        for (id, registration) in guard.values() {
+            if ids.contains(id) {
+                versions.push(WorkflowVersion {
+                    id: *id,
+                    workflow_name: registration.workflow_name.clone(),
+                    workflow_version: registration.workflow_version.clone(),
+                    ir_hash: registration.ir_hash.clone(),
+                    program_proto: registration.program_proto.clone(),
+                    concurrent: registration.concurrent,
+                });
+            }
+        }
+        Ok(versions)
+    }
+}
+
 struct StreamWorkerPool {
     dispatch_tx: mpsc::Sender<proto::WorkflowStreamResponse>,
     completion_rx: Arc<AsyncMutex<mpsc::Receiver<ActionCompletion>>>,
@@ -409,8 +469,10 @@ impl proto::workflow_service_server::WorkflowService for BridgeService {
 
         let program = ir::Program::decode(&registration.ir[..])
             .map_err(|err| Status::invalid_argument(format!("invalid IR: {err}")))?;
-        let dag = convert_to_dag(&program)
-            .map_err(|err| Status::invalid_argument(format!("invalid DAG: {err}")))?;
+        let dag = Arc::new(
+            convert_to_dag(&program)
+                .map_err(|err| Status::invalid_argument(format!("invalid DAG: {err}")))?,
+        );
 
         let version_id = store
             .upsert_workflow_version(&registration)
@@ -418,8 +480,13 @@ impl proto::workflow_service_server::WorkflowService for BridgeService {
             .map_err(|err| Status::internal(format!("database error: {err}")))?;
 
         let instance_id = Uuid::new_v4();
-        let queued = build_queued_instance(instance_id, dag, registration.initial_context)
-            .map_err(Status::invalid_argument)?;
+        let queued = build_queued_instance(
+            instance_id,
+            version_id,
+            Arc::clone(&dag),
+            registration.initial_context,
+        )
+        .map_err(Status::invalid_argument)?;
 
         store
             .queue_instances(&[queued])
@@ -447,8 +514,10 @@ impl proto::workflow_service_server::WorkflowService for BridgeService {
 
         let program = ir::Program::decode(&registration.ir[..])
             .map_err(|err| Status::invalid_argument(format!("invalid IR: {err}")))?;
-        let dag = convert_to_dag(&program)
-            .map_err(|err| Status::invalid_argument(format!("invalid DAG: {err}")))?;
+        let dag = Arc::new(
+            convert_to_dag(&program)
+                .map_err(|err| Status::invalid_argument(format!("invalid DAG: {err}")))?,
+        );
 
         let version_id = store
             .upsert_workflow_version(&registration)
@@ -478,8 +547,9 @@ impl proto::workflow_service_server::WorkflowService for BridgeService {
                 default_inputs.clone().unwrap_or_default()
             };
 
-            let queued = build_queued_instance(instance_id, dag.clone(), Some(inputs))
-                .map_err(Status::invalid_argument)?;
+            let queued =
+                build_queued_instance(instance_id, version_id, Arc::clone(&dag), Some(inputs))
+                    .map_err(Status::invalid_argument)?;
             instances.push(queued);
             if include_ids {
                 instance_ids.push(instance_id.to_string());
@@ -556,16 +626,43 @@ impl proto::workflow_service_server::WorkflowService for BridgeService {
 
         let program = ir::Program::decode(&registration.ir[..])
             .map_err(|err| Status::invalid_argument(format!("invalid IR: {err}")))?;
-        let dag = convert_to_dag(&program)
-            .map_err(|err| Status::invalid_argument(format!("invalid DAG: {err}")))?;
+        let dag = Arc::new(
+            convert_to_dag(&program)
+                .map_err(|err| Status::invalid_argument(format!("invalid DAG: {err}")))?,
+        );
 
-        let instance_id = Uuid::new_v4();
-        let queued = build_queued_instance(instance_id, dag, registration.initial_context)
-            .map_err(Status::invalid_argument)?;
-
-        let queue = Arc::new(Mutex::new(VecDeque::from([queued])));
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
         let results = Arc::new(Mutex::new(HashMap::new()));
         let backend = InMemoryBackend::new(Arc::clone(&queue), Arc::clone(&results));
+
+        let workflow_version = if registration.workflow_version.is_empty() {
+            registration.ir_hash.clone()
+        } else {
+            registration.workflow_version.clone()
+        };
+        let version_id = backend
+            .upsert_workflow_version(&WorkflowRegistration {
+                workflow_name: registration.workflow_name.clone(),
+                workflow_version,
+                ir_hash: registration.ir_hash.clone(),
+                program_proto: registration.ir.clone(),
+                concurrent: registration.concurrent,
+            })
+            .await
+            .map_err(|err| Status::internal(format!("workflow upsert failed: {err}")))?;
+
+        let instance_id = Uuid::new_v4();
+        let queued = build_queued_instance(
+            instance_id,
+            version_id,
+            Arc::clone(&dag),
+            registration.initial_context,
+        )
+        .map_err(Status::invalid_argument)?;
+        queue
+            .lock()
+            .expect("in-memory queue lock")
+            .push_back(queued);
 
         let (response_tx, response_rx) = mpsc::channel::<proto::WorkflowStreamResponse>(64);
         let (completion_tx, completion_rx) = mpsc::channel::<ActionCompletion>(64);
@@ -1035,10 +1132,11 @@ fn ensure_error_fields(mut map: serde_json::Map<String, Value>) -> Value {
 
 fn build_queued_instance(
     instance_id: Uuid,
-    dag: rappel::rappel_core::dag::DAG,
+    workflow_version_id: Uuid,
+    dag: Arc<rappel::rappel_core::dag::DAG>,
     initial_context: Option<proto::WorkflowArguments>,
 ) -> Result<QueuedInstance, String> {
-    let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
+    let mut state = RunnerState::new(Some(Arc::clone(&dag)), None, None, false);
 
     if let Some(context) = initial_context {
         let inputs = workflow_arguments_to_json_map(&context);
@@ -1061,7 +1159,8 @@ fn build_queued_instance(
         .map_err(|err| err.0)?;
 
     Ok(QueuedInstance {
-        dag,
+        workflow_version_id,
+        dag: None,
         entry_node: entry_exec.node_id,
         state: Some(state),
         action_results: HashMap::new(),

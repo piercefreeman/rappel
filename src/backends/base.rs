@@ -1,6 +1,7 @@
 //! Backend interfaces for persisting runner state and action results.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -51,7 +52,9 @@ where
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Queued instance payload for the run loop.
 pub struct QueuedInstance {
-    pub dag: DAG,
+    pub workflow_version_id: Uuid,
+    #[serde(skip, default)]
+    pub dag: Option<Arc<DAG>>,
     pub entry_node: Uuid,
     pub state: Option<RunnerState>,
     #[serde(
@@ -214,7 +217,19 @@ pub trait CoreBackend: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct WorkflowRegistration {
     pub workflow_name: String,
-    pub dag_hash: String,
+    pub workflow_version: String,
+    pub ir_hash: String,
+    pub program_proto: Vec<u8>,
+    pub concurrent: bool,
+}
+
+#[derive(Clone, Debug)]
+/// Stored workflow version metadata and IR payload.
+pub struct WorkflowVersion {
+    pub id: Uuid,
+    pub workflow_name: String,
+    pub workflow_version: String,
+    pub ir_hash: String,
     pub program_proto: Vec<u8>,
     pub concurrent: bool,
 }
@@ -226,6 +241,8 @@ pub trait WorkflowRegistryBackend: Send + Sync {
         &self,
         registration: &WorkflowRegistration,
     ) -> BackendResult<Uuid>;
+
+    async fn get_workflow_versions(&self, ids: &[Uuid]) -> BackendResult<Vec<WorkflowVersion>>;
 }
 
 /// Backend capability for workflow schedule persistence.

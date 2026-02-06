@@ -102,7 +102,7 @@ struct RetryPolicyEvaluator<'a> {
 /// downstream through inline nodes (assignments, branches, joins, etc.), and
 /// returns any newly queued action nodes that are now unblocked.
 pub struct RunnerExecutor {
-    dag: DAG,
+    dag: Arc<DAG>,
     state: RunnerState,
     action_results: ExecutionResultMap,
     backend: Option<Arc<dyn CoreBackend>>,
@@ -118,7 +118,7 @@ pub struct RunnerExecutor {
 
 impl RunnerExecutor {
     pub fn new(
-        dag: DAG,
+        dag: Arc<DAG>,
         state: RunnerState,
         // Action results keyed by execution node id.
         action_results: ExecutionResultMap,
@@ -1223,6 +1223,7 @@ fn exception_type(value: &Value) -> Option<&str> {
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     use crate::messages::ast as ir;
     use crate::rappel_core::dag::{
@@ -1347,13 +1348,13 @@ mod tests {
     }
 
     fn create_rehydrated_executor(
-        dag: &DAG,
+        dag: &Arc<DAG>,
         nodes: HashMap<Uuid, ExecutionNode>,
         edges: HashSet<ExecutionEdge>,
         action_results: HashMap<Uuid, Value>,
     ) -> RunnerExecutor {
-        let state = RunnerState::new(Some(dag.clone()), Some(nodes), Some(edges), false);
-        RunnerExecutor::new(dag.clone(), state, action_results, None)
+        let state = RunnerState::new(Some(Arc::clone(dag)), Some(nodes), Some(edges), false);
+        RunnerExecutor::new(Arc::clone(dag), state, action_results, None)
     }
 
     fn compare_executor_states(original: &RunnerExecutor, rehydrated: &RunnerExecutor) {
@@ -1421,6 +1422,7 @@ mod tests {
             action_next.id.clone(),
         ));
 
+        let dag = Arc::new(dag);
         let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
         let start_exec = state
             .queue_template_node(&action_start.id, None)
@@ -1469,6 +1471,7 @@ mod tests {
             action2.id.clone(),
         ));
 
+        let dag = Arc::new(dag);
         let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
         let exec1 = state.queue_template_node(&action1.id, None).expect("queue");
         let executor = RunnerExecutor::new(dag.clone(), state, HashMap::new(), None);
@@ -1511,6 +1514,7 @@ mod tests {
             action2.id.clone(),
         ));
 
+        let dag = Arc::new(dag);
         let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
         let exec1 = state.queue_template_node(&action1.id, None).expect("queue");
 
@@ -1577,6 +1581,7 @@ mod tests {
             action3.id.clone(),
         ));
 
+        let dag = Arc::new(dag);
         let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
         let exec1 = state.queue_template_node(&action1.id, None).expect("queue");
         let mut executor = RunnerExecutor::new(dag.clone(), state, HashMap::new(), None);
@@ -1663,6 +1668,7 @@ mod tests {
             action2.id.clone(),
         ));
 
+        let dag = Arc::new(dag);
         let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
         let exec1 = state.queue_template_node(&action1.id, None).expect("queue");
 
@@ -1718,6 +1724,7 @@ mod tests {
         dag.add_node(crate::rappel_core::dag::DAGNode::ActionCall(
             action1.clone(),
         ));
+        let dag = Arc::new(dag);
         let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
         let exec1 = state.queue_template_node(&action1.id, None).expect("queue");
         let executor = RunnerExecutor::new(dag.clone(), state, HashMap::new(), None);
@@ -1766,6 +1773,7 @@ mod tests {
             action2.id.clone(),
         ));
 
+        let dag = Arc::new(dag);
         let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
         let exec1 = state.queue_template_node(&action1.id, None).expect("queue");
 
@@ -1809,6 +1817,7 @@ mod tests {
             action1.clone(),
         ));
 
+        let dag = Arc::new(dag);
         let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
         let exec1 = state.queue_template_node(&action1.id, None).expect("queue");
         state.mark_running(exec1.node_id).expect("mark running");
@@ -1860,6 +1869,7 @@ mod tests {
             assign.id.clone(),
         ));
 
+        let dag = Arc::new(dag);
         let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
         let exec1 = state.queue_template_node(&action1.id, None).expect("queue");
 
@@ -1933,6 +1943,7 @@ mod tests {
             aggregator.id.clone(),
         ));
 
+        let dag = Arc::new(dag);
         let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
         let initial_exec = state
             .queue_template_node(&initial_action.id, None)
@@ -2014,6 +2025,7 @@ mod tests {
             aggregator.id.clone(),
         ));
 
+        let dag = Arc::new(dag);
         let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
         let initial_exec = state
             .queue_template_node(&initial_action.id, None)
@@ -2084,6 +2096,7 @@ mod tests {
             ));
         }
 
+        let dag = Arc::new(dag);
         let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
         let mut exec_nodes: Vec<ExecutionNode> = Vec::new();
         exec_nodes.push(
@@ -2148,6 +2161,7 @@ mod tests {
             action2.id.clone(),
         ));
 
+        let dag = Arc::new(dag);
         let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
         let exec1 = state.queue_template_node(&action1.id, None).expect("queue");
 

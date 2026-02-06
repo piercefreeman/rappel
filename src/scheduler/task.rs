@@ -14,7 +14,13 @@ use super::types::{ScheduleId, WorkflowSchedule};
 use crate::backends::{CoreBackend, QueuedInstance, SchedulerBackend};
 use crate::rappel_core::dag::DAG;
 
-type DagResolver = Arc<dyn Fn(&str) -> Option<DAG> + Send + Sync>;
+#[derive(Clone)]
+pub struct WorkflowDag {
+    pub version_id: Uuid,
+    pub dag: Arc<DAG>,
+}
+
+pub type DagResolver = Arc<dyn Fn(&str) -> Option<WorkflowDag> + Send + Sync>;
 
 /// Configuration for the scheduler task.
 #[derive(Debug, Clone)]
@@ -147,8 +153,13 @@ where
         }
 
         // Get the DAG for this workflow
-        let dag = (self.dag_resolver)(&schedule.workflow_name)
-            .ok_or_else(|| format!("no DAG found for workflow: {}", schedule.workflow_name))?;
+        let workflow = (self.dag_resolver)(&schedule.workflow_name).ok_or_else(|| {
+            format!(
+                "no workflow version found for workflow: {}",
+                schedule.workflow_name
+            )
+        })?;
+        let dag = workflow.dag;
 
         // Find the entry node
         let entry_node_str = dag
@@ -157,7 +168,7 @@ where
             .ok_or_else(|| "DAG has no entry node".to_string())?;
 
         let mut state =
-            crate::rappel_core::runner::RunnerState::new(Some(dag.clone()), None, None, false);
+            crate::rappel_core::runner::RunnerState::new(Some(Arc::clone(&dag)), None, None, false);
         let entry_exec = state
             .queue_template_node(entry_node_str, None)
             .map_err(|err| err.0)?;
@@ -165,7 +176,8 @@ where
         // Create a queued instance
         let instance_id = Uuid::new_v4();
         let queued = QueuedInstance {
-            dag,
+            workflow_version_id: workflow.version_id,
+            dag: None,
             entry_node: entry_exec.node_id,
             state: Some(state),
             action_results: HashMap::new(),

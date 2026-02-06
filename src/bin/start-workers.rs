@@ -42,14 +42,14 @@ use rappel::backends::PostgresBackend;
 use rappel::config::WorkerConfig;
 use rappel::db;
 use rappel::messages::ast as ir;
-use rappel::rappel_core::dag::{DAG, convert_to_dag};
+use rappel::rappel_core::dag::convert_to_dag;
 use rappel::rappel_core::runloop::{RunLoopSupervisorConfig, runloop_supervisor};
+use rappel::scheduler::{DagResolver, WorkflowDag};
 use rappel::{
     PythonWorkerConfig, RemoteWorkerPool, WebappServer, spawn_scheduler, spawn_status_reporter,
 };
 use uuid::Uuid;
 
-type DagResolver = Arc<dyn Fn(&str) -> Option<DAG> + Send + Sync>;
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
@@ -186,7 +186,7 @@ fn build_dag_resolver(pool: sqlx::PgPool) -> DagResolver {
             handle.block_on(async move {
                 let row = sqlx::query(
                     r#"
-                    SELECT program_proto
+                    SELECT id, program_proto
                     FROM workflow_versions
                     WHERE workflow_name = $1
                     ORDER BY created_at DESC
@@ -198,9 +198,14 @@ fn build_dag_resolver(pool: sqlx::PgPool) -> DagResolver {
                 .await
                 .ok()??;
 
+                let version_id: Uuid = row.get("id");
                 let payload: Vec<u8> = row.get("program_proto");
                 let program = ir::Program::decode(&payload[..]).ok()?;
-                convert_to_dag(&program).ok()
+                let dag = convert_to_dag(&program).ok()?;
+                Some(WorkflowDag {
+                    version_id,
+                    dag: Arc::new(dag),
+                })
             })
         })
     })

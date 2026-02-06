@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -296,7 +297,8 @@ pub struct ExecutionEdge {
 /// incremental `results` value by following data-flow edges.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunnerState {
-    pub dag: Option<DAG>,
+    #[serde(skip, default)]
+    pub dag: Option<Arc<DAG>>,
     pub nodes: HashMap<Uuid, ExecutionNode>,
     pub edges: HashSet<ExecutionEdge>,
     pub ready_queue: Vec<Uuid>,
@@ -308,7 +310,7 @@ pub struct RunnerState {
 
 impl RunnerState {
     pub fn new(
-        dag: Option<DAG>,
+        dag: Option<Arc<DAG>>,
         nodes: Option<HashMap<Uuid, ExecutionNode>>,
         edges: Option<HashSet<ExecutionEdge>>,
         link_queued_nodes: bool,

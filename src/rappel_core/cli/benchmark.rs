@@ -2,15 +2,20 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use prost::Message;
 use rand::seq::SliceRandom;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::backends::{PostgresBackend, QueuedInstance};
+use crate::backends::{
+    PostgresBackend, QueuedInstance, WorkflowRegistration, WorkflowRegistryBackend,
+};
 use crate::db;
 use crate::messages::ast as ir;
 use crate::observability::obs;
@@ -18,7 +23,7 @@ use crate::rappel_core::cli::smoke::{
     build_control_flow_program, build_parallel_spread_program, build_program,
     build_try_except_program, build_while_loop_program, literal_from_value,
 };
-use crate::rappel_core::dag::{DAG, convert_to_dag};
+use crate::rappel_core::dag::convert_to_dag;
 use crate::rappel_core::runloop::{RunLoop, RunLoopSupervisorConfig};
 use crate::rappel_core::runner::RunnerState;
 use crate::workers::{ActionCallable, InlineWorkerPool, WorkerPoolError};
@@ -81,8 +86,10 @@ fn action_registry() -> HashMap<String, ActionCallable> {
 
 #[derive(Clone)]
 struct BenchmarkCase {
-    dag: DAG,
+    dag: Arc<crate::rappel_core::dag::DAG>,
     inputs: HashMap<String, Value>,
+    program_proto: Vec<u8>,
+    ir_hash: String,
 }
 
 fn build_cases(base: i64) -> HashMap<String, BenchmarkCase> {
@@ -120,14 +127,24 @@ fn build_cases(base: i64) -> HashMap<String, BenchmarkCase> {
     ];
 
     for (name, program, inputs) in entries {
-        let dag = convert_to_dag(&program).expect("convert to dag");
-        cases.insert(name.to_string(), BenchmarkCase { dag, inputs });
+        let program_proto = program.encode_to_vec();
+        let ir_hash = format!("{:x}", Sha256::digest(&program_proto));
+        let dag = Arc::new(convert_to_dag(&program).expect("convert to dag"));
+        cases.insert(
+            name.to_string(),
+            BenchmarkCase {
+                dag,
+                inputs,
+                program_proto,
+                ir_hash,
+            },
+        );
     }
     cases
 }
 
-fn build_instance(case: &BenchmarkCase) -> QueuedInstance {
-    let mut state = RunnerState::new(Some(case.dag.clone()), None, None, false);
+fn build_instance(case: &BenchmarkCase, workflow_version_id: Uuid) -> QueuedInstance {
+    let mut state = RunnerState::new(Some(Arc::clone(&case.dag)), None, None, false);
     for (name, value) in &case.inputs {
         let expr = literal_from_value(value);
         let label = format!("input {name} = {value}");
@@ -144,7 +161,8 @@ fn build_instance(case: &BenchmarkCase) -> QueuedInstance {
         .queue_template_node(&entry, None)
         .expect("queue entry node");
     QueuedInstance {
-        dag: case.dag.clone(),
+        workflow_version_id,
+        dag: None,
         entry_node: entry_exec.node_id,
         state: Some(state),
         action_results: HashMap::new(),
@@ -159,6 +177,22 @@ async fn queue_benchmark_instances(
     count_per_case: usize,
     batch_size: usize,
 ) -> usize {
+    let mut version_ids = HashMap::new();
+    for (name, case) in cases {
+        let registration = WorkflowRegistration {
+            workflow_name: name.clone(),
+            workflow_version: case.ir_hash.clone(),
+            ir_hash: case.ir_hash.clone(),
+            program_proto: case.program_proto.clone(),
+            concurrent: false,
+        };
+        let version_id = backend
+            .upsert_workflow_version(&registration)
+            .await
+            .expect("register workflow version");
+        version_ids.insert(name.clone(), version_id);
+    }
+
     let mut case_names = Vec::new();
     for name in cases.keys() {
         for _ in 0..count_per_case {
@@ -170,7 +204,9 @@ async fn queue_benchmark_instances(
     let mut queued = 0;
     let mut batch = Vec::new();
     for name in case_names {
-        batch.push(build_instance(cases.get(&name).expect("case")));
+        let case = cases.get(&name).expect("case");
+        let version_id = *version_ids.get(&name).expect("workflow version");
+        batch.push(build_instance(case, version_id));
         if batch.len() >= batch_size {
             backend
                 .queue_instances(&batch)

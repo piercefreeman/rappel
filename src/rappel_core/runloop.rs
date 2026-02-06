@@ -10,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use prost::Message;
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc, watch};
 use tracing::{error, warn};
@@ -17,10 +18,11 @@ use uuid::Uuid;
 
 use crate::backends::{
     ActionDone, BackendError, CoreBackend, GraphUpdate, InstanceDone, InstanceLockStatus,
-    LockClaim, QueuedInstance, QueuedInstanceBatch,
+    LockClaim, QueuedInstance, QueuedInstanceBatch, WorkflowRegistryBackend,
 };
+use crate::messages::ast as ir;
 use crate::observability::obs;
-use crate::rappel_core::dag::{DAG, DAGNode, OutputNode, ReturnNode};
+use crate::rappel_core::dag::{DAG, DAGNode, OutputNode, ReturnNode, convert_to_dag};
 use crate::rappel_core::lock::{InstanceLockTracker, spawn_lock_heartbeat};
 use crate::rappel_core::runner::{
     DurableUpdates, ExecutorStep, RunnerExecutor, RunnerExecutorError, SleepRequest,
@@ -229,8 +231,20 @@ fn run_executor_shard(
                             continue;
                         }
                     };
+                    let dag = match instance.dag {
+                        Some(dag) => dag,
+                        None => {
+                            send_error(
+                                RunLoopError::Message(
+                                    "queued instance missing workflow DAG".to_string(),
+                                ),
+                                &sender,
+                            );
+                            continue;
+                        }
+                    };
                     let mut executor = RunnerExecutor::new(
-                        instance.dag,
+                        dag,
                         state,
                         instance.action_results,
                         Some(backend.clone()),
@@ -334,7 +348,9 @@ fn run_executor_shard(
 /// Run loop that fans out executor work across CPU-bound shard threads.
 pub struct RunLoop {
     worker_pool: Arc<dyn BaseWorkerPool>,
-    backend: Arc<dyn CoreBackend>,
+    core_backend: Arc<dyn CoreBackend>,
+    registry_backend: Arc<dyn WorkflowRegistryBackend>,
+    workflow_cache: HashMap<Uuid, Arc<DAG>>,
     max_concurrent_instances: usize,
     instance_done_batch_size: usize,
     poll_interval: Duration,
@@ -362,13 +378,18 @@ pub struct RunLoopSupervisorConfig {
 impl RunLoop {
     pub fn new(
         worker_pool: impl BaseWorkerPool + 'static,
-        backend: impl CoreBackend + 'static,
+        backend: impl CoreBackend + WorkflowRegistryBackend + 'static,
         config: RunLoopSupervisorConfig,
     ) -> Self {
         let max_concurrent_instances = std::cmp::max(1, config.max_concurrent_instances);
+        let backend = Arc::new(backend);
+        let core_backend: Arc<dyn CoreBackend> = backend.clone();
+        let registry_backend: Arc<dyn WorkflowRegistryBackend> = backend;
         Self {
             worker_pool: Arc::new(worker_pool),
-            backend: Arc::new(backend),
+            core_backend,
+            registry_backend,
+            workflow_cache: HashMap::new(),
             max_concurrent_instances,
             instance_done_batch_size: std::cmp::max(
                 1,
@@ -413,6 +434,53 @@ impl RunLoop {
             .collect()
     }
 
+    async fn hydrate_instances(
+        &mut self,
+        instances: &mut [QueuedInstance],
+    ) -> Result<(), RunLoopError> {
+        let mut missing = Vec::new();
+        for instance in instances.iter() {
+            if !self
+                .workflow_cache
+                .contains_key(&instance.workflow_version_id)
+            {
+                missing.push(instance.workflow_version_id);
+            }
+        }
+        missing.sort();
+        missing.dedup();
+
+        if !missing.is_empty() {
+            let versions = self
+                .registry_backend
+                .get_workflow_versions(&missing)
+                .await
+                .map_err(RunLoopError::Backend)?;
+            for version in versions {
+                let program = ir::Program::decode(&version.program_proto[..])
+                    .map_err(|err| RunLoopError::Message(format!("invalid workflow IR: {err}")))?;
+                let dag = convert_to_dag(&program)
+                    .map_err(|err| RunLoopError::Message(format!("invalid workflow DAG: {err}")))?;
+                self.workflow_cache.insert(version.id, Arc::new(dag));
+            }
+        }
+
+        for instance in instances.iter_mut() {
+            let dag = self
+                .workflow_cache
+                .get(&instance.workflow_version_id)
+                .ok_or_else(|| {
+                    RunLoopError::Message(format!(
+                        "workflow version not found: {}",
+                        instance.workflow_version_id
+                    ))
+                })?;
+            instance.dag = Some(Arc::clone(dag));
+        }
+
+        Ok(())
+    }
+
     async fn persist_shard_steps(
         &self,
         steps: &[ShardStep],
@@ -433,11 +501,11 @@ impl RunLoop {
             return Ok(Vec::new());
         }
         if !actions_done.is_empty() {
-            self.backend.save_actions_done(&actions_done).await?;
+            self.core_backend.save_actions_done(&actions_done).await?;
         }
         if !graph_updates.is_empty() {
             return Ok(self
-                .backend
+                .core_backend
                 .save_graphs(self.lock_uuid, &graph_updates)
                 .await?);
         }
@@ -452,7 +520,7 @@ impl RunLoop {
             return Ok(());
         }
         let batch = std::mem::take(pending);
-        self.backend.save_instances_done(&batch).await?;
+        self.core_backend.save_instances_done(&batch).await?;
         Ok(())
     }
 
@@ -483,7 +551,7 @@ impl RunLoop {
                 let _ = sender.send(ShardCommand::Evict(ids));
             }
         }
-        self.backend
+        self.core_backend
             .release_instance_locks(self.lock_uuid, instance_ids)
             .await?;
         Ok(())
@@ -500,7 +568,7 @@ impl RunLoop {
 
         for shard_id in 0..self.shard_count {
             let (cmd_tx, cmd_rx) = std_mpsc::channel();
-            let backend = self.backend.clone();
+            let backend = self.core_backend.clone();
             let event_tx = event_tx.clone();
             let handle = thread::Builder::new()
                 .name(format!("rappel-executor-{shard_id}"))
@@ -524,7 +592,7 @@ impl RunLoop {
         let stop_notify = Arc::new(Notify::new());
         let lock_tracker = InstanceLockTracker::new(self.lock_uuid);
         let lock_handle = spawn_lock_heartbeat(
-            self.backend.clone(),
+            self.core_backend.clone(),
             lock_tracker.clone(),
             self.lock_heartbeat,
             self.lock_ttl,
@@ -556,7 +624,7 @@ impl RunLoop {
             completion_notify.notify_waiters();
         });
 
-        let backend = self.backend.clone();
+        let backend = self.core_backend.clone();
         let poll_interval = self.poll_interval;
         let max_concurrent_instances = self.max_concurrent_instances;
         let lock_uuid = self.lock_uuid;
@@ -802,6 +870,10 @@ impl RunLoop {
             let had_instances = !all_instances.is_empty();
             if had_instances {
                 instances_idle = false;
+                if let Err(err) = self.hydrate_instances(&mut all_instances).await {
+                    run_result = Err(err);
+                    break;
+                }
                 let mut by_shard: HashMap<usize, Vec<QueuedInstance>> = HashMap::new();
                 let mut claimed_instance_ids = Vec::with_capacity(all_instances.len());
                 for instance in all_instances {
@@ -1004,7 +1076,7 @@ pub async fn runloop_supervisor<B, W>(
     config: RunLoopSupervisorConfig,
     shutdown_rx: watch::Receiver<bool>,
 ) where
-    B: CoreBackend + Clone + Send + Sync + 'static,
+    B: CoreBackend + WorkflowRegistryBackend + Clone + Send + Sync + 'static,
     W: BaseWorkerPool + Clone + Send + Sync + 'static,
 {
     let mut backoff = Duration::from_millis(200);
@@ -1133,59 +1205,29 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use crate::backends::MemoryBackend;
+    use prost::Message;
+    use sha2::{Digest, Sha256};
+
+    use crate::backends::{MemoryBackend, WorkflowRegistration, WorkflowRegistryBackend};
     use crate::messages::ast as ir;
-    use crate::rappel_core::dag::{
-        ActionCallNode, ActionCallParams, DAGEdge, DAGNode, InputNode, OutputNode,
-    };
+    use crate::rappel_core::dag::convert_to_dag;
+    use crate::rappel_core::ir_parser::parse_program;
     use crate::rappel_core::runner::RunnerState;
     use crate::workers::ActionCallable;
 
     #[tokio::test]
     async fn test_runloop_executes_actions() {
-        let mut dag = DAG::default();
-        let input_node = InputNode::new("input", vec!["x".to_string()], Some("main".to_string()));
-        let action_node = ActionCallNode::new(
-            "action",
-            "double",
-            ActionCallParams {
-                module_name: None,
-                kwargs: HashMap::new(),
-                kwarg_exprs: HashMap::from([(
-                    "value".to_string(),
-                    ir::Expr {
-                        kind: Some(ir::expr::Kind::Variable(ir::Variable {
-                            name: "x".to_string(),
-                        })),
-                        span: None,
-                    },
-                )]),
-                policies: Vec::new(),
-                targets: Some(vec!["y".to_string()]),
-                target: None,
-                parallel_index: None,
-                aggregates_to: None,
-                spread_loop_var: None,
-                spread_collection_expr: None,
-                function_name: Some("main".to_string()),
-            },
-        );
-        let output_node =
-            OutputNode::new("output", vec!["y".to_string()], Some("main".to_string()));
+        let source = r#"
+fn main(input: [x], output: [y]):
+    y = @tests.fixtures.test_actions.double(value=x)
+    return y
+"#;
+        let program = parse_program(source.trim()).expect("parse program");
+        let program_proto = program.encode_to_vec();
+        let ir_hash = format!("{:x}", Sha256::digest(&program_proto));
+        let dag = Arc::new(convert_to_dag(&program).expect("convert to dag"));
 
-        dag.add_node(DAGNode::Input(input_node.clone()));
-        dag.add_node(DAGNode::ActionCall(action_node.clone()));
-        dag.add_node(DAGNode::Output(output_node.clone()));
-        dag.add_edge(DAGEdge::state_machine(
-            input_node.id.clone(),
-            action_node.id.clone(),
-        ));
-        dag.add_edge(DAGEdge::state_machine(
-            action_node.id.clone(),
-            output_node.id.clone(),
-        ));
-
-        let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
+        let mut state = RunnerState::new(Some(Arc::clone(&dag)), None, None, false);
         let _ = state
             .record_assignment(
                 vec!["x".to_string()],
@@ -1199,12 +1241,27 @@ mod tests {
                 Some("input x = 4".to_string()),
             )
             .expect("record assignment");
+        let entry_node = dag
+            .entry_node
+            .as_ref()
+            .expect("DAG entry node not found")
+            .clone();
         let entry_exec = state
-            .queue_template_node(&input_node.id, None)
+            .queue_template_node(&entry_node, None)
             .expect("queue entry node");
 
         let queue = Arc::new(Mutex::new(VecDeque::new()));
         let backend = MemoryBackend::with_queue(queue.clone());
+        let workflow_version_id = backend
+            .upsert_workflow_version(&WorkflowRegistration {
+                workflow_name: "test".to_string(),
+                workflow_version: ir_hash.clone(),
+                ir_hash,
+                program_proto,
+                concurrent: false,
+            })
+            .await
+            .expect("register workflow version");
 
         let mut actions: HashMap<String, ActionCallable> = HashMap::new();
         actions.insert(
@@ -1237,7 +1294,8 @@ mod tests {
             },
         );
         queue.lock().expect("queue lock").push_back(QueuedInstance {
-            dag: dag.clone(),
+            workflow_version_id,
+            dag: None,
             entry_node: entry_exec.node_id,
             state: Some(state),
             action_results: HashMap::new(),

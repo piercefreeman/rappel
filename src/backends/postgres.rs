@@ -23,7 +23,7 @@ use super::base::{
     ActionDone, BackendError, BackendResult, CoreBackend, GraphUpdate, InstanceDone,
     InstanceLockStatus, LockClaim, QueuedInstance, QueuedInstanceBatch, SchedulerBackend,
     WebappBackend, WorkerStatusBackend, WorkerStatusUpdate, WorkflowRegistration,
-    WorkflowRegistryBackend,
+    WorkflowRegistryBackend, WorkflowVersion,
 };
 
 /// Persist runner state and action results in Postgres.
@@ -466,7 +466,7 @@ impl PostgresBackend {
             if let Some(state_payload) = state_payload {
                 let graph: GraphUpdate = Self::deserialize(&state_payload)?;
                 instance.state = Some(RunnerState::new(
-                    Some(instance.dag.clone()),
+                    None,
                     Some(graph.nodes),
                     Some(graph.edges),
                     false,
@@ -625,24 +625,80 @@ impl WorkflowRegistryBackend for PostgresBackend {
         &self,
         registration: &WorkflowRegistration,
     ) -> BackendResult<Uuid> {
-        let row = sqlx::query(
+        let inserted = sqlx::query(
             r#"
-            INSERT INTO workflow_versions (workflow_name, dag_hash, program_proto, concurrent)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (workflow_name, dag_hash)
-            DO UPDATE SET program_proto = EXCLUDED.program_proto, concurrent = EXCLUDED.concurrent
+            INSERT INTO workflow_versions
+                (workflow_name, workflow_version, ir_hash, program_proto, concurrent)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (workflow_name, workflow_version)
+            DO NOTHING
             RETURNING id
             "#,
         )
         .bind(&registration.workflow_name)
-        .bind(&registration.dag_hash)
+        .bind(&registration.workflow_version)
+        .bind(&registration.ir_hash)
         .bind(&registration.program_proto)
         .bind(registration.concurrent)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(row) = inserted {
+            let id: Uuid = row.get("id");
+            return Ok(id);
+        }
+
+        let row = sqlx::query(
+            r#"
+            SELECT id, ir_hash
+            FROM workflow_versions
+            WHERE workflow_name = $1 AND workflow_version = $2
+            "#,
+        )
+        .bind(&registration.workflow_name)
+        .bind(&registration.workflow_version)
         .fetch_one(&self.pool)
         .await?;
 
         let id: Uuid = row.get("id");
+        let existing_hash: String = row.get("ir_hash");
+        if existing_hash != registration.ir_hash {
+            return Err(BackendError::Message(format!(
+                "workflow version already exists with different IR hash: {}@{}",
+                registration.workflow_name, registration.workflow_version
+            )));
+        }
+
         Ok(id)
+    }
+
+    async fn get_workflow_versions(&self, ids: &[Uuid]) -> BackendResult<Vec<WorkflowVersion>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT id, workflow_name, workflow_version, ir_hash, program_proto, concurrent
+            FROM workflow_versions
+            WHERE id = ANY($1)
+            "#,
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut versions = Vec::with_capacity(rows.len());
+        for row in rows {
+            versions.push(WorkflowVersion {
+                id: row.get("id"),
+                workflow_name: row.get("workflow_name"),
+                workflow_version: row.get("workflow_version"),
+                ir_hash: row.get("ir_hash"),
+                program_proto: row.get("program_proto"),
+                concurrent: row.get("concurrent"),
+            });
+        }
+        Ok(versions)
     }
 }
 
