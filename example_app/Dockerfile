@@ -68,7 +68,6 @@ COPY python /repo/python
 COPY scripts /repo/scripts
 COPY templates /repo/templates
 COPY migrations /repo/migrations
-COPY tests/fixtures/benchmark_workflow.py /repo/tests/fixtures/benchmark_workflow.py
 
 # Build - only recompiles your code, not dependencies
 RUN --mount=type=cache,target=/root/.cargo/registry \
