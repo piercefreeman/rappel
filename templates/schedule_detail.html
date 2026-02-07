@@ -132,9 +132,7 @@
                                 <td class="px-4 py-3 text-zinc-700 dark:text-zinc-300">{{ macros::datetime(timestamp=invocation.created_at) }}</td>
                                 <td class="px-4 py-3">{{ macros::status_badge(status=invocation.status) }}</td>
                                 <td class="px-4 py-3 text-right">
-                                    {% if invocation.workflow_version_id %}
-                                        <a href="/workflows/{{ invocation.workflow_version_id }}/run/{{ invocation.id }}" class="text-sm font-semibold text-indigo-600 dark:text-indigo-400 transition hover:text-indigo-500 dark:hover:text-indigo-300">View &rarr;</a>
-                                    {% endif %}
+                                    <a href="/instance/{{ invocation.id }}" class="text-sm font-semibold text-indigo-600 dark:text-indigo-400 transition hover:text-indigo-500 dark:hover:text-indigo-300">View &rarr;</a>
                                 </td>
                             </tr>
                         {% endfor %}

@@ -12,8 +12,8 @@ use crate::waymark_core::runner::state::{ActionCallSpec, ExecutionNode, NodeStat
 use crate::waymark_core::runner::{RunnerState, ValueExpr, format_value, replay_action_kwargs};
 use crate::webapp::{
     ExecutionEdgeView, ExecutionGraphView, ExecutionNodeView, InstanceDetail, InstanceStatus,
-    InstanceSummary, ScheduleDetail, ScheduleSummary, TimelineEntry, WorkerActionRow,
-    WorkerAggregateStats, WorkerStatus,
+    InstanceSummary, ScheduleDetail, ScheduleInvocationSummary, ScheduleSummary, TimelineEntry,
+    WorkerActionRow, WorkerAggregateStats, WorkerStatus,
 };
 
 #[async_trait]
@@ -419,6 +419,57 @@ impl WebappBackend for PostgresBackend {
             allow_duplicate: row.get("allow_duplicate"),
             input_payload,
         })
+    }
+
+    async fn count_schedule_invocations(&self, schedule_id: Uuid) -> BackendResult<i64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM runner_instances
+            WHERE schedule_id = $1
+            "#,
+        )
+        .bind(schedule_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    async fn list_schedule_invocations(
+        &self,
+        schedule_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> BackendResult<Vec<ScheduleInvocationSummary>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT instance_id, created_at, state, result, error
+            FROM runner_instances
+            WHERE schedule_id = $1
+            ORDER BY created_at DESC, instance_id DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(schedule_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut invocations = Vec::with_capacity(rows.len());
+        for row in rows {
+            let state_bytes: Option<Vec<u8>> = row.get("state");
+            let result_bytes: Option<Vec<u8>> = row.get("result");
+            let error_bytes: Option<Vec<u8>> = row.get("error");
+
+            invocations.push(ScheduleInvocationSummary {
+                id: row.get("instance_id"),
+                created_at: row.get("created_at"),
+                status: determine_status(&state_bytes, &result_bytes, &error_bytes),
+            });
+        }
+
+        Ok(invocations)
     }
 
     async fn update_schedule_status(&self, schedule_id: Uuid, status: &str) -> BackendResult<bool> {
@@ -888,7 +939,7 @@ fn format_node_status(status: &NodeStatus) -> String {
 mod tests {
     use std::collections::{HashMap, HashSet};
 
-    use chrono::Utc;
+    use chrono::{Duration as ChronoDuration, Utc};
     use serial_test::serial;
     use uuid::Uuid;
 
@@ -1131,6 +1182,45 @@ mod tests {
         .0
     }
 
+    async fn insert_scheduled_instance(
+        backend: &PostgresBackend,
+        schedule_id: Uuid,
+        created_at: DateTime<Utc>,
+        with_result: bool,
+    ) -> Uuid {
+        let instance_id = Uuid::new_v4();
+        let entry_node = Uuid::new_v4();
+        let execution_id = Uuid::new_v4();
+        let workflow_version_id = insert_workflow_version(backend, "tests.workflow").await;
+        let graph = sample_graph(instance_id, execution_id);
+        let state_payload = rmp_serde::to_vec_named(&graph).expect("encode graph update");
+        let result_payload = if with_result {
+            Some(
+                rmp_serde::to_vec_named(&serde_json::json!({"result": {"ok": true}}))
+                    .expect("encode result"),
+            )
+        } else {
+            None
+        };
+
+        sqlx::query(
+            "INSERT INTO runner_instances (instance_id, entry_node, workflow_version_id, schedule_id, created_at, state, result, error) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(instance_id)
+        .bind(entry_node)
+        .bind(workflow_version_id)
+        .bind(schedule_id)
+        .bind(created_at)
+        .bind(state_payload)
+        .bind(result_payload)
+        .bind(Option::<Vec<u8>>::None)
+        .execute(backend.pool())
+        .await
+        .expect("insert scheduled instance");
+
+        instance_id
+    }
+
     async fn insert_worker_status(backend: &PostgresBackend, pool_id: Uuid) {
         WorkerStatusBackend::upsert_worker_status(
             backend,
@@ -1337,6 +1427,45 @@ mod tests {
             .expect("get schedule");
         assert_eq!(schedule.id, schedule_id.to_string());
         assert_eq!(schedule.schedule_name, "detail");
+    }
+
+    #[serial(postgres)]
+    #[tokio::test]
+    async fn webapp_schedule_invocations_are_filtered_by_schedule_id() {
+        let backend = setup_backend().await;
+        let schedule_id = insert_schedule(&backend, "invocations-a").await;
+        let other_schedule_id = insert_schedule(&backend, "invocations-b").await;
+
+        let running_instance_id = insert_scheduled_instance(
+            &backend,
+            schedule_id,
+            Utc::now() - ChronoDuration::minutes(2),
+            false,
+        )
+        .await;
+        let completed_instance_id = insert_scheduled_instance(
+            &backend,
+            schedule_id,
+            Utc::now() - ChronoDuration::minutes(1),
+            true,
+        )
+        .await;
+        let _other_instance_id =
+            insert_scheduled_instance(&backend, other_schedule_id, Utc::now(), true).await;
+
+        let total = WebappBackend::count_schedule_invocations(&backend, schedule_id)
+            .await
+            .expect("count schedule invocations");
+        assert_eq!(total, 2);
+
+        let invocations = WebappBackend::list_schedule_invocations(&backend, schedule_id, 10, 0)
+            .await
+            .expect("list schedule invocations");
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[0].id, completed_instance_id);
+        assert_eq!(invocations[0].status, InstanceStatus::Completed);
+        assert_eq!(invocations[1].id, running_instance_id);
+        assert_eq!(invocations[1].status, InstanceStatus::Running);
     }
 
     #[serial(postgres)]

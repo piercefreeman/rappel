@@ -198,6 +198,7 @@ where
         let instance_id = Uuid::new_v4();
         let queued = QueuedInstance {
             workflow_version_id: workflow.version_id,
+            schedule_id: Some(schedule.id),
             dag: None,
             entry_node: entry_exec.node_id,
             state: Some(state),
@@ -403,6 +404,7 @@ fn main(input: [number], output: [result]):
         assert_eq!(batch.instances.len(), 1);
 
         let queued = &batch.instances[0];
+        assert_eq!(queued.schedule_id, Some(schedule.id));
         let state = queued.state.clone().expect("queued state");
         let mut executor =
             RunnerExecutor::new(Arc::clone(&dag), state, queued.action_results.clone(), None);

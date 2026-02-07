@@ -1514,6 +1514,7 @@ fn main(input: [x], output: [y]):
         );
         queue.lock().expect("queue lock").push_back(QueuedInstance {
             workflow_version_id,
+            schedule_id: None,
             dag: None,
             entry_node: entry_exec.node_id,
             state: Some(state),
@@ -1589,6 +1590,7 @@ fn main(input: [x], output: [y]):
         let instance_id = Uuid::new_v4();
         queue.lock().expect("queue lock").push_back(QueuedInstance {
             workflow_version_id,
+            schedule_id: None,
             dag: None,
             entry_node: entry_exec.node_id,
             state: Some(state),
@@ -1727,6 +1729,7 @@ fn main(input: [limit], output: [result]):
         );
         queue.lock().expect("queue lock").push_back(QueuedInstance {
             workflow_version_id,
+            schedule_id: None,
             dag: None,
             entry_node: entry_exec.node_id,
             state: Some(state),

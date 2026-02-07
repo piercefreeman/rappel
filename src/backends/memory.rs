@@ -16,7 +16,8 @@ use crate::scheduler::compute_next_run;
 use crate::scheduler::{CreateScheduleParams, ScheduleId, ScheduleType, WorkflowSchedule};
 use crate::webapp::{
     ExecutionGraphView, InstanceDetail, InstanceStatus, InstanceSummary, ScheduleDetail,
-    ScheduleSummary, TimelineEntry, WorkerActionRow, WorkerAggregateStats, WorkerStatus,
+    ScheduleInvocationSummary, ScheduleSummary, TimelineEntry, WorkerActionRow,
+    WorkerAggregateStats, WorkerStatus,
 };
 use tonic::async_trait;
 
@@ -629,6 +630,19 @@ impl WebappBackend for MemoryBackend {
             allow_duplicate: schedule.allow_duplicate,
             input_payload,
         })
+    }
+
+    async fn count_schedule_invocations(&self, _schedule_id: Uuid) -> BackendResult<i64> {
+        Ok(0)
+    }
+
+    async fn list_schedule_invocations(
+        &self,
+        _schedule_id: Uuid,
+        _limit: i64,
+        _offset: i64,
+    ) -> BackendResult<Vec<ScheduleInvocationSummary>> {
+        Ok(Vec::new())
     }
 
     async fn update_schedule_status(&self, schedule_id: Uuid, status: &str) -> BackendResult<bool> {

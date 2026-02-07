@@ -608,6 +608,7 @@ fn build_queued_instance(
 
     Ok(QueuedInstance {
         workflow_version_id,
+        schedule_id: None,
         dag: None,
         entry_node: entry_exec.node_id,
         state: Some(state),
