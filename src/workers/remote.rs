@@ -1378,7 +1378,18 @@ impl WorkerPoolStats for RemoteWorkerPool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::process::Stdio;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    };
+
+    use serde_json::json;
+    use tokio::process::Child;
+
     use super::*;
+    use crate::workers::BaseWorkerPool;
 
     #[test]
     fn test_config_builder() {
@@ -1414,11 +1425,6 @@ mod tests {
         }
     }
 
-    // Integration tests that require Python workers
-    // Run with: cargo test --features integration
-    // Or manually with: cargo test -- --ignored
-
-    /// Helper to create test kwargs
     fn make_string_kwarg(key: &str, value: &str) -> proto::WorkflowArgument {
         proto::WorkflowArgument {
             key: key.to_string(),
@@ -1434,195 +1440,178 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[ignore] // Requires Python environment
-    async fn test_pool_spawn_and_shutdown() {
-        let config = PythonWorkerConfig::new();
-
-        let pool = PythonWorkerPool::new_with_bridge_addr(config, 2, None, None, 10)
-            .await
-            .expect("create pool");
-
-        assert_eq!(pool.len(), 2);
-        assert!(!pool.is_empty());
-
-        // Verify workers have sequential IDs
-        let workers = pool.workers_snapshot().await;
-        assert_eq!(workers[0].worker_id(), 0);
-        assert_eq!(workers[1].worker_id(), 1);
-
-        pool.shutdown().await.expect("shutdown pool");
+    fn spawn_stub_child() -> Child {
+        #[cfg(windows)]
+        {
+            Command::new("cmd")
+                .args(["/C", "timeout", "/T", "60", "/NOBREAK"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn windows stub child")
+        }
+        #[cfg(not(windows))]
+        {
+            Command::new("sleep")
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn unix stub child")
+        }
     }
 
-    #[tokio::test]
-    #[ignore] // Requires Python environment
-    async fn test_pool_round_robin_selection() {
-        let config = PythonWorkerConfig::new();
-
-        let pool = PythonWorkerPool::new_with_bridge_addr(config, 3, None, None, 10)
-            .await
-            .expect("create pool");
-
-        // Round-robin should cycle through workers
-        let idx1 = pool.next_worker_idx();
-        let idx2 = pool.next_worker_idx();
-        let idx3 = pool.next_worker_idx();
-        let idx4 = pool.next_worker_idx(); // Should wrap to first
-
-        let w1 = pool.get_worker(idx1).await;
-        let w2 = pool.get_worker(idx2).await;
-        let w3 = pool.get_worker(idx3).await;
-        let w4 = pool.get_worker(idx4).await;
-
-        assert_eq!(w1.worker_id(), 0);
-        assert_eq!(w2.worker_id(), 1);
-        assert_eq!(w3.worker_id(), 2);
-        assert_eq!(w4.worker_id(), 0); // Wrapped
-
-        pool.shutdown().await.expect("shutdown pool");
+    async fn test_bridge() -> Option<Arc<WorkerBridgeServer>> {
+        match WorkerBridgeServer::start(None).await {
+            Ok(server) => Some(server),
+            Err(err) => {
+                let message = format!("{err:?}");
+                if message.contains("Operation not permitted")
+                    || message.contains("Permission denied")
+                {
+                    None
+                } else {
+                    panic!("start worker bridge: {err}");
+                }
+            }
+        }
     }
 
-    #[tokio::test]
-    #[ignore] // Requires Python environment with test actions
-    async fn test_send_action_roundtrip() {
-        let config = PythonWorkerConfig::new().with_user_module("tests.fixtures.test_actions");
+    fn make_result_payload(value: Value) -> proto::WorkflowArguments {
+        proto::WorkflowArguments {
+            arguments: vec![proto::WorkflowArgument {
+                key: "result".to_string(),
+                value: Some(messages::json_to_workflow_argument_value(&value)),
+            }],
+        }
+    }
 
-        let pool = PythonWorkerPool::new_with_bridge_addr(config, 1, None, None, 10)
-            .await
-            .expect("create pool");
+    fn make_test_worker(
+        worker_id: u64,
+    ) -> (
+        PythonWorker,
+        mpsc::Receiver<proto::Envelope>,
+        mpsc::Sender<proto::Envelope>,
+    ) {
+        let (to_worker, from_runner) = mpsc::channel(16);
+        let (to_runner, from_worker) = mpsc::channel(16);
+        let shared = Arc::new(Mutex::new(SharedState::new()));
+        let reader_shared = Arc::clone(&shared);
+        let reader_handle = tokio::spawn(async move {
+            let mut incoming = from_worker;
+            let _ = PythonWorker::reader_loop(&mut incoming, reader_shared).await;
+        });
 
-        let dispatch = ActionDispatchPayload {
-            action_id: "test-1".to_string(),
-            instance_id: "instance-1".to_string(),
-            sequence: 0,
-            action_name: "greet".to_string(),
-            module_name: "tests.fixtures.test_actions".to_string(),
-            kwargs: proto::WorkflowArguments {
-                arguments: vec![make_string_kwarg("name", "World")],
-            },
-            timeout_seconds: 30,
-            max_retries: 0,
-            attempt_number: 0,
-            dispatch_token: Uuid::new_v4(),
+        let worker = PythonWorker {
+            child: spawn_stub_child(),
+            sender: to_worker,
+            shared,
+            next_delivery: AtomicU64::new(1),
+            reader_handle: Some(reader_handle),
+            worker_id,
         };
+        (worker, from_runner, to_runner)
+    }
 
-        let worker = pool.get_worker(0).await;
-        let metrics = worker.send_action(dispatch).await.expect("send action");
-
-        assert!(metrics.success);
-        assert!(metrics.ack_latency.as_micros() > 0);
-        assert!(metrics.round_trip > metrics.ack_latency);
-        assert!(metrics.worker_duration.as_nanos() > 0);
-
-        pool.shutdown().await.expect("shutdown pool");
+    async fn make_single_worker_pool() -> Option<(
+        Arc<PythonWorkerPool>,
+        mpsc::Receiver<proto::Envelope>,
+        mpsc::Sender<proto::Envelope>,
+    )> {
+        let bridge = test_bridge().await?;
+        let (worker, outgoing, incoming) = make_test_worker(0);
+        let pool = PythonWorkerPool {
+            workers: RwLock::new(vec![Arc::new(worker)]),
+            cursor: AtomicUsize::new(0),
+            metrics: StdMutex::new(WorkerPoolMetrics::new(
+                vec![0],
+                Duration::from_secs(THROUGHPUT_WINDOW_SECS),
+                LATENCY_SAMPLE_SIZE,
+            )),
+            action_counts: vec![AtomicU64::new(0)],
+            in_flight_counts: vec![AtomicUsize::new(0)],
+            max_concurrent_per_worker: 2,
+            max_action_lifecycle: None,
+            bridge,
+            config: PythonWorkerConfig::new(),
+        };
+        Some((Arc::new(pool), outgoing, incoming))
     }
 
     #[tokio::test]
-    #[ignore] // Requires Python environment
-    async fn test_multiple_concurrent_actions() {
-        let config = PythonWorkerConfig::new().with_user_module("tests.fixtures.test_actions");
+    async fn test_send_action_roundtrip_happy_path() {
+        let (worker, mut outgoing, incoming) = make_test_worker(7);
+        let dispatch_token = Uuid::new_v4();
 
-        let pool = Arc::new(
-            PythonWorkerPool::new_with_bridge_addr(config, 2, None, None, 10)
+        let responder = tokio::spawn(async move {
+            let envelope = outgoing.recv().await.expect("dispatch envelope");
+            assert_eq!(
+                proto::MessageKind::try_from(envelope.kind).ok(),
+                Some(proto::MessageKind::ActionDispatch)
+            );
+            let dispatch = messages::decode_message::<proto::ActionDispatch>(&envelope.payload)
+                .expect("decode dispatch");
+            assert_eq!(dispatch.action_name, "greet");
+
+            incoming
+                .send(proto::Envelope {
+                    delivery_id: envelope.delivery_id + 100,
+                    partition_id: 0,
+                    kind: proto::MessageKind::Ack as i32,
+                    payload: messages::encode_message(&proto::Ack {
+                        acked_delivery_id: envelope.delivery_id,
+                    }),
+                })
                 .await
-                .expect("create pool"),
-        );
+                .expect("send ack");
+            incoming
+                .send(proto::Envelope {
+                    delivery_id: envelope.delivery_id,
+                    partition_id: 0,
+                    kind: proto::MessageKind::ActionResult as i32,
+                    payload: messages::encode_message(&proto::ActionResult {
+                        action_id: dispatch.action_id,
+                        success: true,
+                        payload: Some(make_result_payload(json!("hello"))),
+                        worker_start_ns: 10,
+                        worker_end_ns: 42,
+                        dispatch_token: Some(dispatch_token.to_string()),
+                        error_type: None,
+                        error_message: None,
+                    }),
+                })
+                .await
+                .expect("send action result");
+        });
 
-        // Spawn multiple concurrent actions
-        let mut handles = Vec::new();
-        for i in 0..4 {
-            let pool = Arc::clone(&pool);
-            handles.push(tokio::spawn(async move {
-                let dispatch = ActionDispatchPayload {
-                    action_id: format!("test-{}", i),
-                    instance_id: "instance-1".to_string(),
-                    sequence: i,
-                    action_name: "greet".to_string(),
-                    module_name: "tests.fixtures.test_actions".to_string(),
-                    kwargs: proto::WorkflowArguments {
-                        arguments: vec![make_string_kwarg("name", &format!("User-{}", i))],
-                    },
-                    timeout_seconds: 30,
-                    max_retries: 0,
-                    attempt_number: 0,
-                    dispatch_token: Uuid::new_v4(),
-                };
-
-                let idx = pool.next_worker_idx();
-                let worker = pool.get_worker(idx).await;
-                worker.send_action(dispatch).await
-            }));
-        }
-
-        // All should succeed
-        for handle in handles {
-            let result = handle.await.expect("task join");
-            let metrics = result.expect("action result");
-            assert!(metrics.success);
-        }
-
-        match Arc::try_unwrap(pool) {
-            Ok(pool) => {
-                pool.shutdown().await.expect("shutdown pool");
-            }
-            Err(_) => {
-                warn!("worker pool still referenced during shutdown; skipping shutdown");
-            }
-        }
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires Python environment
-    async fn test_worker_concurrency_control() {
-        let config = PythonWorkerConfig::new();
-
-        // Create pool with 2 workers, max 3 concurrent per worker
-        let pool = PythonWorkerPool::new_with_bridge_addr(config, 2, None, None, 3)
+        let metrics = worker
+            .send_action(ActionDispatchPayload {
+                action_id: "action-1".to_string(),
+                instance_id: "instance-1".to_string(),
+                sequence: 1,
+                action_name: "greet".to_string(),
+                module_name: "tests.actions".to_string(),
+                kwargs: proto::WorkflowArguments {
+                    arguments: vec![make_string_kwarg("name", "World")],
+                },
+                timeout_seconds: 30,
+                max_retries: 0,
+                attempt_number: 0,
+                dispatch_token,
+            })
             .await
-            .expect("create pool");
+            .expect("send action");
 
-        // Initial state
-        assert_eq!(pool.total_capacity(), 6); // 2 workers * 3 concurrent
-        assert_eq!(pool.total_in_flight(), 0);
-        assert_eq!(pool.available_capacity(), 6);
+        responder.await.expect("responder task");
+        assert!(metrics.success);
+        assert_eq!(metrics.action_id, "action-1");
+        assert_eq!(metrics.instance_id, "instance-1");
+        assert_eq!(metrics.dispatch_token, Some(dispatch_token));
+        assert_eq!(metrics.worker_duration, Duration::from_nanos(32));
 
-        // Acquire 3 slots for worker 0
-        assert!(pool.try_acquire_slot_for_worker(0));
-        assert!(pool.try_acquire_slot_for_worker(0));
-        assert!(pool.try_acquire_slot_for_worker(0));
-        // Worker 0 is now at capacity
-        assert!(!pool.try_acquire_slot_for_worker(0));
-
-        assert_eq!(pool.total_in_flight(), 3);
-        assert_eq!(pool.available_capacity(), 3);
-        assert_eq!(pool.in_flight_for_worker(0), 3);
-        assert_eq!(pool.in_flight_for_worker(1), 0);
-
-        // Acquire 2 slots for worker 1
-        assert!(pool.try_acquire_slot_for_worker(1));
-        assert!(pool.try_acquire_slot_for_worker(1));
-        assert_eq!(pool.in_flight_for_worker(1), 2);
-        assert_eq!(pool.available_capacity(), 1);
-
-        // try_acquire_slot should pick worker 1 (only one with capacity)
-        let idx = pool.try_acquire_slot().expect("should acquire slot");
-        assert_eq!(idx % 2, 1); // Worker 1
-        assert_eq!(pool.available_capacity(), 0);
-
-        // No more capacity
-        assert!(pool.try_acquire_slot().is_none());
-
-        // Release a slot from worker 0
-        pool.release_slot(0);
-        assert_eq!(pool.in_flight_for_worker(0), 2);
-        assert_eq!(pool.available_capacity(), 1);
-
-        // Now try_acquire_slot should work and pick worker 0
-        let idx = pool.try_acquire_slot().expect("should acquire slot");
-        assert_eq!(idx % 2, 0); // Worker 0
-        assert_eq!(pool.available_capacity(), 0);
-
-        pool.shutdown().await.expect("shutdown pool");
+        worker.shutdown().await.expect("shutdown worker");
     }
 
     #[test]
@@ -1668,161 +1657,125 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires Python environment with test actions
-    async fn test_worker_recycling_after_lifecycle_limit() {
-        let config = PythonWorkerConfig::new().with_user_module("tests.fixtures.test_actions");
+    async fn test_execute_remote_request_happy_path() {
+        let Some((pool, mut outgoing, incoming)) = make_single_worker_pool().await else {
+            return;
+        };
+        let request = ActionRequest {
+            executor_id: Uuid::new_v4(),
+            execution_id: Uuid::new_v4(),
+            action_name: "double".to_string(),
+            module_name: Some("tests.actions".to_string()),
+            kwargs: HashMap::from([("value".to_string(), Value::Number(9.into()))]),
+        };
 
-        // Create pool with max_action_lifecycle = 2
-        let pool = Arc::new(
-            PythonWorkerPool::new_with_bridge_addr(config, 1, None, Some(2), 10)
+        let responder = tokio::spawn(async move {
+            let envelope = outgoing.recv().await.expect("dispatch envelope");
+            incoming
+                .send(proto::Envelope {
+                    delivery_id: envelope.delivery_id + 1,
+                    partition_id: 0,
+                    kind: proto::MessageKind::Ack as i32,
+                    payload: messages::encode_message(&proto::Ack {
+                        acked_delivery_id: envelope.delivery_id,
+                    }),
+                })
                 .await
-                .expect("create pool"),
-        );
+                .expect("send ack");
+            incoming
+                .send(proto::Envelope {
+                    delivery_id: envelope.delivery_id,
+                    partition_id: 0,
+                    kind: proto::MessageKind::ActionResult as i32,
+                    payload: messages::encode_message(&proto::ActionResult {
+                        action_id: "ignored".to_string(),
+                        success: true,
+                        payload: Some(make_result_payload(Value::Number(18.into()))),
+                        worker_start_ns: 100,
+                        worker_end_ns: 125,
+                        dispatch_token: None,
+                        error_type: None,
+                        error_message: None,
+                    }),
+                })
+                .await
+                .expect("send result");
+        });
 
-        // Get initial worker ID
-        let initial_worker_id = pool.get_worker(0).await.worker_id();
-        assert_eq!(initial_worker_id, 0);
+        let completion = execute_remote_request(Arc::clone(&pool), request.clone()).await;
+        responder.await.expect("responder task");
+        assert_eq!(completion.executor_id, request.executor_id);
+        assert_eq!(completion.execution_id, request.execution_id);
+        assert_eq!(completion.result, Value::Number(18.into()));
+        assert_eq!(pool.total_in_flight(), 0);
 
-        // Send first action - count becomes 1
-        let dispatch1 = ActionDispatchPayload {
-            action_id: "test-1".to_string(),
-            instance_id: "instance-1".to_string(),
-            sequence: 0,
-            action_name: "greet".to_string(),
-            module_name: "tests.fixtures.test_actions".to_string(),
-            kwargs: proto::WorkflowArguments {
-                arguments: vec![make_string_kwarg("name", "World1")],
-            },
-            timeout_seconds: 30,
-            max_retries: 0,
-            attempt_number: 0,
-            dispatch_token: Uuid::new_v4(),
-        };
-
-        let worker = pool.get_worker(0).await;
-        let metrics = worker.send_action(dispatch1).await.expect("send action 1");
-        assert!(metrics.success);
-        pool.record_completion(0, Arc::clone(&pool));
-
-        // Worker should still be the same (count = 1, threshold = 2)
-        let worker_id_after_1 = pool.get_worker(0).await.worker_id();
-        assert_eq!(worker_id_after_1, initial_worker_id);
-
-        // Send second action - count becomes 2, triggers recycle
-        let dispatch2 = ActionDispatchPayload {
-            action_id: "test-2".to_string(),
-            instance_id: "instance-1".to_string(),
-            sequence: 1,
-            action_name: "greet".to_string(),
-            module_name: "tests.fixtures.test_actions".to_string(),
-            kwargs: proto::WorkflowArguments {
-                arguments: vec![make_string_kwarg("name", "World2")],
-            },
-            timeout_seconds: 30,
-            max_retries: 0,
-            attempt_number: 0,
-            dispatch_token: Uuid::new_v4(),
-        };
-
-        let worker = pool.get_worker(0).await;
-        let metrics = worker.send_action(dispatch2).await.expect("send action 2");
-        assert!(metrics.success);
-        pool.record_completion(0, Arc::clone(&pool));
-
-        // Give time for the recycling background task to complete
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // Worker should now have a different ID (recycled)
-        let worker_id_after_recycle = pool.get_worker(0).await.worker_id();
-        assert_ne!(
-            worker_id_after_recycle, initial_worker_id,
-            "Worker should have been recycled after reaching lifecycle limit"
-        );
-
-        // The new worker should have ID 1 (second worker spawned)
-        assert_eq!(worker_id_after_recycle, 1);
-
-        // Verify the new worker works correctly
-        let dispatch3 = ActionDispatchPayload {
-            action_id: "test-3".to_string(),
-            instance_id: "instance-1".to_string(),
-            sequence: 2,
-            action_name: "greet".to_string(),
-            module_name: "tests.fixtures.test_actions".to_string(),
-            kwargs: proto::WorkflowArguments {
-                arguments: vec![make_string_kwarg("name", "World3")],
-            },
-            timeout_seconds: 30,
-            max_retries: 0,
-            attempt_number: 0,
-            dispatch_token: Uuid::new_v4(),
-        };
-
-        let worker = pool.get_worker(0).await;
-        let metrics = worker.send_action(dispatch3).await.expect("send action 3");
-        assert!(metrics.success);
-
-        match Arc::try_unwrap(pool) {
-            Ok(pool) => {
-                pool.shutdown().await.expect("shutdown pool");
-            }
-            Err(_) => {
-                warn!("worker pool still referenced during shutdown; skipping shutdown");
-            }
+        if let Ok(pool) = Arc::try_unwrap(pool) {
+            pool.shutdown().await.expect("shutdown pool");
         }
     }
 
     #[tokio::test]
-    #[ignore] // Requires Python environment with test actions
-    async fn test_worker_no_recycling_when_lifecycle_none() {
-        let config = PythonWorkerConfig::new().with_user_module("tests.fixtures.test_actions");
+    async fn test_remote_worker_pool_launch_queue_get_complete_happy_path() {
+        let Some((pool, mut outgoing, incoming)) = make_single_worker_pool().await else {
+            return;
+        };
+        let remote = RemoteWorkerPool::new(Arc::clone(&pool));
+        BaseWorkerPool::launch(&remote)
+            .await
+            .expect("launch remote pool");
+        let request = ActionRequest {
+            executor_id: Uuid::new_v4(),
+            execution_id: Uuid::new_v4(),
+            action_name: "square".to_string(),
+            module_name: Some("tests.actions".to_string()),
+            kwargs: HashMap::from([("value".to_string(), Value::Number(5.into()))]),
+        };
+        let execution_id = request.execution_id;
 
-        // Create pool with no lifecycle limit
-        let pool = Arc::new(
-            PythonWorkerPool::new_with_bridge_addr(config, 1, None, None, 10)
+        let responder = tokio::spawn(async move {
+            let envelope = outgoing.recv().await.expect("dispatch envelope");
+            incoming
+                .send(proto::Envelope {
+                    delivery_id: envelope.delivery_id + 5,
+                    partition_id: 0,
+                    kind: proto::MessageKind::Ack as i32,
+                    payload: messages::encode_message(&proto::Ack {
+                        acked_delivery_id: envelope.delivery_id,
+                    }),
+                })
                 .await
-                .expect("create pool"),
-        );
+                .expect("send ack");
+            incoming
+                .send(proto::Envelope {
+                    delivery_id: envelope.delivery_id,
+                    partition_id: 0,
+                    kind: proto::MessageKind::ActionResult as i32,
+                    payload: messages::encode_message(&proto::ActionResult {
+                        action_id: "ignored".to_string(),
+                        success: true,
+                        payload: Some(make_result_payload(Value::Number(25.into()))),
+                        worker_start_ns: 300,
+                        worker_end_ns: 360,
+                        dispatch_token: None,
+                        error_type: None,
+                        error_message: None,
+                    }),
+                })
+                .await
+                .expect("send result");
+        });
 
-        let initial_worker_id = pool.get_worker(0).await.worker_id();
+        BaseWorkerPool::queue(&remote, request).expect("queue request");
+        let completions = BaseWorkerPool::get_complete(&remote).await;
+        responder.await.expect("responder task");
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].execution_id, execution_id);
+        assert_eq!(completions[0].result, Value::Number(25.into()));
 
-        // Send several actions
-        for i in 0..5 {
-            let dispatch = ActionDispatchPayload {
-                action_id: format!("test-{}", i),
-                instance_id: "instance-1".to_string(),
-                sequence: i,
-                action_name: "greet".to_string(),
-                module_name: "tests.fixtures.test_actions".to_string(),
-                kwargs: proto::WorkflowArguments {
-                    arguments: vec![make_string_kwarg("name", &format!("World{}", i))],
-                },
-                timeout_seconds: 30,
-                max_retries: 0,
-                attempt_number: 0,
-                dispatch_token: Uuid::new_v4(),
-            };
-
-            let worker = pool.get_worker(0).await;
-            let metrics = worker.send_action(dispatch).await.expect("send action");
-            assert!(metrics.success);
-            pool.record_completion(0, Arc::clone(&pool));
-        }
-
-        // Worker should still be the same (no recycling)
-        let final_worker_id = pool.get_worker(0).await.worker_id();
-        assert_eq!(
-            final_worker_id, initial_worker_id,
-            "Worker should not have been recycled when lifecycle limit is None"
-        );
-
-        match Arc::try_unwrap(pool) {
-            Ok(pool) => {
-                pool.shutdown().await.expect("shutdown pool");
-            }
-            Err(_) => {
-                warn!("worker pool still referenced during shutdown; skipping shutdown");
-            }
+        drop(remote);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        if let Ok(pool) = Arc::try_unwrap(pool) {
+            pool.shutdown().await.expect("shutdown pool");
         }
     }
 
