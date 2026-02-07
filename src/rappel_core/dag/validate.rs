@@ -2,7 +2,9 @@
 
 use std::collections::HashSet;
 
-use super::models::{DAG, DagConversionError, EdgeType};
+use crate::messages::ast as ir;
+
+use super::models::{DAG, DAGNode, DagConversionError, EdgeType};
 
 pub fn validate_dag(dag: &DAG) -> Result<(), DagConversionError> {
     validate_edges_reference_existing_nodes(dag)?;
@@ -10,6 +12,7 @@ pub fn validate_dag(dag: &DAG) -> Result<(), DagConversionError> {
     validate_loop_incr_edges(dag)?;
     validate_no_duplicate_state_machine_edges(dag)?;
     validate_input_nodes_have_no_incoming_edges(dag)?;
+    validate_variable_references_have_data_flow(dag)?;
     Ok(())
 }
 
@@ -123,4 +126,248 @@ pub fn validate_input_nodes_have_no_incoming_edges(dag: &DAG) -> Result<(), DagC
         }
     }
     Ok(())
+}
+
+/// Fail if a node references a variable that has no incoming data-flow edge.
+pub fn validate_variable_references_have_data_flow(dag: &DAG) -> Result<(), DagConversionError> {
+    let incoming_data_flow: HashSet<(String, String)> = dag
+        .edges
+        .iter()
+        .filter(|edge| edge.edge_type == EdgeType::DataFlow)
+        .filter_map(|edge| {
+            edge.variable
+                .as_ref()
+                .map(|var| (edge.target.clone(), var.clone()))
+        })
+        .collect();
+
+    let mut missing_references: Vec<String> = Vec::new();
+    for (node_id, node) in &dag.nodes {
+        let mut referenced_vars = node_referenced_variables(node);
+        referenced_vars.extend(node_guard_variables(dag, node_id));
+        for var_name in referenced_vars {
+            if !incoming_data_flow.contains(&(node_id.clone(), var_name.clone())) {
+                missing_references.push(format!(
+                    "node '{}' ({}) references variable '{}' without incoming data-flow",
+                    node_id,
+                    node.node_type(),
+                    var_name
+                ));
+            }
+        }
+    }
+
+    if missing_references.is_empty() {
+        return Ok(());
+    }
+    missing_references.sort();
+    missing_references.dedup();
+    Err(DagConversionError(format!(
+        "Undefined variable references detected: {}",
+        missing_references.join("; ")
+    )))
+}
+
+fn node_guard_variables(dag: &DAG, node_id: &str) -> HashSet<String> {
+    let mut vars = HashSet::new();
+    for edge in &dag.edges {
+        if edge.edge_type != EdgeType::StateMachine || edge.source != node_id {
+            continue;
+        }
+        if let Some(guard_expr) = edge.guard_expr.as_ref() {
+            collect_expr_variables(guard_expr, &mut vars);
+        }
+    }
+    vars
+}
+
+fn node_referenced_variables(node: &DAGNode) -> HashSet<String> {
+    let mut vars = HashSet::new();
+    match node {
+        DAGNode::ActionCall(action) => {
+            for value in action.kwargs.values() {
+                if let Some(var_name) = value.strip_prefix('$') {
+                    vars.insert(var_name.to_string());
+                }
+            }
+            for expr in action.kwarg_exprs.values() {
+                collect_expr_variables(expr, &mut vars);
+            }
+            if let Some(expr) = action.spread_collection_expr.as_ref() {
+                collect_expr_variables(expr, &mut vars);
+            }
+        }
+        DAGNode::FnCall(function) => {
+            for value in function.kwargs.values() {
+                if let Some(var_name) = value.strip_prefix('$') {
+                    vars.insert(var_name.to_string());
+                }
+            }
+            for expr in function.kwarg_exprs.values() {
+                collect_expr_variables(expr, &mut vars);
+            }
+            if let Some(expr) = function.assign_expr.as_ref() {
+                collect_expr_variables(expr, &mut vars);
+            }
+        }
+        DAGNode::Assignment(assignment) => {
+            if let Some(expr) = assignment.assign_expr.as_ref() {
+                collect_expr_variables(expr, &mut vars);
+            }
+        }
+        DAGNode::Return(ret) => {
+            if let Some(expr) = ret.assign_expr.as_ref() {
+                collect_expr_variables(expr, &mut vars);
+            }
+        }
+        DAGNode::Sleep(sleep) => {
+            if let Some(expr) = sleep.duration_expr.as_ref() {
+                collect_expr_variables(expr, &mut vars);
+            }
+        }
+        DAGNode::Input(_)
+        | DAGNode::Output(_)
+        | DAGNode::Parallel(_)
+        | DAGNode::Aggregator(_)
+        | DAGNode::Branch(_)
+        | DAGNode::Join(_)
+        | DAGNode::Break(_)
+        | DAGNode::Continue(_)
+        | DAGNode::Expression(_) => {}
+    }
+    vars
+}
+
+fn collect_expr_variables(expr: &ir::Expr, vars: &mut HashSet<String>) {
+    match expr.kind.as_ref() {
+        Some(ir::expr::Kind::Variable(var)) => {
+            vars.insert(var.name.clone());
+        }
+        Some(ir::expr::Kind::BinaryOp(op)) => {
+            if let Some(left) = op.left.as_ref() {
+                collect_expr_variables(left, vars);
+            }
+            if let Some(right) = op.right.as_ref() {
+                collect_expr_variables(right, vars);
+            }
+        }
+        Some(ir::expr::Kind::UnaryOp(op)) => {
+            if let Some(operand) = op.operand.as_ref() {
+                collect_expr_variables(operand, vars);
+            }
+        }
+        Some(ir::expr::Kind::List(list_expr)) => {
+            for element in &list_expr.elements {
+                collect_expr_variables(element, vars);
+            }
+        }
+        Some(ir::expr::Kind::Dict(dict_expr)) => {
+            for entry in &dict_expr.entries {
+                if let Some(key) = entry.key.as_ref() {
+                    collect_expr_variables(key, vars);
+                }
+                if let Some(value) = entry.value.as_ref() {
+                    collect_expr_variables(value, vars);
+                }
+            }
+        }
+        Some(ir::expr::Kind::Index(index)) => {
+            if let Some(object) = index.object.as_ref() {
+                collect_expr_variables(object, vars);
+            }
+            if let Some(index_expr) = index.index.as_ref() {
+                collect_expr_variables(index_expr, vars);
+            }
+        }
+        Some(ir::expr::Kind::Dot(dot)) => {
+            if let Some(object) = dot.object.as_ref() {
+                collect_expr_variables(object, vars);
+            }
+        }
+        Some(ir::expr::Kind::FunctionCall(call)) => {
+            for arg in &call.args {
+                collect_expr_variables(arg, vars);
+            }
+            for kw in &call.kwargs {
+                if let Some(value) = kw.value.as_ref() {
+                    collect_expr_variables(value, vars);
+                }
+            }
+        }
+        Some(ir::expr::Kind::ActionCall(call)) => {
+            for kw in &call.kwargs {
+                if let Some(value) = kw.value.as_ref() {
+                    collect_expr_variables(value, vars);
+                }
+            }
+        }
+        Some(ir::expr::Kind::ParallelExpr(parallel)) => {
+            for call in &parallel.calls {
+                match call.kind.as_ref() {
+                    Some(ir::call::Kind::Action(action)) => {
+                        for kw in &action.kwargs {
+                            if let Some(value) = kw.value.as_ref() {
+                                collect_expr_variables(value, vars);
+                            }
+                        }
+                    }
+                    Some(ir::call::Kind::Function(function)) => {
+                        for arg in &function.args {
+                            collect_expr_variables(arg, vars);
+                        }
+                        for kw in &function.kwargs {
+                            if let Some(value) = kw.value.as_ref() {
+                                collect_expr_variables(value, vars);
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+        Some(ir::expr::Kind::SpreadExpr(spread)) => {
+            if let Some(collection) = spread.collection.as_ref() {
+                collect_expr_variables(collection, vars);
+            }
+            if let Some(action) = spread.action.as_ref() {
+                for kw in &action.kwargs {
+                    if let Some(value) = kw.value.as_ref() {
+                        collect_expr_variables(value, vars);
+                    }
+                }
+            }
+        }
+        Some(ir::expr::Kind::Literal(_)) | None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_dag;
+    use crate::rappel_core::dag::convert_to_dag;
+    use crate::rappel_core::ir_parser::parse_program;
+
+    #[test]
+    fn validate_dag_rejects_unresolved_variable_reference() {
+        let source = r#"
+fn main(input: [input_text], output: [result]):
+    result = @double(value=global_fallback)
+    return result
+"#;
+        let program = parse_program(source.trim()).expect("parse program");
+        let err = convert_to_dag(&program).expect_err("expected unresolved variable error");
+        assert!(err.0.contains("global_fallback"));
+    }
+
+    #[test]
+    fn validate_dag_allows_resolved_variable_reference() {
+        let source = r#"
+fn main(input: [input_text], output: [result]):
+    result = @double(value=input_text)
+    return result
+"#;
+        let program = parse_program(source.trim()).expect("parse program");
+        let dag = convert_to_dag(&program).expect("convert dag");
+        validate_dag(&dag).expect("validate dag");
+    }
 }

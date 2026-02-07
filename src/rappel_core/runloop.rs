@@ -76,7 +76,11 @@ struct EvictionState<'a> {
 
 enum ShardEvent {
     Step(ShardStep),
-    Error(RunLoopError),
+    InstanceFailed {
+        executor_id: Uuid,
+        entry_node: Uuid,
+        error: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -219,9 +223,17 @@ fn run_executor_shard(
 ) {
     let mut executors: HashMap<Uuid, ShardExecutor> = HashMap::new();
 
-    let send_error = |err: RunLoopError, sender: &mpsc::UnboundedSender<ShardEvent>| {
-        let _ = sender.send(ShardEvent::Error(err));
-    };
+    let send_instance_failed =
+        |executor_id: Uuid,
+         entry_node: Uuid,
+         err: RunLoopError,
+         sender: &mpsc::UnboundedSender<ShardEvent>| {
+            let _ = sender.send(ShardEvent::InstanceFailed {
+                executor_id,
+                entry_node,
+                error: err.to_string(),
+            });
+        };
 
     while let Ok(command) = receiver.recv() {
         match command {
@@ -245,7 +257,9 @@ fn run_executor_shard(
                     let state = match instance.state {
                         Some(state) => state,
                         None => {
-                            send_error(
+                            send_instance_failed(
+                                instance.instance_id,
+                                instance.entry_node,
                                 RunLoopError::Message(
                                     "queued instance missing runner state".to_string(),
                                 ),
@@ -257,7 +271,9 @@ fn run_executor_shard(
                     let dag = match instance.dag {
                         Some(dag) => dag,
                         None => {
-                            send_error(
+                            send_instance_failed(
+                                instance.instance_id,
+                                instance.entry_node,
                                 RunLoopError::Message(
                                     "queued instance missing workflow DAG".to_string(),
                                 ),
@@ -278,8 +294,13 @@ fn run_executor_shard(
                     let step = match owner.start() {
                         Ok(step) => step,
                         Err(err) => {
-                            send_error(err, &sender);
-                            return;
+                            send_instance_failed(
+                                instance.instance_id,
+                                instance.entry_node,
+                                err,
+                                &sender,
+                            );
+                            continue;
                         }
                     };
                     let done = step.instance_done.is_some();
@@ -312,8 +333,10 @@ fn run_executor_shard(
                         Ok(Some(step)) => step,
                         Ok(None) => continue,
                         Err(err) => {
-                            send_error(err, &sender);
-                            return;
+                            let entry_node = owner.entry_node;
+                            executors.remove(&executor_id);
+                            send_instance_failed(executor_id, entry_node, err, &sender);
+                            continue;
                         }
                     };
                     let done = step.instance_done.is_some();
@@ -343,8 +366,10 @@ fn run_executor_shard(
                         Ok(Some(step)) => step,
                         Ok(None) => continue,
                         Err(err) => {
-                            send_error(err, &sender);
-                            return;
+                            let entry_node = owner.entry_node;
+                            executors.remove(&executor_id);
+                            send_instance_failed(executor_id, entry_node, err, &sender);
+                            continue;
                         }
                     };
                     let done = step.instance_done.is_some();
@@ -808,6 +833,7 @@ impl RunLoop {
             let mut all_completions: Vec<ActionCompletion> = Vec::new();
             let mut all_instances: Vec<QueuedInstance> = Vec::new();
             let mut all_steps: Vec<ShardStep> = Vec::new();
+            let mut all_failed_instances: Vec<InstanceDone> = Vec::new();
             let mut all_wakes: Vec<SleepWake> = Vec::new();
             let mut saw_empty_instances = false;
 
@@ -829,10 +855,17 @@ impl RunLoop {
                 }
                 CoordinatorEvent::Shard(event) => match event {
                     ShardEvent::Step(step) => all_steps.push(step),
-                    ShardEvent::Error(err) => {
-                        warn!(error = %err, "runloop exiting: shard error");
-                        run_result = Err(err);
-                        break;
+                    ShardEvent::InstanceFailed {
+                        executor_id,
+                        entry_node,
+                        error,
+                    } => {
+                        all_failed_instances.push(InstanceDone {
+                            executor_id,
+                            entry_node,
+                            result: None,
+                            error: Some(error_value("ExecutionError", &error)),
+                        });
                     }
                 },
                 CoordinatorEvent::SleepWake(wake) => {
@@ -866,10 +899,17 @@ impl RunLoop {
             while let Ok(event) = event_rx.try_recv() {
                 match event {
                     ShardEvent::Step(step) => all_steps.push(step),
-                    ShardEvent::Error(err) => {
-                        warn!(error = %err, "runloop exiting: shard error");
-                        run_result = Err(err);
-                        break;
+                    ShardEvent::InstanceFailed {
+                        executor_id,
+                        entry_node,
+                        error,
+                    } => {
+                        all_failed_instances.push(InstanceDone {
+                            executor_id,
+                            entry_node,
+                            result: None,
+                            error: Some(error_value("ExecutionError", &error)),
+                        });
                     }
                 }
             }
@@ -1010,6 +1050,30 @@ impl RunLoop {
                 instances_idle = true;
             }
 
+            let failed_executor_ids: HashSet<Uuid> = all_failed_instances
+                .iter()
+                .map(|instance_done| instance_done.executor_id)
+                .collect();
+            if !all_failed_instances.is_empty() {
+                for instance_done in all_failed_instances {
+                    warn!(
+                        executor_id = %instance_done.executor_id,
+                        error = ?instance_done.error,
+                        "marking instance as failed after shard execution error"
+                    );
+                    executor_shards.remove(&instance_done.executor_id);
+                    inflight_actions.remove(&instance_done.executor_id);
+                    lock_tracker.remove_all([instance_done.executor_id]);
+                    if let Some(nodes) = sleeping_by_instance.remove(&instance_done.executor_id) {
+                        for node_id in nodes {
+                            sleeping_nodes.remove(&node_id);
+                        }
+                    }
+                    blocked_until_by_instance.remove(&instance_done.executor_id);
+                    instances_done_pending.push(instance_done);
+                }
+            }
+
             if !all_steps.is_empty() {
                 let lock_statuses = match self.persist_shard_steps(&all_steps).await {
                     Ok(statuses) => statuses,
@@ -1039,6 +1103,9 @@ impl RunLoop {
                     break;
                 }
                 for step in all_steps {
+                    if failed_executor_ids.contains(&step.executor_id) {
+                        continue;
+                    }
                     if evict_ids.contains(&step.executor_id) {
                         continue;
                     }
@@ -1462,5 +1529,94 @@ fn main(input: [x], output: [y]):
             panic!("expected output object");
         };
         assert_eq!(map.get("y"), Some(&Value::Number(8.into())));
+    }
+
+    #[tokio::test]
+    async fn test_runloop_marks_instance_failed_on_executor_error() {
+        let source = r#"
+fn main(input: [x], output: [y]):
+    y = @tests.fixtures.test_actions.double(value=x)
+    return y
+"#;
+        let program = parse_program(source.trim()).expect("parse program");
+        let program_proto = program.encode_to_vec();
+        let ir_hash = format!("{:x}", Sha256::digest(&program_proto));
+        let dag = Arc::new(convert_to_dag(&program).expect("convert to dag"));
+
+        // Intentionally omit input assignment so action kwarg resolution fails at runtime.
+        let mut state = RunnerState::new(Some(Arc::clone(&dag)), None, None, false);
+        let entry_node = dag
+            .entry_node
+            .as_ref()
+            .expect("DAG entry node not found")
+            .clone();
+        let entry_exec = state
+            .queue_template_node(&entry_node, None)
+            .expect("queue entry node");
+
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let backend = MemoryBackend::with_queue(queue.clone());
+        let workflow_version_id = backend
+            .upsert_workflow_version(&WorkflowRegistration {
+                workflow_name: "test".to_string(),
+                workflow_version: ir_hash.clone(),
+                ir_hash,
+                program_proto,
+                concurrent: false,
+            })
+            .await
+            .expect("register workflow version");
+
+        let worker_pool = crate::workers::InlineWorkerPool::new(HashMap::new());
+        let mut runloop = RunLoop::new(
+            worker_pool,
+            backend.clone(),
+            RunLoopSupervisorConfig {
+                max_concurrent_instances: 25,
+                executor_shards: 1,
+                instance_done_batch_size: None,
+                poll_interval: Duration::from_secs_f64(0.0),
+                persistence_interval: Duration::from_secs_f64(0.1),
+                lock_uuid: Uuid::new_v4(),
+                lock_ttl: Duration::from_secs(15),
+                lock_heartbeat: Duration::from_secs(5),
+                evict_sleep_threshold: Duration::from_secs(10),
+                active_instance_gauge: None,
+            },
+        );
+        let instance_id = Uuid::new_v4();
+        queue.lock().expect("queue lock").push_back(QueuedInstance {
+            workflow_version_id,
+            dag: None,
+            entry_node: entry_exec.node_id,
+            state: Some(state),
+            action_results: HashMap::new(),
+            instance_id,
+            scheduled_at: None,
+        });
+
+        runloop
+            .run()
+            .await
+            .expect("runloop should continue after instance failure");
+        let instances_done = backend.instances_done();
+        assert_eq!(instances_done.len(), 1);
+
+        let done = &instances_done[0];
+        assert_eq!(done.executor_id, instance_id);
+        assert!(done.result.is_none());
+        let error = done.error.as_ref().expect("instance error");
+        let Value::Object(error_obj) = error else {
+            panic!("expected error payload object");
+        };
+        assert_eq!(
+            error_obj.get("type"),
+            Some(&Value::String("ExecutionError".to_string()))
+        );
+        let message = error_obj
+            .get("message")
+            .and_then(Value::as_str)
+            .expect("error message");
+        assert!(message.contains("variable not found: x"));
     }
 }
