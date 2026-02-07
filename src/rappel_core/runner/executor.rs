@@ -1237,8 +1237,10 @@ mod tests {
 
     use crate::messages::ast as ir;
     use crate::rappel_core::dag::{
-        ActionCallNode, ActionCallParams, AggregatorNode, AssignmentNode, DAG, DAGEdge, SleepNode,
+        ActionCallNode, ActionCallParams, AggregatorNode, AssignmentNode, DAG, DAGEdge,
+        convert_to_dag,
     };
+    use crate::rappel_core::ir_parser::parse_program;
     use crate::rappel_core::runner::state::{
         ExecutionEdge, ExecutionNode, NodeStatus, RunnerState,
     };
@@ -1327,15 +1329,6 @@ mod tests {
         )
     }
 
-    fn sleep_node(node_id: &str, duration_expr: ir::Expr) -> SleepNode {
-        SleepNode::new(
-            node_id,
-            Some(duration_expr),
-            Some("sleep".to_string()),
-            Some("main".to_string()),
-        )
-    }
-
     fn aggregator_node(
         node_id: &str,
         aggregates_from: &str,
@@ -1393,6 +1386,367 @@ mod tests {
             assert_eq!(orig_node.action_attempt, rehy_node.action_attempt);
         }
         assert_eq!(orig_state.edges, rehy_state.edges);
+    }
+
+    fn completion_action_result(action: &ExecutionNode) -> Value {
+        Value::String(format!(
+            "{}:attempt{}",
+            action.template_id.as_deref().unwrap_or("unknown_action"),
+            action.action_attempt
+        ))
+    }
+
+    fn dag_from_ir_source(source: &str) -> Arc<DAG> {
+        let program = parse_program(source.trim()).expect("parse program");
+        Arc::new(convert_to_dag(&program).expect("convert program to DAG"))
+    }
+
+    fn build_executor_at_entry(dag: &Arc<DAG>) -> (RunnerExecutor, Uuid) {
+        let mut state = RunnerState::new(Some(Arc::clone(dag)), None, None, false);
+        let entry_template = dag.entry_node.as_ref().expect("dag entry node");
+        let entry_exec = state
+            .queue_template_node(entry_template, None)
+            .expect("queue entry node");
+        (
+            RunnerExecutor::new(Arc::clone(dag), state, HashMap::new(), None),
+            entry_exec.node_id,
+        )
+    }
+
+    fn advance_executor_one_increment<F>(
+        executor: &mut RunnerExecutor,
+        action_result_for: F,
+    ) -> Result<bool, RunnerExecutorError>
+    where
+        F: Fn(&ExecutionNode) -> Value + Copy,
+    {
+        let queued_actions: Vec<ExecutionNode> = executor
+            .state()
+            .nodes
+            .values()
+            .filter(|node| node.status == NodeStatus::Queued && node.is_action_call())
+            .cloned()
+            .collect();
+        for action in &queued_actions {
+            if !executor.action_results().contains_key(&action.node_id) {
+                executor.set_action_result(action.node_id, action_result_for(action));
+            }
+        }
+
+        let mut finished_nodes: Vec<Uuid> =
+            queued_actions.iter().map(|node| node.node_id).collect();
+        finished_nodes.extend(
+            executor
+                .state()
+                .nodes
+                .values()
+                .filter(|node| {
+                    node.status == NodeStatus::Queued
+                        && node.is_sleep()
+                        && node.scheduled_at.is_some()
+                })
+                .map(|node| node.node_id),
+        );
+
+        if finished_nodes.is_empty() {
+            return Ok(false);
+        }
+
+        let step = executor.increment(&finished_nodes)?;
+        for action in &step.actions {
+            if !executor.action_results().contains_key(&action.node_id) {
+                executor.set_action_result(action.node_id, action_result_for(action));
+            }
+        }
+        for sleep_request in &step.sleep_requests {
+            executor
+                .state_mut()
+                .set_node_scheduled_at(
+                    sleep_request.node_id,
+                    Some(Utc::now() - chrono::Duration::seconds(1)),
+                )
+                .map_err(|err| RunnerExecutorError(err.0))?;
+        }
+        Ok(true)
+    }
+
+    fn advance_executor_to_completion<F>(
+        executor: &mut RunnerExecutor,
+        action_result_for: F,
+    ) -> Result<(), RunnerExecutorError>
+    where
+        F: Fn(&ExecutionNode) -> Value + Copy,
+    {
+        const MAX_TICKS: usize = 256;
+        for _ in 0..MAX_TICKS {
+            if !advance_executor_one_increment(executor, action_result_for)? {
+                return Ok(());
+            }
+        }
+
+        Err(RunnerExecutorError(
+            "executor did not converge to completion".to_string(),
+        ))
+    }
+
+    fn assert_rehydrate_completion_equivalent<F>(
+        dag: &Arc<DAG>,
+        mut executor: RunnerExecutor,
+        action_result_for: F,
+    ) where
+        F: Fn(&ExecutionNode) -> Value + Copy,
+    {
+        fn count_keyed(items: impl IntoIterator<Item = String>) -> HashMap<String, usize> {
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for item in items {
+                *counts.entry(item).or_insert(0) += 1;
+            }
+            counts
+        }
+
+        fn node_shape_counts(executor: &RunnerExecutor) -> HashMap<String, usize> {
+            count_keyed(executor.state().nodes.values().map(|node| {
+                let mut targets = node.targets.clone();
+                targets.sort();
+                let mut assignment_keys: Vec<String> = node.assignments.keys().cloned().collect();
+                assignment_keys.sort();
+                let mut action_kwarg_keys = node
+                    .action
+                    .as_ref()
+                    .map(|action| action.kwargs.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                action_kwarg_keys.sort();
+                format!(
+                    "type={}|template={}|status={:?}|attempt={}|targets={targets:?}|assignments={assignment_keys:?}|action={}({action_kwarg_keys:?})|scheduled={}",
+                    node.node_type,
+                    node.template_id.clone().unwrap_or_default(),
+                    node.status,
+                    node.action_attempt,
+                    node.action
+                        .as_ref()
+                        .map(|action| action.action_name.clone())
+                        .unwrap_or_default(),
+                    node.scheduled_at.is_some(),
+                )
+            }))
+        }
+
+        fn edge_shape_counts(executor: &RunnerExecutor) -> HashMap<String, usize> {
+            count_keyed(executor.state().edges.iter().map(|edge| {
+                let source = executor
+                    .state()
+                    .nodes
+                    .get(&edge.source)
+                    .expect("source node")
+                    .template_id
+                    .clone()
+                    .unwrap_or_else(|| "__unknown_source".to_string());
+                let target = executor
+                    .state()
+                    .nodes
+                    .get(&edge.target)
+                    .expect("target node")
+                    .template_id
+                    .clone()
+                    .unwrap_or_else(|| "__unknown_target".to_string());
+                format!("{source}-{:?}->{target}", edge.edge_type)
+            }))
+        }
+
+        fn action_result_counts(executor: &RunnerExecutor) -> HashMap<String, usize> {
+            count_keyed(executor.action_results().iter().map(|(node_id, value)| {
+                let template_id = executor
+                    .state()
+                    .nodes
+                    .get(node_id)
+                    .and_then(|node| node.template_id.clone())
+                    .unwrap_or_else(|| "__unknown_action".to_string());
+                let rendered =
+                    serde_json::to_string(value).expect("action result should serialize to JSON");
+                format!("{template_id}:{rendered}")
+            }))
+        }
+
+        fn assert_completed_executor_equivalent(
+            canonical: &RunnerExecutor,
+            rehydrated: &RunnerExecutor,
+        ) {
+            assert_eq!(node_shape_counts(canonical), node_shape_counts(rehydrated));
+            assert_eq!(edge_shape_counts(canonical), edge_shape_counts(rehydrated));
+            assert_eq!(
+                canonical.state().timeline.len(),
+                rehydrated.state().timeline.len()
+            );
+            assert_eq!(
+                action_result_counts(canonical),
+                action_result_counts(rehydrated)
+            );
+            assert_eq!(
+                canonical.state().ready_queue.is_empty(),
+                rehydrated.state().ready_queue.is_empty()
+            );
+
+            let replay_canonical = crate::rappel_core::runner::replay_variables(
+                canonical.state(),
+                canonical.action_results(),
+            )
+            .expect("replay canonical");
+            let replay_rehydrated = crate::rappel_core::runner::replay_variables(
+                rehydrated.state(),
+                rehydrated.action_results(),
+            )
+            .expect("replay rehydrated");
+
+            let mut assignment_counts: HashMap<String, usize> = HashMap::new();
+            for node in canonical.state().nodes.values() {
+                for target in node.assignments.keys() {
+                    *assignment_counts.entry(target.clone()).or_insert(0) += 1;
+                }
+            }
+            let stable_canonical: HashMap<String, Value> = replay_canonical
+                .variables
+                .into_iter()
+                .filter(|(name, _)| assignment_counts.get(name).copied().unwrap_or(0) <= 1)
+                .collect();
+            let stable_rehydrated: HashMap<String, Value> = replay_rehydrated
+                .variables
+                .into_iter()
+                .filter(|(name, _)| assignment_counts.get(name).copied().unwrap_or(0) <= 1)
+                .collect();
+            assert_eq!(stable_canonical, stable_rehydrated);
+        }
+
+        let mut branches: Vec<RunnerExecutor> = Vec::new();
+        let (nodes_snap, edges_snap, results_snap) =
+            snapshot_state(executor.state(), executor.action_results());
+        branches.push(create_rehydrated_executor(
+            dag,
+            nodes_snap,
+            edges_snap,
+            results_snap,
+        ));
+
+        const MAX_TICKS: usize = 256;
+        let mut converged = false;
+        for _ in 0..MAX_TICKS {
+            let progressed = advance_executor_one_increment(&mut executor, action_result_for)
+                .expect("advance canonical executor");
+            if !progressed {
+                converged = true;
+                break;
+            }
+
+            let (nodes_snap, edges_snap, results_snap) =
+                snapshot_state(executor.state(), executor.action_results());
+            branches.push(create_rehydrated_executor(
+                dag,
+                nodes_snap,
+                edges_snap,
+                results_snap,
+            ));
+        }
+        assert!(converged, "canonical executor did not converge");
+        assert!(
+            !branches.is_empty(),
+            "expected at least one rehydrated branch"
+        );
+
+        for (index, branch) in branches.iter_mut().enumerate() {
+            advance_executor_to_completion(branch, action_result_for)
+                .unwrap_or_else(|err| panic!("branch {index} failed to complete: {err}"));
+            assert_completed_executor_equivalent(&executor, branch);
+        }
+    }
+
+    fn setup_linear_assignment_checkpoint() -> (Arc<DAG>, RunnerExecutor) {
+        let dag = dag_from_ir_source(
+            r#"
+fn main(input: [], output: [z]):
+    x = @fetch()
+    y = x + 1
+    z = @process(value=y)
+    return z
+"#,
+        );
+        let (mut executor, entry_exec_id) = build_executor_at_entry(&dag);
+
+        let first_step = executor
+            .increment(&[entry_exec_id])
+            .expect("advance from entry");
+        assert_eq!(first_step.actions.len(), 1);
+        let first_exec = first_step.actions[0].clone();
+        executor.set_action_result(first_exec.node_id, Value::Number(10.into()));
+
+        let step = executor.increment(&[first_exec.node_id]).expect("advance");
+        assert_eq!(step.actions.len(), 1);
+        (dag, executor)
+    }
+
+    fn setup_sleep_resume_checkpoint() -> (Arc<DAG>, RunnerExecutor) {
+        let dag = dag_from_ir_source(
+            r#"
+fn main(input: [], output: [resumed]):
+    seed = 1
+    started = @get_timestamp()
+    sleep 60
+    resumed = @get_timestamp()
+    return resumed
+"#,
+        );
+        let (mut executor, entry_exec_id) = build_executor_at_entry(&dag);
+
+        let start_step = executor.increment(&[entry_exec_id]).expect("start");
+        assert_eq!(start_step.actions.len(), 1);
+        let start_exec = start_step.actions[0].clone();
+        executor.set_action_result(start_exec.node_id, Value::String("t0".to_string()));
+
+        let sleep_step = executor
+            .increment(&[start_exec.node_id])
+            .expect("advance to sleep");
+        assert!(sleep_step.actions.is_empty());
+        assert_eq!(sleep_step.sleep_requests.len(), 1);
+        (dag, executor)
+    }
+
+    fn setup_spread_checkpoint() -> (Arc<DAG>, RunnerExecutor) {
+        let dag = dag_from_ir_source(
+            r#"
+fn main(input: [], output: [done]):
+    items = @get_items()
+    results = spread items:item -> @double(value=item)
+    done = @finalize(values=results)
+    return done
+"#,
+        );
+        let (mut executor, entry_exec_id) = build_executor_at_entry(&dag);
+
+        let first_step = executor.increment(&[entry_exec_id]).expect("start");
+        assert_eq!(first_step.actions.len(), 1);
+        let initial_exec = first_step.actions[0].clone();
+        executor.set_action_result(
+            initial_exec.node_id,
+            Value::Array(vec![1.into(), 2.into(), 3.into()]),
+        );
+
+        let step1 = executor
+            .increment(&[initial_exec.node_id])
+            .expect("expand spread");
+        assert_eq!(step1.actions.len(), 3);
+        for (idx, node) in step1.actions.iter().enumerate() {
+            executor.set_action_result(node.node_id, Value::Number(((idx + 1) as i64).into()));
+        }
+
+        let step2 = executor
+            .increment(
+                &step1
+                    .actions
+                    .iter()
+                    .map(|node| node.node_id)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("complete spread");
+        assert_eq!(step2.actions.len(), 1);
+        (dag, executor)
     }
 
     #[test]
@@ -1920,102 +2274,27 @@ mod tests {
     }
 
     #[test]
-    fn test_rehydrate_sleep_resume_does_not_rerun_upstream_action() {
-        let mut dag = DAG::default();
-        let entry = assignment_node("entry", vec!["seed".to_string()], literal_int(1));
-        let action_start = action_node(
-            "action_start",
-            "get_timestamp",
-            HashMap::new(),
-            vec!["started".to_string()],
-            ActionNodeOptions::default(),
-        );
-        let sleep = sleep_node("sleep", literal_int(60));
-        let action_resume = action_node(
-            "action_resume",
-            "get_timestamp",
-            HashMap::new(),
-            vec!["resumed".to_string()],
-            ActionNodeOptions::default(),
+    fn test_rehydrate_completion_equivalent_across_ir_scenarios() {
+        let (linear_dag, linear_executor) = setup_linear_assignment_checkpoint();
+        assert_rehydrate_completion_equivalent(
+            &linear_dag,
+            linear_executor,
+            completion_action_result,
         );
 
-        dag.add_node(crate::rappel_core::dag::DAGNode::Assignment(entry.clone()));
-        dag.add_node(crate::rappel_core::dag::DAGNode::ActionCall(
-            action_start.clone(),
-        ));
-        dag.add_node(crate::rappel_core::dag::DAGNode::Sleep(sleep.clone()));
-        dag.add_node(crate::rappel_core::dag::DAGNode::ActionCall(
-            action_resume.clone(),
-        ));
-        dag.add_edge(DAGEdge::state_machine(
-            entry.id.clone(),
-            action_start.id.clone(),
-        ));
-        dag.add_edge(DAGEdge::state_machine(
-            action_start.id.clone(),
-            sleep.id.clone(),
-        ));
-        dag.add_edge(DAGEdge::state_machine(
-            sleep.id.clone(),
-            action_resume.id.clone(),
-        ));
-
-        let dag = Arc::new(dag);
-        let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
-        let entry_exec = state.queue_template_node(&entry.id, None).expect("queue");
-        let mut executor = RunnerExecutor::new(dag.clone(), state, HashMap::new(), None);
-
-        let start_step = executor.increment(&[entry_exec.node_id]).expect("start");
-        assert_eq!(start_step.actions.len(), 1);
-        assert_eq!(
-            start_step.actions[0].template_id.as_deref(),
-            Some(action_start.id.as_str())
-        );
-        let start_exec = start_step.actions[0].clone();
-        executor.set_action_result(start_exec.node_id, Value::String("t0".to_string()));
-
-        let sleep_step = executor
-            .increment(&[start_exec.node_id])
-            .expect("advance to sleep");
-        assert!(sleep_step.actions.is_empty());
-        assert_eq!(sleep_step.sleep_requests.len(), 1);
-        let sleep_exec_id = sleep_step.sleep_requests[0].node_id;
-
-        let (nodes_snap, edges_snap, results_snap) =
-            snapshot_state(executor.state(), executor.action_results());
-        let mut rehydrated = create_rehydrated_executor(&dag, nodes_snap, edges_snap, results_snap);
-
-        let start_nodes_before: Vec<_> = rehydrated
-            .state()
-            .nodes
-            .values()
-            .filter(|node| node.template_id.as_deref() == Some(action_start.id.as_str()))
-            .collect();
-        assert_eq!(start_nodes_before.len(), 1);
-        assert_eq!(start_nodes_before[0].status, NodeStatus::Completed);
-
-        // Shard startup currently replays from entry_node; that should recover
-        // the sleep request without creating a second action_start execution.
-        let resume_step = rehydrated
-            .increment(&[entry_exec.node_id])
-            .expect("resume from entry");
-        assert!(resume_step.actions.is_empty());
-        assert_eq!(resume_step.sleep_requests.len(), 1);
-        assert_eq!(resume_step.sleep_requests[0].node_id, sleep_exec_id);
-        assert!(
-            resume_step
-                .actions
-                .iter()
-                .all(|action| action.template_id.as_deref() != Some(action_start.id.as_str()))
+        let (sleep_dag, sleep_executor) = setup_sleep_resume_checkpoint();
+        assert_rehydrate_completion_equivalent(
+            &sleep_dag,
+            sleep_executor,
+            completion_action_result,
         );
 
-        let start_nodes_after: Vec<_> = rehydrated
-            .state()
-            .nodes
-            .values()
-            .filter(|node| node.template_id.as_deref() == Some(action_start.id.as_str()))
-            .collect();
-        assert_eq!(start_nodes_after.len(), 1);
+        let (spread_dag, spread_executor) = setup_spread_checkpoint();
+        assert_rehydrate_completion_equivalent(
+            &spread_dag,
+            spread_executor,
+            completion_action_result,
+        );
     }
 
     #[test]

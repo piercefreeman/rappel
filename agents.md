@@ -131,6 +131,7 @@ Follow a modern, developer-focused design language. The design prioritizes clari
 
 - Run python tests with `uv run pytest`
 - To run the rust integration tests you'll have to do something like: source .env && cargo test ...
+- Unless there's a compelling reason, you should construct synthetic graphs via writing code in our IR language and then parsing with `ir_parser.rs`. This makes it much easier for people to add additional IRs in the future. It also guarantees that the output DAG will match the DAG that's actually created at runtime. If you _really_ need control at the level of the DAG, write a detailed comment justifying why we need to do it manually versus just using the parser.
 
 ## AI Controlled
 
