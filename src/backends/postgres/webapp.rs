@@ -567,7 +567,12 @@ impl WebappBackend for PostgresBackend {
                 MAX(total_in_flight) as total_in_flight,
                 MAX(median_instance_duration_secs) as median_instance_duration_secs,
                 MAX(active_instance_count) as active_instance_count,
-                COALESCE(SUM(total_instances_completed), 0)::BIGINT as total_instances_completed,
+                (
+                    SELECT COUNT(*)::BIGINT
+                    FROM runner_instances ri
+                    WHERE ri.result IS NOT NULL
+                      AND ri.error IS NULL
+                ) as total_instances_completed,
                 MAX(instances_per_sec) as instances_per_sec,
                 MAX(instances_per_min) as instances_per_min,
                 (
@@ -803,9 +808,7 @@ mod tests {
     async fn reset_database(pool: &PgPool) {
         sqlx::query(
             r#"
-            TRUNCATE runner_graph_updates,
-                     runner_actions_done,
-                     runner_instances_done,
+            TRUNCATE runner_actions_done,
                      queued_instances,
                      runner_instances,
                      workflow_versions,
@@ -1238,6 +1241,28 @@ mod tests {
         let backend = setup_backend().await;
         let pool_id = Uuid::new_v4();
         insert_worker_status(&backend, pool_id).await;
+        let (completed_instance_id, _, _) = insert_instance_with_graph(&backend).await;
+        let completed_payload =
+            rmp_serde::to_vec_named(&serde_json::json!({"ok": true})).expect("encode result");
+        sqlx::query("UPDATE runner_instances SET result = $2 WHERE instance_id = $1")
+            .bind(completed_instance_id)
+            .bind(completed_payload)
+            .execute(backend.pool())
+            .await
+            .expect("mark instance completed");
+
+        let (failed_instance_id, _, _) = insert_instance_with_graph(&backend).await;
+        let error_payload = rmp_serde::to_vec_named(&serde_json::json!({
+            "type": "Exception",
+            "message": "boom",
+        }))
+        .expect("encode error");
+        sqlx::query("UPDATE runner_instances SET error = $2 WHERE instance_id = $1")
+            .bind(failed_instance_id)
+            .bind(error_payload)
+            .execute(backend.pool())
+            .await
+            .expect("mark instance failed");
 
         let statuses = WebappBackend::get_worker_statuses(&backend, 60)
             .await
@@ -1245,6 +1270,7 @@ mod tests {
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].pool_id, pool_id);
         assert_eq!(statuses[0].total_completed, 20);
+        assert_eq!(statuses[0].total_instances_completed, 1);
         assert_eq!(statuses[0].total_in_flight, Some(2));
         assert_eq!(statuses[0].dispatch_queue_size, Some(3));
     }

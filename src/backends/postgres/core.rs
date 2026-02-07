@@ -400,6 +400,8 @@ impl PostgresBackend {
         tx.commit().await?;
 
         let mut instances = Vec::new();
+        let mut action_node_ids_by_instance: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        let mut all_action_node_ids: Vec<Uuid> = Vec::new();
         for row in rows {
             let instance_id: Uuid = row.get(0);
             let payload: Vec<u8> = row.get(1);
@@ -408,6 +410,15 @@ impl PostgresBackend {
             instance.instance_id = instance_id;
             if let Some(state_payload) = state_payload {
                 let graph: GraphUpdate = Self::deserialize(&state_payload)?;
+                let action_node_ids: Vec<Uuid> = graph
+                    .nodes
+                    .iter()
+                    .filter_map(|(node_id, node)| node.is_action_call().then_some(*node_id))
+                    .collect();
+                if !action_node_ids.is_empty() {
+                    all_action_node_ids.extend(action_node_ids.iter().copied());
+                    action_node_ids_by_instance.insert(instance_id, action_node_ids);
+                }
                 instance.state = Some(RunnerState::new(
                     None,
                     Some(graph.nodes),
@@ -416,6 +427,53 @@ impl PostgresBackend {
                 ));
             }
             instances.push(instance);
+        }
+
+        if !all_action_node_ids.is_empty() {
+            all_action_node_ids.sort_unstable();
+            all_action_node_ids.dedup();
+
+            Self::count_query(
+                &self.query_counts,
+                "select:runner_actions_done_by_execution_id",
+            );
+            let rows = sqlx::query(
+                r#"
+                SELECT DISTINCT ON (execution_id)
+                    execution_id,
+                    result
+                FROM runner_actions_done
+                WHERE execution_id = ANY($1)
+                ORDER BY execution_id, attempt DESC, id DESC
+                "#,
+            )
+            .bind(&all_action_node_ids)
+            .fetch_all(&self.pool)
+            .await?;
+
+            let mut action_results_by_execution_id: HashMap<Uuid, serde_json::Value> =
+                HashMap::new();
+            for row in rows {
+                let execution_id: Uuid = row.get("execution_id");
+                let result_payload: Option<Vec<u8>> = row.get("result");
+                let Some(result_payload) = result_payload else {
+                    continue;
+                };
+                let result: serde_json::Value = Self::deserialize(&result_payload)?;
+                action_results_by_execution_id.insert(execution_id, result);
+            }
+
+            for instance in &mut instances {
+                let Some(action_node_ids) = action_node_ids_by_instance.get(&instance.instance_id)
+                else {
+                    continue;
+                };
+                for node_id in action_node_ids {
+                    if let Some(result) = action_results_by_execution_id.get(node_id) {
+                        instance.action_results.insert(*node_id, result.clone());
+                    }
+                }
+            }
         }
 
         Ok(QueuedInstanceBatch { instances })
@@ -586,9 +644,7 @@ mod tests {
     async fn reset_database(pool: &PgPool) {
         sqlx::query(
             r#"
-            TRUNCATE runner_graph_updates,
-                     runner_actions_done,
-                     runner_instances_done,
+            TRUNCATE runner_actions_done,
                      queued_instances,
                      runner_instances,
                      workflow_versions,
@@ -719,6 +775,66 @@ mod tests {
             .expect("queued lock row");
         let lock_uuid: Option<Uuid> = row.get("lock_uuid");
         assert_eq!(lock_uuid, Some(claim.lock_uuid));
+    }
+
+    #[serial(postgres)]
+    #[tokio::test]
+    async fn core_get_queued_instances_restores_action_results_from_actions_done() {
+        let backend = setup_backend().await;
+        let instance_id = Uuid::new_v4();
+        let entry_node = Uuid::new_v4();
+        CoreBackend::queue_instances(&backend, &[sample_queued_instance(instance_id, entry_node)])
+            .await
+            .expect("queue instances");
+
+        let initial_claim = sample_lock_claim();
+        let initial_batch = CoreBackend::get_queued_instances(&backend, 1, initial_claim.clone())
+            .await
+            .expect("initial claim");
+        assert_eq!(initial_batch.instances.len(), 1);
+
+        let execution_id = Uuid::new_v4();
+        let mut completed_action_node = sample_execution_node(execution_id);
+        completed_action_node.status = NodeStatus::Completed;
+        completed_action_node.scheduled_at = None;
+
+        let graph = GraphUpdate {
+            instance_id,
+            nodes: HashMap::from([(execution_id, completed_action_node)]),
+            edges: std::collections::HashSet::new(),
+        };
+        CoreBackend::save_graphs(
+            &backend,
+            initial_claim.lock_uuid,
+            std::slice::from_ref(&graph),
+        )
+        .await
+        .expect("persist graph");
+
+        CoreBackend::save_actions_done(
+            &backend,
+            &[ActionDone {
+                execution_id,
+                attempt: 1,
+                result: serde_json::json!({"ok": true}),
+            }],
+        )
+        .await
+        .expect("persist action result");
+
+        CoreBackend::release_instance_locks(&backend, initial_claim.lock_uuid, &[instance_id])
+            .await
+            .expect("release initial lock");
+
+        let second_claim = sample_lock_claim();
+        let batch = CoreBackend::get_queued_instances(&backend, 1, second_claim)
+            .await
+            .expect("rehydrate instance");
+        assert_eq!(batch.instances.len(), 1);
+        assert_eq!(
+            batch.instances[0].action_results.get(&execution_id),
+            Some(&serde_json::json!({"ok": true}))
+        );
     }
 
     #[serial(postgres)]

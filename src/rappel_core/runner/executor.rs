@@ -284,6 +284,7 @@ impl RunnerExecutor {
         let mut pending = vec![(node, exception_value)];
         let mut actions = Vec::new();
         let mut sleep_requests = Vec::new();
+        let mut forwarded_completed: HashSet<Uuid> = HashSet::new();
 
         while let Some((current, current_exception)) = pending.pop() {
             // template_id is the DAG node id, not the execution id.
@@ -301,6 +302,11 @@ impl RunnerExecutor {
                 let successors = self.queue_successor(&current, &edge)?;
                 for successor in successors {
                     if successor.status == NodeStatus::Completed {
+                        if forwarded_completed.insert(successor.node_id) {
+                            // Rehydrated runs can revisit completed paths to recover
+                            // downstream sleep/action work without re-creating nodes.
+                            pending.push((successor, None));
+                        }
                         continue;
                     }
                     if successor.is_action_call() {
@@ -584,7 +590,7 @@ impl RunnerExecutor {
                 self.expand_spread_action(source, action.as_ref())
             }
             TemplateKind::Aggregator(template_id) => {
-                if let Some(existing) = self.find_connected_aggregator(source.node_id, &template_id)
+                if let Some(existing) = self.find_connected_successor(source.node_id, &template_id)
                 {
                     return Ok(vec![existing]);
                 }
@@ -593,6 +599,10 @@ impl RunnerExecutor {
                 Ok(vec![agg_node])
             }
             TemplateKind::Regular(template_id) => {
+                if let Some(existing) = self.find_connected_successor(source.node_id, &template_id)
+                {
+                    return Ok(vec![existing]);
+                }
                 let exec_node = self.get_or_create_exec_node(&template_id)?;
                 self.add_exec_edge(source.node_id, exec_node.node_id);
                 Ok(vec![exec_node])
@@ -1062,7 +1072,7 @@ impl RunnerExecutor {
         connected
     }
 
-    fn find_connected_aggregator(
+    fn find_connected_successor(
         &self,
         source_id: Uuid,
         template_id: &str,
@@ -1227,7 +1237,7 @@ mod tests {
 
     use crate::messages::ast as ir;
     use crate::rappel_core::dag::{
-        ActionCallNode, ActionCallParams, AggregatorNode, AssignmentNode, DAG, DAGEdge,
+        ActionCallNode, ActionCallParams, AggregatorNode, AssignmentNode, DAG, DAGEdge, SleepNode,
     };
     use crate::rappel_core::runner::state::{
         ExecutionEdge, ExecutionNode, NodeStatus, RunnerState,
@@ -1313,6 +1323,15 @@ mod tests {
             None,
             Some(assign_expr),
             None,
+            Some("main".to_string()),
+        )
+    }
+
+    fn sleep_node(node_id: &str, duration_expr: ir::Expr) -> SleepNode {
+        SleepNode::new(
+            node_id,
+            Some(duration_expr),
+            Some("sleep".to_string()),
             Some("main".to_string()),
         )
     }
@@ -1898,6 +1917,105 @@ mod tests {
             rehy_replay.variables.get("doubled"),
             Some(&Value::Number(42.into()))
         );
+    }
+
+    #[test]
+    fn test_rehydrate_sleep_resume_does_not_rerun_upstream_action() {
+        let mut dag = DAG::default();
+        let entry = assignment_node("entry", vec!["seed".to_string()], literal_int(1));
+        let action_start = action_node(
+            "action_start",
+            "get_timestamp",
+            HashMap::new(),
+            vec!["started".to_string()],
+            ActionNodeOptions::default(),
+        );
+        let sleep = sleep_node("sleep", literal_int(60));
+        let action_resume = action_node(
+            "action_resume",
+            "get_timestamp",
+            HashMap::new(),
+            vec!["resumed".to_string()],
+            ActionNodeOptions::default(),
+        );
+
+        dag.add_node(crate::rappel_core::dag::DAGNode::Assignment(entry.clone()));
+        dag.add_node(crate::rappel_core::dag::DAGNode::ActionCall(
+            action_start.clone(),
+        ));
+        dag.add_node(crate::rappel_core::dag::DAGNode::Sleep(sleep.clone()));
+        dag.add_node(crate::rappel_core::dag::DAGNode::ActionCall(
+            action_resume.clone(),
+        ));
+        dag.add_edge(DAGEdge::state_machine(
+            entry.id.clone(),
+            action_start.id.clone(),
+        ));
+        dag.add_edge(DAGEdge::state_machine(
+            action_start.id.clone(),
+            sleep.id.clone(),
+        ));
+        dag.add_edge(DAGEdge::state_machine(
+            sleep.id.clone(),
+            action_resume.id.clone(),
+        ));
+
+        let dag = Arc::new(dag);
+        let mut state = RunnerState::new(Some(dag.clone()), None, None, false);
+        let entry_exec = state.queue_template_node(&entry.id, None).expect("queue");
+        let mut executor = RunnerExecutor::new(dag.clone(), state, HashMap::new(), None);
+
+        let start_step = executor.increment(&[entry_exec.node_id]).expect("start");
+        assert_eq!(start_step.actions.len(), 1);
+        assert_eq!(
+            start_step.actions[0].template_id.as_deref(),
+            Some(action_start.id.as_str())
+        );
+        let start_exec = start_step.actions[0].clone();
+        executor.set_action_result(start_exec.node_id, Value::String("t0".to_string()));
+
+        let sleep_step = executor
+            .increment(&[start_exec.node_id])
+            .expect("advance to sleep");
+        assert!(sleep_step.actions.is_empty());
+        assert_eq!(sleep_step.sleep_requests.len(), 1);
+        let sleep_exec_id = sleep_step.sleep_requests[0].node_id;
+
+        let (nodes_snap, edges_snap, results_snap) =
+            snapshot_state(executor.state(), executor.action_results());
+        let mut rehydrated = create_rehydrated_executor(&dag, nodes_snap, edges_snap, results_snap);
+
+        let start_nodes_before: Vec<_> = rehydrated
+            .state()
+            .nodes
+            .values()
+            .filter(|node| node.template_id.as_deref() == Some(action_start.id.as_str()))
+            .collect();
+        assert_eq!(start_nodes_before.len(), 1);
+        assert_eq!(start_nodes_before[0].status, NodeStatus::Completed);
+
+        // Shard startup currently replays from entry_node; that should recover
+        // the sleep request without creating a second action_start execution.
+        let resume_step = rehydrated
+            .increment(&[entry_exec.node_id])
+            .expect("resume from entry");
+        assert!(resume_step.actions.is_empty());
+        assert_eq!(resume_step.sleep_requests.len(), 1);
+        assert_eq!(resume_step.sleep_requests[0].node_id, sleep_exec_id);
+        assert!(
+            resume_step
+                .actions
+                .iter()
+                .all(|action| action.template_id.as_deref() != Some(action_start.id.as_str()))
+        );
+
+        let start_nodes_after: Vec<_> = rehydrated
+            .state()
+            .nodes
+            .values()
+            .filter(|node| node.template_id.as_deref() == Some(action_start.id.as_str()))
+            .collect();
+        assert_eq!(start_nodes_after.len(), 1);
     }
 
     #[test]

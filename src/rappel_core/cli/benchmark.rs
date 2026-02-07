@@ -279,10 +279,8 @@ async fn drop_benchmark_tables(pool: &PgPool) {
             worker_status,
             workflow_schedules,
             queued_instances,
-            runner_instances_done,
             runner_instances,
             runner_actions_done,
-            runner_graph_updates,
             workflow_versions,
             _sqlx_migrations
         CASCADE

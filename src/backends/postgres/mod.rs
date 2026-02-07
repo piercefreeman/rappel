@@ -59,10 +59,8 @@ impl PostgresBackend {
         Self::count_query(&self.query_counts, "truncate:runner_tables");
         sqlx::query(
             r#"
-            TRUNCATE runner_graph_updates,
-                     runner_actions_done,
+            TRUNCATE runner_actions_done,
                      runner_instances,
-                     runner_instances_done,
                      queued_instances
             RESTART IDENTITY
             "#,
