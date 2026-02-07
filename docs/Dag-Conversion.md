@@ -1,6 +1,6 @@
 # DAG Conversion
 
-We start with the parsed IR (Rappel AST) and produce a graph the runner can execute. It is a DAG for most workflows, with a single back-edge for loops. The conversion step is where control flow and data flow are made explicit.
+We start with the parsed IR (Waymark AST) and produce a graph the runner can execute. It is a DAG for most workflows, with a single back-edge for loops. The conversion step is where control flow and data flow are made explicit.
 
 ## Mental model
 
@@ -59,7 +59,7 @@ A `branch` node fans out to guarded edges for `if` / `elif` and an `else` edge f
 
 ### Try/except
 
-Try bodies are flattened. Every node inside the try body can emit exception edges to handlers. Success edges flow to a join node. If the handler binds an exception variable, we insert an assignment from `__rappel_exception__` before the handler body.
+Try bodies are flattened. Every node inside the try body can emit exception edges to handlers. Success edges flow to a join node. If the handler binds an exception variable, we insert an assignment from `__waymark_exception__` before the handler body.
 
 ### For/while loops
 

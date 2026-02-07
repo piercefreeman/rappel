@@ -1,12 +1,12 @@
 # Action Retries
 
-Actions support retry policies for automatic error recovery. Retry configuration exists at two levels: the Rappel IR syntax and the Python workflow API via `run_action`.
+Actions support retry policies for automatic error recovery. Retry configuration exists at two levels: the Waymark IR syntax and the Python workflow API via `run_action`.
 
 ## IR Syntax
 
-In the Rappel IR, retry policies are specified in brackets after action calls. Timeout is a separate bracket since it's independent of exception handling:
+In the Waymark IR, retry policies are specified in brackets after action calls. Timeout is a separate bracket since it's independent of exception handling:
 
-```rappel
+```waymark
 # Catch all exceptions, retry up to 3 times with 60s exponential backoff
 result = @risky_action() [retry: 3, backoff: 60]
 
@@ -36,8 +36,8 @@ Retry and timeout policies are attached at the call site using `Workflow.run_act
 ```python
 from datetime import timedelta
 
-from rappel import action, workflow
-from rappel.workflow import RetryPolicy, Workflow
+from waymark import action, workflow
+from waymark.workflow import RetryPolicy, Workflow
 
 
 @action

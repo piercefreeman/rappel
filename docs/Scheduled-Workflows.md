@@ -1,6 +1,6 @@
 # Scheduled Workflows
 
-Rappel supports scheduling workflows to run automatically on a recurring basis. You define your workflow once, then register a schedule to have it execute at regular intervals or according to a cron expression.
+Waymark supports scheduling workflows to run automatically on a recurring basis. You define your workflow once, then register a schedule to have it execute at regular intervals or according to a cron expression.
 
 ## Overview
 
@@ -11,7 +11,7 @@ Scheduled workflows are useful for:
 - **Report generation**: Generate daily/weekly reports
 - **Health checks**: Monitor external services at fixed intervals
 
-Schedules are tied to workflow names, not specific versions. When a schedule fires, Rappel executes the latest registered version of that workflow.
+Schedules are tied to workflow names, not specific versions. When a schedule fires, Waymark executes the latest registered version of that workflow.
 
 ## Python API
 
@@ -21,7 +21,7 @@ Use `schedule_workflow` to register a recurring schedule:
 
 ```python
 from datetime import timedelta
-from rappel import Workflow, action, workflow, schedule_workflow
+from waymark import Workflow, action, workflow, schedule_workflow
 
 @action
 async def fetch_data() -> dict:
@@ -83,7 +83,7 @@ await schedule_workflow(
 Temporarily stop a schedule without deleting it:
 
 ```python
-from rappel import pause_schedule, resume_schedule
+from waymark import pause_schedule, resume_schedule
 
 # Pause the schedule (it won't fire until resumed)
 await pause_schedule(DataSyncWorkflow)
@@ -97,7 +97,7 @@ await resume_schedule(DataSyncWorkflow)
 Remove a schedule entirely:
 
 ```python
-from rappel import delete_schedule
+from waymark import delete_schedule
 
 await delete_schedule(DataSyncWorkflow)
 ```
@@ -109,7 +109,7 @@ Deleted schedules can be recreated by calling `schedule_workflow` again.
 Query all registered schedules:
 
 ```python
-from rappel import list_schedules, ScheduleInfo
+from waymark import list_schedules, ScheduleInfo
 
 # List all non-deleted schedules
 schedules = await list_schedules()

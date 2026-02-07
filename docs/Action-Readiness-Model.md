@@ -1,6 +1,6 @@
 # Unified Readiness Model
 
-This document explains how Rappel decides when a node is runnable. The same model also defines our push-based scheduling behavior: completions push readiness forward; we never rescan the DAG to find work.
+This document explains how Waymark decides when a node is runnable. The same model also defines our push-based scheduling behavior: completions push readiness forward; we never rescan the DAG to find work.
 
 ## Core principle
 
