@@ -4,6 +4,21 @@
 
 waymark is a library to let you build durable background tasks that withstand server restarts, task crashes, and long-running jobs. It's built for Python and Postgres without any additional deploy time requirements.
 
+## Getting Started
+
+We ship all client and server wheels as a python package. Install it via your package manager of choice:
+
+```bash
+uv add waymark
+```
+
+Once installed, Waymark exposes `start-workers` as a runnable bin entrypoint in your environment.
+You can boot the worker pool directly with `uv run`:
+
+```bash
+WAYMARK_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/waymark uv run start-workers
+```
+
 ## Usage
 
 Let's say you need to send welcome emails to a batch of users, but only the active ones. You want to fetch them all, filter out inactive accounts, then fan out emails in parallel. This is how you write that workflow in waymark:
@@ -186,19 +201,28 @@ uv run pytest
 Waymark runtime configuration is environment-variable driven.
 Waymark reads the process environment directly; it does not auto-load `.env` files.
 
-### `start-workers` runtime (`WorkerConfig::from_env`)
+### `start-workers` runtime
+
+#### Commonly customized
 
 | Environment Variable | Description | Default |
 |---------------------|-------------|---------|
 | `WAYMARK_DATABASE_URL` | PostgreSQL DSN for worker runtime state/backend | required |
-| `WAYMARK_WORKER_GRPC_ADDR` | gRPC bind addr used by the Python worker bridge server | `127.0.0.1:24118` |
 | `WAYMARK_WORKER_COUNT` | Number of Python worker processes | host CPU count (`available_parallelism`) |
 | `WAYMARK_CONCURRENT_PER_WORKER` | Max concurrent actions per Python worker | `10` |
-| `WAYMARK_USER_MODULE` | Comma-separated Python modules preloaded in workers | unset |
-| `WAYMARK_MAX_ACTION_LIFECYCLE` | Max actions per worker before worker recycle | unset (no recycle limit) |
-| `WAYMARK_POLL_INTERVAL_MS` | Queue poll interval for runloop | `100` |
 | `WAYMARK_MAX_CONCURRENT_INSTANCES` | Max in-memory instances across runloop shards | `500` |
 | `WAYMARK_EXECUTOR_SHARDS` | Number of executor shards | host CPU count (`available_parallelism`) |
+| `WAYMARK_USER_MODULE` | Comma-separated Python modules preloaded in workers | unset |
+| `WAYMARK_MAX_ACTION_LIFECYCLE` | Max actions per worker before worker recycle | unset (no recycle limit) |
+| `WAYMARK_WEBAPP_ENABLED` | Enable embedded webapp | `false` |
+| `WAYMARK_WEBAPP_ADDR` | Webapp bind address | `0.0.0.0:24119` |
+
+#### Advanced tuning
+
+| Environment Variable | Description | Default |
+|---------------------|-------------|---------|
+| `WAYMARK_WORKER_GRPC_ADDR` | gRPC bind addr used by the Python worker bridge server | `127.0.0.1:24118` |
+| `WAYMARK_POLL_INTERVAL_MS` | Queue poll interval for runloop | `100` |
 | `WAYMARK_INSTANCE_DONE_BATCH_SIZE` | Batch size for persisting completed instances | unset (uses `WAYMARK_MAX_CONCURRENT_INSTANCES`) |
 | `WAYMARK_PERSIST_INTERVAL_MS` | Persistence flush interval | `500` |
 | `WAYMARK_LOCK_TTL_MS` | Queue lock TTL | `15000` |
@@ -208,9 +232,9 @@ Waymark reads the process environment directly; it does not auto-load `.env` fil
 | `WAYMARK_EXPIRED_LOCK_RECLAIMER_BATCH_SIZE` | Max locks reclaimed per sweep | `1000` (clamped to min `1`) |
 | `WAYMARK_SCHEDULER_POLL_INTERVAL_MS` | Scheduler poll interval | `1000` |
 | `WAYMARK_SCHEDULER_BATCH_SIZE` | Scheduler due-item batch size | `100` |
-| `WAYMARK_WEBAPP_ENABLED` | Enable embedded webapp | `false` |
-| `WAYMARK_WEBAPP_ADDR` | Webapp bind address | `0.0.0.0:24119` |
 | `WAYMARK_RUNNER_PROFILE_INTERVAL_MS` | Worker status/profile publish interval | `5000` (clamped to min `1`) |
+
+If you need to customize Python startup/bootstrap behavior (for example custom boot commands), see `Bootstrap / Python SDK overrides` below.
 
 ### `waymark-bridge` runtime
 
@@ -291,15 +315,6 @@ There is no shortage of robust background queues in Python, including ones like 
 Almost all of these require a dedicated task broker that you host alongside your app. This usually isn't a huge deal during POCs but can get complex as you need to performance tune it for production. Cloud hosting of most of these are billed per-event and can get very expensive depending on how you orchestrate your jobs. They also typically force you to migrate your logic to fit the conventions of the framework.
 
 Open source solutions like RabbitMQ have been battle tested over decades & large companies like Temporal are able to throw a lot of resources towards optimization. Both of these solutions are great choices - just intended to solve for different scopes. Expect an associated higher amount of setup and management complexity.
-
-## Worker Pool
-
-`start-workers` is the main invocation point to boot your worker cluster on a new node. It launches the gRPC bridge plus a polling dispatcher that streams
-queued actions from Postgres into the Python workers. You should use this as your docker entrypoint:
-
-```bash
-$ cargo run --bin start-workers
-```
 
 ## Development
 
