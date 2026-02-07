@@ -147,11 +147,12 @@ If you have a particular workflow that you think should be working but isn't yet
 
 ### Rust tests (unit + integration)
 
-Integration tests are regular Rust tests in `tests/` and run against a real Postgres database. The test harness:
-- Uses a fixed DSN: `postgresql://waymark:waymark@127.0.0.1:5433/waymark`
-- Runs DB migrations automatically on connect
-- Truncates integration tables before each test
-- Creates a temporary Python environment using `uv` and spawns `python/.venv/bin/waymark-worker`
+Integration fixtures are run by the Rust entrypoint binary `src/bin/integration_test.rs`.
+It runs curated fixtures from `tests/integration_tests` and checks parity:
+- Baseline execution via direct inline Python workflow logic
+- Runtime execution via Rust DAG execution + in-memory backend
+- Runtime execution via Rust DAG execution + Postgres backend
+- Backend results must exactly match the inline baseline (result or error payload)
 
 Commands:
 
@@ -159,23 +160,19 @@ Commands:
 # Everything (unit + integration)
 cargo test
 
-# Only integration tests
-cargo test --test integration_test
-cargo test --test schedule_test
+# Run fixture integration parity (default backends: in-memory,postgres)
+cargo run --bin integration_test
 
-# Single integration test
-cargo test gather_listcomp_matches_in_memory --test integration_test
+# Run selected fixture case IDs only
+cargo run --bin integration_test -- --case simple --case parallel
+
+# Restrict parity backends (comma-separated)
+cargo run --bin integration_test -- --backends in-memory
 ```
 
 Prereqs:
-- Ensure Postgres is running on `127.0.0.1:5433` with credentials from `docker-compose.yml`
-- Ensure `uv` is installed (the tests call `uv sync` under the hood)
-
-Example (matches `docker-compose.yml` in this repo):
-
-```bash
-docker compose up -d postgres
-```
+- No manual Postgres startup is required for the default test harness configuration.
+- Ensure `uv` is installed and `python/.venv` is prepared (`cd python && uv sync`)
 
 ### Python tests
 
