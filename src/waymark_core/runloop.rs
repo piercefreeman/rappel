@@ -411,6 +411,7 @@ pub struct RunLoop {
     lock_heartbeat: Duration,
     evict_sleep_threshold: Duration,
     active_instance_gauge: Option<Arc<AtomicUsize>>,
+    shutdown_rx: Option<watch::Receiver<bool>>,
 }
 
 #[derive(Clone, Debug)]
@@ -432,6 +433,24 @@ impl RunLoop {
         worker_pool: impl BaseWorkerPool + 'static,
         backend: impl CoreBackend + WorkflowRegistryBackend + 'static,
         config: RunLoopSupervisorConfig,
+    ) -> Self {
+        Self::new_internal(worker_pool, backend, config, None)
+    }
+
+    pub fn new_with_shutdown(
+        worker_pool: impl BaseWorkerPool + 'static,
+        backend: impl CoreBackend + WorkflowRegistryBackend + 'static,
+        config: RunLoopSupervisorConfig,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> Self {
+        Self::new_internal(worker_pool, backend, config, Some(shutdown_rx))
+    }
+
+    fn new_internal(
+        worker_pool: impl BaseWorkerPool + 'static,
+        backend: impl CoreBackend + WorkflowRegistryBackend + 'static,
+        config: RunLoopSupervisorConfig,
+        shutdown_rx: Option<watch::Receiver<bool>>,
     ) -> Self {
         let max_concurrent_instances = std::cmp::max(1, config.max_concurrent_instances);
         let backend = Arc::new(backend);
@@ -457,6 +476,7 @@ impl RunLoop {
             lock_heartbeat: config.lock_heartbeat,
             evict_sleep_threshold: config.evict_sleep_threshold,
             active_instance_gauge: config.active_instance_gauge.clone(),
+            shutdown_rx,
         }
     }
 
@@ -789,9 +809,21 @@ impl RunLoop {
         let mut instances_idle = false;
         let mut instances_done_pending: Vec<InstanceDone> = Vec::new();
         let mut run_result = Ok(());
+        let mut shutdown_rx = self.shutdown_rx.clone();
 
         loop {
-            if instances_idle && executor_shards.is_empty() && sleeping_nodes.is_empty() {
+            if let Some(rx) = shutdown_rx.as_ref()
+                && *rx.borrow()
+            {
+                info!("runloop exiting: shutdown requested");
+                break;
+            }
+
+            if shutdown_rx.is_none()
+                && instances_idle
+                && executor_shards.is_empty()
+                && sleeping_nodes.is_empty()
+            {
                 warn!(
                     inflight = inflight_actions.len(),
                     blocked = blocked_until_by_instance.len(),
@@ -801,6 +833,19 @@ impl RunLoop {
             }
 
             let first_event = tokio::select! {
+                shutdown_signal = async {
+                    if let Some(rx) = shutdown_rx.as_mut() {
+                        rx.changed().await.is_ok()
+                    } else {
+                        std::future::pending::<bool>().await
+                    }
+                } => {
+                    if !shutdown_signal || shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
+                        info!("runloop exiting: shutdown requested");
+                        break;
+                    }
+                    None
+                }
                 Some(completions) = completion_rx.recv() => {
                     Some(CoordinatorEvent::Completions(completions))
                 }
@@ -1306,7 +1351,12 @@ pub async fn runloop_supervisor<B, W>(
             lock_uuid = %config.lock_uuid,
             "runloop starting"
         );
-        let mut runloop = RunLoop::new(worker_pool.clone(), backend.clone(), config.clone());
+        let mut runloop = RunLoop::new_with_shutdown(
+            worker_pool.clone(),
+            backend.clone(),
+            config.clone(),
+            shutdown_rx.clone(),
+        );
 
         let result = runloop.run().await;
 
