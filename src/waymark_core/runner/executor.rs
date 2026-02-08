@@ -10,7 +10,7 @@ use rustc_hash::FxHashMap;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::backends::{ActionDone, CoreBackend, GraphUpdate};
+use crate::backends::{ActionAttemptStatus, ActionDone, CoreBackend, GraphUpdate};
 use crate::messages::ast as ir;
 use crate::observability::obs;
 use crate::waymark_core::dag::{
@@ -371,28 +371,49 @@ impl RunnerExecutor {
             let action_value = self.action_results.get(&node_id).cloned().ok_or_else(|| {
                 RunnerExecutorError(format!("missing action result for {}", node_id))
             })?;
-            let attempt = {
+            let (attempt, started_at) = {
                 let node = self.state.nodes.get(&node_id).ok_or_else(|| {
                     RunnerExecutorError(format!("execution node not found: {node_id}"))
                 })?;
-                node.action_attempt
+                (node.action_attempt, node.started_at)
             };
             if is_exception_value(&action_value) {
                 exception_value = Some(action_value.clone());
-                action_done = Some(ActionDone {
-                    execution_id: node_id,
-                    attempt,
-                    result: action_value.clone(),
-                });
-                if let Some(node) = self.handle_action_failure(node_id, exception_value.as_ref())? {
+                let status = action_done_status_for_exception(&action_value);
+                let finished_at = Utc::now();
+                if let Some(node) =
+                    self.handle_action_failure(node_id, exception_value.as_ref(), finished_at)?
+                {
                     retry_action = Some(node);
+                    action_done = Some(build_action_done(
+                        node_id,
+                        attempt,
+                        status,
+                        started_at,
+                        finished_at,
+                        action_value.clone(),
+                    ));
                     return Ok((None, None, action_done, retry_action));
                 }
                 if !self.failure_has_exception_handler(node_id, &action_value)?
                     && self.terminal_error.is_none()
                 {
-                    self.terminal_error = Some(action_value);
+                    self.terminal_error = Some(action_value.clone());
                 }
+                let completed_at = self
+                    .state
+                    .nodes
+                    .get(&node_id)
+                    .and_then(|node| node.completed_at)
+                    .unwrap_or(finished_at);
+                action_done = Some(build_action_done(
+                    node_id,
+                    attempt,
+                    status,
+                    started_at,
+                    completed_at,
+                    action_value.clone(),
+                ));
             } else {
                 self.state
                     .mark_completed(node_id)
@@ -406,11 +427,20 @@ impl RunnerExecutor {
                 if !assignments.is_empty() {
                     self.state.mark_latest_assignments(node_id, &assignments);
                 }
-                action_done = Some(ActionDone {
-                    execution_id: node_id,
+                let completed_at = self
+                    .state
+                    .nodes
+                    .get(&node_id)
+                    .and_then(|node| node.completed_at)
+                    .unwrap_or_else(Utc::now);
+                action_done = Some(build_action_done(
+                    node_id,
                     attempt,
-                    result: action_value,
-                });
+                    ActionAttemptStatus::Completed,
+                    started_at,
+                    completed_at,
+                    action_value,
+                ));
             }
         } else {
             self.state
@@ -429,6 +459,7 @@ impl RunnerExecutor {
         &mut self,
         node_id: Uuid,
         exception_value: Option<&Value>,
+        finished_at: DateTime<Utc>,
     ) -> Result<Option<ExecutionNode>, RunnerExecutorError> {
         let node =
             self.state.nodes.get(&node_id).ok_or_else(|| {
@@ -442,6 +473,7 @@ impl RunnerExecutor {
             let should_queue = !self.state.ready_queue.contains(&node_id);
             if let Some(node) = self.state.nodes.get_mut(&node_id) {
                 node.status = NodeStatus::Queued;
+                node.completed_at = Some(finished_at);
             }
             if should_queue {
                 self.state.ready_queue.push(node_id);
@@ -455,6 +487,9 @@ impl RunnerExecutor {
         self.state
             .mark_failed(node_id)
             .map_err(|err| RunnerExecutorError(err.0))?;
+        if let Some(node) = self.state.nodes.get_mut(&node_id) {
+            node.completed_at = Some(finished_at);
+        }
         if let Some(exception_value) = exception_value {
             let exception_expr = ValueExpr::Literal(LiteralValue {
                 value: exception_value.clone(),
@@ -1268,6 +1303,49 @@ fn exception_type(value: &Value) -> Option<&str> {
     }
 }
 
+fn action_done_status_for_exception(value: &Value) -> ActionAttemptStatus {
+    let normalized = exception_type(value)
+        .map(|name| name.to_ascii_lowercase())
+        .unwrap_or_default();
+    if normalized == "executorresume" || normalized.contains("timeout") {
+        ActionAttemptStatus::TimedOut
+    } else {
+        ActionAttemptStatus::Failed
+    }
+}
+
+fn compute_action_duration_ms(
+    started_at: Option<DateTime<Utc>>,
+    completed_at: DateTime<Utc>,
+) -> Option<i64> {
+    started_at
+        .map(|started_at| {
+            completed_at
+                .signed_duration_since(started_at)
+                .num_milliseconds()
+        })
+        .filter(|duration| *duration >= 0)
+}
+
+fn build_action_done(
+    execution_id: Uuid,
+    attempt: i32,
+    status: ActionAttemptStatus,
+    started_at: Option<DateTime<Utc>>,
+    completed_at: DateTime<Utc>,
+    result: Value,
+) -> ActionDone {
+    ActionDone {
+        execution_id,
+        attempt,
+        status,
+        started_at,
+        completed_at: Some(completed_at),
+        duration_ms: compute_action_duration_ms(started_at, completed_at),
+        result,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1312,6 +1390,52 @@ mod tests {
             }))),
             span: None,
         }
+    }
+
+    #[test]
+    fn test_action_done_status_for_resume_exception_is_timed_out() {
+        let value = serde_json::json!({
+            "type": "ExecutorResume",
+            "message": "resumed action timed out",
+        });
+        assert_eq!(
+            action_done_status_for_exception(&value),
+            ActionAttemptStatus::TimedOut
+        );
+    }
+
+    #[test]
+    fn test_action_done_status_for_generic_exception_is_failed() {
+        let value = serde_json::json!({
+            "type": "ValueError",
+            "message": "boom",
+        });
+        assert_eq!(
+            action_done_status_for_exception(&value),
+            ActionAttemptStatus::Failed
+        );
+    }
+
+    #[test]
+    fn test_build_action_done_sets_duration_from_started_and_completed() {
+        let execution_id = Uuid::new_v4();
+        let started_at = Utc::now();
+        let completed_at = started_at + chrono::Duration::milliseconds(275);
+        let done = build_action_done(
+            execution_id,
+            2,
+            ActionAttemptStatus::Completed,
+            Some(started_at),
+            completed_at,
+            serde_json::json!({"ok": true}),
+        );
+
+        assert_eq!(done.execution_id, execution_id);
+        assert_eq!(done.attempt, 2);
+        assert_eq!(done.status, ActionAttemptStatus::Completed);
+        assert_eq!(done.started_at, Some(started_at));
+        assert_eq!(done.completed_at, Some(completed_at));
+        assert_eq!(done.duration_ms, Some(275));
     }
 
     #[derive(Default)]
