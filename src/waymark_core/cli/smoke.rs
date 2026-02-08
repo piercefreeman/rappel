@@ -284,6 +284,7 @@ async fn run_program_smoke(case: &SmokeCase, worker_pool: RemoteWorkerPool) -> R
             lock_ttl: Duration::from_secs(15),
             lock_heartbeat: Duration::from_secs(5),
             evict_sleep_threshold: Duration::from_secs(10),
+            skip_sleep: false,
             active_instance_gauge: None,
         },
     );

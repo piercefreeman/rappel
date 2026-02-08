@@ -60,6 +60,7 @@ pub async fn run_case(case_index: usize, case: &GeneratedCase) -> Result<()> {
             lock_ttl: Duration::from_secs(15),
             lock_heartbeat: Duration::from_secs(5),
             evict_sleep_threshold: Duration::from_secs(10),
+            skip_sleep: false,
             active_instance_gauge: None,
         },
     );

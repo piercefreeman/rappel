@@ -615,6 +615,7 @@ impl proto::workflow_service_server::WorkflowService for BridgeService {
             return Err(Status::invalid_argument("missing registration"));
         };
 
+        let skip_sleep = first.skip_sleep;
         let registration = match first.kind {
             Some(proto::workflow_stream_request::Kind::Registration(registration)) => registration,
             _ => {
@@ -707,6 +708,7 @@ impl proto::workflow_service_server::WorkflowService for BridgeService {
                         lock_ttl: Duration::from_secs(15),
                         lock_heartbeat: Duration::from_secs(5),
                         evict_sleep_threshold: Duration::from_secs(10),
+                        skip_sleep,
                         active_instance_gauge: None,
                     },
                 );

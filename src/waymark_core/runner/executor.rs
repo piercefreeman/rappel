@@ -114,6 +114,7 @@ pub struct RunnerExecutor {
     /// Cleared at the start of each increment call.
     eval_cache: RefCell<FxHashMap<(Uuid, String), Value>>,
     instance_id: Option<Uuid>,
+    terminal_error: Option<Value>,
 }
 
 impl RunnerExecutor {
@@ -142,6 +143,7 @@ impl RunnerExecutor {
             template_to_exec_nodes,
             eval_cache: RefCell::new(FxHashMap::default()),
             instance_id: None,
+            terminal_error: None,
         }
     }
 
@@ -167,6 +169,10 @@ impl RunnerExecutor {
 
     pub fn set_instance_id(&mut self, instance_id: Uuid) {
         self.instance_id = Some(instance_id);
+    }
+
+    pub fn terminal_error(&self) -> Option<&Value> {
+        self.terminal_error.as_ref()
     }
 
     pub(super) fn eval_cache_get(&self, key: &(Uuid, String)) -> Option<Value> {
@@ -382,6 +388,11 @@ impl RunnerExecutor {
                     retry_action = Some(node);
                     return Ok((None, None, action_done, retry_action));
                 }
+                if !self.failure_has_exception_handler(node_id, &action_value)?
+                    && self.terminal_error.is_none()
+                {
+                    self.terminal_error = Some(action_value);
+                }
             } else {
                 self.state
                     .mark_completed(node_id)
@@ -458,6 +469,29 @@ impl RunnerExecutor {
                 .mark_latest_assignments(node_id, &exception_assignment);
         }
         Ok(None)
+    }
+
+    fn failure_has_exception_handler(
+        &self,
+        node_id: Uuid,
+        exception_value: &Value,
+    ) -> Result<bool, RunnerExecutorError> {
+        let node =
+            self.state.nodes.get(&node_id).ok_or_else(|| {
+                RunnerExecutorError(format!("execution node not found: {node_id}"))
+            })?;
+        let template_id = match &node.template_id {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let template_edges = match self.template_index.outgoing(template_id) {
+            Some(edges) => edges,
+            None => return Ok(false),
+        };
+        let selected = self.select_edges(template_edges, node, Some(exception_value.clone()))?;
+        Ok(selected
+            .iter()
+            .any(|edge| edge.edge_type == EdgeType::StateMachine))
     }
 
     fn retry_decision(
