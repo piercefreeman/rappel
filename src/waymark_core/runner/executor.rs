@@ -1710,21 +1710,24 @@ mod tests {
             executor: &mut RunnerExecutor,
             action_result_for: ActionResultFor,
         ) -> Result<bool, RunnerExecutorError> {
-            let queued_actions: Vec<ExecutionNode> = executor
+            let active_actions: Vec<ExecutionNode> = executor
                 .state()
                 .nodes
                 .values()
-                .filter(|node| node.status == NodeStatus::Queued && node.is_action_call())
+                .filter(|node| {
+                    node.is_action_call()
+                        && matches!(node.status, NodeStatus::Queued | NodeStatus::Running)
+                })
                 .cloned()
                 .collect();
-            for action in &queued_actions {
+            for action in &active_actions {
                 if !executor.action_results().contains_key(&action.node_id) {
                     executor.set_action_result(action.node_id, action_result_for(action));
                 }
             }
 
             let mut finished_nodes: Vec<Uuid> =
-                queued_actions.iter().map(|node| node.node_id).collect();
+                active_actions.iter().map(|node| node.node_id).collect();
             finished_nodes.extend(
                 executor
                     .state()
@@ -2152,7 +2155,7 @@ fn main(input: [], output: [done]):
         let node1 = rehydrated.state().nodes.get(&exec1.node_id).unwrap();
         assert_eq!(node1.status, NodeStatus::Completed);
         let node2 = rehydrated.state().nodes.get(&exec2.node_id).unwrap();
-        assert_eq!(node2.status, NodeStatus::Queued);
+        assert_eq!(node2.status, NodeStatus::Running);
     }
 
     #[test]
@@ -2905,7 +2908,7 @@ fn main(input: [], output: [done]):
     }
 
     #[test]
-    fn test_rehydrate_ready_queue_rebuilt() {
+    fn test_rehydrate_ready_queue_rebuilt_for_running_actions() {
         let mut dag = DAG::default();
         let action1 = action_node(
             "action1",
@@ -2953,7 +2956,18 @@ fn main(input: [], output: [done]):
             .values()
             .filter(|node| node.status == NodeStatus::Queued)
             .collect();
-        assert_eq!(queued_nodes.len(), 1);
-        assert_eq!(queued_nodes[0].node_id, exec2.node_id);
+        assert!(queued_nodes.is_empty());
+        let running_nodes: Vec<_> = rehydrated
+            .state()
+            .nodes
+            .values()
+            .filter(|node| node.status == NodeStatus::Running)
+            .collect();
+        assert_eq!(running_nodes.len(), 1);
+        assert_eq!(running_nodes[0].node_id, exec2.node_id);
+        assert!(
+            rehydrated.state().ready_queue.is_empty(),
+            "rehydration should not requeue running action nodes"
+        );
     }
 }

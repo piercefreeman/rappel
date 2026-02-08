@@ -497,6 +497,7 @@ impl RunnerState {
             }
             is_action
         };
+        self.ready_queue.retain(|id| id != &node_id);
         if is_action {
             self.mark_graph_dirty();
         }
@@ -2032,6 +2033,10 @@ mod tests {
                 .and_then(|node| node.completed_at)
                 .is_none(),
             "running action should clear completed_at"
+        );
+        assert!(
+            !state.ready_queue.contains(&action_result.node_id),
+            "running action should be removed from ready_queue"
         );
         assert!(state.consume_graph_dirty_for_durable_execution());
 
