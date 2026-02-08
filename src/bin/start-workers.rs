@@ -168,6 +168,7 @@ async fn main() -> Result<()> {
             lock_ttl: config.lock_ttl,
             lock_heartbeat: config.lock_heartbeat,
             evict_sleep_threshold: config.evict_sleep_threshold,
+            skip_sleep: false,
             active_instance_gauge: Some(active_instance_gauge),
         },
         shutdown_rx,

@@ -410,6 +410,7 @@ pub struct RunLoop {
     lock_ttl: Duration,
     lock_heartbeat: Duration,
     evict_sleep_threshold: Duration,
+    skip_sleep: bool,
     active_instance_gauge: Option<Arc<AtomicUsize>>,
     shutdown_rx: Option<watch::Receiver<bool>>,
 }
@@ -425,6 +426,7 @@ pub struct RunLoopSupervisorConfig {
     pub lock_ttl: Duration,
     pub lock_heartbeat: Duration,
     pub evict_sleep_threshold: Duration,
+    pub skip_sleep: bool,
     pub active_instance_gauge: Option<Arc<AtomicUsize>>,
 }
 
@@ -475,6 +477,7 @@ impl RunLoop {
             lock_ttl: config.lock_ttl,
             lock_heartbeat: config.lock_heartbeat,
             evict_sleep_threshold: config.evict_sleep_threshold,
+            skip_sleep: config.skip_sleep,
             active_instance_gauge: config.active_instance_gauge.clone(),
             shutdown_rx,
         }
@@ -1166,7 +1169,10 @@ impl RunLoop {
                     if run_result.is_err() {
                         break;
                     }
-                    for sleep_request in step.sleep_requests {
+                    for mut sleep_request in step.sleep_requests {
+                        if self.skip_sleep {
+                            sleep_request.wake_at = Utc::now();
+                        }
                         let existing = sleeping_nodes.get(&sleep_request.node_id);
                         let should_update = match existing {
                             Some(existing) => sleep_request.wake_at < existing.wake_at,
@@ -1457,6 +1463,14 @@ fn build_instance_done(
     entry_node: Uuid,
     executor: &RunnerExecutor,
 ) -> InstanceDone {
+    if let Some(error_payload) = executor.terminal_error().cloned() {
+        return InstanceDone {
+            executor_id,
+            entry_node,
+            result: None,
+            error: Some(error_payload),
+        };
+    }
     let (result_payload, error_payload) = compute_instance_payload(executor);
     InstanceDone {
         executor_id,
@@ -1559,6 +1573,7 @@ fn main(input: [x], output: [y]):
                 lock_ttl: Duration::from_secs(15),
                 lock_heartbeat: Duration::from_secs(5),
                 evict_sleep_threshold: Duration::from_secs(10),
+                skip_sleep: false,
                 active_instance_gauge: None,
             },
         );
@@ -1634,6 +1649,7 @@ fn main(input: [x], output: [y]):
                 lock_ttl: Duration::from_secs(15),
                 lock_heartbeat: Duration::from_secs(5),
                 evict_sleep_threshold: Duration::from_secs(10),
+                skip_sleep: false,
                 active_instance_gauge: None,
             },
         );
@@ -1774,6 +1790,7 @@ fn main(input: [limit], output: [result]):
                 lock_ttl: Duration::from_secs(15),
                 lock_heartbeat: Duration::from_secs(5),
                 evict_sleep_threshold: Duration::from_secs(10),
+                skip_sleep: false,
                 active_instance_gauge: None,
             },
         );
