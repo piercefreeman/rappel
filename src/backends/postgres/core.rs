@@ -40,6 +40,7 @@ impl PostgresBackend {
                 instance.instance_id,
                 instance.entry_node,
                 instance.workflow_version_id,
+                instance.schedule_id,
                 Self::serialize(&graph)?,
             ));
         }
@@ -57,15 +58,16 @@ impl PostgresBackend {
         );
 
         let mut runner_builder: QueryBuilder<Postgres> = QueryBuilder::new(
-            "INSERT INTO runner_instances (instance_id, entry_node, workflow_version_id, state) ",
+            "INSERT INTO runner_instances (instance_id, entry_node, workflow_version_id, schedule_id, state) ",
         );
         runner_builder.push_values(
             runner_payloads.iter(),
-            |mut builder, (id, entry, workflow_version_id, payload)| {
+            |mut builder, (id, entry, workflow_version_id, schedule_id, payload)| {
                 builder
                     .push_bind(*id)
                     .push_bind(*entry)
                     .push_bind(*workflow_version_id)
+                    .push_bind(*schedule_id)
                     .push_bind(payload.as_slice());
             },
         );
@@ -642,6 +644,7 @@ mod tests {
     fn sample_queued_instance(instance_id: Uuid, entry_node: Uuid) -> QueuedInstance {
         QueuedInstance {
             workflow_version_id: Uuid::new_v4(),
+            schedule_id: None,
             dag: None,
             entry_node,
             state: Some(sample_runner_state()),

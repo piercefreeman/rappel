@@ -551,7 +551,10 @@ async fn list_schedules(
 async fn schedule_detail(
     State(state): State<WebappState>,
     Path(schedule_id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<ScheduleDetailQuery>,
 ) -> impl IntoResponse {
+    let per_page = 20i64;
+
     let schedule = match state.database.get_schedule(schedule_id).await {
         Ok(s) => s,
         Err(err) => {
@@ -564,7 +567,50 @@ async fn schedule_detail(
         }
     };
 
-    Html(render_schedule_detail_page(&state.templates, &schedule))
+    let total_count = match state.database.count_schedule_invocations(schedule_id).await {
+        Ok(count) => count,
+        Err(err) => {
+            error!(?err, %schedule_id, "failed to count schedule invocations");
+            return Html(render_error_page(
+                &state.templates,
+                "Unable to load schedule",
+                "We couldn't fetch invocation history for this schedule.",
+            ));
+        }
+    };
+
+    let total_pages = (total_count as f64 / per_page as f64).ceil() as i64;
+    let current_page = query.page.unwrap_or(1).max(1).min(total_pages.max(1));
+    let offset = (current_page - 1) * per_page;
+
+    let invocations = match state
+        .database
+        .list_schedule_invocations(schedule_id, per_page, offset)
+        .await
+    {
+        Ok(invocations) => invocations,
+        Err(err) => {
+            error!(?err, %schedule_id, "failed to list schedule invocations");
+            return Html(render_error_page(
+                &state.templates,
+                "Unable to load schedule",
+                "We couldn't fetch invocation history for this schedule.",
+            ));
+        }
+    };
+
+    Html(render_schedule_detail_page(
+        &state.templates,
+        &schedule,
+        &invocations,
+        current_page,
+        total_pages,
+    ))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ScheduleDetailQuery {
+    page: Option<i64>,
 }
 
 async fn pause_schedule(
@@ -914,6 +960,11 @@ struct ScheduleDetailPageContext {
     title: String,
     active_tab: String,
     schedule: ScheduleDetailView,
+    invocations: Vec<ScheduleInvocationRow>,
+    current_page: i64,
+    total_pages: i64,
+    has_pagination: bool,
+    has_invocations: bool,
 }
 
 #[derive(Serialize)]
@@ -937,15 +988,34 @@ struct ScheduleDetailView {
     input_payload: Option<String>,
 }
 
+#[derive(Serialize)]
+struct ScheduleInvocationRow {
+    id: String,
+    created_at: String,
+    status: String,
+}
+
 fn render_schedule_detail_page(
     templates: &Tera,
     schedule: &super::types::ScheduleDetail,
+    invocations: &[super::types::ScheduleInvocationSummary],
+    current_page: i64,
+    total_pages: i64,
 ) -> String {
     let schedule_expression = if schedule.schedule_type == "cron" {
         schedule.cron_expression.clone().unwrap_or_default()
     } else {
         format!("every {} seconds", schedule.interval_seconds.unwrap_or(0))
     };
+
+    let invocation_rows = invocations
+        .iter()
+        .map(|invocation| ScheduleInvocationRow {
+            id: invocation.id.to_string(),
+            created_at: invocation.created_at.to_rfc3339(),
+            status: invocation.status.to_string(),
+        })
+        .collect::<Vec<_>>();
 
     let context = ScheduleDetailPageContext {
         title: format!("Schedule: {}", schedule.schedule_name),
@@ -969,6 +1039,11 @@ fn render_schedule_detail_page(
             allow_duplicate: schedule.allow_duplicate,
             input_payload: schedule.input_payload.clone(),
         },
+        has_invocations: !invocation_rows.is_empty(),
+        invocations: invocation_rows,
+        current_page,
+        total_pages,
+        has_pagination: total_pages > 1,
     };
 
     render_template(templates, "schedule_detail.html", &context)

@@ -289,3 +289,11 @@ pub struct ScheduleDetail {
     pub allow_duplicate: bool,
     pub input_payload: Option<String>,
 }
+
+/// Invocation summary row for schedule detail pages.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduleInvocationSummary {
+    pub id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub status: InstanceStatus,
+}

@@ -13,8 +13,8 @@ use crate::scheduler::{CreateScheduleParams, ScheduleId, WorkflowSchedule};
 use crate::waymark_core::dag::DAG;
 use crate::waymark_core::runner::state::{ExecutionEdge, ExecutionNode, NodeStatus, RunnerState};
 use crate::webapp::{
-    ExecutionGraphView, InstanceDetail, InstanceSummary, ScheduleDetail, ScheduleSummary,
-    TimelineEntry, WorkerActionRow, WorkerAggregateStats, WorkerStatus,
+    ExecutionGraphView, InstanceDetail, InstanceSummary, ScheduleDetail, ScheduleInvocationSummary,
+    ScheduleSummary, TimelineEntry, WorkerActionRow, WorkerAggregateStats, WorkerStatus,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +53,8 @@ where
 /// Queued instance payload for the run loop.
 pub struct QueuedInstance {
     pub workflow_version_id: Uuid,
+    #[serde(default)]
+    pub schedule_id: Option<Uuid>,
     #[serde(skip, default)]
     pub dag: Option<Arc<DAG>>,
     pub entry_node: Uuid,
@@ -136,7 +138,7 @@ impl GraphUpdate {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-/// Batch payload representing a completed action execution.
+/// Batch payload representing a finished action attempt (success or failure).
 pub struct ActionDone {
     pub execution_id: Uuid,
     pub attempt: i32,
@@ -182,7 +184,7 @@ pub trait CoreBackend: Send + Sync {
         graphs: &[GraphUpdate],
     ) -> BackendResult<Vec<InstanceLockStatus>>;
 
-    /// Persist completed action executions.
+    /// Persist finished action attempts (success or failure).
     async fn save_actions_done(&self, actions: &[ActionDone]) -> BackendResult<()>;
 
     /// Return up to size queued instances without blocking.
@@ -291,6 +293,13 @@ pub trait WebappBackend: Send + Sync {
     async fn count_schedules(&self) -> BackendResult<i64>;
     async fn list_schedules(&self, limit: i64, offset: i64) -> BackendResult<Vec<ScheduleSummary>>;
     async fn get_schedule(&self, schedule_id: Uuid) -> BackendResult<ScheduleDetail>;
+    async fn count_schedule_invocations(&self, schedule_id: Uuid) -> BackendResult<i64>;
+    async fn list_schedule_invocations(
+        &self,
+        schedule_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> BackendResult<Vec<ScheduleInvocationSummary>>;
     async fn update_schedule_status(&self, schedule_id: Uuid, status: &str) -> BackendResult<bool>;
     async fn get_distinct_schedule_statuses(&self) -> BackendResult<Vec<String>>;
     async fn get_distinct_schedule_types(&self) -> BackendResult<Vec<String>>;
