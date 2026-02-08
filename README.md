@@ -2,7 +2,7 @@
 
 ![Waymark Logo](https://raw.githubusercontent.com/piercefreeman/waymark/main/media/header.png)
 
-waymark is a library to let you build durable background tasks that withstand server restarts, task crashes, and long-running jobs. It's built for Python and Postgres without any additional deploy time requirements.
+waymark is a library to let you build durable background tasks that withstand server restarts, task crashes, and long-running jobs. It's built for Python and Postgres without any additional deploy time requirements. More languages are coming soon.
 
 ## Getting Started
 
