@@ -194,6 +194,27 @@ impl RunnerExecutor {
         self.action_results.remove(&node_id);
     }
 
+    /// Resolve timeout policy seconds for an action node.
+    pub fn action_timeout_seconds(&self, node_id: Uuid) -> Result<u32, RunnerExecutorError> {
+        let node =
+            self.state.nodes.get(&node_id).ok_or_else(|| {
+                RunnerExecutorError(format!("execution node not found: {node_id}"))
+            })?;
+        if !node.is_action_call() {
+            return Ok(0);
+        }
+        let Some(template_id) = node.template_id.as_ref() else {
+            return Ok(0);
+        };
+        let Some(template) = self.dag.nodes.get(template_id) else {
+            return Ok(0);
+        };
+        let crate::waymark_core::dag::DAGNode::ActionCall(action) = template else {
+            return Ok(0);
+        };
+        Ok(timeout_seconds_from_policies(&action.policies).unwrap_or(0))
+    }
+
     /// Fail inflight actions and return any that should be retried.
     ///
     /// Use this after recovering from a crash: running actions are treated as
@@ -205,8 +226,7 @@ impl RunnerExecutor {
             if node.is_action_call() && node.status == NodeStatus::Running {
                 finished_nodes.push(*node_id);
                 self.action_results
-                    .entry(*node_id)
-                    .or_insert_with(|| Self::resume_exception_value(*node_id));
+                    .insert(*node_id, Self::resume_exception_value(*node_id));
             }
         }
         if finished_nodes.is_empty() {
@@ -268,13 +288,32 @@ impl RunnerExecutor {
             }
         }
 
+        for action in &actions {
+            self.clear_action_result(action.node_id);
+            self.state
+                .mark_running(action.node_id)
+                .map_err(|err| RunnerExecutorError(err.0))?;
+        }
+        let mut running_actions = Vec::with_capacity(actions.len());
+        for action in actions {
+            let running = self
+                .state
+                .nodes
+                .get(&action.node_id)
+                .cloned()
+                .ok_or_else(|| {
+                    RunnerExecutorError(format!("execution node not found: {}", action.node_id))
+                })?;
+            running_actions.push(running);
+        }
+
         let updates = self.collect_updates(actions_done)?;
 
         // Note: Action timeouts and delayed retries require wall-clock tracking in the run loop.
         // The executor only handles timeout failures once they surface as action results.
 
         Ok(ExecutorStep {
-            actions,
+            actions: running_actions,
             sleep_requests,
             updates,
         })
@@ -1294,6 +1333,28 @@ impl<'a> RetryPolicyEvaluator<'a> {
 
         RetryDecision { should_retry }
     }
+}
+
+fn timeout_seconds_from_policies(policies: &[ir::PolicyBracket]) -> Option<u32> {
+    let mut timeout_seconds: Option<u64> = None;
+    for policy in policies {
+        let Some(ir::policy_bracket::Kind::Timeout(timeout)) = policy.kind.as_ref() else {
+            continue;
+        };
+        let seconds = timeout
+            .timeout
+            .as_ref()
+            .map(|duration| duration.seconds)
+            .unwrap_or(0);
+        if seconds == 0 {
+            continue;
+        }
+        timeout_seconds = Some(match timeout_seconds {
+            Some(existing) => existing.min(seconds),
+            None => seconds,
+        });
+    }
+    timeout_seconds.map(|seconds| seconds.min(u64::from(u32::MAX)) as u32)
 }
 
 fn exception_type(value: &Value) -> Option<&str> {
@@ -2394,8 +2455,9 @@ fn main(input: [], output: [done]):
         assert_eq!(step.actions.len(), 1);
         assert_eq!(step.actions[0].node_id, exec1.node_id);
         let node = rehydrated.state().nodes.get(&exec1.node_id).unwrap();
-        assert_eq!(node.status, NodeStatus::Queued);
+        assert_eq!(node.status, NodeStatus::Running);
         assert_eq!(node.action_attempt, 2);
+        assert!(node.started_at.is_some());
     }
 
     #[test]
@@ -2503,7 +2565,7 @@ fn main(input: [], output: [done]):
                 .nodes
                 .get(&exec.node_id)
                 .map(|n| n.status.clone()),
-            Some(NodeStatus::Queued)
+            Some(NodeStatus::Running)
         );
         assert_eq!(
             executor
