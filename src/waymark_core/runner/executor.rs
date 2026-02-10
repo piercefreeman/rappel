@@ -2550,7 +2550,7 @@ fn main(input: [], output: [done]):
                     kind: Some(ir::policy_bracket::Kind::Retry(ir::RetryPolicy {
                         max_retries: 3,
                         backoff: None,
-                        exception_types: Vec::new(),
+                        exception_types: vec!["ExecutorResume".to_string()],
                     })),
                 }],
                 ..ActionNodeOptions::default()
