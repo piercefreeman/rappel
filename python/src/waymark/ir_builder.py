@@ -268,6 +268,7 @@ GLOBAL_FUNCTIONS = {
     "range": ir.GlobalFunction.GLOBAL_FUNCTION_RANGE,
 }
 ALLOWED_SYNC_FUNCTIONS = set(GLOBAL_FUNCTIONS)
+DEFAULT_RETRY_POLICY_MAX_RETRIES = 100
 
 _CURRENT_ACTION_NAMES: set[str] = set()
 
@@ -2692,7 +2693,8 @@ class IRBuilder(ast.NodeVisitor):
         if func_name != "RetryPolicy":
             return None
 
-        policy = ir.RetryPolicy()
+        # RetryPolicy() defaults to a high retry cap when attempts is omitted.
+        policy = ir.RetryPolicy(max_retries=DEFAULT_RETRY_POLICY_MAX_RETRIES)
 
         for kw in node.keywords:
             if kw.arg == "attempts" and isinstance(kw.value, ast.Constant):

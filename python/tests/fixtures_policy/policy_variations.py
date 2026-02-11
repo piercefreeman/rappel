@@ -31,6 +31,12 @@ async def action_with_retry_exceptions(value: str) -> str:
 
 
 @action
+async def action_with_retry_default(value: str) -> str:
+    """Action with RetryPolicy() defaults."""
+    return f"done({value})"
+
+
+@action
 async def action_with_timeout_hours(value: str) -> str:
     """Action with timedelta hours."""
     return f"done({value})"
@@ -67,8 +73,16 @@ class PolicyVariationsWorkflow(Workflow):
             retry=RetryPolicy(attempts=2, exception_types=["ValueError", "KeyError"]),
         )
 
+        # Test RetryPolicy() default max retries
+        d_retry_default = await self.run_action(
+            action_with_retry_default(value=d),
+            retry=RetryPolicy(),
+        )
+
         # Test timeout with timedelta hours
-        e = await self.run_action(action_with_timeout_hours(value=d), timeout=timedelta(hours=1))
+        e = await self.run_action(
+            action_with_timeout_hours(value=d_retry_default), timeout=timedelta(hours=1)
+        )
 
         # Test timeout with timedelta days
         f = await self.run_action(action_with_timeout_days(value=e), timeout=timedelta(days=1))

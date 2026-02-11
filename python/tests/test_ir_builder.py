@@ -2724,6 +2724,20 @@ class TestPolicyVariations:
         assert "ValueError" in policy.retry.exception_types
         assert "KeyError" in policy.retry.exception_types
 
+    def test_retry_without_attempts_uses_default_max_retries(self) -> None:
+        """Test: retry=RetryPolicy() uses the default max retries."""
+        from tests.fixtures_policy.policy_variations import PolicyVariationsWorkflow
+
+        program = PolicyVariationsWorkflow.workflow_ir()
+
+        action = self._find_action_by_name(program, "action_with_retry_default")
+        assert action is not None, "Should find action_with_retry_default"
+        assert len(action.policies) == 1, "Should have 1 policy"
+
+        policy = action.policies[0]
+        assert policy.HasField("retry"), "Should be retry policy"
+        assert policy.retry.max_retries == 100
+
     def test_timeout_with_timedelta_hours(self) -> None:
         """Test: timeout=timedelta(hours=1)."""
         from tests.fixtures_policy.policy_variations import PolicyVariationsWorkflow

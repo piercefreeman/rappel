@@ -229,7 +229,7 @@ Waymark reads the process environment directly; it does not auto-load `.env` fil
 | `WAYMARK_LOCK_TTL_MS` | Queue lock TTL | `15000` |
 | `WAYMARK_LOCK_HEARTBEAT_MS` | Queue lock heartbeat interval | `5000` |
 | `WAYMARK_EVICT_SLEEP_THRESHOLD_MS` | Sleep threshold for evicting idle instances from memory | `10000` |
-| `WAYMARK_EXPIRED_LOCK_RECLAIMER_INTERVAL_MS` | Expired lock reclaim sweep interval | `1000` (clamped to min `1`) |
+| `WAYMARK_EXPIRED_LOCK_RECLAIMER_INTERVAL_MS` | Expired lock reclaim sweep interval | `15000` (clamped to min `1`) |
 | `WAYMARK_EXPIRED_LOCK_RECLAIMER_BATCH_SIZE` | Max locks reclaimed per sweep | `1000` (clamped to min `1`) |
 | `WAYMARK_SCHEDULER_POLL_INTERVAL_MS` | Scheduler poll interval | `1000` |
 | `WAYMARK_SCHEDULER_BATCH_SIZE` | Scheduler due-item batch size | `100` |

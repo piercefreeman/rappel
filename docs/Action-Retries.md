@@ -42,6 +42,11 @@ await self.run_action(
 )
 ```
 
+Python retry defaults in the IR builder:
+
+- `RetryPolicy(attempts=N)` maps to `max_retries = N - 1` (`attempts` is total executions).
+- `RetryPolicy()` (no `attempts`) maps to `max_retries = 100`.
+
 ## Runtime behavior implemented today
 
 Action failure handling happens in `RunnerExecutor`:
