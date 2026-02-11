@@ -956,15 +956,18 @@ impl RunnerState {
         targets: &[String],
         value: &ValueExpr,
     ) -> Result<HashMap<String, ValueExpr>, RunnerStateError> {
-        let value = self.materialize_value(value.clone());
         if targets.is_empty() {
             return Ok(HashMap::new());
         }
         if targets.len() == 1 {
             let mut map = HashMap::new();
-            map.insert(targets[0].clone(), value);
+            // Keep single-target assignments symbolic to avoid recursively
+            // embedding prior values into each update (which can explode
+            // persisted runner_instances.state size/depth in loops).
+            map.insert(targets[0].clone(), value.clone());
             return Ok(map);
         }
+        let value = self.materialize_value(value.clone());
 
         match value {
             ValueExpr::List(ListValue { elements }) => {
@@ -1926,40 +1929,87 @@ mod tests {
         }
 
         let results = results.expect("results assignment");
-        let list_value = match results {
+        let binary = match results {
+            ValueExpr::BinaryOp(value) => value,
+            other => panic!("expected BinaryOpValue, got {other:?}"),
+        };
+
+        match binary.left.as_ref() {
+            ValueExpr::Variable(value) => assert_eq!(value.name, "results"),
+            other => panic!("expected VariableValue, got {other:?}"),
+        }
+
+        let right_list = match binary.right.as_ref() {
             ValueExpr::List(value) => value,
             other => panic!("expected ListValue, got {other:?}"),
         };
-        assert_eq!(list_value.elements.len(), 2);
+        assert_eq!(right_list.elements.len(), 1);
 
-        let first_item = &list_value.elements[0];
-        let second_item = &list_value.elements[1];
-
-        let first_bin = match first_item {
-            ValueExpr::BinaryOp(value) => value,
-            other => panic!("expected BinaryOpValue, got {other:?}"),
-        };
-        let second_bin = match second_item {
+        let item_bin = match &right_list.elements[0] {
             ValueExpr::BinaryOp(value) => value,
             other => panic!("expected BinaryOpValue, got {other:?}"),
         };
 
-        match first_bin.left.as_ref() {
-            ValueExpr::ActionResult(value) => assert_eq!(value.iteration_index, Some(0)),
-            other => panic!("expected ActionResultValue, got {other:?}"),
-        }
-        match second_bin.left.as_ref() {
-            ValueExpr::ActionResult(value) => assert_eq!(value.iteration_index, Some(1)),
-            other => panic!("expected ActionResultValue, got {other:?}"),
+        match item_bin.left.as_ref() {
+            ValueExpr::Variable(value) => assert_eq!(value.name, "action_result"),
+            other => panic!("expected VariableValue, got {other:?}"),
         }
 
-        match first_bin.right.as_ref() {
+        match item_bin.right.as_ref() {
             ValueExpr::Literal(value) => assert_eq!(value.value, Value::Number(2.into())),
             other => panic!("expected LiteralValue, got {other:?}"),
         }
-        match second_bin.right.as_ref() {
-            ValueExpr::Literal(value) => assert_eq!(value.value, Value::Number(2.into())),
-            other => panic!("expected LiteralValue, got {other:?}"),
+    }
+
+    #[test]
+    fn test_runner_state_single_target_assignments_stay_symbolic() {
+        let mut state = RunnerState::new(None, None, None, true);
+
+        let initial = ValueExpr::Dict(DictValue {
+            entries: vec![DictEntryValue {
+                key: ValueExpr::Literal(LiteralValue {
+                    value: Value::String("result".to_string()),
+                }),
+                value: ValueExpr::Literal(LiteralValue {
+                    value: Value::Number(1.into()),
+                }),
+            }],
+        });
+        state
+            .record_assignment_value(vec!["result".to_string()], initial, None, None)
+            .expect("record initial assignment");
+
+        let wrapped = ValueExpr::Dict(DictValue {
+            entries: vec![DictEntryValue {
+                key: ValueExpr::Literal(LiteralValue {
+                    value: Value::String("result".to_string()),
+                }),
+                value: ValueExpr::Variable(VariableValue {
+                    name: "result".to_string(),
+                }),
+            }],
+        });
+        state
+            .record_assignment_value(vec!["result".to_string()], wrapped, None, None)
+            .expect("record wrapped assignment");
+
+        let mut latest: Option<ValueExpr> = None;
+        for node_id in state.timeline.iter().rev() {
+            let node = state.nodes.get(node_id).expect("node");
+            if let Some(value) = node.assignments.get("result") {
+                latest = Some(value.clone());
+                break;
+            }
+        }
+        let latest = latest.expect("latest assignment");
+        let dict = match latest {
+            ValueExpr::Dict(value) => value,
+            other => panic!("expected DictValue, got {other:?}"),
+        };
+        assert_eq!(dict.entries.len(), 1);
+        match &dict.entries[0].value {
+            ValueExpr::Variable(value) => assert_eq!(value.name, "result"),
+            other => panic!("expected VariableValue, got {other:?}"),
         }
     }
 
