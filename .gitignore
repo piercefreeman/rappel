@@ -224,3 +224,5 @@ autospec
 
 dag_smoke_*
 profile.json.gz
+
+.DS_Store
