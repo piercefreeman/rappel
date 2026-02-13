@@ -732,8 +732,6 @@ async def reset_database() -> ResetResponse:
         conn = await asyncpg.connect(database_url)
         try:
             # Delete in order respecting foreign key constraints
-            await conn.execute("DELETE FROM daemon_action_ledger")
-            await conn.execute("DELETE FROM workflow_instances")
             await conn.execute("DELETE FROM workflow_versions")
             return ResetResponse(success=True, message="All workflow data cleared")
         finally:
