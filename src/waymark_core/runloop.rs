@@ -1200,9 +1200,7 @@ impl RunLoop {
             }
 
             let has_shutdown = shutdown_rx.is_some();
-            let shutdown_rx_fut = async {
-                shutdown_rx.as_mut().unwrap().changed().await.is_ok()
-            };
+            let shutdown_rx_fut = async { shutdown_rx.as_mut().unwrap().changed().await.is_ok() };
             let first_event = tokio::select! {
                 shutdown_signal = shutdown_rx_fut, if has_shutdown => {
                     if !shutdown_signal || shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
