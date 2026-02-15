@@ -276,3 +276,7 @@ There is no shortage of robust background queues in Python, including ones like 
 Almost all of these require a dedicated task broker that you host alongside your app. This usually isn't a huge deal during POCs but can get complex as you need to performance tune it for production. Cloud hosting of most of these are billed per-event and can get very expensive depending on how you orchestrate your jobs. They also typically force you to migrate your logic to fit the conventions of the framework.
 
 Open source solutions like RabbitMQ have been battle tested over decades & large companies like Temporal are able to throw a lot of resources towards optimization. Both of these solutions are great choices - just intended to solve for different scopes. Expect an associated higher amount of setup and management complexity.
+
+## Contributing
+
+If you want to contribute, check out the [contributing guidelines](./CONTRIBUTING.md).
