@@ -1,13 +1,3 @@
-#!/usr/bin/env -S uv run
-# /// script
-# requires-python = ">=3.12"
-# dependencies = [
-#   "waymark",
-#   "pytest",
-# ]
-# ///
-
-
 import asyncio
 import os
 from pathlib import Path
