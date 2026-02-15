@@ -1,19 +1,14 @@
+#!/bin/bash
 set -euox pipefail
 
-# Stop any container using port 5433
-docker ps --filter "publish=5433" -q | xargs -r docker stop 2>/dev/null || true
+CONTAINER=pg
+docker rm -f $CONTAINER 2>/dev/null || true
+docker run -d --name $CONTAINER --rm -e POSTGRES_PASSWORD=pass postgres:17-alpine >/dev/null
+until docker exec $CONTAINER pg_isready >/dev/null 2>&1; do :; done; sleep 1
 
-# Clean up this project's containers
-docker compose down -v 2>/dev/null || true
+# run stuff
+docker exec $CONTAINER psql -U postgres -c "CREATE TABLE demo (word TEXT);"
+docker exec $CONTAINER psql -U postgres -c "INSERT INTO demo VALUES ('hello'), ('world'); SELECT * FROM demo;"
+docker exec $CONTAINER psql -U postgres -c "SELECT * FROM demo;"
 
-# Format
-uvx isort .
-uvx autoflake --remove-all-unused-imports --recursive --in-place .
-uvx black --line-length 5000 .
-
-# Start fresh
-docker compose up -d --wait
-uv run --no-project --with waymark --with pytest --with pytest-asyncio pytest run.py -v --tb=short -x
-RET=$?
-docker compose down -v
-exit $RET
+docker stop $CONTAINER >/dev/null
