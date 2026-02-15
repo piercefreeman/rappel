@@ -7,6 +7,7 @@ os.environ["WAYMARK_DATABASE_URL"] = "postgresql://waymark:waymark@localhost:543
 from waymark import Workflow, action, workflow
 from waymark.workflow import RetryPolicy
 
+
 # =============================================================================
 # Actions & Workflows - Parallel Execution
 # =============================================================================
