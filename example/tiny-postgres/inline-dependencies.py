@@ -1,11 +1,18 @@
 # /// script
-# requires-python = ">=3.14"
-# dependencies = [
-#     "tqdm==4.66.4",
-# ]
+# dependencies = ["psycopg2-binary"]
 # ///
 
-from tqdm import tqdm
+import psycopg2
 
-for i in tqdm(range(5)):
-    pass
+conn = psycopg2.connect("postgresql://postgres:pass@localhost/postgres")
+cur = conn.cursor()
+
+cur.execute("CREATE TABLE demo (word TEXT);")
+cur.execute("INSERT INTO demo VALUES ('hello'), ('world');")
+conn.commit()
+
+cur.execute("SELECT * FROM demo;")
+for row in cur.fetchall():
+    print(row[0])
+
+conn.close()

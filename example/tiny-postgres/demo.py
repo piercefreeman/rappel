@@ -2,10 +2,13 @@ import asyncio
 import os
 from pathlib import Path
 
-os.environ["WAYMARK_DATABASE_URL"] = "postgresql://waymark:waymark@localhost:5433/waymark"
+os.environ["WAYMARK_DATABASE_URL"] = (
+    "postgresql://waymark:waymark@localhost:5433/waymark"
+)
 
 from waymark import Workflow, action, workflow
 from waymark.workflow import RetryPolicy
+
 
 # =============================================================================
 # Actions & Workflows - Parallel Execution
@@ -42,7 +45,9 @@ async def summarize_math(factorial: int, fibonacci: int, n: int) -> dict:
 @workflow
 class ParallelMathWorkflow(Workflow):
     async def run(self, n: int) -> dict:
-        factorial, fibonacci = await asyncio.gather(compute_factorial(n), compute_fibonacci(n), return_exceptions=True)
+        factorial, fibonacci = await asyncio.gather(
+            compute_factorial(n), compute_fibonacci(n), return_exceptions=True
+        )
         return await summarize_math(factorial, fibonacci, n)
 
 
@@ -163,8 +168,20 @@ class LoopReturnWorkflow(Workflow):
         for value in items:
             checked += 1
             if await matches_needle(value, needle):
-                return {"items": items, "needle": needle, "found": True, "value": value, "checked": checked}
-        return {"items": items, "needle": needle, "found": False, "value": None, "checked": checked}
+                return {
+                    "items": items,
+                    "needle": needle,
+                    "found": True,
+                    "value": value,
+                    "checked": checked,
+                }
+        return {
+            "items": items,
+            "needle": needle,
+            "found": False,
+            "value": None,
+            "checked": checked,
+        }
 
 
 # =============================================================================
@@ -193,7 +210,9 @@ class ErrorHandlingWorkflow(Workflow):
     async def run(self, should_fail: bool) -> dict:
         recovered, message = False, ""
         try:
-            result = await self.run_action(risky_action(should_fail), retry=RetryPolicy(attempts=1))
+            result = await self.run_action(
+                risky_action(should_fail), retry=RetryPolicy(attempts=1)
+            )
             message = result
         except IntentionalError:
             recovered = True
@@ -225,12 +244,26 @@ class ExceptionMetadataWorkflow(Workflow):
     async def run(self, should_fail: bool) -> dict:
         recovered, message, error_type, code, detail = False, "", None, None, None
         try:
-            result = await self.run_action(risky_metadata_action(should_fail), retry=RetryPolicy(attempts=1))
+            result = await self.run_action(
+                risky_metadata_action(should_fail), retry=RetryPolicy(attempts=1)
+            )
             message = result
         except ExceptionMetadataError as e:
-            recovered, error_type, code, detail = True, "ExceptionMetadataError", e.code, e.detail
+            recovered, error_type, code, detail = (
+                True,
+                "ExceptionMetadataError",
+                e.code,
+                e.detail,
+            )
             message = await recovery_action("Captured metadata")
-        return {"attempted": True, "recovered": recovered, "message": message, "error_type": error_type, "error_code": code, "error_detail": detail}
+        return {
+            "attempted": True,
+            "recovered": recovered,
+            "message": message,
+            "error_type": error_type,
+            "error_code": code,
+            "error_detail": detail,
+        }
 
 
 # =============================================================================
@@ -282,16 +315,27 @@ async def format_retry_message(succeeded: bool, final: int) -> str:
 
 @workflow
 class RetryCounterWorkflow(Workflow):
-    async def run(self, succeed_on_attempt: int, max_attempts: int, counter_slot: int = 1) -> dict:
+    async def run(
+        self, succeed_on_attempt: int, max_attempts: int, counter_slot: int = 1
+    ) -> dict:
         counter_path = await reset_counter(counter_slot)
         succeeded = True
         try:
-            final = await self.run_action(increment_retry_counter(counter_path, succeed_on_attempt), retry=RetryPolicy(attempts=max_attempts))
+            final = await self.run_action(
+                increment_retry_counter(counter_path, succeed_on_attempt),
+                retry=RetryPolicy(attempts=max_attempts),
+            )
         except RetryCounterError:
             succeeded = False
             final = await read_counter(counter_path)
         msg = await format_retry_message(succeeded, final)
-        return {"succeed_on_attempt": succeed_on_attempt, "max_attempts": max_attempts, "final_attempt": final, "succeeded": succeeded, "message": msg}
+        return {
+            "succeed_on_attempt": succeed_on_attempt,
+            "max_attempts": max_attempts,
+            "final_attempt": final,
+            "succeeded": succeeded,
+            "message": msg,
+        }
 
 
 # =============================================================================
@@ -314,12 +358,23 @@ class TimeoutProbeWorkflow(Workflow):
         counter_path = await reset_counter(10_000 + counter_slot)
         timed_out, error_type = False, None
         try:
-            await self.run_action(timeout_action(counter_path), retry=RetryPolicy(attempts=max_attempts), timeout=1)
+            await self.run_action(
+                timeout_action(counter_path),
+                retry=RetryPolicy(attempts=max_attempts),
+                timeout=1,
+            )
         except Exception:
             timed_out, error_type = True, "ActionTimeout"
         final = await read_counter(counter_path)
         msg = f"Timed out after {final}" if timed_out else f"Unexpected success {final}"
-        return {"timeout_seconds": 1, "max_attempts": max_attempts, "final_attempt": final, "timed_out": timed_out, "error_type": error_type, "message": msg}
+        return {
+            "timeout_seconds": 1,
+            "max_attempts": max_attempts,
+            "final_attempt": final,
+            "timed_out": timed_out,
+            "error_type": error_type,
+            "message": msg,
+        }
 
 
 # =============================================================================
@@ -427,7 +482,9 @@ async def describe_location(latitude: float | None, longitude: float | None) -> 
 
 @workflow
 class KwOnlyLocationWorkflow(Workflow):
-    async def run(self, *, latitude: float | None = None, longitude: float | None = None) -> dict:
+    async def run(
+        self, *, latitude: float | None = None, longitude: float | None = None
+    ) -> dict:
         return await describe_location(latitude, longitude)
 
 
@@ -473,12 +530,19 @@ class LoopExceptionWorkflow(Workflow):
         processed, error_count = [], 0
         for item in items:
             try:
-                result = await self.run_action(process_item_may_fail(item), retry=RetryPolicy(attempts=1))
+                result = await self.run_action(
+                    process_item_may_fail(item), retry=RetryPolicy(attempts=1)
+                )
                 processed.append(result)
             except ItemProcessingError:
                 error_count = error_count + 1
         msg = f"Processed {len(processed)} items, {error_count} failures"
-        return {"items": items, "processed": processed, "error_count": error_count, "message": msg}
+        return {
+            "items": items,
+            "processed": processed,
+            "error_count": error_count,
+            "message": msg,
+        }
 
 
 # =============================================================================
@@ -494,9 +558,13 @@ async def process_spread_item(item: str) -> str:
 @workflow
 class SpreadEmptyCollectionWorkflow(Workflow):
     async def run(self, items: list[str]) -> dict:
-        results = await asyncio.gather(*[process_spread_item(item) for item in items], return_exceptions=True)
+        results = await asyncio.gather(
+            *[process_spread_item(item) for item in items], return_exceptions=True
+        )
         count = len(results)
-        msg = "No items - empty spread OK!" if count == 0 else f"Processed {count} items"
+        msg = (
+            "No items - empty spread OK!" if count == 0 else f"Processed {count} items"
+        )
         return {"items_processed": count, "message": msg}
 
 
@@ -514,12 +582,19 @@ async def compute_square(value: int) -> int:
 class ManyActionsWorkflow(Workflow):
     async def run(self, action_count: int = 50, parallel: bool = True) -> dict:
         if parallel:
-            results = await asyncio.gather(*[compute_square(i) for i in range(action_count)], return_exceptions=True)
+            results = await asyncio.gather(
+                *[compute_square(i) for i in range(action_count)],
+                return_exceptions=True,
+            )
         else:
             results = []
             for i in range(action_count):
                 results.append(await compute_square(i))
-        return {"action_count": action_count, "parallel": parallel, "total": sum(results)}
+        return {
+            "action_count": action_count,
+            "parallel": parallel,
+            "total": sum(results),
+        }
 
 
 # =============================================================================
@@ -569,14 +644,22 @@ async def noop_tag(value: int) -> dict:
 @workflow
 class NoOpWorkflow(Workflow):
     async def run(self, indices: list[int]) -> dict:
-        stage1 = await asyncio.gather(*[noop_int(i) for i in indices], return_exceptions=True)
+        stage1 = await asyncio.gather(
+            *[noop_int(i) for i in indices], return_exceptions=True
+        )
         processed = []
         for value in stage1:
             result = await noop_int(value)
             processed.append(result)
-        tagged = await asyncio.gather(*[noop_tag(value) for value in processed], return_exceptions=True)
+        tagged = await asyncio.gather(
+            *[noop_tag(value) for value in processed], return_exceptions=True
+        )
         even_count = sum(1 for item in tagged if item["tag"] == "even")
-        return {"count": len(tagged), "even_count": even_count, "odd_count": len(tagged) - even_count}
+        return {
+            "count": len(tagged),
+            "even_count": even_count,
+            "odd_count": len(tagged) - even_count,
+        }
 
 
 # =============================================================================
@@ -673,14 +756,18 @@ async def test_exception_metadata():
 
 @pytest.mark.asyncio
 async def test_retry_counter_success():
-    result = await RetryCounterWorkflow().run(succeed_on_attempt=2, max_attempts=3, counter_slot=1)
+    result = await RetryCounterWorkflow().run(
+        succeed_on_attempt=2, max_attempts=3, counter_slot=1
+    )
     assert result["succeeded"] is True
     assert result["final_attempt"] == 2
 
 
 @pytest.mark.asyncio
 async def test_retry_counter_failure():
-    result = await RetryCounterWorkflow().run(succeed_on_attempt=5, max_attempts=3, counter_slot=2)
+    result = await RetryCounterWorkflow().run(
+        succeed_on_attempt=5, max_attempts=3, counter_slot=2
+    )
     assert result["succeeded"] is False
     assert result["final_attempt"] == 3
 
