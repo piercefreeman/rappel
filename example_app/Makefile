@@ -1,42 +1,33 @@
-IMAGE_NAME ?= waymark-example-app
-COMPOSE_CMD ?= docker compose -f docker-compose.yml
-DOCKER_TEST_TIMEOUT ?= 300
-DOCKER_LOG_TAIL ?= 200
+.PHONY: install
+install:
+	cd ../scripts && uv run python build_wheel.py --out-dir target/wheels
+	uv venv --clear
+	uv pip install pydantic asyncpg pytest pytest-asyncio
+	uv pip install --force-reinstall $$(ls ../target/wheels/waymark-*.whl | head -1)
 
-.PHONY: build up down logs docker-test
+CONTAINER := waymark-pg
+PID_FILE := /tmp/waymark-workers.pid
 
-build:
-	@echo "Building $(IMAGE_NAME) image"
-	docker build -f Dockerfile -t $(IMAGE_NAME) ..
+define ENV
+	PATH=.venv/bin:$$PATH PYTHONPATH=$(PWD)/.. \
+	WAYMARK_DATABASE_URL=postgresql://postgres:pass@localhost:5432/postgres?sslmode=disable \
+	WAYMARK_USER_MODULE=example_app.workflows
+endef
 
-up:
-	$(COMPOSE_CMD) up --build -d
+.PHONY: run
+run:
+	docker rm -f $(CONTAINER) 2>/dev/null || true
+	docker run -d --name $(CONTAINER) --rm -e POSTGRES_PASSWORD=pass -p 5432:5432 postgres:17-alpine >/dev/null
+	until docker exec $(CONTAINER) pg_isready >/dev/null 2>&1; do sleep 0.1; done
+	$(ENV) .venv/bin/start-workers >/dev/null 2>&1 & echo $$! > $(PID_FILE)
+	until nc -z 127.0.0.1 24118 2>/dev/null; do sleep 0.1; done
+	$(ENV) WAYMARK_RUN_REAL_CLUSTER=1 .venv/bin/pytest . -vvv -o asyncio_mode=strict -o asyncio_default_fixture_loop_scope=function; \
+	TEST_EXIT=$$?; \
+	kill $$(cat $(PID_FILE) 2>/dev/null) 2>/dev/null || true; \
+	docker stop $(CONTAINER) >/dev/null 2>&1; \
+	exit $$TEST_EXIT
 
-logs:
-	$(COMPOSE_CMD) logs -f
-
-down:
-	$(COMPOSE_CMD) down -v
-
-docker-test:
-	@echo "Running tests in docker-compose environment (timeout $(DOCKER_TEST_TIMEOUT)s)"
-	$(COMPOSE_CMD) up -d postgres daemons
-	@echo "Waiting for postgres to be healthy..."
-	@timeout 30 sh -c 'until docker compose exec postgres pg_isready -U waymark > /dev/null 2>&1; do sleep 1; done' || (echo "Postgres failed to become healthy" && exit 1)
-	@echo "Waiting for workers to be ready..."
-	@sleep 3
-	@echo "Checking that daemons are running and ready..."
-	@timeout 60 sh -c 'until $(COMPOSE_CMD) ps --status=running --services | grep -q "^daemons$$"; do sleep 1; done' || (echo "Daemons failed to stay running" && $(COMPOSE_CMD) logs daemons || true; $(COMPOSE_CMD) down -v; exit 1)
-	@timeout 60 sh -c 'until $(COMPOSE_CMD) exec -T daemons python -c "import socket; s = socket.create_connection((\"127.0.0.1\", 24118), 1); s.close()" >/dev/null 2>&1; do sleep 1; done' || (echo "Daemons never opened worker bridge port 24118" && $(COMPOSE_CMD) logs daemons || true; $(COMPOSE_CMD) down -v; exit 1)
-	@set -e; \
-	TEST_EXIT_CODE=0; \
-	timeout $(DOCKER_TEST_TIMEOUT) $(COMPOSE_CMD) run --rm -e WAYMARK_DATABASE_URL=postgresql://waymark:waymark@postgres:5432/waymark_example webapp pytest -vvv || TEST_EXIT_CODE=$$?; \
-	echo ""; \
-	echo "=== Daemon Logs ==="; \
-	$(COMPOSE_CMD) logs --tail=$(DOCKER_LOG_TAIL) daemons || true; \
-	echo ""; \
-	echo "=== Webapp Logs ==="; \
-	$(COMPOSE_CMD) logs --tail=$(DOCKER_LOG_TAIL) webapp || true; \
-	echo ""; \
-	$(COMPOSE_CMD) down -v; \
-	exit $$TEST_EXIT_CODE
+.PHONY: clean
+clean:
+	rm -rf .venv ../target/wheels $(PID_FILE)
+	docker rm -f $(CONTAINER) 2>/dev/null || true
