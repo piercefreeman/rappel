@@ -1,38 +1,34 @@
-IMAGE_NAME ?= waymark-example-app
-COMPOSE_CMD ?= docker compose -f docker-compose.yml
-DOCKER_TEST_TIMEOUT ?= 300
-DOCKER_LOG_TAIL ?= 200
 
-.PHONY: build up down logs docker-test
+# Build Rust binaries + install Python packages
+.PHONY: install
+install:
+	cd ../scripts && uv run python build_wheel.py --out-dir ../target/wheels
+	test -d .venv || uv venv
+	uv pip install -e .
+	uv pip install --force-reinstall $$(ls ../../target/wheels/waymark-*.whl | head -1)
 
-build:
-	@echo "Building $(IMAGE_NAME) image"
-	docker build -f Dockerfile -t $(IMAGE_NAME) ..
+VENV := $(PWD)/.venv/bin
+DB := postgresql://postgres:pass@localhost:5432/postgres?sslmode=disable
+CONTAINER := waymark-pg
 
-up:
-	$(COMPOSE_CMD) up --build -d
+# Start postgres, run workers + demo, cleanup
+.PHONY: run
+run:
+	docker rm -f $(CONTAINER) 2>/dev/null || true
 
-logs:
-	$(COMPOSE_CMD) logs -f
+	docker run -d --name $(CONTAINER) --rm -e POSTGRES_PASSWORD=pass -p 5432:5432 postgres:17-alpine >/dev/null
+	until docker exec $(CONTAINER) pg_isready >/dev/null 2>&1; do sleep 0.5; done
 
-down:
-	$(COMPOSE_CMD) down -v
+	PATH=$(VENV):$(PATH) PYTHONPATH=$(PWD) WAYMARK_DATABASE_URL=$(DB) WAYMARK_USER_MODULE=example_app.workflows $(VENV)/start-workers >/dev/null 2>&1 & echo $$! > /tmp/workers.pid
+	sleep 3
 
-docker-test:
-	@echo "Running tests in docker-compose environment (timeout $(DOCKER_TEST_TIMEOUT)s)"
-	$(COMPOSE_CMD) up -d postgres daemons
-	@echo "Waiting for postgres to be healthy..."
-	@until $(COMPOSE_CMD) exec -T postgres pg_isready -U waymark >/dev/null 2>&1; do sleep 1; done
-	@echo "Waiting for worker bridge port 24118 to be ready..."
-	@until $(COMPOSE_CMD) exec -T daemons python -c "import socket; s = socket.create_connection(('127.0.0.1', 24118), 1); s.close()" >/dev/null 2>&1; do sleep 1; done
-	@TEST_EXIT_CODE=0; \
-	timeout $(DOCKER_TEST_TIMEOUT) $(COMPOSE_CMD) run -T --rm -e WAYMARK_DATABASE_URL=postgresql://waymark:waymark@postgres:5432/waymark_example webapp pytest -vvv </dev/null || TEST_EXIT_CODE=$$?; \
-	echo ""; \
-	echo "=== Daemon Logs ==="; \
-	$(COMPOSE_CMD) logs --tail=$(DOCKER_LOG_TAIL) daemons || true; \
-	echo ""; \
-	echo "=== Webapp Logs ==="; \
-	$(COMPOSE_CMD) logs --tail=$(DOCKER_LOG_TAIL) webapp || true; \
-	echo ""; \
-	$(COMPOSE_CMD) down -v || true; \
-	exit $$TEST_EXIT_CODE
+	PYTHONPATH=$(PWD) PATH=$(VENV):$(PATH) WAYMARK_DATABASE_URL=$(DB) WAYMARK_USER_MODULE=example_app.workflows $(VENV)/python demo.py
+
+	kill $$(cat /tmp/workers.pid) 2>/dev/null || true
+	docker stop $(CONTAINER) >/dev/null
+
+# Remove venv, wheels, postgres container
+.PHONY: clean
+clean:
+	rm -rf .venv ../../target/wheels
+	docker rm -f $(CONTAINER) 2>/dev/null || true
