@@ -1,8 +1,9 @@
 .PHONY: install
 install:
-	cd ../scripts && uv run python build_wheel.py --out-dir ../target/wheels
-	uv sync --group dev
-	uv pip install --force-reinstall $$(ls ../../target/wheels/waymark-*.whl | head -1)
+	cd ../scripts && uv run python build_wheel.py --out-dir target/wheels
+	uv venv --clear
+	uv pip install pydantic asyncpg pytest pytest-asyncio
+	uv pip install --force-reinstall $$(ls ../target/wheels/waymark-*.whl | head -1)
 
 CONTAINER := waymark-pg
 PID_FILE := /tmp/waymark-workers.pid
@@ -28,5 +29,5 @@ run:
 
 .PHONY: clean
 clean:
-	rm -rf .venv ../../target/wheels $(PID_FILE)
+	rm -rf .venv ../target/wheels $(PID_FILE)
 	docker rm -f $(CONTAINER) 2>/dev/null || true
