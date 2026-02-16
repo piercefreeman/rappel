@@ -16,9 +16,9 @@ run:
 	docker rm -f $(CONTAINER) 2>/dev/null || true
 	docker run -d --name $(CONTAINER) --rm -e POSTGRES_PASSWORD=pass -p 5432:5432 postgres:17-alpine >/dev/null
 	until docker exec $(CONTAINER) pg_isready >/dev/null 2>&1; do sleep 0.5; done
-	PATH=$(VENV):$(PATH) PYTHONPATH=$(PWD)/src WAYMARK_DATABASE_URL=$(DB) WAYMARK_USER_MODULE=$(USER_MODULE) $(VENV)/start-workers >/dev/null 2>&1 & echo $$! > /tmp/workers.pid
+	PATH=$(VENV):$(PATH) PYTHONPATH=$(PWD)/.. WAYMARK_DATABASE_URL=$(DB) WAYMARK_USER_MODULE=$(USER_MODULE) $(VENV)/start-workers >/dev/null 2>&1 & echo $$! > /tmp/workers.pid
 	sleep 3
-	PATH=$(VENV):$(PATH) PYTHONPATH=$(PWD)/src WAYMARK_DATABASE_URL=$(DB) WAYMARK_USER_MODULE=$(USER_MODULE) WAYMARK_RUN_REAL_CLUSTER=1 $(VENV)/pytest tests/ -vvv || true
+	PATH=$(VENV):$(PATH) PYTHONPATH=$(PWD)/.. WAYMARK_DATABASE_URL=$(DB) WAYMARK_USER_MODULE=$(USER_MODULE) WAYMARK_RUN_REAL_CLUSTER=1 $(VENV)/pytest . -vvv || true
 	kill $$(cat /tmp/workers.pid) 2>/dev/null || true
 	docker stop $(CONTAINER) >/dev/null 2>&1
 

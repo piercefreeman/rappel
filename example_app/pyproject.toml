@@ -26,8 +26,8 @@ dev = [
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+py-modules = ["workflows"]
 
 [tool.uv.sources]
 waymark = { path = "../python" }
