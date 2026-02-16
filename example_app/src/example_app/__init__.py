@@ -1,4 +1,4 @@
-"""Example waymark FastAPI application."""
+"""Example waymark workflow application."""
 
 from .workflows import ComputationRequest, ComputationResult, ExampleMathWorkflow
 
