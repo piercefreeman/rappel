@@ -731,8 +731,17 @@ async def reset_database() -> ResetResponse:
     try:
         conn = await asyncpg.connect(database_url)
         try:
-            # Delete in order respecting foreign key constraints
-            await conn.execute("DELETE FROM workflow_versions")
+            # Truncate all data.
+            # See also src/backends/postgres/test_helpers.rs
+            await conn.execute("""
+                TRUNCATE runner_actions_done,
+                    queued_instances,
+                    runner_instances,
+                    workflow_versions,
+                    workflow_schedules,
+                    worker_status
+                RESTART IDENTITY CASCADE
+            """)
             return ResetResponse(success=True, message="All workflow data cleared")
         finally:
             await conn.close()
