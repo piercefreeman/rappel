@@ -12,11 +12,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
         .compile(
             &[
-                "proto/messages.proto",
-                "proto/ast.proto",
-                "proto/execution.proto",
+                "../../proto/messages.proto",
+                "../../proto/ast.proto",
+                "../../proto/execution.proto",
             ],
-            &["proto"],
+            &["../../proto"],
         )?;
 
     Ok(())
