@@ -4,6 +4,7 @@ members = ["crates/*"]
 
 [workspace.dependencies]
 waymark = { path = "crates/waymark" }
+waymark-dag = { path = "crates/dag" }
 waymark-proto = { path = "crates/proto" }
 
 anyhow = "1"

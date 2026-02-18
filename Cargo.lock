@@ -3385,6 +3385,7 @@ dependencies = [
  "tracing-chrome",
  "tracing-subscriber",
  "uuid",
+ "waymark-dag",
  "waymark-observability-macros",
  "waymark-proto",
 ]
@@ -3414,6 +3415,7 @@ dependencies = [
  "tokio",
  "uuid",
  "waymark",
+ "waymark-dag",
 ]
 
 [[package]]
