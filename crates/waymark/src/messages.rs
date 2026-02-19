@@ -10,22 +10,13 @@ use prost::Message;
 use thiserror::Error;
 
 /// Re-export generated protobuf types
-pub mod proto {
-    // Messages for worker bridge communication
-    tonic::include_proto!("waymark.messages");
-}
+pub use waymark_proto::messages as proto;
 
 /// AST types from ast.proto for IR representation
-pub mod ast {
-    // IR AST types
-    tonic::include_proto!("waymark.ast");
-}
+pub use waymark_proto::ast;
 
 /// Execution graph types from execution.proto
-pub mod execution {
-    // Execution state types
-    tonic::include_proto!("waymark.execution");
-}
+pub use waymark_proto::execution;
 
 /// Errors that can occur during message encoding/decoding
 #[derive(Debug, Error)]

@@ -3365,7 +3365,6 @@ dependencies = [
  "metrics",
  "once_cell",
  "prost 0.12.6",
- "prost-types 0.12.6",
  "rand 0.8.5",
  "regex",
  "rmp-serde",
@@ -3380,7 +3379,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic 0.11.0",
- "tonic-build",
  "tonic-health",
  "tower 0.5.2",
  "tracing",
@@ -3388,6 +3386,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "waymark-observability-macros",
+ "waymark-proto",
 ]
 
 [[package]]
@@ -3412,6 +3411,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "waymark-proto"
+version = "0.1.0"
+dependencies = [
+ "prost 0.12.6",
+ "prost-types 0.12.6",
+ "serde",
+ "tonic 0.11.0",
+ "tonic-build",
 ]
 
 [[package]]
